@@ -1,0 +1,18 @@
+[package]
+name = "block-junk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Bevy 0.18 made input sources opt-in features; "default" is just 2d/3d/ui rendering.
+bevy = { version = "0.18", features = ["mouse", "keyboard"] }
+block-mesh = "0.2"
+ndshape = "0.3"
+lightyear = "0.26"
+avian3d = "0.6"
+bevy-inspector-egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+bincode = "2"
+
+block-junk-mod-api = { path = "../block-junk-mod-api" }
+block-junk-scripting = { path = "../block-junk-scripting" }

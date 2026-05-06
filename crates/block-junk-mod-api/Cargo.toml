@@ -1,0 +1,8 @@
+[package]
+name = "block-junk-mod-api"
+version.workspace = true
+edition.workspace = true
+description = "Public extension surface for block-junk mods. Versioned independently from the engine."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

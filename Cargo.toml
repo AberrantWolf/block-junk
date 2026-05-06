@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/block-junk",
+    "crates/block-junk-mod-api",
+    "crates/block-junk-scripting",
+]
+default-members = ["crates/block-junk"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Bevy's recommended dev profile: own code lightly optimized,
+# deps fully optimized so iteration time stays bearable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
