@@ -17,21 +17,55 @@ impl Plugin for ClientPlugin {
     }
 }
 
-fn setup_scene(mut commands: Commands) {
+fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) {
+    // Default ambient (80) leaves shadowed faces near-black. Bumping it
+    // floods all surfaces with enough light to read geometry.
+    ambient.brightness = 250.0;
+
+    // Camera + a point "headlamp" so the player can read shapes in the
+    // shadow of nearby geometry without needing to fly around to find
+    // a light angle that works.
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(17.0, 17.0, 80.0),
         FlyCam::default(),
-    ));
-
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 10_000.0,
-            shadows_enabled: true,
+        PointLight {
+            intensity: 750_000.0,
+            range: 60.0,
+            shadows_enabled: false,
             ..default()
         },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, 0.4, 0.0)),
     ));
+
+    // Two directional lights from opposite angles. The key light casts
+    // shadows; the back light only fills (no shadow map) so it doesn't
+    // create competing shadows that fight the key light's. The back light
+    // is tinted slightly cool so the two sides of geometry read differently
+    // even where they're both lit.
+    for (rot, illuminance, shadows, color) in [
+        (
+            Quat::from_euler(EulerRot::XYZ, -0.8, 0.4, 0.0),
+            10_000.0,
+            true,
+            Color::WHITE,
+        ),
+        (
+            Quat::from_euler(EulerRot::XYZ, 0.5, 2.6, 0.0),
+            3_000.0,
+            false,
+            Color::srgb(0.75, 0.85, 1.0),
+        ),
+    ] {
+        commands.spawn((
+            DirectionalLight {
+                color,
+                illuminance,
+                shadows_enabled: shadows,
+                ..default()
+            },
+            Transform::from_rotation(rot),
+        ));
+    }
 
     // Screen-centred crosshair: a fullscreen flex container with one tiny child.
     commands
