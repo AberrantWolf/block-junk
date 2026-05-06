@@ -7,7 +7,7 @@ use block_mesh::{
 use ndshape::{ConstShape, ConstShape3u32};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{Block, CHUNK_PADDED};
+use crate::protocol::{Block, CHUNK_PADDED, CHUNK_SIZE, ChunkCoord};
 
 pub type ChunkShape = ConstShape3u32<CHUNK_PADDED, CHUNK_PADDED, CHUNK_PADDED>;
 
@@ -52,18 +52,16 @@ impl RayHit {
 }
 
 impl Chunk {
-    pub fn new_sphere() -> Self {
+    /// Generate a chunk at `coord` from the deterministic terrain function.
+    /// Both server and client derive the same blocks for an unedited chunk
+    /// — that's what enables the "procedural-default" bandwidth shortcut
+    /// described in the networking-design skill.
+    pub fn from_terrain(coord: ChunkCoord) -> Self {
         let mut blocks = vec![Block::Empty; ChunkShape::USIZE];
-        let center = (CHUNK_PADDED as f32) * 0.5;
-        let radius = (CHUNK_PADDED as f32) * 0.4;
         for i in 0..ChunkShape::SIZE {
-            let [x, y, z] = ChunkShape::delinearize(i);
-            let dx = x as f32 + 0.5 - center;
-            let dy = y as f32 + 0.5 - center;
-            let dz = z as f32 + 0.5 - center;
-            if dx * dx + dy * dy + dz * dz <= radius * radius {
-                blocks[i as usize] = Block::Solid;
-            }
+            let [lx, ly, lz] = ChunkShape::delinearize(i);
+            let world = chunk_local_to_world(coord, IVec3::new(lx as i32, ly as i32, lz as i32));
+            blocks[i as usize] = terrain_block(world);
         }
         Self { blocks }
     }
@@ -208,5 +206,33 @@ fn argmin3(v: Vec3) -> usize {
         1
     } else {
         2
+    }
+}
+
+/// World-space coordinate of a chunk's local cell. Chunk-local indices live
+/// in `[0, CHUNK_PADDED)` with interior at `[1, CHUNK_PADDED-1)`; the world
+/// cell corresponds to the padding-stripped position.
+pub fn chunk_local_to_world(coord: ChunkCoord, local: IVec3) -> IVec3 {
+    coord.0 * CHUNK_SIZE as i32 + local - IVec3::ONE
+}
+
+/// World-space transform for a chunk's render entity. Aligns interior cell
+/// `(1,1,1)` of the chunk with world cell `(coord*CHUNK_SIZE)`.
+pub fn chunk_world_transform(coord: ChunkCoord) -> Transform {
+    let origin = (coord.0 * CHUNK_SIZE as i32 - IVec3::ONE).as_vec3();
+    Transform::from_translation(origin)
+}
+
+/// Deterministic terrain: a gentle sine-wave heightmap. Identical on every
+/// machine so an unedited chunk doesn't need its bytes shipped over the wire
+/// — both sides can regenerate it from the coord alone.
+fn terrain_block(world: IVec3) -> Block {
+    let h = (world.x as f32 * 0.07).sin() * 4.0
+        + (world.z as f32 * 0.05).sin() * 4.0
+        + 8.0;
+    if (world.y as f32) < h {
+        Block::Solid
+    } else {
+        Block::Empty
     }
 }

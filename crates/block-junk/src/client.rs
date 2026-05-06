@@ -39,7 +39,8 @@ fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) 
     // a light angle that works.
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(17.0, 17.0, 80.0),
+        // Above the sine-wave terrain (peaks around y=16), looking down -Z.
+        Transform::from_xyz(0.0, 32.0, 60.0),
         FlyCam::default(),
         PointLight {
             intensity: 750_000.0,
@@ -178,7 +179,7 @@ fn receive_snapshots(
                             },
                             snapshot.coord,
                             Name::new(format!("chunk{:?}", snapshot.coord.0.to_array())),
-                            Transform::default(),
+                            crate::voxel::chunk_world_transform(snapshot.coord),
                         ))
                         .id();
                     map.0.insert(snapshot.coord, entity);

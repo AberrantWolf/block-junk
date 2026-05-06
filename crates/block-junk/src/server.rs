@@ -25,17 +25,34 @@ impl Plugin for ServerPlugin {
 #[derive(Resource, Default)]
 pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
 
+/// Initial world: a small grid of chunks generated from the terrain
+/// function. This is the staged-A "no AoI yet" world; later commits add
+/// streaming so the world is effectively unbounded but only nearby chunks
+/// exist on the server at any time.
+const INITIAL_RADIUS_XZ: i32 = 2;
+const INITIAL_RADIUS_Y: i32 = 1;
+
 fn spawn_world(mut commands: Commands, mut map: ResMut<ChunkMap>) {
-    let coord = ChunkCoord(IVec3::ZERO);
-    let entity = commands
-        .spawn((
-            Chunk::new_sphere(),
-            coord,
-            Name::new("chunk(0,0,0)"),
-            Transform::default(),
-        ))
-        .id();
-    map.0.insert(coord, entity);
+    use crate::voxel::chunk_world_transform;
+
+    for cy in -INITIAL_RADIUS_Y..=INITIAL_RADIUS_Y {
+        for cz in -INITIAL_RADIUS_XZ..=INITIAL_RADIUS_XZ {
+            for cx in -INITIAL_RADIUS_XZ..=INITIAL_RADIUS_XZ {
+                let coord = ChunkCoord(IVec3::new(cx, cy, cz));
+                let entity = commands
+                    .spawn((
+                        Chunk::from_terrain(coord),
+                        coord,
+                        Name::new(format!("chunk{:?}", coord.0.to_array())),
+                        chunk_world_transform(coord),
+                    ))
+                    .id();
+                map.0.insert(coord, entity);
+            }
+        }
+    }
+    let total = (2 * INITIAL_RADIUS_XZ + 1).pow(2) * (2 * INITIAL_RADIUS_Y + 1);
+    info!("world spawned: {total} chunks");
 }
 
 /// When a client connects, hand them a snapshot of every chunk we have so
