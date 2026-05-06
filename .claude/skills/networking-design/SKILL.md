@@ -8,6 +8,24 @@ user-invocable: false
 
 This is a project-locked architecture, not a list of options. Every cross-boundary feature must obey these rules unless we explicitly revisit them. The "why" matters because it's the only way to judge edge cases.
 
+## Always-client architecture (Quake/CS pattern)
+
+There is no "host mode" in this project. **Every player runs only as a client.** Solo play just means *we also spin up a server thread* (a headless Bevy App listening on UDP-localhost) and the client connects to it. The wire format is identical to friends-mode.
+
+**Why:** the alternative (lightyear's `HostClient` shared-world pattern) requires special-case dedup logic, observer-timing races between server-spawn and client-snapshot, two `ChunkMap` resources sharing one `World`, and an "are we host or split" branch in every cross-side feature. The cost of always-going-through-UDP-loopback is ~1 ms latency on a localhost packet — imperceptible. The benefit is **one code path** for solo, friends-host, and split modes. Networking bugs surface in the dev's own play session instead of "works in solo, breaks on someone else's machine."
+
+The three modes:
+
+| Command | What runs |
+|---|---|
+| `cargo run` (default = solo) | Server thread + client App on main thread, connected via UDP-localhost. |
+| `cargo run -- server` | Just the server, headless. Listens on `SERVER_ADDR` (currently `127.0.0.1:5050`; configurable later). |
+| `cargo run -- client` | Just the client. Connects to `SERVER_ADDR`. (Eventually take an `--addr` arg for friends-join.) |
+
+Friends-host = run the server somewhere reachable (your machine with port-forwarded `5050`, or a small dedicated VM). Friends connect via `cargo run -- client --addr <host>`. Identical code path to your own local client.
+
+This rule is load-bearing — adding a "shortcut for local play that bypasses serialisation" because it seems faster is exactly the kind of choice that sneaks divergence in. Don't.
+
 ## Bandwidth budget
 
 **Target ≤ 40 kbps per player after compression.** That's roughly Minecraft-vanilla territory (sources: vanilla servers report 30–50 kB/s **per server** with 4–8 players, so a few kB/s per player; we target a comfortable overhead for the simulation depth we want).

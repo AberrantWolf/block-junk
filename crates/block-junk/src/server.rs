@@ -11,6 +11,10 @@ impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::scripting::ServerScriptingPlugin);
         app.init_resource::<ChunkMap>();
+        // Local Bevy bus for server-internal observers (scripting, building
+        // detection, etc.). Not what crosses the wire — that's lightyear's
+        // MessageSender/Receiver. Server-only.
+        app.add_message::<BlockEdit>();
         app.add_systems(Startup, spawn_world);
         app.add_systems(Update, receive_block_edits.in_set(GameSet::Simulation));
         app.add_observer(send_initial_chunks_to_new_client);

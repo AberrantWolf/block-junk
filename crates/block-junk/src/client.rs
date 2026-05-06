@@ -156,39 +156,22 @@ fn place_break_input(
 }
 
 /// Snapshot from server → spawn (or replace) the corresponding local chunk.
-///
-/// In host mode the server-spawned chunk is already in the world, so we
-/// find it via `existing` and just update its blocks in place. In split
-/// mode the existing query is empty for this coord and we spawn a fresh
-/// client-side entity.
 fn receive_snapshots(
     mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<ChunkSnapshot>>,
     mut chunks: Query<&mut Chunk>,
-    existing: Query<(Entity, &ChunkCoord)>,
     mut map: ResMut<ChunkMap>,
 ) {
     for mut receiver in receivers.iter_mut() {
         for snapshot in receiver.receive() {
-            let entity = map
-                .0
-                .get(&snapshot.coord)
-                .copied()
-                .or_else(|| {
-                    existing
-                        .iter()
-                        .find(|(_, c)| **c == snapshot.coord)
-                        .map(|(e, _)| e)
-                });
-            match entity {
-                Some(e) => {
-                    if let Ok(mut chunk) = chunks.get_mut(e) {
+            match map.0.get(&snapshot.coord).copied() {
+                Some(entity) => {
+                    if let Ok(mut chunk) = chunks.get_mut(entity) {
                         chunk.blocks = snapshot.blocks;
                     }
-                    map.0.insert(snapshot.coord, e);
                 }
                 None => {
-                    let e = commands
+                    let entity = commands
                         .spawn((
                             Chunk {
                                 blocks: snapshot.blocks,
@@ -198,7 +181,7 @@ fn receive_snapshots(
                             Transform::default(),
                         ))
                         .id();
-                    map.0.insert(snapshot.coord, e);
+                    map.0.insert(snapshot.coord, entity);
                 }
             }
         }

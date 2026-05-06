@@ -1,12 +1,14 @@
-//! Lightyear network setup. Mode-aware: spawns the server entity on
-//! server/host, the host-client entity in host mode, the netcode-client in
-//! split-client mode.
+//! Lightyear network setup. Two modes only:
 //!
-//! Cross-side messaging shape (see networking-design skill):
-//!   - server-only state: `ChunkMap`, `Chunk` components — never replicated.
-//!   - client-side state: built from `ChunkSnapshot` (initial) +
-//!     `BlockEdit` broadcasts (deltas).
-//!   - one ordered-reliable `WorldChannel` carries both message types.
+//! - `Server` spawns a netcode-UDP listener on `SERVER_ADDR`.
+//! - `Client` connects to `SERVER_ADDR` over UDP.
+//!
+//! Solo play (the `cargo run` default) is "spawn a server thread + run a
+//! client App that connects to localhost." Same wire format as friends-mode;
+//! no special-case host pattern.
+//!
+//! See the networking-design skill for what crosses the wire (events, not
+//! state) and why we identify chunks by `ChunkCoord` rather than `Entity`.
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -18,12 +20,8 @@ use crate::protocol::{BlockEdit, ChunkSnapshot, WorldChannel};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetMode {
-    /// Dedicated server (no rendering). Listens on UDP for clients.
     Server,
-    /// Dedicated client connecting to a remote server over UDP.
     Client,
-    /// Server + a local host-client in the same process. No transport.
-    Host,
 }
 
 pub const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5050);
@@ -36,19 +34,10 @@ pub struct NetworkPlugin {
 impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ProtocolPlugin);
-
         match self.mode {
-            NetMode::Server => {
-                app.add_systems(Startup, start_netcode_server);
-            }
-            NetMode::Host => {
-                app.add_systems(Startup, start_host_server);
-                app.add_systems(PostStartup, connect_host_client);
-            }
-            NetMode::Client => {
-                app.add_systems(Startup, start_netcode_client);
-            }
-        }
+            NetMode::Server => app.add_systems(Startup, start_netcode_server),
+            NetMode::Client => app.add_systems(Startup, start_netcode_client),
+        };
     }
 }
 
@@ -71,29 +60,6 @@ impl Plugin for ProtocolPlugin {
     }
 }
 
-#[derive(Resource)]
-struct LocalServerEntity(Entity);
-
-fn start_host_server(mut commands: Commands) {
-    let server = commands.spawn(Server::default()).id();
-    commands.trigger(Start { entity: server });
-    commands.insert_resource(LocalServerEntity(server));
-    info!("host server started ({:?})", server);
-}
-
-fn connect_host_client(mut commands: Commands, server: Res<LocalServerEntity>) {
-    let host_client = commands
-        .spawn((
-            Client::default(),
-            LinkOf { server: server.0 },
-            Link::new(None),
-            Linked,
-        ))
-        .id();
-    commands.trigger(Connect { entity: host_client });
-    info!("host client connecting ({:?})", host_client);
-}
-
 fn start_netcode_server(mut commands: Commands) {
     use lightyear::prelude::server::{NetcodeConfig, NetcodeServer, ServerUdpIo};
 
@@ -111,8 +77,8 @@ fn start_netcode_server(mut commands: Commands) {
 fn start_netcode_client(mut commands: Commands) {
     use lightyear::netcode::Key;
     use lightyear::prelude::client::{NetcodeClient, NetcodeConfig};
-    // Authentication and UdpIo come from the top-level prelude, not the
-    // client-only one. Imported via the file's `lightyear::prelude::*`.
+    // Authentication and UdpIo come from the top-level prelude (already
+    // imported via `lightyear::prelude::*`).
 
     let auth = Authentication::Manual {
         server_addr: SERVER_ADDR,
