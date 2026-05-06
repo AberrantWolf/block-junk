@@ -5,13 +5,20 @@ mod scripting;
 mod server;
 mod voxel;
 
+use core::time::Duration;
+
 use bevy::log::{DEFAULT_FILTER, LogPlugin};
 use bevy::prelude::*;
 
 use crate::protocol::{BlockEdit, GameSet};
 
+const TICK_HZ: f64 = 60.0;
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "host".into());
+    let run_server = mode != "client";
+    let run_client = mode != "server";
+    let tick_duration = Duration::from_secs_f64(1.0 / TICK_HZ);
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(LogPlugin {
@@ -23,6 +30,16 @@ fn main() {
         ..default()
     }));
     app.add_plugins(avian3d::PhysicsPlugins::default());
+
+    // lightyear plugin groups must be added BEFORE any ProtocolPlugin and
+    // before our gameplay plugins. Both groups can coexist in host mode —
+    // the shared sub-plugins dedupe internally.
+    if run_server {
+        app.add_plugins(lightyear::prelude::server::ServerPlugins { tick_duration });
+    }
+    if run_client {
+        app.add_plugins(lightyear::prelude::client::ClientPlugins { tick_duration });
+    }
 
     // Cross-plugin schedule order so client input → server simulation → re-mesh
     // runs in a single deterministic frame.
@@ -37,17 +54,11 @@ fn main() {
     );
     app.add_message::<BlockEdit>();
 
-    match mode.as_str() {
-        "server" => {
-            app.add_plugins(server::ServerPlugin);
-        }
-        "client" => {
-            app.add_plugins(client::ClientPlugin);
-        }
-        _ => {
-            app.add_plugins(server::ServerPlugin);
-            app.add_plugins(client::ClientPlugin);
-        }
+    if run_server {
+        app.add_plugins(server::ServerPlugin);
+    }
+    if run_client {
+        app.add_plugins(client::ClientPlugin);
     }
 
     app.run();
