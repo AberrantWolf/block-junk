@@ -1,8 +1,11 @@
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
+use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 
-use crate::protocol::{BlockEdit, ChunkCoord, ChunkSnapshot, GameSet, WorldChannel};
+use crate::protocol::{
+    BlockEdit, ChunkCoord, ChunkSnapshot, GameSet, PlayerPosition, WorldChannel,
+};
 use crate::voxel::Chunk;
 
 pub struct ServerPlugin;
@@ -11,15 +14,26 @@ impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::scripting::ServerScriptingPlugin);
         app.init_resource::<ChunkMap>();
+        app.init_resource::<ClientPositions>();
         // Local Bevy bus for server-internal observers (scripting, building
         // detection, etc.). Not what crosses the wire — that's lightyear's
         // MessageSender/Receiver. Server-only.
         app.add_message::<BlockEdit>();
         app.add_systems(Startup, spawn_world);
-        app.add_systems(Update, receive_block_edits.in_set(GameSet::Simulation));
+        app.add_systems(
+            Update,
+            (receive_block_edits, track_client_positions).in_set(GameSet::Simulation),
+        );
         app.add_observer(send_initial_chunks_to_new_client);
+        app.add_observer(forget_disconnected_client);
     }
 }
+
+/// Latest known position for each connected client, keyed by the connection
+/// entity (the `ClientOf` link entity). Filled by `track_client_positions`,
+/// consumed by AoI streaming (Stage C).
+#[derive(Resource, Default)]
+pub struct ClientPositions(pub HashMap<Entity, Vec3>);
 
 /// Maps chunk coords to their entity in this world. Server-authoritative.
 #[derive(Resource, Default)]
@@ -81,6 +95,26 @@ fn send_initial_chunks_to_new_client(
 ///
 /// "Validation" is currently just "the chunk exists and Chunk::set accepts
 /// the edit"; later we add ownership checks, anti-cheat, etc.
+fn track_client_positions(
+    mut receivers: Query<(Entity, &mut MessageReceiver<PlayerPosition>)>,
+    mut positions: ResMut<ClientPositions>,
+) {
+    for (entity, mut receiver) in receivers.iter_mut() {
+        for msg in receiver.receive() {
+            positions.0.insert(entity, msg.0);
+        }
+    }
+}
+
+/// Drop the position record for a client when its connection ends. Without
+/// this the map would grow unbounded over a long server lifetime.
+fn forget_disconnected_client(
+    trigger: On<Remove, ClientOf>,
+    mut positions: ResMut<ClientPositions>,
+) {
+    positions.0.remove(&trigger.entity);
+}
+
 fn receive_block_edits(
     mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
     mut chunks: Query<&mut Chunk>,

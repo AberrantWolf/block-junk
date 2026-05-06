@@ -4,7 +4,9 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use lightyear::prelude::*;
 
 use crate::camera::{FlyCam, FlyCamPlugin};
-use crate::protocol::{Block, BlockEdit, ChunkCoord, ChunkSnapshot, GameSet, WorldChannel};
+use crate::protocol::{
+    Block, BlockEdit, ChunkCoord, ChunkSnapshot, GameSet, PlayerPosition, WorldChannel,
+};
 use crate::voxel::Chunk;
 
 pub struct ClientPlugin;
@@ -15,7 +17,10 @@ impl Plugin for ClientPlugin {
             .add_plugins(crate::scripting::ClientScriptingPlugin)
             .init_resource::<ChunkMap>()
             .add_systems(Startup, setup_scene)
-            .add_systems(Update, place_break_input.in_set(GameSet::Input))
+            .add_systems(
+                Update,
+                (place_break_input, send_player_position).in_set(GameSet::Input),
+            )
             .add_systems(
                 Update,
                 (receive_snapshots, receive_block_edit_broadcasts).in_set(GameSet::Simulation),
@@ -204,6 +209,31 @@ fn receive_snapshots(
             }
         }
     }
+}
+
+/// Period (seconds) between player-position updates sent to the server.
+/// 10 Hz is plenty for AoI streaming decisions and stays under 200 B/s.
+const POSITION_SEND_PERIOD: f32 = 0.1;
+
+fn send_player_position(
+    time: Res<Time>,
+    mut accum: Local<f32>,
+    cam: Query<&GlobalTransform, With<FlyCam>>,
+    mut sender: Query<&mut MessageSender<PlayerPosition>>,
+) {
+    *accum += time.delta_secs();
+    if *accum < POSITION_SEND_PERIOD {
+        return;
+    }
+    *accum = 0.0;
+
+    let Ok(cam_t) = cam.single() else {
+        return;
+    };
+    let Ok(mut sender) = sender.single_mut() else {
+        return;
+    };
+    sender.send::<WorldChannel>(PlayerPosition(cam_t.translation()));
 }
 
 /// Server broadcast of an applied edit → apply it to our local chunk so the

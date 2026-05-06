@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
-use crate::protocol::{BlockEdit, ChunkSnapshot, WorldChannel};
+use crate::protocol::{BlockEdit, ChunkSnapshot, PlayerPosition, WorldChannel};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetMode {
@@ -57,6 +57,8 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::Bidirectional);
         app.register_message::<ChunkSnapshot>()
             .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<PlayerPosition>()
+            .add_direction(NetworkDirection::ClientToServer);
     }
 }
 

@@ -34,6 +34,12 @@ pub struct ChunkSnapshot {
     pub blocks: Vec<Block>,
 }
 
+/// Client → server: where this client's avatar/camera is. The server uses
+/// it for area-of-interest filtering (which chunks to stream). Sent at a
+/// modest rate (≈10 Hz) — server tick interpolates between updates.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PlayerPosition(pub Vec3);
+
 /// Channel marker. One ordered-reliable channel for all world events
 /// (BlockEdit, ChunkSnapshot, building events…). Future work may split
 /// priorities; for now KISS.
