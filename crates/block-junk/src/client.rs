@@ -5,7 +5,8 @@ use lightyear::prelude::*;
 
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::protocol::{
-    Block, BlockEdit, ChunkCoord, ChunkSnapshot, ChunkUnload, GameSet, PlayerPosition, WorldChannel,
+    Block, BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, PlayerPosition,
+    WorldChannel,
 };
 use crate::voxel::Chunk;
 
@@ -184,6 +185,9 @@ fn place_break_input(
 }
 
 /// Snapshot from server → spawn (or replace) the corresponding local chunk.
+/// `ChunkData::Procedural` means "regenerate from the shared terrain
+/// function locally" — server didn't ship the bytes because the chunk
+/// has never been edited.
 fn receive_snapshots(
     mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<ChunkSnapshot>>,
@@ -192,18 +196,20 @@ fn receive_snapshots(
 ) {
     for mut receiver in receivers.iter_mut() {
         for snapshot in receiver.receive() {
+            let chunk = match snapshot.data {
+                ChunkData::Procedural => Chunk::from_terrain(snapshot.coord),
+                ChunkData::Edited(blocks) => Chunk { blocks },
+            };
             match map.0.get(&snapshot.coord).copied() {
                 Some(entity) => {
-                    if let Ok(mut chunk) = chunks.get_mut(entity) {
-                        chunk.blocks = snapshot.blocks;
+                    if let Ok(mut existing) = chunks.get_mut(entity) {
+                        *existing = chunk;
                     }
                 }
                 None => {
                     let entity = commands
                         .spawn((
-                            Chunk {
-                                blocks: snapshot.blocks,
-                            },
+                            chunk,
                             snapshot.coord,
                             Name::new(format!("chunk{:?}", snapshot.coord.0.to_array())),
                             crate::voxel::chunk_world_transform(snapshot.coord),

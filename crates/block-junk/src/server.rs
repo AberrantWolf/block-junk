@@ -5,9 +5,16 @@ use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 
 use crate::protocol::{
-    BlockEdit, ChunkCoord, ChunkSnapshot, ChunkUnload, GameSet, PlayerPosition, WorldChannel,
+    BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, PlayerPosition,
+    WorldChannel,
 };
 use crate::voxel::{Chunk, chunk_world_transform};
+
+/// Marker on chunks whose state has diverged from the deterministic terrain
+/// function. Server uses it to decide whether to ship the bytes or just
+/// tell the client "regenerate locally" on AoI entry.
+#[derive(Component)]
+pub struct ChunkEdited;
 
 pub struct ServerPlugin;
 
@@ -135,7 +142,7 @@ fn poll_chunk_gen(
 /// we don't lose player edits when the last viewer wanders off.
 fn update_aoi(
     chunk_map: Res<ChunkMap>,
-    chunks: Query<&Chunk>,
+    chunks: Query<(&Chunk, Has<ChunkEdited>)>,
     mut pending: ResMut<PendingChunks>,
     positions: Res<ClientPositions>,
     mut sent: ResMut<ClientChunks>,
@@ -151,10 +158,18 @@ fn update_aoi(
         let removed: Vec<ChunkCoord> = current.difference(&desired).copied().collect();
 
         for coord in &candidates {
-            let blocks: Option<Vec<crate::protocol::Block>> = if let Some(&entity) =
-                chunk_map.0.get(coord)
-            {
-                chunks.get(entity).ok().map(|c| c.blocks.clone())
+            // Resolve the chunk's wire payload. Three states:
+            //   - server has the chunk, edited: send the bytes
+            //   - server has the chunk, never edited: send Procedural (tiny)
+            //   - server doesn't have the chunk yet: queue async gen and skip
+            let data: Option<ChunkData> = if let Some(&entity) = chunk_map.0.get(coord) {
+                chunks.get(entity).ok().map(|(chunk, edited)| {
+                    if edited {
+                        ChunkData::Edited(chunk.blocks.clone())
+                    } else {
+                        ChunkData::Procedural
+                    }
+                })
             } else {
                 if !pending.0.contains_key(coord) {
                     let coord_for_task = *coord;
@@ -165,13 +180,13 @@ fn update_aoi(
                 None
             };
 
-            let Some(blocks) = blocks else {
+            let Some(data) = data else {
                 continue; // still generating; try again next tick
             };
             if let Ok(mut sender) = snapshots.get_mut(client_entity) {
                 sender.send::<WorldChannel>(ChunkSnapshot {
                     coord: *coord,
-                    blocks,
+                    data,
                 });
                 current.insert(*coord);
             }
@@ -210,6 +225,7 @@ fn aoi_around(centre: ChunkCoord) -> HashSet<ChunkCoord> {
 }
 
 fn receive_block_edits(
+    mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
     mut chunks: Query<&mut Chunk>,
     map: Res<ChunkMap>,
@@ -231,6 +247,11 @@ fn receive_block_edits(
             if !chunk.set(edit.pos, edit.block) {
                 continue;
             }
+
+            // Mark the chunk as having diverged from procedural terrain —
+            // future AoI snapshots for it ship bytes, not the regen hint.
+            // No-op insert if already present.
+            commands.entity(entity).insert(ChunkEdited);
 
             // Broadcast the applied edit to every connected client.
             if let Err(err) =

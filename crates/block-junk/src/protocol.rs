@@ -25,13 +25,25 @@ pub struct BlockEdit {
     pub block: Block,
 }
 
-/// Server → client only: full snapshot of one chunk's blocks. Sent once
-/// when a client first comes into AoI of that chunk. Subsequent changes
-/// arrive as `BlockEdit` broadcasts.
+/// Server → client only: tells a client what to put in a chunk it just
+/// entered AoI of. Two payload variants — see `ChunkData`. Subsequent
+/// changes arrive as `BlockEdit` broadcasts; this message fires once
+/// per (chunk, client) pair on AoI entry.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkSnapshot {
     pub coord: ChunkCoord,
-    pub blocks: Vec<Block>,
+    pub data: ChunkData,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ChunkData {
+    /// The chunk has never been edited. The client generates it locally
+    /// from the deterministic terrain function (`Chunk::from_terrain`).
+    /// ~13 B on the wire.
+    Procedural,
+    /// The chunk has been edited; the client must use these blocks rather
+    /// than regenerating. ~32 KB on the wire (RLE later).
+    Edited(Vec<Block>),
 }
 
 /// Client → server: where this client's avatar/camera is. The server uses
