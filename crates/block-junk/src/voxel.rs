@@ -5,6 +5,7 @@ use block_mesh::{
     GreedyQuadsBuffer, MergeVoxel, RIGHT_HANDED_Y_UP_CONFIG, Voxel, VoxelVisibility, greedy_quads,
 };
 use ndshape::{ConstShape, ConstShape3u32};
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::{Block, CHUNK_PADDED};
 
@@ -26,7 +27,7 @@ impl MergeVoxel for Block {
     }
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chunk {
     /// Flat array indexed by `ChunkShape`. Padded by one voxel per side so meshing
     /// has neighbour data at chunk borders.

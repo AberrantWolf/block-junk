@@ -176,7 +176,8 @@ The `crossbeam` feature must be enabled. Check `lightyear-0.26.4/src/shared.rs` 
 Add `Replicate` to entities you want the server to push to clients:
 
 ```rust
-use lightyear::prelude::server::*; // Replicate lives in the server prelude
+use lightyear::prelude::*; // Replicate is in the top-level prelude
+                            // (NOT lightyear::prelude::server, despite the name)
 
 commands.spawn((
     MyComponent { ... },

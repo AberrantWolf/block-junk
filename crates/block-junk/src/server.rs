@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use lightyear::prelude::*;
 
 use crate::protocol::{BlockEdit, GameSet};
 use crate::voxel::Chunk;
@@ -19,6 +20,10 @@ fn spawn_world(mut commands: Commands) {
         Chunk::new_sphere(),
         Name::new("test_chunk"),
         Transform::default(),
+        // Replicate to every connected client. In host mode this is a no-op
+        // (HostClient short-circuits via shared world); in split mode the
+        // client receives a copy of the chunk entity over the wire.
+        Replicate::to_clients(NetworkTarget::All),
     ));
 }
 

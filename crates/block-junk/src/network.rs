@@ -50,9 +50,8 @@ impl Plugin for NetworkPlugin {
 struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
-    fn build(&self, _app: &mut App) {
-        // Empty for now — adding messages, channels, and replicated
-        // components lands in step 3 of the lightyear plan.
+    fn build(&self, app: &mut App) {
+        app.register_component::<crate::voxel::Chunk>();
     }
 }
 
