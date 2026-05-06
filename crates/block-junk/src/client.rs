@@ -1,8 +1,10 @@
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use lightyear::prelude::*;
 
 use crate::camera::{FlyCam, FlyCamPlugin};
-use crate::protocol::{Block, BlockEdit, GameSet};
+use crate::protocol::{Block, BlockEdit, ChunkCoord, ChunkSnapshot, GameSet, WorldChannel};
 use crate::voxel::Chunk;
 
 pub struct ClientPlugin;
@@ -11,11 +13,21 @@ impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FlyCamPlugin)
             .add_plugins(crate::scripting::ClientScriptingPlugin)
+            .init_resource::<ChunkMap>()
             .add_systems(Startup, setup_scene)
             .add_systems(Update, place_break_input.in_set(GameSet::Input))
+            .add_systems(
+                Update,
+                (receive_snapshots, receive_block_edit_broadcasts).in_set(GameSet::Simulation),
+            )
             .add_systems(Update, mesh_chunks.in_set(GameSet::PostSimulation));
     }
 }
+
+/// Client-side chunk lookup, parallel to the server's. Filled by snapshot
+/// receipt; consulted when applying broadcast edits or raycasting.
+#[derive(Resource, Default)]
+pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
 
 fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) {
     // Default ambient (80) leaves shadowed faces near-black. Bumping it
@@ -95,8 +107,8 @@ fn place_break_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
     cam: Query<&GlobalTransform, With<FlyCam>>,
-    chunks: Query<(Entity, &Chunk, &GlobalTransform)>,
-    mut writer: MessageWriter<BlockEdit>,
+    chunks: Query<(&Chunk, &ChunkCoord, &GlobalTransform)>,
+    mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
     let break_click = mouse.just_pressed(MouseButton::Left);
     let place_click = mouse.just_pressed(MouseButton::Right);
@@ -114,26 +126,100 @@ fn place_break_input(
     let Ok(cam_t) = cam.single() else {
         return;
     };
+    // The MessageSender lives on the connection entity (host-client or
+    // netcode client). There's exactly one in any non-server-only mode.
+    let Ok(mut sender) = sender.single_mut() else {
+        return;
+    };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
 
-    for (entity, chunk, chunk_t) in chunks.iter() {
+    for (chunk, coord, chunk_t) in chunks.iter() {
         let local_origin = cam_pos - chunk_t.translation();
         if let Some(hit) = chunk.raycast(local_origin, cam_dir, RAYCAST_REACH) {
             // Place at the cell adjacent to the hit face; break the hit cell
-            // itself. Chunk::set silently rejects out-of-interior writes, so
-            // a place click against the chunk's outer face is a no-op.
+            // itself. Server-side Chunk::set rejects out-of-interior writes,
+            // so a place click against the chunk's outer face becomes a no-op.
             let (pos, block) = if break_click {
                 (hit.hit, Block::Empty)
             } else {
                 (hit.place_cell(), Block::Solid)
             };
-            writer.write(BlockEdit {
-                chunk: entity,
+            sender.send::<WorldChannel>(BlockEdit {
+                coord: *coord,
                 pos,
                 block,
             });
             return;
+        }
+    }
+}
+
+/// Snapshot from server → spawn (or replace) the corresponding local chunk.
+///
+/// In host mode the server-spawned chunk is already in the world, so we
+/// find it via `existing` and just update its blocks in place. In split
+/// mode the existing query is empty for this coord and we spawn a fresh
+/// client-side entity.
+fn receive_snapshots(
+    mut commands: Commands,
+    mut receivers: Query<&mut MessageReceiver<ChunkSnapshot>>,
+    mut chunks: Query<&mut Chunk>,
+    existing: Query<(Entity, &ChunkCoord)>,
+    mut map: ResMut<ChunkMap>,
+) {
+    for mut receiver in receivers.iter_mut() {
+        for snapshot in receiver.receive() {
+            let entity = map
+                .0
+                .get(&snapshot.coord)
+                .copied()
+                .or_else(|| {
+                    existing
+                        .iter()
+                        .find(|(_, c)| **c == snapshot.coord)
+                        .map(|(e, _)| e)
+                });
+            match entity {
+                Some(e) => {
+                    if let Ok(mut chunk) = chunks.get_mut(e) {
+                        chunk.blocks = snapshot.blocks;
+                    }
+                    map.0.insert(snapshot.coord, e);
+                }
+                None => {
+                    let e = commands
+                        .spawn((
+                            Chunk {
+                                blocks: snapshot.blocks,
+                            },
+                            snapshot.coord,
+                            Name::new(format!("chunk{:?}", snapshot.coord.0.to_array())),
+                            Transform::default(),
+                        ))
+                        .id();
+                    map.0.insert(snapshot.coord, e);
+                }
+            }
+        }
+    }
+}
+
+/// Server broadcast of an applied edit → apply it to our local chunk so the
+/// client view stays in sync.
+fn receive_block_edit_broadcasts(
+    mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
+    mut chunks: Query<&mut Chunk>,
+    map: Res<ChunkMap>,
+) {
+    for mut receiver in receivers.iter_mut() {
+        for edit in receiver.receive() {
+            let Some(&entity) = map.0.get(&edit.coord) else {
+                continue;
+            };
+            if let Ok(mut chunk) = chunks.get_mut(entity) {
+                chunk.set(edit.pos, edit.block);
+            }
         }
     }
 }

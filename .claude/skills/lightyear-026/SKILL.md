@@ -195,6 +195,32 @@ Components on the entity are only replicated if you `app.register_component::<T>
 
 `NetworkTarget` variants: `All`, `None`, `Single(client_id)`, `AllExceptSingle(client_id)`, `Only(Vec<client_id>)`, `AllExcept(Vec<client_id>)`.
 
+## Path-resolution traps (verified in 0.26.4)
+
+The prelude is split into a top-level part and `client`/`server` submodules. Items aren't always where the name suggests:
+
+| Item | Lives in | Notes |
+|---|---|---|
+| `Server`, `LinkOf`, `Link`, `Linked` | top-level prelude | shared |
+| `Client`, `Connect`, `Connected`, `Disconnect` | top-level prelude | shared (despite the names) |
+| `Start`, `Started`, `Stop`, `Stopped` | `prelude::server` only | server lifecycle triggers/markers |
+| `LocalAddr`, `PeerAddr` | top-level prelude | from `aeronet_io` |
+| `Authentication` | top-level prelude | from `lightyear_netcode`, *not* `prelude::client` |
+| `UdpIo` | top-level prelude | from `lightyear_udp` |
+| `ServerUdpIo` | `prelude::server` | server-side UDP IO |
+| `NetcodeServer` | `prelude::server` | |
+| `NetcodeClient` | `prelude::client` | |
+| **`NetcodeConfig`** | **both `prelude::client` AND `prelude::server`** — different types! | Must qualify or scope-import. Glob-importing both = E0308 type mismatch. |
+| `ServerMultiMessageSender` | top-level prelude | despite the `Server` prefix it's not in `prelude::server` |
+| `MessageSender<T>`, `MessageReceiver<T>` | top-level prelude | components on connection entities |
+| `Replicate` | top-level prelude | not `prelude::server` |
+| `NetworkTarget` | top-level prelude | |
+| `NetworkDirection` | top-level prelude | |
+
+**Rule of thumb**: try the top-level prelude first. If something resolves but doesn't compile (or doesn't exist), check `prelude::server` for server-only lifecycle types and `prelude::client` for `Authentication` exceptions and the netcode client config.
+
+When `NetcodeConfig` ambiguity bites, use scoped function-local imports: `use lightyear::prelude::server::NetcodeConfig;` inside `start_netcode_server`, etc.
+
 ## Common gotchas
 
 - **`ProtocolPlugin` registered before `ClientPlugins`/`ServerPlugins`**: silent breakage. Required order.

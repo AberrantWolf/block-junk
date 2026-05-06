@@ -8,7 +8,12 @@ edition.workspace = true
 bevy = { version = "0.18", features = ["mouse", "keyboard"] }
 block-mesh = "0.2"
 ndshape = "0.3"
-lightyear = "0.26"
+# Features:
+# - default brings client/server/replication/prediction/interpolation
+# - netcode + udp wire up real network transport for split mode
+# - Note we do NOT enable crossbeam: host mode uses lightyear's built-in
+#   HostClient pattern (shared world), not in-process channels.
+lightyear = { version = "0.26", features = ["netcode", "udp"] }
 avian3d = "0.6"
 bevy-inspector-egui = "0.36"
 serde = { version = "1", features = ["derive"] }

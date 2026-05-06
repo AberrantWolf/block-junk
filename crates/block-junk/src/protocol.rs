@@ -10,19 +10,38 @@ pub enum Block {
     Solid,
 }
 
-/// Client → server intent: set a block in a chunk to a particular state.
-/// Eventually this will be replicated by lightyear; today it's an in-process
-/// message handed off between the client and server plugins.
-#[derive(Message, Clone, Copy, Debug)]
+/// Stable identifier for a chunk in the world grid. Both client and server
+/// key their `ChunkMap` by this — see the networking-design skill for why
+/// we avoid `Entity` in cross-side messages.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChunkCoord(pub IVec3);
+
+/// Client → server: an edit request. Server → client (after validation):
+/// the applied edit broadcast to everyone in the chunk's AoI.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BlockEdit {
-    pub chunk: Entity,
+    pub coord: ChunkCoord,
     pub pos: IVec3,
     pub block: Block,
 }
 
+/// Server → client only: full snapshot of one chunk's blocks. Sent once
+/// when a client first comes into AoI of that chunk. Subsequent changes
+/// arrive as `BlockEdit` broadcasts.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct ChunkSnapshot {
+    pub coord: ChunkCoord,
+    pub blocks: Vec<Block>,
+}
+
+/// Channel marker. One ordered-reliable channel for all world events
+/// (BlockEdit, ChunkSnapshot, building events…). Future work may split
+/// priorities; for now KISS.
+pub struct WorldChannel;
+
 /// Game-wide schedule ordering. Plugins assign their systems to one of these
-/// sets so that input → simulation → re-mesh runs in a single frame in the
-/// correct order, even when the systems live in different plugins.
+/// sets so input → simulation → re-mesh runs in one frame in the right order,
+/// even across plugin boundaries.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GameSet {
     Input,
