@@ -1,5 +1,6 @@
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
+use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 
@@ -16,13 +17,19 @@ impl Plugin for ServerPlugin {
         app.init_resource::<ChunkMap>();
         app.init_resource::<ClientPositions>();
         app.init_resource::<ClientChunks>();
+        app.init_resource::<PendingChunks>();
         // Local Bevy bus for server-internal observers (scripting, building
         // detection, etc.). Not what crosses the wire — that's lightyear's
         // MessageSender/Receiver. Server-only.
         app.add_message::<BlockEdit>();
         app.add_systems(
             Update,
-            (receive_block_edits, track_client_positions, update_aoi)
+            (
+                receive_block_edits,
+                track_client_positions,
+                poll_chunk_gen,
+                update_aoi,
+            )
                 .chain()
                 .in_set(GameSet::Simulation),
         );
@@ -44,6 +51,12 @@ pub struct ClientChunks(pub HashMap<Entity, HashSet<ChunkCoord>>);
 /// Authoritative map of chunk coords to their entity in this world.
 #[derive(Resource, Default)]
 pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
+
+/// Chunks whose generation is currently in flight on a worker thread.
+/// `update_aoi` skips coords already in here so we don't queue duplicate
+/// generations; `poll_chunk_gen` drains them as they complete.
+#[derive(Resource, Default)]
+pub struct PendingChunks(pub HashMap<ChunkCoord, Task<Chunk>>);
 
 const AOI_RADIUS_XZ: i32 = 2;
 const AOI_RADIUS_Y: i32 = 1;
@@ -80,18 +93,50 @@ fn forget_disconnected_client(
     sent.0.remove(&trigger.entity);
 }
 
-/// Streaming + lazy generation. For each client, computes the chunk set in
-/// their AoI, diffs against what they currently have, sends snapshots for
-/// new chunks (generating them if this is the first time anyone needs them)
-/// and unloads for chunks that left.
+/// Drains completed chunk-generation tasks off the AsyncComputeTaskPool,
+/// installing the resulting chunks into the world. Runs before `update_aoi`
+/// so newly-completed chunks are available to send this same tick.
+fn poll_chunk_gen(
+    mut commands: Commands,
+    mut chunk_map: ResMut<ChunkMap>,
+    mut pending: ResMut<PendingChunks>,
+) {
+    let mut completed: Vec<(ChunkCoord, Chunk)> = Vec::new();
+    pending.0.retain(|coord, task| {
+        if let Some(chunk) = block_on(poll_once(&mut *task)) {
+            completed.push((*coord, chunk));
+            false
+        } else {
+            true
+        }
+    });
+    for (coord, chunk) in completed {
+        let entity = commands
+            .spawn((
+                chunk,
+                coord,
+                Name::new(format!("chunk{:?}", coord.0.to_array())),
+                chunk_world_transform(coord),
+            ))
+            .id();
+        chunk_map.0.insert(coord, entity);
+    }
+}
+
+/// Streaming. For each client, computes the chunk set in their AoI and
+/// diffs against what they have. Chunks newly in AoI:
+///   - if generated already, snapshot is sent immediately
+///   - else if a generation task is in flight, skipped (will land later)
+///   - else a fresh task is queued on `AsyncComputeTaskPool`
+/// Chunks no longer in AoI: a `ChunkUnload` is sent.
 ///
 /// Master chunk records in `ChunkMap` are NOT evicted when no client needs
 /// them — that's deferred to a later stage with the "edited?" tracking, so
 /// we don't lose player edits when the last viewer wanders off.
 fn update_aoi(
-    mut commands: Commands,
-    mut chunk_map: ResMut<ChunkMap>,
+    chunk_map: Res<ChunkMap>,
     chunks: Query<&Chunk>,
+    mut pending: ResMut<PendingChunks>,
     positions: Res<ClientPositions>,
     mut sent: ResMut<ClientChunks>,
     mut snapshots: Query<&mut MessageSender<ChunkSnapshot>>,
@@ -102,37 +147,33 @@ fn update_aoi(
         let desired = aoi_around(player_chunk);
         let current = sent.0.entry(client_entity).or_default();
 
-        // Chunks newly in AoI: ensure they exist on the server, send a snapshot.
-        // We collect first to avoid a borrow tangle (current is used for read+write).
-        let added: Vec<ChunkCoord> = desired.difference(current).copied().collect();
+        let candidates: Vec<ChunkCoord> = desired.difference(current).copied().collect();
         let removed: Vec<ChunkCoord> = current.difference(&desired).copied().collect();
 
-        for coord in &added {
-            let blocks = match chunk_map.0.get(coord).copied() {
-                Some(entity) => chunks.get(entity).ok().map(|c| c.blocks.clone()),
-                None => {
-                    let chunk = Chunk::from_terrain(*coord);
-                    let blocks = chunk.blocks.clone();
-                    let entity = commands
-                        .spawn((
-                            chunk,
-                            *coord,
-                            Name::new(format!("chunk{:?}", coord.0.to_array())),
-                            chunk_world_transform(*coord),
-                        ))
-                        .id();
-                    chunk_map.0.insert(*coord, entity);
-                    Some(blocks)
+        for coord in &candidates {
+            let blocks: Option<Vec<crate::protocol::Block>> = if let Some(&entity) =
+                chunk_map.0.get(coord)
+            {
+                chunks.get(entity).ok().map(|c| c.blocks.clone())
+            } else {
+                if !pending.0.contains_key(coord) {
+                    let coord_for_task = *coord;
+                    let task = AsyncComputeTaskPool::get()
+                        .spawn(async move { Chunk::from_terrain(coord_for_task) });
+                    pending.0.insert(*coord, task);
                 }
+                None
             };
+
             let Some(blocks) = blocks else {
-                continue;
+                continue; // still generating; try again next tick
             };
             if let Ok(mut sender) = snapshots.get_mut(client_entity) {
                 sender.send::<WorldChannel>(ChunkSnapshot {
                     coord: *coord,
                     blocks,
                 });
+                current.insert(*coord);
             }
         }
 
@@ -140,13 +181,7 @@ fn update_aoi(
             if let Ok(mut sender) = unloads.get_mut(client_entity) {
                 sender.send::<WorldChannel>(ChunkUnload { coord: *coord });
             }
-        }
-
-        for c in &added {
-            current.insert(*c);
-        }
-        for c in &removed {
-            current.remove(c);
+            current.remove(coord);
         }
     }
 }
