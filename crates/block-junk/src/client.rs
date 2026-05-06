@@ -5,7 +5,7 @@ use lightyear::prelude::*;
 
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::protocol::{
-    Block, BlockEdit, ChunkCoord, ChunkSnapshot, GameSet, PlayerPosition, WorldChannel,
+    Block, BlockEdit, ChunkCoord, ChunkSnapshot, ChunkUnload, GameSet, PlayerPosition, WorldChannel,
 };
 use crate::voxel::Chunk;
 
@@ -23,7 +23,12 @@ impl Plugin for ClientPlugin {
             )
             .add_systems(
                 Update,
-                (receive_snapshots, receive_block_edit_broadcasts).in_set(GameSet::Simulation),
+                (
+                    receive_snapshots,
+                    receive_block_edit_broadcasts,
+                    receive_chunk_unloads,
+                )
+                    .in_set(GameSet::Simulation),
             )
             .add_systems(Update, mesh_chunks.in_set(GameSet::PostSimulation));
     }
@@ -234,6 +239,23 @@ fn send_player_position(
         return;
     };
     sender.send::<WorldChannel>(PlayerPosition(cam_t.translation()));
+}
+
+/// Server says a chunk has left our AoI: drop our local copy. The server
+/// keeps its master record (so any edits we made aren't lost), and we'll
+/// receive a fresh snapshot next time we walk back into range.
+fn receive_chunk_unloads(
+    mut commands: Commands,
+    mut receivers: Query<&mut MessageReceiver<ChunkUnload>>,
+    mut map: ResMut<ChunkMap>,
+) {
+    for mut receiver in receivers.iter_mut() {
+        for unload in receiver.receive() {
+            if let Some(entity) = map.0.remove(&unload.coord) {
+                commands.entity(entity).despawn();
+            }
+        }
+    }
 }
 
 /// Server broadcast of an applied edit → apply it to our local chunk so the

@@ -40,6 +40,14 @@ pub struct ChunkSnapshot {
 #[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PlayerPosition(pub Vec3);
 
+/// Server → client: this chunk has left your AoI; despawn your local copy.
+/// The server may still hold its data (we don't evict the master record yet),
+/// but you don't need it anymore.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ChunkUnload {
+    pub coord: ChunkCoord,
+}
+
 /// Channel marker. One ordered-reliable channel for all world events
 /// (BlockEdit, ChunkSnapshot, building events…). Future work may split
 /// priorities; for now KISS.
