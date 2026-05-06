@@ -102,13 +102,16 @@ fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) 
         });
 }
 
-const RAYCAST_REACH: f32 = 100.0;
+/// Reach in world cells. Generous because the camera is a flying free-cam;
+/// real survival reach (Minecraft-y ~5 blocks) lands when there's an avatar.
+const RAYCAST_REACH: f32 = 256.0;
 
 fn place_break_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
     cam: Query<&GlobalTransform, With<FlyCam>>,
-    chunks: Query<(&Chunk, &ChunkCoord, &GlobalTransform)>,
+    chunks: Query<&Chunk>,
+    chunk_map: Res<ChunkMap>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
     let break_click = mouse.just_pressed(MouseButton::Left);
@@ -127,33 +130,47 @@ fn place_break_input(
     let Ok(cam_t) = cam.single() else {
         return;
     };
-    // The MessageSender lives on the connection entity (host-client or
-    // netcode client). There's exactly one in any non-server-only mode.
+    // MessageSender lives on the connection entity; exactly one in any
+    // non-server-only mode.
     let Ok(mut sender) = sender.single_mut() else {
         return;
     };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
 
-    for (chunk, coord, chunk_t) in chunks.iter() {
-        let local_origin = cam_pos - chunk_t.translation();
-        if let Some(hit) = chunk.raycast(local_origin, cam_dir, RAYCAST_REACH) {
-            // Place at the cell adjacent to the hit face; break the hit cell
-            // itself. Server-side Chunk::set rejects out-of-interior writes,
-            // so a place click against the chunk's outer face becomes a no-op.
-            let (pos, block) = if break_click {
-                (hit.hit, Block::Empty)
-            } else {
-                (hit.place_cell(), Block::Solid)
-            };
-            sender.send::<WorldChannel>(BlockEdit {
-                coord: *coord,
-                pos,
-                block,
-            });
-            return;
-        }
-    }
+    // World-space raycast: walk world cells, dispatch each to its owning
+    // chunk via the ChunkMap. Avoids per-chunk iteration order dependence
+    // and the padding-vs-interior ambiguity that plagued the per-chunk
+    // approach.
+    let get_block = |world: IVec3| -> Block {
+        let (coord, local) = crate::voxel::world_to_chunk(world);
+        chunk_map
+            .0
+            .get(&coord)
+            .and_then(|&entity| chunks.get(entity).ok())
+            .map(|chunk| chunk.get(local))
+            .unwrap_or(Block::Empty)
+    };
+    let Some(hit) = crate::voxel::world_raycast(cam_pos, cam_dir, RAYCAST_REACH, get_block) else {
+        return;
+    };
+
+    let world_target = if break_click {
+        hit.hit
+    } else {
+        hit.hit + hit.face_normal
+    };
+    let (target_coord, target_local) = crate::voxel::world_to_chunk(world_target);
+    let block = if break_click {
+        Block::Empty
+    } else {
+        Block::Solid
+    };
+    sender.send::<WorldChannel>(BlockEdit {
+        coord: target_coord,
+        pos: target_local,
+        block,
+    });
 }
 
 /// Snapshot from server → spawn (or replace) the corresponding local chunk.

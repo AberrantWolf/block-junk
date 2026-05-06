@@ -35,20 +35,12 @@ pub struct Chunk {
 }
 
 pub struct RayHit {
-    /// Cell containing the solid block that was hit.
+    /// World cell containing the solid block that was hit.
     pub hit: IVec3,
     /// Outward normal of the face the ray entered through (unit vector along
     /// one axis, e.g. `(0, 1, 0)` for the +Y face). `hit + face_normal` is
-    /// the cell where a "place" action would put a new block.
+    /// the world cell where a "place" action would put a new block.
     pub face_normal: IVec3,
-}
-
-impl RayHit {
-    /// Cell where placing a block puts it. The caller still has to check
-    /// whether the chunk accepts edits at that position (e.g. interior bounds).
-    pub fn place_cell(&self) -> IVec3 {
-        self.hit + self.face_normal
-    }
 }
 
 impl Chunk {
@@ -112,47 +104,6 @@ impl Chunk {
             && cell.z < hi
     }
 
-    /// Amanatides–Woo voxel ray traversal. `origin` and `dir` are in chunk-local
-    /// coordinates (caller transforms world → local). Cells outside the chunk
-    /// are treated as Empty — the ray walks until it enters the chunk or runs
-    /// out of `max_distance`, so cameras outside the chunk hit fine.
-    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_distance: f32) -> Option<RayHit> {
-        let mut cell = origin.floor().as_ivec3();
-        if self.get(cell) == Block::Solid {
-            return None;
-        }
-
-        let step = dir.signum().as_ivec3();
-        // For each axis, the first voxel boundary along the ray is at cell+1
-        // for dir>0, cell for dir<=0. When dir==0 the division gives ±inf or
-        // NaN — Vec3::select replaces those with +inf so the axis is never
-        // picked by argmin.
-        let next = cell.as_vec3() + dir.signum().max(Vec3::ZERO);
-        let mut t_max = Vec3::select(
-            dir.cmpeq(Vec3::ZERO),
-            Vec3::INFINITY,
-            (next - origin) / dir,
-        );
-        // recip(0.0) = inf, so a zero-direction axis naturally never advances.
-        let t_delta = dir.abs().recip();
-
-        loop {
-            let axis = argmin3(t_max);
-            let t = t_max[axis];
-            if t > max_distance {
-                return None;
-            }
-            cell[axis] += step[axis];
-            t_max[axis] += t_delta[axis];
-
-            if self.get(cell) == Block::Solid {
-                let mut face_normal = IVec3::ZERO;
-                face_normal[axis] = -step[axis];
-                return Some(RayHit { hit: cell, face_normal });
-            }
-        }
-    }
-
     pub fn build_mesh(&self) -> Option<Mesh> {
         let mut buffer = GreedyQuadsBuffer::new(self.blocks.len());
         greedy_quads(
@@ -209,11 +160,82 @@ fn argmin3(v: Vec3) -> usize {
     }
 }
 
+/// World-space Amanatides–Woo voxel raycast. Steps cells in world coords;
+/// each cell is looked up via `get_block`, which is responsible for
+/// resolving the world cell to its owning chunk and returning the block.
+///
+/// Returning `Block::Empty` for unloaded chunks is fine — the ray just
+/// walks past them. `max_distance` is in world cells.
+pub fn world_raycast(
+    origin: Vec3,
+    dir: Vec3,
+    max_distance: f32,
+    get_block: impl Fn(IVec3) -> Block,
+) -> Option<RayHit> {
+    let mut cell = origin.floor().as_ivec3();
+    if get_block(cell) == Block::Solid {
+        return None;
+    }
+
+    let step = dir.signum().as_ivec3();
+    let next = cell.as_vec3() + dir.signum().max(Vec3::ZERO);
+    // Per-axis t to the next voxel boundary. NaN-safe: when dir==0 the
+    // division yields ±inf or NaN; select replaces it with +inf so that
+    // axis is never picked.
+    let mut t_max = Vec3::select(
+        dir.cmpeq(Vec3::ZERO),
+        Vec3::INFINITY,
+        (next - origin) / dir,
+    );
+    let t_delta = dir.abs().recip();
+
+    loop {
+        let axis = argmin3(t_max);
+        let t = t_max[axis];
+        if t > max_distance {
+            return None;
+        }
+        cell[axis] += step[axis];
+        t_max[axis] += t_delta[axis];
+
+        if get_block(cell) == Block::Solid {
+            let mut face_normal = IVec3::ZERO;
+            face_normal[axis] = -step[axis];
+            return Some(RayHit {
+                hit: cell,
+                face_normal,
+            });
+        }
+    }
+}
+
 /// World-space coordinate of a chunk's local cell. Chunk-local indices live
 /// in `[0, CHUNK_PADDED)` with interior at `[1, CHUNK_PADDED-1)`; the world
 /// cell corresponds to the padding-stripped position.
 pub fn chunk_local_to_world(coord: ChunkCoord, local: IVec3) -> IVec3 {
     coord.0 * CHUNK_SIZE as i32 + local - IVec3::ONE
+}
+
+/// Inverse of `chunk_local_to_world`: pick the unique (chunk, interior-local)
+/// pair that corresponds to a world cell. Uses `div_euclid`/`rem_euclid` so
+/// negative world coords land on the right chunk.
+///
+/// Important for edits at chunk boundaries: a raycast may hit a *padding*
+/// cell of one chunk that's actually the *interior* of its neighbour. The
+/// edit needs to be addressed to the neighbour or `Chunk::set` will refuse it.
+pub fn world_to_chunk(world: IVec3) -> (ChunkCoord, IVec3) {
+    let size = CHUNK_SIZE as i32;
+    let coord = ChunkCoord(IVec3::new(
+        world.x.div_euclid(size),
+        world.y.div_euclid(size),
+        world.z.div_euclid(size),
+    ));
+    let local = IVec3::new(
+        world.x.rem_euclid(size) + 1,
+        world.y.rem_euclid(size) + 1,
+        world.z.rem_euclid(size) + 1,
+    );
+    (coord, local)
 }
 
 /// World-space transform for a chunk's render entity. Aligns interior cell
