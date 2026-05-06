@@ -23,10 +23,13 @@ fn tick_duration() -> Duration {
 }
 
 fn main() {
-    let mode_arg = std::env::args().nth(1).unwrap_or_else(|| "solo".into());
-    match mode_arg.as_str() {
-        "server" => run_server(),
-        "client" => run_client(),
+    // Accept `server` / `--server` / `-s`, `client` / `--client` / `-c`,
+    // anything else (or no arg) → solo. trim handles the cargo-style
+    // `cargo run -- --client` where the binary sees `--client` verbatim.
+    let raw = std::env::args().nth(1).unwrap_or_default();
+    match raw.trim_start_matches('-') {
+        "server" | "s" => run_server(),
+        "client" | "c" => run_client(),
         _ => {
             // Solo: server thread, client main thread. The thread is detached
             // — when main exits, the process ends and the server dies with it.

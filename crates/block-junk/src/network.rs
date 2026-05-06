@@ -80,9 +80,14 @@ fn start_netcode_client(mut commands: Commands) {
     // Authentication and UdpIo come from the top-level prelude (already
     // imported via `lightyear::prelude::*`).
 
+    // Process-unique client ID. Hardcoding 0 means a second client trying
+    // to connect to the same server gets `ClientIdInUse` — fine for unit
+    // tests, fatal for actually playing together. A real auth flow lands
+    // when we add accounts; PID is enough until then.
+    let client_id: u64 = std::process::id() as u64;
     let auth = Authentication::Manual {
         server_addr: SERVER_ADDR,
-        client_id: 0,
+        client_id,
         private_key: Key::default(),
         protocol_id: 0,
     };
