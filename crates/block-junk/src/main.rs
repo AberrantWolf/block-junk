@@ -1,5 +1,6 @@
 mod camera;
 mod client;
+mod network;
 mod protocol;
 mod scripting;
 mod server;
@@ -10,14 +11,20 @@ use core::time::Duration;
 use bevy::log::{DEFAULT_FILTER, LogPlugin};
 use bevy::prelude::*;
 
+use crate::network::{NetMode, NetworkPlugin};
 use crate::protocol::{BlockEdit, GameSet};
 
 const TICK_HZ: f64 = 60.0;
 
 fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "host".into());
-    let run_server = mode != "client";
-    let run_client = mode != "server";
+    let mode_arg = std::env::args().nth(1).unwrap_or_else(|| "host".into());
+    let net_mode = match mode_arg.as_str() {
+        "server" => NetMode::Server,
+        "client" => NetMode::Client,
+        _ => NetMode::Host,
+    };
+    let run_server = matches!(net_mode, NetMode::Server | NetMode::Host);
+    let run_client = matches!(net_mode, NetMode::Client | NetMode::Host);
     let tick_duration = Duration::from_secs_f64(1.0 / TICK_HZ);
 
     let mut app = App::new();
@@ -53,6 +60,11 @@ fn main() {
             .chain(),
     );
     app.add_message::<BlockEdit>();
+
+    // ProtocolPlugin etc. registered here so it lands AFTER the lightyear
+    // plugin groups but BEFORE our gameplay plugins, per lightyear's
+    // ordering requirement.
+    app.add_plugins(NetworkPlugin { mode: net_mode });
 
     if run_server {
         app.add_plugins(server::ServerPlugin);
