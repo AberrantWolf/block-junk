@@ -74,6 +74,22 @@ register {
     color = { 0.20, 0.50, 0.25 },
 }
 
+-- Doors. `walkable_boundary` marks them as access points the room
+-- detector needs at least one of for a region to count as a real room.
+-- They still bound the flood-fill horizontally (`room_boundary`); future
+-- NPC AI is what actually walks through them.
+register {
+    id = "vanilla:door",
+    display_name = "Door",
+    flags = {
+        solid = true,
+        room_boundary = true,
+        walkable_boundary = true,
+        support_below = true,
+    },
+    color = { 0.40, 0.18, 0.05 },
+}
+
 -- Seed room patterns. The detector isn't wired yet (next chunk of work);
 -- these prove the registry's parent-chain and domain validation.
 
@@ -84,6 +100,11 @@ engine.rooms.register {
     constraints = {
         { kind = "floor_area", min = 4, max = 4096 },
         { kind = "headroom", min = 2 },
+        -- Every room needs an explicit access point. Without this,
+        -- accidental enclosures (a divot in the terrain, a hole the
+        -- player dug for fun) would all register as rooms. Children
+        -- inherit this so walled_yard and small_house both require it.
+        { kind = "door_count", min = 1 },
     },
 }
 

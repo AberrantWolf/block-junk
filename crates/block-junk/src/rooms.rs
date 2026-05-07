@@ -531,6 +531,27 @@ fn compute_signature(
         comp.support_in_cell /= n;
     }
 
+    // Door count: walk the floor's horizontal boundary (cells *not* in the
+    // fill that are directly adjacent to a floor cell at the same Y) and
+    // count distinct cells whose block has `walkable_boundary` set. A
+    // single 2-tall door's lower block is at floor-Y, which is what the
+    // boundary walk encounters. Distinct cells, so a door adjacent to
+    // multiple floor cells still counts once.
+    let floor_set: HashSet<IVec3> = floor_cells.iter().copied().collect();
+    let mut door_cells: HashSet<IVec3> = HashSet::new();
+    for &c in floor_cells {
+        for dir in [IVec3::X, -IVec3::X, IVec3::Z, -IVec3::Z] {
+            let n = c + dir;
+            if floor_set.contains(&n) {
+                continue;
+            }
+            if reg.def(get_block(n)).flags.walkable_boundary {
+                door_cells.insert(n);
+            }
+        }
+    }
+    let door_count = door_cells.len() as u32;
+
     let mut min_hr: u32 = u32::MAX;
     let mut max_hr: u32 = 0;
     let mut volume: u32 = 0;
@@ -606,7 +627,7 @@ fn compute_signature(
         min_headroom: Some(min_hr),
         max_headroom: Some(max_hr),
         has_roof: Some(all_roofed),
-        door_count: None, // wall-walk for door counting isn't done yet
+        door_count: Some(door_count),
         floor_composition: Some(comp),
         tag_counts: tag_counts
             .into_iter()
@@ -703,6 +724,10 @@ fn evaluate_constraint(c: &Constraint, sig: &RoomSignature) -> bool {
         Constraint::ComponentSize { min, max } => {
             let v = sig.cell_count;
             min.is_none_or(|m| v >= m) && max.is_none_or(|m| v <= m)
+        }
+        Constraint::DoorCount { min, max } => {
+            let v = sig.door_count.unwrap_or(0);
+            v >= *min && max.is_none_or(|m| v <= m)
         }
         // Connective domain — no detector for it yet, so any pattern with
         // an `AdjacentPair` constraint can't match. Returning false keeps

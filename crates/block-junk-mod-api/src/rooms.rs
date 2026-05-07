@@ -133,6 +133,16 @@ pub enum Constraint {
         #[serde(default)]
         max: Option<u32>,
     },
+    /// Required count of `walkable_boundary` cells in the room's wall ring
+    /// (volumetric only). Use with `min = 1` to require an explicit access
+    /// point — keeps the detector from registering accidental enclosures
+    /// players never intended (a hole dug in terrain, a divot under a tree).
+    DoorCount {
+        #[serde(default)]
+        min: u32,
+        #[serde(default)]
+        max: Option<u32>,
+    },
     /// Number of `(a, b)` adjacency pairs in the component (connective only).
     /// Crossroads-style: `{ a = "vanilla:road", b = "vanilla:sign", min = 2 }`.
     AdjacentPair { a: TagId, b: TagId, min: u32 },
