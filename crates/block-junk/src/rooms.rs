@@ -234,14 +234,18 @@ pub fn process_dirty(
             .unwrap_or(BlockSlot::EMPTY)
     };
 
-    // Each edit's 6-neighbourhood is the candidate seed set. An edit at E
-    // can change floor-cell status of cells in E ± {X, Y, Z}: removing E
-    // changes whether cells at E ± Y have headroom/support; adding E
-    // changes cells next to E that previously fanned through E's location.
-    let mut seeds: HashSet<IVec3> = HashSet::with_capacity(edited.len() * 7);
+    // Each edit's horizontal 4-neighbourhood is the candidate seed set.
+    // We deliberately *don't* seed at ±Y from the edit: an edit at E that
+    // creates a fresh floor cell directly above (because E became a
+    // support_below) is real, but isolating that 1-cell "podium-top"
+    // region as its own room flickers spurious Created/Destroyed events.
+    // The same rule applies for cells above ground inside a yard with
+    // uneven terrain — each Y level becomes its own room until a `step`
+    // block tag exists to mark explicit Y-traversal points.
+    let mut seeds: HashSet<IVec3> = HashSet::with_capacity(edited.len() * 5);
     for &c in &edited {
         seeds.insert(c);
-        for dir in [IVec3::X, -IVec3::X, IVec3::Y, -IVec3::Y, IVec3::Z, -IVec3::Z] {
+        for dir in [IVec3::X, -IVec3::X, IVec3::Z, -IVec3::Z] {
             seeds.insert(c + dir);
         }
     }
@@ -471,23 +475,22 @@ fn flood_fill_floor(
             return None;
         }
         out.push(c);
-        // 4 cardinal horizontals × {-1, 0, +1} Y. The ±1 Y step lets the
-        // fill cross uneven terrain and stair-shaped geometry: the
-        // destination still has to be a floor cell on its own (which
-        // requires headroom + support), so wall tops in normal rooms
-        // (≥2-high walls) don't get traversed because the cells directly
-        // above the floor inside the room have no `support_below` and so
-        // aren't candidates. Edge cases that *do* leak (1-high "fences",
-        // wall-flush ramps onto wall tops) hit the floor cap and bail.
+        // Pure 2D fill at the seed Y. ±Y traversal is *intentionally* off
+        // for now — with our "any solid block has support_below" tagging,
+        // a 1-high wall's top would qualify as a floor cell, and ±Y step
+        // would let the fill leap onto wall tops and back down outside.
+        // Cost: each Y level becomes its own room when terrain inside an
+        // enclosure is uneven. Worth it because 1-high wall enclosures
+        // are a much more common user expectation than multi-Y unions.
+        // A future `step` block tag (or `wall_only` tag, or a structural
+        // wall-detector) can re-enable selective ±Y traversal.
         for [dx, dz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
-            for dy in [-1, 0, 1] {
-                let n = c + IVec3::new(dx, dy, dz);
-                if !visited.insert(n) {
-                    continue;
-                }
-                if is_floor_cell(n, get_block, reg) {
-                    queue.push_back(n);
-                }
+            let n = c + IVec3::new(dx, 0, dz);
+            if !visited.insert(n) {
+                continue;
+            }
+            if is_floor_cell(n, get_block, reg) {
+                queue.push_back(n);
             }
         }
     }
