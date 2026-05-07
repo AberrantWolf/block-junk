@@ -67,7 +67,11 @@ fn dispatch_block_placed(mut reader: MessageReader<BlockEdit>, mut mods: ResMut<
             },
             block: match edit.block {
                 Block::Empty => BlockKind::Empty,
-                Block::Solid => BlockKind::Solid,
+                Block::Stone => BlockKind::Stone,
+                Block::Dirt => BlockKind::Dirt,
+                Block::Grass => BlockKind::Grass,
+                Block::Wood => BlockKind::Wood,
+                Block::Leaves => BlockKind::Leaves,
             },
         };
         mods.0.dispatch_block_placed(event);

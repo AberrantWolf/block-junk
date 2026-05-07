@@ -4,10 +4,41 @@ use serde::{Deserialize, Serialize};
 pub const CHUNK_SIZE: u32 = 32;
 pub const CHUNK_PADDED: u32 = CHUNK_SIZE + 2;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Block {
     Empty,
-    Solid,
+    Stone,
+    Dirt,
+    Grass,
+    Wood,
+    Leaves,
+}
+
+impl Block {
+    /// All non-empty blocks, in the order they appear in the hotbar.
+    pub const PLACEABLE: &'static [Block] = &[
+        Block::Stone,
+        Block::Dirt,
+        Block::Grass,
+        Block::Wood,
+        Block::Leaves,
+    ];
+
+    /// Display colour for this block, used as the per-vertex tint when
+    /// meshing and as the swatch colour in the hotbar UI. RGB only — alpha
+    /// is added at the call site.
+    pub fn color(self) -> [f32; 3] {
+        match self {
+            Block::Empty => [0.0, 0.0, 0.0],
+            Block::Stone => [0.55, 0.55, 0.58],
+            Block::Dirt => [0.45, 0.32, 0.20],
+            Block::Grass => [0.36, 0.62, 0.30],
+            Block::Wood => [0.55, 0.40, 0.22],
+            Block::Leaves => [0.20, 0.50, 0.25],
+        }
+    }
+
 }
 
 /// Stable identifier for a chunk in the world grid. Both client and server

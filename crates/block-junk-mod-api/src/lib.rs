@@ -136,7 +136,11 @@ pub mod shared {
     #[serde(rename_all = "lowercase")]
     pub enum BlockKind {
         Empty,
-        Solid,
+        Stone,
+        Dirt,
+        Grass,
+        Wood,
+        Leaves,
     }
 
     #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

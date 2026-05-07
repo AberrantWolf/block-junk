@@ -15,7 +15,7 @@ impl Voxel for Block {
     fn get_visibility(&self) -> VoxelVisibility {
         match self {
             Block::Empty => VoxelVisibility::Empty,
-            Block::Solid => VoxelVisibility::Opaque,
+            _ => VoxelVisibility::Opaque,
         }
     }
 }
@@ -123,6 +123,7 @@ impl Chunk {
         let num_vertices = buffer.quads.num_quads() * 4;
         let mut positions = Vec::with_capacity(num_vertices);
         let mut normals = Vec::with_capacity(num_vertices);
+        let mut colors = Vec::with_capacity(num_vertices);
         let mut indices = Vec::with_capacity(num_indices);
 
         for (group, face) in buffer
@@ -132,9 +133,19 @@ impl Chunk {
             .zip(RIGHT_HANDED_Y_UP_CONFIG.faces.iter())
         {
             for quad in group {
+                // Look up the block this quad belongs to so each face's
+                // four verts get the right colour (Bevy's StandardMaterial
+                // multiplies vertex colour by base_color when ATTRIBUTE_COLOR
+                // is present).
+                let cell_idx = ChunkShape::linearize(quad.minimum) as usize;
+                let block = self.blocks[cell_idx];
+                let [r, g, b] = block.color();
+                let rgba = [r, g, b, 1.0];
+
                 indices.extend_from_slice(&face.quad_mesh_indices(positions.len() as u32));
                 positions.extend_from_slice(&face.quad_mesh_positions(quad, 1.0));
                 normals.extend_from_slice(&face.quad_mesh_normals());
+                colors.extend_from_slice(&[rgba; 4]);
             }
         }
 
@@ -144,6 +155,7 @@ impl Chunk {
         );
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         mesh.insert_indices(Indices::U32(indices));
         Some(mesh)
     }
@@ -173,7 +185,7 @@ pub fn world_raycast(
     get_block: impl Fn(IVec3) -> Block,
 ) -> Option<RayHit> {
     let mut cell = origin.floor().as_ivec3();
-    if get_block(cell) == Block::Solid {
+    if get_block(cell) != Block::Empty {
         return None;
     }
 
@@ -198,7 +210,7 @@ pub fn world_raycast(
         cell[axis] += step[axis];
         t_max[axis] += t_delta[axis];
 
-        if get_block(cell) == Block::Solid {
+        if get_block(cell) != Block::Empty {
             let mut face_normal = IVec3::ZERO;
             face_normal[axis] = -step[axis];
             return Some(RayHit {
@@ -245,16 +257,21 @@ pub fn chunk_world_transform(coord: ChunkCoord) -> Transform {
     Transform::from_translation(origin)
 }
 
-/// Deterministic terrain: a gentle sine-wave heightmap. Identical on every
-/// machine so an unedited chunk doesn't need its bytes shipped over the wire
-/// — both sides can regenerate it from the coord alone.
+/// Deterministic terrain: a gentle sine-wave heightmap with grass/dirt/stone
+/// layering. Identical on every machine so an unedited chunk doesn't need
+/// its bytes shipped over the wire — both sides regenerate from the coord.
 fn terrain_block(world: IVec3) -> Block {
     let h = (world.x as f32 * 0.07).sin() * 4.0
         + (world.z as f32 * 0.05).sin() * 4.0
         + 8.0;
-    if (world.y as f32) < h {
-        Block::Solid
-    } else {
+    let h = h.floor() as i32;
+    if world.y >= h {
         Block::Empty
+    } else if world.y == h - 1 {
+        Block::Grass
+    } else if world.y >= h - 4 {
+        Block::Dirt
+    } else {
+        Block::Stone
     }
 }

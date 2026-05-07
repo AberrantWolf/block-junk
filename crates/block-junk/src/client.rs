@@ -1,3 +1,4 @@
+use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
@@ -17,10 +18,12 @@ impl Plugin for ClientPlugin {
         app.add_plugins(FlyCamPlugin)
             .add_plugins(crate::scripting::ClientScriptingPlugin)
             .init_resource::<ChunkMap>()
+            .init_resource::<SelectedBlock>()
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
-                (place_break_input, send_player_position).in_set(GameSet::Input),
+                (place_break_input, send_player_position, cycle_selected_block)
+                    .in_set(GameSet::Input),
             )
             .add_systems(
                 Update,
@@ -31,7 +34,10 @@ impl Plugin for ClientPlugin {
                 )
                     .in_set(GameSet::Simulation),
             )
-            .add_systems(Update, mesh_chunks.in_set(GameSet::PostSimulation));
+            .add_systems(
+                Update,
+                (mesh_chunks, update_hotbar_highlight).in_set(GameSet::PostSimulation),
+            );
     }
 }
 
@@ -39,6 +45,26 @@ impl Plugin for ClientPlugin {
 /// receipt; consulted when applying broadcast edits or raycasting.
 #[derive(Resource, Default)]
 pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
+
+/// Index into `Block::PLACEABLE` of the currently selected block. Mouse
+/// wheel cycles; right-click places.
+#[derive(Resource)]
+pub struct SelectedBlock(pub usize);
+
+impl Default for SelectedBlock {
+    fn default() -> Self {
+        Self(0)
+    }
+}
+
+impl SelectedBlock {
+    pub fn current(&self) -> Block {
+        Block::PLACEABLE[self.0]
+    }
+}
+
+#[derive(Component)]
+struct HotbarSlot(usize);
 
 fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) {
     // Default ambient (80) leaves shadowed faces near-black. Bumping it
@@ -91,7 +117,7 @@ fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) 
         ));
     }
 
-    // Screen-centred crosshair: a fullscreen flex container with one tiny child.
+    // Screen-centred crosshair.
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -111,6 +137,93 @@ fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) 
                 BackgroundColor(Color::WHITE),
             ));
         });
+
+    // Hotbar on the right edge: vertical column of slots. Selected slot
+    // gets a white border via update_hotbar_highlight.
+    commands
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            position_type: PositionType::Absolute,
+            justify_content: JustifyContent::FlexEnd,
+            align_items: AlignItems::Center,
+            padding: UiRect::right(Val::Px(20.0)),
+            ..default()
+        })
+        .with_children(|root| {
+            root.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(4.0),
+                ..default()
+            })
+            .with_children(|row| {
+                for (i, &block) in Block::PLACEABLE.iter().enumerate() {
+                    let [r, g, b] = block.color();
+                    row.spawn((
+                        Node {
+                            width: Val::Px(44.0),
+                            height: Val::Px(44.0),
+                            border: UiRect::all(Val::Px(2.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BorderColor::all(Color::BLACK),
+                        BackgroundColor(Color::srgba(0.1, 0.1, 0.1, 0.6)),
+                        HotbarSlot(i),
+                    ))
+                    .with_children(|slot| {
+                        slot.spawn((
+                            Node {
+                                width: Val::Px(32.0),
+                                height: Val::Px(32.0),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(r, g, b)),
+                        ));
+                    });
+                }
+            });
+        });
+}
+
+fn cycle_selected_block(
+    scroll: Res<AccumulatedMouseScroll>,
+    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    mut selected: ResMut<SelectedBlock>,
+) {
+    // Don't steal scrolls from menus / unlocked cursor states.
+    let locked = cursors
+        .single()
+        .map(|c| c.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+    if !locked {
+        return;
+    }
+    let n = Block::PLACEABLE.len();
+    // Hotbar is laid out top→bottom (index 0 at top). Scroll up moves the
+    // highlight to the slot *above* the current one, i.e. toward index 0.
+    if scroll.delta.y > 0.5 {
+        selected.0 = (selected.0 + n - 1) % n;
+    } else if scroll.delta.y < -0.5 {
+        selected.0 = (selected.0 + 1) % n;
+    }
+}
+
+fn update_hotbar_highlight(
+    selected: Res<SelectedBlock>,
+    mut slots: Query<(&HotbarSlot, &mut BorderColor)>,
+) {
+    if !selected.is_changed() {
+        return;
+    }
+    for (slot, mut border) in slots.iter_mut() {
+        *border = if slot.0 == selected.0 {
+            BorderColor::all(Color::WHITE)
+        } else {
+            BorderColor::all(Color::BLACK)
+        };
+    }
 }
 
 /// Reach in world cells. Generous because the camera is a flying free-cam;
@@ -123,6 +236,7 @@ fn place_break_input(
     cam: Query<&GlobalTransform, With<FlyCam>>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
+    selected: Res<SelectedBlock>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
     let break_click = mouse.just_pressed(MouseButton::Left);
@@ -175,7 +289,7 @@ fn place_break_input(
     let block = if break_click {
         Block::Empty
     } else {
-        Block::Solid
+        selected.current()
     };
     sender.send::<WorldChannel>(BlockEdit {
         coord: target_coord,
@@ -304,8 +418,10 @@ fn mesh_chunks(
         let mut e = commands.entity(entity);
         e.insert(Mesh3d(mesh_handle));
         if material.is_none() {
+            // base_color WHITE so the per-vertex colours emitted by the
+            // mesher are passed through unmodulated; PBR still adds shading.
             e.insert(MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.5, 0.7, 0.4),
+                base_color: Color::WHITE,
                 perceptual_roughness: 0.9,
                 ..default()
             })));
