@@ -11,6 +11,7 @@ use crate::protocol::{
     Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
     ChunkUnload, GameSet, PlayerPose, WorldChannel,
 };
+use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::voxel::{Chunk, chunk_world_transform};
 
 /// Marker on chunks whose state has diverged from the deterministic terrain
@@ -32,18 +33,27 @@ impl Plugin for ServerPlugin {
         app.init_resource::<ClientAvatars>();
         app.init_resource::<ClientChunks>();
         app.init_resource::<PendingChunks>();
+        app.init_resource::<RoomMap>();
+        app.init_resource::<DetectionDirty>();
         // Local Bevy bus for server-internal observers (scripting, building
         // detection, etc.). Not what crosses the wire — that's lightyear's
         // MessageSender/Receiver. Server-only.
         app.add_message::<BlockEdit>();
+        app.add_message::<RoomEventMsg>();
+        // Two chained groups in Simulation. Splitting into two `add_systems`
+        // calls works around a Bevy 0.18 trait-resolution wall on chained
+        // tuples beyond ~5 systems. The room group reads chunks updated by
+        // `receive_block_edits`, so its order is "after edits"; the AoI
+        // group is independent.
         app.add_systems(
             Update,
-            (
-                receive_block_edits,
-                track_client_positions,
-                poll_chunk_gen,
-                update_aoi,
-            )
+            (receive_block_edits, mark_dirty_from_edits, process_dirty)
+                .chain()
+                .in_set(GameSet::Simulation),
+        );
+        app.add_systems(
+            Update,
+            (track_client_positions, poll_chunk_gen, update_aoi)
                 .chain()
                 .in_set(GameSet::Simulation),
         );

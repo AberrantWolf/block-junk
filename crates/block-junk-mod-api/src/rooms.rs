@@ -209,3 +209,40 @@ pub struct RoomSignature {
     #[serde(default)]
     pub tag_counts: Vec<TagCount>,
 }
+
+/// Stable session-scoped room handle. Issued by the detector; lifetime
+/// tied to the region's existence. A wall break that destroys two rooms
+/// and creates one merged room consumes two old ids and issues a new one.
+/// Not persisted (today) — RoomIds are not stable across server restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RoomId(pub u32);
+
+/// Server-side hook event. Mods subscribe via `engine.on_room_event` to
+/// react — spawn an NPC, log to a journal, fire a sound.
+///
+/// `Created`/`Destroyed` always fire on appearance/disappearance.
+/// `Changed` fires when an existing region (same floor footprint) gains
+/// or loses a pattern match — e.g. a furniture block lands inside,
+/// deepening the matched type from `enclosed_space` to `small_house`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RoomEvent {
+    Created {
+        room: RoomId,
+        /// Deepest matching pattern, or `None` if the region passes no
+        /// registered pattern's constraints (still a valid `RoomId` —
+        /// the engine tracks unmatched regions so a later edit can turn
+        /// one into a match without re-creating the room handle).
+        pattern: Option<RoomPatternId>,
+        signature: RoomSignature,
+    },
+    Changed {
+        room: RoomId,
+        from: Option<RoomPatternId>,
+        to: Option<RoomPatternId>,
+        signature: RoomSignature,
+    },
+    Destroyed {
+        room: RoomId,
+    },
+}

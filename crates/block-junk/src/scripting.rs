@@ -14,7 +14,7 @@ use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
 use crate::blocks::{BlockRegistry, WorldSlots};
 use crate::protocol::{BlockEdit, GameSet};
-use crate::rooms::RoomPatternRegistry;
+use crate::rooms::{RoomEventMsg, RoomPatternRegistry};
 
 const MODS_DIR: &str = "./mods";
 
@@ -43,7 +43,7 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(rooms);
         app.add_systems(
             Update,
-            dispatch_block_placed.in_set(GameSet::PostSimulation),
+            (dispatch_block_placed, dispatch_room_events).in_set(GameSet::PostSimulation),
         );
     }
 }
@@ -125,5 +125,14 @@ fn dispatch_block_placed(
             block: registry.id_of(edit.block).clone(),
         };
         mods.0.dispatch_block_placed(event);
+    }
+}
+
+fn dispatch_room_events(
+    mut reader: MessageReader<RoomEventMsg>,
+    mut mods: ResMut<ServerMods>,
+) {
+    for msg in reader.read() {
+        mods.0.dispatch_room_event(&msg.0);
     }
 }

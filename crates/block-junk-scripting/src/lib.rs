@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use block_junk_mod_api::{
-    API_VERSION, ApiVersion, ModManifest, Side, blocks::BlockDef, rooms::RoomPattern,
+    API_VERSION, ApiVersion, ModManifest, Side,
+    blocks::BlockDef,
+    rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
 };
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
@@ -51,6 +53,7 @@ pub enum LoadError {
 
 /// Slot in the per-mod `engine` table where a registered hook callback lives.
 const BLOCK_PLACED_SLOT: &str = "_block_placed_handler";
+const ROOM_EVENT_SLOT: &str = "_room_event_handler";
 
 /// Shared state passed to [`ModRegistry::load_dir`]. Each registration call
 /// from a mod's Lua state appends into one of these buffers; the engine
@@ -154,6 +157,20 @@ impl ModRegistry {
                 continue;
             }
             if let Err(e) = call_block_placed(&m.lua, &event) {
+                error!(mod_name = %m.name, error = %e, "disabling mod after callback error");
+                m.disabled = true;
+            }
+        }
+    }
+
+    /// Server-only: dispatch a room-detector event to every active mod.
+    pub fn dispatch_room_event(&mut self, event: &RoomEvent) {
+        debug_assert_eq!(self.side, Side::Server);
+        for m in &mut self.mods {
+            if m.disabled {
+                continue;
+            }
+            if let Err(e) = call_room_event(&m.lua, event) {
                 error!(mod_name = %m.name, error = %e, "disabling mod after callback error");
                 m.disabled = true;
             }
@@ -302,6 +319,13 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
             Ok(())
         })?;
         engine.set("on_block_placed", register)?;
+
+        let register_room = lua.create_function(|lua, callback: Function| {
+            let engine: Table = lua.globals().get("engine")?;
+            engine.set(ROOM_EVENT_SLOT, callback)?;
+            Ok(())
+        })?;
+        engine.set("on_room_event", register_room)?;
     }
 
     lua.globals().set("engine", engine)?;
@@ -311,6 +335,16 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
 fn call_block_placed(lua: &Lua, event: &BlockPlacedEvent) -> Result<(), mlua::Error> {
     let engine: Table = lua.globals().get("engine")?;
     let handler: Value = engine.get(BLOCK_PLACED_SLOT)?;
+    let Value::Function(handler) = handler else {
+        return Ok(());
+    };
+    let event_value = lua.to_value(event)?;
+    handler.call::<()>(event_value)
+}
+
+fn call_room_event(lua: &Lua, event: &RoomEvent) -> Result<(), mlua::Error> {
+    let engine: Table = lua.globals().get("engine")?;
+    let handler: Value = engine.get(ROOM_EVENT_SLOT)?;
     let Value::Function(handler) = handler else {
         return Ok(());
     };
