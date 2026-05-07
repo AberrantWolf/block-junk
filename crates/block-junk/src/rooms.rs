@@ -255,26 +255,26 @@ pub fn process_dirty(
         }
     }
 
-    // Collect the new fills before mutating `rooms`. Skip seeds already
-    // covered by an earlier fill from this batch.
+    // Collect the new fills before mutating `rooms`. The `visited` set is
+    // shared across every seed in this batch — both as the within-fill
+    // dedup AND as the across-fill "this region was already explored"
+    // marker. So a fill that bails at the cap (outdoor leak) leaves the
+    // walked cells marked, and the next sibling seed in the same outdoor
+    // region skips immediately instead of rewalking 4096 cells.
     let mut new_fills: Vec<Vec<IVec3>> = Vec::new();
-    let mut covered: HashSet<IVec3> = HashSet::new();
+    let mut visited: HashSet<IVec3> = HashSet::new();
     for &s in &seeds {
-        if covered.contains(&s) {
+        if visited.contains(&s) {
             continue;
         }
         if !is_floor_cell(s, &get_block, &block_registry) {
             continue;
         }
-        let Some(cells) = flood_fill_floor(s, &get_block, &block_registry, FLOOD_CAP) else {
-            // Either over the cap or the fill leaked outdoors. Either way,
-            // not a tracked room.
-            continue;
-        };
-        for &c in &cells {
-            covered.insert(c);
+        if let Some(cells) =
+            flood_fill_floor(s, &get_block, &block_registry, FLOOD_CAP, &mut visited)
+        {
+            new_fills.push(cells);
         }
-        new_fills.push(cells);
     }
 
     // 3-way diff: a region whose floor_cells set is unchanged is the
@@ -310,7 +310,12 @@ pub fn process_dirty(
     }
 
     // For each invalidated room: if its canonical key matches a pending
-    // fill AND the cell sets agree, treat as Changed. Otherwise destroy.
+    // fill, the room *kept its identity* (its anchor cell is still part
+    // of the new region) and we emit Changed instead of Destroyed+Created.
+    // Cell sets aren't required to match exactly — a single edit usually
+    // trades a cell at Y for a new one at Y+1 (block placed) or vice
+    // versa, which would otherwise flicker as Destroyed+Created every
+    // time the player toggles a single block.
     let mut changed_pairs: HashMap<IVec3, RoomId> = HashMap::new();
     for id in &to_invalidate {
         let Some(room) = rooms.rooms.get(id) else {
@@ -319,10 +324,8 @@ pub fn process_dirty(
         let Some(canon) = canonical_min(&room.floor_cells) else {
             continue;
         };
-        if let Some(p) = pending.iter().find(|p| p.canonical == canon) {
-            if cells_equal(&room.floor_cells, &p.cells) {
-                changed_pairs.insert(canon, *id);
-            }
+        if pending.iter().any(|p| p.canonical == canon) {
+            changed_pairs.insert(canon, *id);
         }
     }
 
@@ -420,14 +423,6 @@ fn canonical_min(cells: &[IVec3]) -> Option<IVec3> {
         .min_by_key(|c| (c.y, c.x, c.z))
 }
 
-fn cells_equal(a: &[IVec3], b: &[IVec3]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let set: HashSet<IVec3> = a.iter().copied().collect();
-    b.iter().all(|c| set.contains(c))
-}
-
 /// Cell `c` qualifies as a floor cell if a player can stand there: the
 /// cell itself is air (or carries `support_in_cell`), there are
 /// [`PLAYER_HEIGHT`] passable cells starting at `c`, and the cell below
@@ -464,9 +459,9 @@ fn flood_fill_floor(
     get_block: &impl Fn(IVec3) -> BlockSlot,
     reg: &BlockRegistry,
     cap: u32,
+    visited: &mut HashSet<IVec3>,
 ) -> Option<Vec<IVec3>> {
     debug_assert!(is_floor_cell(seed, get_block, reg));
-    let mut visited: HashSet<IVec3> = HashSet::new();
     let mut queue: VecDeque<IVec3> = VecDeque::new();
     let mut out: Vec<IVec3> = Vec::new();
     queue.push_back(seed);
@@ -476,16 +471,23 @@ fn flood_fill_floor(
             return None;
         }
         out.push(c);
-        // Pure-2D fill at the seed's Y plane. Step-up across Y is gated
-        // until we have a `step` block tag — see the design doc note in
-        // `process_dirty` for why.
+        // 4 cardinal horizontals × {-1, 0, +1} Y. The ±1 Y step lets the
+        // fill cross uneven terrain and stair-shaped geometry: the
+        // destination still has to be a floor cell on its own (which
+        // requires headroom + support), so wall tops in normal rooms
+        // (≥2-high walls) don't get traversed because the cells directly
+        // above the floor inside the room have no `support_below` and so
+        // aren't candidates. Edge cases that *do* leak (1-high "fences",
+        // wall-flush ramps onto wall tops) hit the floor cap and bail.
         for [dx, dz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
-            let n = c + IVec3::new(dx, 0, dz);
-            if !visited.insert(n) {
-                continue;
-            }
-            if is_floor_cell(n, get_block, reg) {
-                queue.push_back(n);
+            for dy in [-1, 0, 1] {
+                let n = c + IVec3::new(dx, dy, dz);
+                if !visited.insert(n) {
+                    continue;
+                }
+                if is_floor_cell(n, get_block, reg) {
+                    queue.push_back(n);
+                }
             }
         }
     }
