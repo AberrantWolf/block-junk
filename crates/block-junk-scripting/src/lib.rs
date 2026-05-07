@@ -8,8 +8,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use block_junk_mod_api::{API_VERSION, ApiVersion, ModManifest, Side, server::BlockPlacedEvent};
+use block_junk_mod_api::{
+    API_VERSION, ApiVersion, ModManifest, Side, blocks::BlockDef, rooms::RoomPattern,
+    server::BlockPlacedEvent,
+};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -48,6 +52,36 @@ pub enum LoadError {
 /// Slot in the per-mod `engine` table where a registered hook callback lives.
 const BLOCK_PLACED_SLOT: &str = "_block_placed_handler";
 
+/// Shared state passed to [`ModRegistry::load_dir`]. Each registration call
+/// from a mod's Lua state appends into one of these buffers; the engine
+/// drains them after load to build its real registries (BlockRegistry, etc.).
+///
+/// One context is built per side (server / client). Both sides run the
+/// `shared.lua` of every mod, so the same blocks register into both — the
+/// engine builds two parallel registries that agree slot-for-slot.
+#[derive(Clone, Default)]
+pub struct LoadContext {
+    pub pending_blocks: Arc<Mutex<Vec<BlockDef>>>,
+    pub pending_rooms: Arc<Mutex<Vec<RoomPattern>>>,
+}
+
+impl LoadContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drain the accumulated block defs. Called by the engine after
+    /// `load_dir` returns so it can build the real `BlockRegistry`.
+    pub fn take_blocks(&self) -> Vec<BlockDef> {
+        std::mem::take(&mut *self.pending_blocks.lock().unwrap())
+    }
+
+    /// Drain the accumulated room patterns.
+    pub fn take_rooms(&self) -> Vec<RoomPattern> {
+        std::mem::take(&mut *self.pending_rooms.lock().unwrap())
+    }
+}
+
 pub struct LoadedMod {
     pub name: String,
     pub manifest: ModManifest,
@@ -66,7 +100,7 @@ impl ModRegistry {
     /// table appropriate for `side`. Mods that don't declare a script for
     /// `side` (or `shared`) are still listed as loaded — they just have no
     /// hooks registered, which is valid.
-    pub fn load_dir(side: Side, mods_dir: &Path) -> Result<Self, LoadError> {
+    pub fn load_dir(side: Side, mods_dir: &Path, ctx: &LoadContext) -> Result<Self, LoadError> {
         let mut mods = Vec::new();
         if !mods_dir.exists() {
             info!("no mods directory at {}", mods_dir.display());
@@ -78,6 +112,12 @@ impl ModRegistry {
             source: e,
         })?;
 
+        // Mod load order has to be stable so block-slot assignment is
+        // deterministic across runs. Rule: `vanilla` first if present,
+        // then everything else by directory name. Once we have an explicit
+        // `load_after` field in the manifest, this becomes a topological
+        // sort with the same vanilla-first behaviour falling out naturally.
+        let mut dirs: Vec<PathBuf> = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| LoadError::Io {
                 path: mods_dir.to_owned(),
@@ -90,7 +130,15 @@ impl ModRegistry {
             if !dir.join("manifest.toml").exists() {
                 continue;
             }
-            mods.push(load_mod(side, &dir)?);
+            dirs.push(dir);
+        }
+        dirs.sort_by(|a, b| {
+            let a_van = a.file_name().and_then(|n| n.to_str()) == Some("vanilla");
+            let b_van = b.file_name().and_then(|n| n.to_str()) == Some("vanilla");
+            b_van.cmp(&a_van).then_with(|| a.cmp(b))
+        });
+        for dir in dirs {
+            mods.push(load_mod(side, &dir, ctx)?);
         }
 
         info!("[{}] loaded {} mod(s)", side.as_str(), mods.len());
@@ -105,7 +153,7 @@ impl ModRegistry {
             if m.disabled {
                 continue;
             }
-            if let Err(e) = call_block_placed(&m.lua, event) {
+            if let Err(e) = call_block_placed(&m.lua, &event) {
                 error!(mod_name = %m.name, error = %e, "disabling mod after callback error");
                 m.disabled = true;
             }
@@ -122,7 +170,7 @@ pub fn warn_if_empty(registry: &ModRegistry) {
     }
 }
 
-fn load_mod(side: Side, dir: &Path) -> Result<LoadedMod, LoadError> {
+fn load_mod(side: Side, dir: &Path, ctx: &LoadContext) -> Result<LoadedMod, LoadError> {
     let manifest_path = dir.join("manifest.toml");
     let manifest_str = fs::read_to_string(&manifest_path).map_err(|e| LoadError::Io {
         path: manifest_path.clone(),
@@ -154,7 +202,7 @@ fn load_mod(side: Side, dir: &Path) -> Result<LoadedMod, LoadError> {
     }
 
     let lua = Lua::new();
-    install_engine_table(&lua, side).map_err(|source| LoadError::Lua {
+    install_engine_table(&lua, side, ctx).map_err(|source| LoadError::Lua {
         name: manifest.name.clone(),
         side: side.as_str(),
         source,
@@ -203,9 +251,49 @@ fn run_script(
 
 /// Build the per-mod `engine` table. Functions exposed here differ by side —
 /// hooks that mutate world state only exist on the server, etc.
-fn install_engine_table(lua: &Lua, side: Side) -> Result<(), mlua::Error> {
+fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), mlua::Error> {
     let engine = lua.create_table()?;
     engine.set("side", side.as_str())?;
+
+    // engine.blocks.register(def) — both sides; the same shared.lua runs in
+    // both Lua states, so each side accumulates an identical block list and
+    // ends up with matching slots.
+    let blocks_table = lua.create_table()?;
+    let pending = ctx.pending_blocks.clone();
+    let register_block = lua.create_function(move |lua, def_value: Value| {
+        let def: BlockDef = lua.from_value(def_value)?;
+        let mut buf = pending.lock().unwrap();
+        if buf.iter().any(|d| d.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate block id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    blocks_table.set("register", register_block)?;
+    engine.set("blocks", blocks_table)?;
+
+    // engine.rooms.register(pattern) — both sides accumulate the same set
+    // since shared.lua runs in both Lua states. The engine builds parallel
+    // RoomPatternRegistries that agree.
+    let rooms_table = lua.create_table()?;
+    let pending_rooms = ctx.pending_rooms.clone();
+    let register_room = lua.create_function(move |lua, value: Value| {
+        let pattern: RoomPattern = lua.from_value(value)?;
+        let mut buf = pending_rooms.lock().unwrap();
+        if buf.iter().any(|p| p.id == pattern.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate room pattern id {}",
+                pattern.id
+            )));
+        }
+        buf.push(pattern);
+        Ok(())
+    })?;
+    rooms_table.set("register", register_room)?;
+    engine.set("rooms", rooms_table)?;
 
     if side == Side::Server {
         let register = lua.create_function(|lua, callback: Function| {
@@ -220,12 +308,12 @@ fn install_engine_table(lua: &Lua, side: Side) -> Result<(), mlua::Error> {
     Ok(())
 }
 
-fn call_block_placed(lua: &Lua, event: BlockPlacedEvent) -> Result<(), mlua::Error> {
+fn call_block_placed(lua: &Lua, event: &BlockPlacedEvent) -> Result<(), mlua::Error> {
     let engine: Table = lua.globals().get("engine")?;
     let handler: Value = engine.get(BLOCK_PLACED_SLOT)?;
     let Value::Function(handler) = handler else {
         return Ok(());
     };
-    let event_value = lua.to_value(&event)?;
+    let event_value = lua.to_value(event)?;
     handler.call::<()>(event_value)
 }

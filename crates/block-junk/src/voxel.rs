@@ -1,37 +1,20 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::prelude::*;
-use block_mesh::{
-    GreedyQuadsBuffer, MergeVoxel, RIGHT_HANDED_Y_UP_CONFIG, Voxel, VoxelVisibility, greedy_quads,
-};
+use block_mesh::{GreedyQuadsBuffer, RIGHT_HANDED_Y_UP_CONFIG, greedy_quads};
 use ndshape::{ConstShape, ConstShape3u32};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{Block, CHUNK_PADDED, CHUNK_SIZE, ChunkCoord};
+use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
+use crate::protocol::{CHUNK_PADDED, CHUNK_SIZE, ChunkCoord};
 
 pub type ChunkShape = ConstShape3u32<CHUNK_PADDED, CHUNK_PADDED, CHUNK_PADDED>;
-
-impl Voxel for Block {
-    fn get_visibility(&self) -> VoxelVisibility {
-        match self {
-            Block::Empty => VoxelVisibility::Empty,
-            _ => VoxelVisibility::Opaque,
-        }
-    }
-}
-
-impl MergeVoxel for Block {
-    type MergeValue = Self;
-    fn merge_value(&self) -> Self {
-        *self
-    }
-}
 
 #[derive(Component, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chunk {
     /// Flat array indexed by `ChunkShape`. Padded by one voxel per side so meshing
     /// has neighbour data at chunk borders.
-    pub blocks: Vec<Block>,
+    pub blocks: Vec<BlockSlot>,
 }
 
 pub struct RayHit {
@@ -48,27 +31,27 @@ impl Chunk {
     /// Both server and client derive the same blocks for an unedited chunk
     /// — that's what enables the "procedural-default" bandwidth shortcut
     /// described in the networking-design skill.
-    pub fn from_terrain(coord: ChunkCoord) -> Self {
-        let mut blocks = vec![Block::Empty; ChunkShape::USIZE];
+    pub fn from_terrain(coord: ChunkCoord, slots: &TerrainSlots) -> Self {
+        let mut blocks = vec![BlockSlot::EMPTY; ChunkShape::USIZE];
         for i in 0..ChunkShape::SIZE {
             let [lx, ly, lz] = ChunkShape::delinearize(i);
             let world = chunk_local_to_world(coord, IVec3::new(lx as i32, ly as i32, lz as i32));
-            blocks[i as usize] = terrain_block(world);
+            blocks[i as usize] = terrain_block(world, slots);
         }
         Self { blocks }
     }
 
-    pub fn get(&self, cell: IVec3) -> Block {
+    pub fn get(&self, cell: IVec3) -> BlockSlot {
         match Self::cell_index(cell) {
             Some(i) => self.blocks[i],
-            None => Block::Empty,
+            None => BlockSlot::EMPTY,
         }
     }
 
     /// Returns true if the block actually changed. Edits at padding cells are
     /// rejected — `block-mesh` only generates faces for interior cells, so a
     /// block placed at a padding index would mutate state but never render.
-    pub fn set(&mut self, cell: IVec3, block: Block) -> bool {
+    pub fn set(&mut self, cell: IVec3, block: BlockSlot) -> bool {
         if !Self::is_interior(cell) {
             return false;
         }
@@ -104,7 +87,7 @@ impl Chunk {
             && cell.z < hi
     }
 
-    pub fn build_mesh(&self) -> Option<Mesh> {
+    pub fn build_mesh(&self, registry: &BlockRegistry) -> Option<Mesh> {
         let mut buffer = GreedyQuadsBuffer::new(self.blocks.len());
         greedy_quads(
             &self.blocks,
@@ -138,8 +121,8 @@ impl Chunk {
                 // multiplies vertex colour by base_color when ATTRIBUTE_COLOR
                 // is present).
                 let cell_idx = ChunkShape::linearize(quad.minimum) as usize;
-                let block = self.blocks[cell_idx];
-                let [r, g, b] = block.color();
+                let slot = self.blocks[cell_idx];
+                let [r, g, b] = registry.def(slot).color;
                 let rgba = [r, g, b, 1.0];
 
                 indices.extend_from_slice(&face.quad_mesh_indices(positions.len() as u32));
@@ -174,18 +157,18 @@ fn argmin3(v: Vec3) -> usize {
 
 /// World-space Amanatides–Woo voxel raycast. Steps cells in world coords;
 /// each cell is looked up via `get_block`, which is responsible for
-/// resolving the world cell to its owning chunk and returning the block.
+/// resolving the world cell to its owning chunk and returning the slot.
 ///
-/// Returning `Block::Empty` for unloaded chunks is fine — the ray just
-/// walks past them. `max_distance` is in world cells.
+/// Returning `BlockSlot::EMPTY` for unloaded chunks is fine — the ray
+/// just walks past them. `max_distance` is in world cells.
 pub fn world_raycast(
     origin: Vec3,
     dir: Vec3,
     max_distance: f32,
-    get_block: impl Fn(IVec3) -> Block,
+    get_block: impl Fn(IVec3) -> BlockSlot,
 ) -> Option<RayHit> {
     let mut cell = origin.floor().as_ivec3();
-    if get_block(cell) != Block::Empty {
+    if !get_block(cell).is_empty() {
         return None;
     }
 
@@ -210,7 +193,7 @@ pub fn world_raycast(
         cell[axis] += step[axis];
         t_max[axis] += t_delta[axis];
 
-        if get_block(cell) != Block::Empty {
+        if !get_block(cell).is_empty() {
             let mut face_normal = IVec3::ZERO;
             face_normal[axis] = -step[axis];
             return Some(RayHit {
@@ -260,18 +243,18 @@ pub fn chunk_world_transform(coord: ChunkCoord) -> Transform {
 /// Deterministic terrain: a gentle sine-wave heightmap with grass/dirt/stone
 /// layering. Identical on every machine so an unedited chunk doesn't need
 /// its bytes shipped over the wire — both sides regenerate from the coord.
-fn terrain_block(world: IVec3) -> Block {
+fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
     let h = (world.x as f32 * 0.07).sin() * 4.0
         + (world.z as f32 * 0.05).sin() * 4.0
         + 8.0;
     let h = h.floor() as i32;
     if world.y >= h {
-        Block::Empty
+        slots.empty
     } else if world.y == h - 1 {
-        Block::Grass
+        slots.grass
     } else if world.y >= h - 4 {
-        Block::Dirt
+        slots.dirt
     } else {
-        Block::Stone
+        slots.stone
     }
 }

@@ -17,7 +17,8 @@ use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
 use crate::protocol::{
-    Avatar, AvatarPose, BlockEdit, ChunkSnapshot, ChunkUnload, PlayerPose, WorldChannel,
+    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkSnapshot, ChunkUnload, PlayerPose,
+    WorldChannel,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +61,8 @@ impl Plugin for ProtocolPlugin {
         app.register_message::<ChunkSnapshot>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ChunkUnload>()
+            .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<BlockManifest>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<PlayerPose>()
             .add_direction(NetworkDirection::ClientToServer);

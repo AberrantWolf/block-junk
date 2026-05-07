@@ -10,6 +10,11 @@
 //! - [`shared`] — types and hooks available to scripts on either side.
 //! - [`server`] — types and hooks only available to a mod's `server.lua`.
 //! - [`client`] — types and hooks only available to a mod's `client.lua`.
+//! - [`blocks`] — block registry types (id, def, flags, tags). Side-agnostic.
+//! - [`rooms`] — room pattern registry types. Side-agnostic.
+
+pub mod blocks;
+pub mod rooms;
 
 use serde::{Deserialize, Serialize};
 
@@ -132,17 +137,6 @@ impl Side {
 pub mod shared {
     use super::*;
 
-    #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-    #[serde(rename_all = "lowercase")]
-    pub enum BlockKind {
-        Empty,
-        Stone,
-        Dirt,
-        Grass,
-        Wood,
-        Leaves,
-    }
-
     #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
     pub struct BlockPos {
         pub x: i32,
@@ -156,10 +150,10 @@ pub mod server {
 
     /// Fired after a place-or-break edit has been applied to the authoritative
     /// world. Server-only because it sees the canonical post-edit state.
-    #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct BlockPlacedEvent {
         pub pos: shared::BlockPos,
-        pub block: shared::BlockKind,
+        pub block: blocks::BlockId,
     }
 }
 

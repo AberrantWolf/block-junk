@@ -4,10 +4,11 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use lightyear::prelude::*;
 
+use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::protocol::{
-    Avatar, AvatarPose, Block, BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    GameSet, PlayerPose, WorldChannel,
+    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
+    ChunkUnload, GameSet, PlayerPose, WorldChannel,
 };
 use crate::voxel::Chunk;
 
@@ -16,8 +17,17 @@ pub struct ClientPlugin;
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FlyCamPlugin)
-            .add_plugins(crate::scripting::ClientScriptingPlugin)
-            .init_resource::<ChunkMap>()
+            .add_plugins(crate::scripting::ClientScriptingPlugin);
+        // ClientScriptingPlugin inserts BlockRegistry. Derive client-side
+        // resources from it.
+        let palette = {
+            let reg = app.world().resource::<BlockRegistry>();
+            PlaceablePalette(reg.iter_placeable().collect())
+        };
+        let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
+        app.insert_resource(palette);
+        app.insert_resource(terrain_slots);
+        app.init_resource::<ChunkMap>()
             .init_resource::<SelectedBlock>()
             .add_systems(Startup, setup_scene)
             .add_systems(
@@ -28,6 +38,7 @@ impl Plugin for ClientPlugin {
             .add_systems(
                 Update,
                 (
+                    receive_block_manifest,
                     receive_snapshots,
                     receive_block_edit_broadcasts,
                     receive_chunk_unloads,
@@ -57,20 +68,20 @@ struct AvatarAssets {
 #[derive(Resource, Default)]
 pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
 
-/// Index into `Block::PLACEABLE` of the currently selected block. Mouse
-/// wheel cycles; right-click places.
+/// Cached list of placeable blocks for hotbar / cycling. Built once at
+/// startup from `BlockRegistry::iter_placeable`. If/when mods can add
+/// blocks at runtime this will need invalidation; for now it's static.
 #[derive(Resource)]
+pub struct PlaceablePalette(pub Vec<BlockSlot>);
+
+/// Index into [`PlaceablePalette`] of the currently selected block. Mouse
+/// wheel cycles; right-click places.
+#[derive(Resource, Default)]
 pub struct SelectedBlock(pub usize);
 
-impl Default for SelectedBlock {
-    fn default() -> Self {
-        Self(0)
-    }
-}
-
 impl SelectedBlock {
-    pub fn current(&self) -> Block {
-        Block::PLACEABLE[self.0]
+    pub fn current(&self, palette: &PlaceablePalette) -> BlockSlot {
+        palette.0[self.0]
     }
 }
 
@@ -82,6 +93,8 @@ fn setup_scene(
     mut ambient: ResMut<GlobalAmbientLight>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    palette: Res<PlaceablePalette>,
+    registry: Res<BlockRegistry>,
 ) {
     // Default ambient (80) leaves shadowed faces near-black. Bumping it
     // floods all surfaces with enough light to read geometry.
@@ -186,8 +199,8 @@ fn setup_scene(
                 ..default()
             })
             .with_children(|row| {
-                for (i, &block) in Block::PLACEABLE.iter().enumerate() {
-                    let [r, g, b] = block.color();
+                for (i, &slot) in palette.0.iter().enumerate() {
+                    let [r, g, b] = registry.def(slot).color;
                     row.spawn((
                         Node {
                             width: Val::Px(44.0),
@@ -220,6 +233,7 @@ fn cycle_selected_block(
     scroll: Res<AccumulatedMouseScroll>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
     mut selected: ResMut<SelectedBlock>,
+    palette: Res<PlaceablePalette>,
 ) {
     // Don't steal scrolls from menus / unlocked cursor states.
     let locked = cursors
@@ -229,7 +243,10 @@ fn cycle_selected_block(
     if !locked {
         return;
     }
-    let n = Block::PLACEABLE.len();
+    let n = palette.0.len();
+    if n == 0 {
+        return;
+    }
     // Hotbar is laid out top→bottom (index 0 at top). Scroll up moves the
     // highlight to the slot *above* the current one, i.e. toward index 0.
     if scroll.delta.y > 0.5 {
@@ -266,6 +283,7 @@ fn place_break_input(
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
     selected: Res<SelectedBlock>,
+    palette: Res<PlaceablePalette>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
     let break_click = mouse.just_pressed(MouseButton::Left);
@@ -296,14 +314,14 @@ fn place_break_input(
     // chunk via the ChunkMap. Avoids per-chunk iteration order dependence
     // and the padding-vs-interior ambiguity that plagued the per-chunk
     // approach.
-    let get_block = |world: IVec3| -> Block {
+    let get_block = |world: IVec3| -> BlockSlot {
         let (coord, local) = crate::voxel::world_to_chunk(world);
         chunk_map
             .0
             .get(&coord)
             .and_then(|&entity| chunks.get(entity).ok())
             .map(|chunk| chunk.get(local))
-            .unwrap_or(Block::Empty)
+            .unwrap_or(BlockSlot::EMPTY)
     };
     let Some(hit) = crate::voxel::world_raycast(cam_pos, cam_dir, RAYCAST_REACH, get_block) else {
         return;
@@ -316,9 +334,9 @@ fn place_break_input(
     };
     let (target_coord, target_local) = crate::voxel::world_to_chunk(world_target);
     let block = if break_click {
-        Block::Empty
+        BlockSlot::EMPTY
     } else {
-        selected.current()
+        selected.current(&palette)
     };
     sender.send::<WorldChannel>(BlockEdit {
         coord: target_coord,
@@ -336,11 +354,12 @@ fn receive_snapshots(
     mut receivers: Query<&mut MessageReceiver<ChunkSnapshot>>,
     mut chunks: Query<&mut Chunk>,
     mut map: ResMut<ChunkMap>,
+    terrain_slots: Res<TerrainSlots>,
 ) {
     for mut receiver in receivers.iter_mut() {
         for snapshot in receiver.receive() {
             let chunk = match snapshot.data {
-                ChunkData::Procedural => Chunk::from_terrain(snapshot.coord),
+                ChunkData::Procedural => Chunk::from_terrain(snapshot.coord, &terrain_slots),
                 ChunkData::Edited(blocks) => Chunk { blocks },
             };
             match map.0.get(&snapshot.coord).copied() {
@@ -406,6 +425,53 @@ fn sync_avatar_transforms(
     }
 }
 
+/// Server's slot ↔ id table arrives once on connect. Compare against our
+/// local `BlockRegistry`; any mismatch indicates a divergent mod set and
+/// is logged loudly. We don't disconnect today (until saves exist there's
+/// no real harm), but the loud log makes the failure obvious in dev.
+fn receive_block_manifest(
+    mut receivers: Query<&mut MessageReceiver<BlockManifest>>,
+    registry: Res<BlockRegistry>,
+) {
+    for mut receiver in receivers.iter_mut() {
+        for manifest in receiver.receive() {
+            let mut mismatches = 0usize;
+            for (i, server_id) in manifest.slots.iter().enumerate() {
+                let slot = BlockSlot(i as u16);
+                if i >= registry.slot_count() {
+                    error!(slot = i, id = %server_id, "server has block id we don't");
+                    mismatches += 1;
+                    continue;
+                }
+                let local_id = registry.id_of(slot);
+                if local_id != server_id {
+                    error!(
+                        slot = i,
+                        server_id = %server_id,
+                        client_id = %local_id,
+                        "block manifest mismatch",
+                    );
+                    mismatches += 1;
+                }
+            }
+            if manifest.slots.len() < registry.slot_count() {
+                error!(
+                    server_count = manifest.slots.len(),
+                    client_count = registry.slot_count(),
+                    "client registered more blocks than server",
+                );
+                mismatches += 1;
+            }
+            if mismatches == 0 {
+                info!(
+                    "block manifest OK ({} slot(s) agreed)",
+                    manifest.slots.len()
+                );
+            }
+        }
+    }
+}
+
 /// Server says a chunk has left our AoI: drop our local copy. The server
 /// keeps its master record (so any edits we made aren't lost), and we'll
 /// receive a fresh snapshot next time we walk back into range.
@@ -461,6 +527,7 @@ fn mesh_chunks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    registry: Res<BlockRegistry>,
     chunks: Query<
         (
             Entity,
@@ -471,7 +538,7 @@ fn mesh_chunks(
     >,
 ) {
     for (entity, chunk, material) in chunks.iter() {
-        let Some(mesh) = chunk.build_mesh() else {
+        let Some(mesh) = chunk.build_mesh(&registry) else {
             continue;
         };
         let mesh_handle = meshes.add(mesh);

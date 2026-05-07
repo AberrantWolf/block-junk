@@ -1,45 +1,11 @@
 use bevy::prelude::*;
+use block_junk_mod_api::blocks::BlockId;
 use serde::{Deserialize, Serialize};
+
+use crate::blocks::BlockSlot;
 
 pub const CHUNK_SIZE: u32 = 32;
 pub const CHUNK_PADDED: u32 = CHUNK_SIZE + 2;
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum Block {
-    Empty,
-    Stone,
-    Dirt,
-    Grass,
-    Wood,
-    Leaves,
-}
-
-impl Block {
-    /// All non-empty blocks, in the order they appear in the hotbar.
-    pub const PLACEABLE: &'static [Block] = &[
-        Block::Stone,
-        Block::Dirt,
-        Block::Grass,
-        Block::Wood,
-        Block::Leaves,
-    ];
-
-    /// Display colour for this block, used as the per-vertex tint when
-    /// meshing and as the swatch colour in the hotbar UI. RGB only — alpha
-    /// is added at the call site.
-    pub fn color(self) -> [f32; 3] {
-        match self {
-            Block::Empty => [0.0, 0.0, 0.0],
-            Block::Stone => [0.55, 0.55, 0.58],
-            Block::Dirt => [0.45, 0.32, 0.20],
-            Block::Grass => [0.36, 0.62, 0.30],
-            Block::Wood => [0.55, 0.40, 0.22],
-            Block::Leaves => [0.20, 0.50, 0.25],
-        }
-    }
-
-}
 
 /// Stable identifier for a chunk in the world grid. Both client and server
 /// key their `ChunkMap` by this — see the networking-design skill for why
@@ -53,7 +19,16 @@ pub struct ChunkCoord(pub IVec3);
 pub struct BlockEdit {
     pub coord: ChunkCoord,
     pub pos: IVec3,
-    pub block: Block,
+    pub block: BlockSlot,
+}
+
+/// Server → client on connect: the slot ↔ id table the server is using.
+/// Client validates against its own registry; mismatched slot/id pairs
+/// indicate a divergent mod set and the connection is rejected.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct BlockManifest {
+    /// Slot index = position in this Vec. Slot 0 is always `vanilla:empty`.
+    pub slots: Vec<BlockId>,
 }
 
 /// Server → client only: tells a client what to put in a chunk it just
@@ -73,8 +48,8 @@ pub enum ChunkData {
     /// ~13 B on the wire.
     Procedural,
     /// The chunk has been edited; the client must use these blocks rather
-    /// than regenerating. ~32 KB on the wire (RLE later).
-    Edited(Vec<Block>),
+    /// than regenerating. ~64 KB on the wire (RLE later).
+    Edited(Vec<BlockSlot>),
 }
 
 /// Client → server: where this client's avatar is and which way they're

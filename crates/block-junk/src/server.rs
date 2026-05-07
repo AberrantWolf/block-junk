@@ -6,9 +6,10 @@ use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 
+use crate::blocks::{BlockRegistry, TerrainSlots};
 use crate::protocol::{
-    Avatar, AvatarPose, BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
-    PlayerPose, WorldChannel,
+    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
+    ChunkUnload, GameSet, PlayerPose, WorldChannel,
 };
 use crate::voxel::{Chunk, chunk_world_transform};
 
@@ -23,6 +24,10 @@ pub struct ServerPlugin;
 impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::scripting::ServerScriptingPlugin);
+        // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
+        // terrain slots from it once so chunk gen doesn't hash strings.
+        let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
+        app.insert_resource(terrain_slots);
         app.init_resource::<ChunkMap>();
         app.init_resource::<ClientAvatars>();
         app.init_resource::<ClientChunks>();
@@ -105,6 +110,8 @@ fn register_new_client(
     mut commands: Commands,
     mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
+    registry: Res<BlockRegistry>,
+    mut manifests: Query<&mut MessageSender<BlockManifest>>,
 ) {
     let connection = trigger.entity;
     let Ok(remote) = remote_ids.get(connection) else {
@@ -121,6 +128,15 @@ fn register_new_client(
         .id();
     avatars.0.insert(connection, avatar);
     sent.0.entry(connection).or_default();
+
+    // Send the slot table once so the client can sanity-check it against
+    // its own. Mismatches indicate a divergent mod set; logged client-side.
+    if let Ok(mut sender) = manifests.get_mut(connection) {
+        let manifest = BlockManifest {
+            slots: registry.iter().map(|(_, def)| def.id.clone()).collect(),
+        };
+        sender.send::<WorldChannel>(manifest);
+    }
 }
 
 fn track_client_positions(
@@ -207,6 +223,7 @@ fn update_aoi(
     mut sent: ResMut<ClientChunks>,
     mut snapshots: Query<&mut MessageSender<ChunkSnapshot>>,
     mut unloads: Query<&mut MessageSender<ChunkUnload>>,
+    terrain_slots: Res<TerrainSlots>,
 ) {
     for (&client_entity, &avatar_entity) in avatars.0.iter() {
         let Ok(avatar_pose) = poses.get(avatar_entity) else {
@@ -235,8 +252,9 @@ fn update_aoi(
             } else {
                 if !pending.0.contains_key(coord) {
                     let coord_for_task = *coord;
+                    let slots = *terrain_slots;
                     let task = AsyncComputeTaskPool::get()
-                        .spawn(async move { Chunk::from_terrain(coord_for_task) });
+                        .spawn(async move { Chunk::from_terrain(coord_for_task, &slots) });
                     pending.0.insert(*coord, task);
                 }
                 None

@@ -1,7 +1,9 @@
+mod blocks;
 mod camera;
 mod client;
 mod network;
 mod protocol;
+mod rooms;
 mod scripting;
 mod server;
 mod voxel;
@@ -28,18 +30,21 @@ fn main() {
     // `cargo run -- --client` where the binary sees `--client` verbatim.
     let raw = std::env::args().nth(1).unwrap_or_default();
     match raw.trim_start_matches('-') {
-        "server" | "s" => run_server(),
+        "server" | "s" => run_server(true),
         "client" | "c" => run_client(),
         _ => {
             // Solo: server thread, client main thread. The thread is detached
             // — when main exits, the process ends and the server dies with it.
-            std::thread::spawn(run_server);
+            // Tracing has a process-global subscriber, so only one side
+            // installs LogPlugin; client wins because it's the one with
+            // `DEFAULT_FILTER` tuned for ecosystem noise (gilrs etc.).
+            std::thread::spawn(|| run_server(false));
             run_client();
         }
     }
 }
 
-fn run_server() {
+fn run_server(install_log_plugin: bool) {
     let tick = tick_duration();
     let mut app = App::new();
 
@@ -47,10 +52,12 @@ fn run_server() {
     // Throttle the run loop to the tick rate so we don't peg a core spinning.
     app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(tick)));
     app.add_plugins(TransformPlugin);
-    app.add_plugins(LogPlugin {
-        filter: format!("{DEFAULT_FILTER}gilrs_core=off,"),
-        ..default()
-    });
+    if install_log_plugin {
+        app.add_plugins(LogPlugin {
+            filter: format!("{DEFAULT_FILTER}gilrs_core=off,"),
+            ..default()
+        });
+    }
     // TODO: avian3d needs server-headless feature flags before we can add
     // physics on the dedicated server. Defer until we have a server-side use.
 
