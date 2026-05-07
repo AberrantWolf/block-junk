@@ -6,8 +6,8 @@ use lightyear::prelude::*;
 
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::protocol::{
-    Block, BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, PlayerPosition,
-    WorldChannel,
+    Avatar, AvatarPose, Block, BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
+    GameSet, PlayerPose, WorldChannel,
 };
 use crate::voxel::Chunk;
 
@@ -22,7 +22,7 @@ impl Plugin for ClientPlugin {
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
-                (place_break_input, send_player_position, cycle_selected_block)
+                (place_break_input, send_player_pose, cycle_selected_block)
                     .in_set(GameSet::Input),
             )
             .add_systems(
@@ -31,14 +31,25 @@ impl Plugin for ClientPlugin {
                     receive_snapshots,
                     receive_block_edit_broadcasts,
                     receive_chunk_unloads,
+                    sync_avatar_transforms,
                 )
                     .in_set(GameSet::Simulation),
             )
             .add_systems(
                 Update,
                 (mesh_chunks, update_hotbar_highlight).in_set(GameSet::PostSimulation),
-            );
+            )
+            .add_observer(attach_avatar_visuals);
     }
+}
+
+/// Pre-built mesh + material for remote-player avatars. Built once during
+/// `setup_scene` so every replicated avatar shares the same handles instead
+/// of allocating new GPU resources per spawn.
+#[derive(Resource)]
+struct AvatarAssets {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
 }
 
 /// Client-side chunk lookup, parallel to the server's. Filled by snapshot
@@ -66,10 +77,28 @@ impl SelectedBlock {
 #[derive(Component)]
 struct HotbarSlot(usize);
 
-fn setup_scene(mut commands: Commands, mut ambient: ResMut<GlobalAmbientLight>) {
+fn setup_scene(
+    mut commands: Commands,
+    mut ambient: ResMut<GlobalAmbientLight>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     // Default ambient (80) leaves shadowed faces near-black. Bumping it
     // floods all surfaces with enough light to read geometry.
     ambient.brightness = 250.0;
+
+    // Single shared cuboid + material for all remote-player avatars. Roughly
+    // Minecraft proportions (0.6×1.8×0.6 m), centred on the avatar's
+    // Transform so the world position matches the camera-eye height that
+    // the owner reports to the server.
+    commands.insert_resource(AvatarAssets {
+        mesh: meshes.add(Cuboid::new(0.6, 1.8, 0.6)),
+        material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.95, 0.55, 0.25),
+            perceptual_roughness: 0.6,
+            ..default()
+        }),
+    });
 
     // Camera + a point "headlamp" so the player can read shapes in the
     // shadow of nearby geometry without needing to fly around to find
@@ -336,29 +365,45 @@ fn receive_snapshots(
     }
 }
 
-/// Period (seconds) between player-position updates sent to the server.
-/// 10 Hz is plenty for AoI streaming decisions and stays under 200 B/s.
-const POSITION_SEND_PERIOD: f32 = 0.1;
+/// Period (seconds) between player-pose updates sent to the server. 10 Hz
+/// is plenty for AoI streaming decisions and stays under 200 B/s.
+const POSE_SEND_PERIOD: f32 = 0.1;
 
-fn send_player_position(
+fn send_player_pose(
     time: Res<Time>,
     mut accum: Local<f32>,
-    cam: Query<&GlobalTransform, With<FlyCam>>,
-    mut sender: Query<&mut MessageSender<PlayerPosition>>,
+    cam: Query<(&GlobalTransform, &FlyCam)>,
+    mut sender: Query<&mut MessageSender<PlayerPose>>,
 ) {
     *accum += time.delta_secs();
-    if *accum < POSITION_SEND_PERIOD {
+    if *accum < POSE_SEND_PERIOD {
         return;
     }
     *accum = 0.0;
 
-    let Ok(cam_t) = cam.single() else {
+    let Ok((cam_t, fly)) = cam.single() else {
         return;
     };
     let Ok(mut sender) = sender.single_mut() else {
         return;
     };
-    sender.send::<WorldChannel>(PlayerPosition(cam_t.translation()));
+    sender.send::<WorldChannel>(PlayerPose {
+        translation: cam_t.translation(),
+        yaw: fly.yaw,
+    });
+}
+
+/// Replicated `AvatarPose` is the authoritative state for remote players;
+/// Bevy's renderer reads `Transform`. Copy across whenever the pose changes.
+/// Yaw rotates the body around +Y; pitch is intentionally not applied —
+/// when we add a head/torso split the head will get its own component.
+fn sync_avatar_transforms(
+    mut avatars: Query<(&AvatarPose, &mut Transform), Changed<AvatarPose>>,
+) {
+    for (pose, mut transform) in avatars.iter_mut() {
+        transform.translation = pose.translation;
+        transform.rotation = Quat::from_rotation_y(pose.yaw);
+    }
 }
 
 /// Server says a chunk has left our AoI: drop our local copy. The server
@@ -395,6 +440,21 @@ fn receive_block_edit_broadcasts(
             }
         }
     }
+}
+
+/// A replicated avatar entity arrived from the server — paint it with the
+/// shared mesh + material so the player has something to look at. The
+/// entity already has a Transform from replication; Mesh3d won't override it.
+fn attach_avatar_visuals(
+    trigger: On<Add, Avatar>,
+    assets: Res<AvatarAssets>,
+    mut commands: Commands,
+) {
+    info!("remote avatar entered view: {:?}", trigger.entity);
+    commands.entity(trigger.entity).insert((
+        Mesh3d(assets.mesh.clone()),
+        MeshMaterial3d(assets.material.clone()),
+    ));
 }
 
 fn mesh_chunks(

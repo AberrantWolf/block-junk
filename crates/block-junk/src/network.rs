@@ -16,7 +16,9 @@ use bevy::prelude::*;
 use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
-use crate::protocol::{BlockEdit, ChunkSnapshot, ChunkUnload, PlayerPosition, WorldChannel};
+use crate::protocol::{
+    Avatar, AvatarPose, BlockEdit, ChunkSnapshot, ChunkUnload, PlayerPose, WorldChannel,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetMode {
@@ -59,8 +61,16 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ChunkUnload>()
             .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<PlayerPosition>()
+        app.register_message::<PlayerPose>()
             .add_direction(NetworkDirection::ClientToServer);
+
+        // Player-avatar replication. Server owns the avatar entities; the
+        // marker tells receivers "attach a mesh," and `AvatarPose` is the
+        // per-tick state. We deliberately don't replicate `Transform` — the
+        // 40-byte rotation+scale baggage isn't used.
+        // See networking-design: state for entities, events for the grid.
+        app.register_component::<Avatar>();
+        app.register_component::<AvatarPose>();
     }
 }
 

@@ -77,11 +77,36 @@ pub enum ChunkData {
     Edited(Vec<Block>),
 }
 
-/// Client → server: where this client's avatar/camera is. The server uses
-/// it for area-of-interest filtering (which chunks to stream). Sent at a
-/// modest rate (≈10 Hz) — server tick interpolates between updates.
+/// Client → server: where this client's avatar is and which way they're
+/// facing. Translation drives AoI; yaw drives the body orientation other
+/// clients see. Sent at ≈10 Hz; server tick interpolates between updates.
+/// Pitch isn't included — the visible avatar is a single block-shape with
+/// no separate head, so head pitch buys nothing on the wire today.
 #[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct PlayerPosition(pub Vec3);
+pub struct PlayerPose {
+    pub translation: Vec3,
+    /// Body yaw in radians (rotation around +Y).
+    pub yaw: f32,
+}
+
+/// Marker component on the server-side player-avatar entity. Replicated to
+/// every *other* client so they get a visible body for that player. Paired
+/// with `AvatarPose`, which carries the per-tick state.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Avatar;
+
+/// Authoritative pose of an `Avatar`, written on the server from `PlayerPose`
+/// ingests and replicated out as state. Sixteen bytes (Vec3 + yaw f32) vs
+/// the forty a full `Transform` would cost — rotation+scale of the full
+/// transform are dead weight when all we render is a yaw-rotated cuboid.
+/// Quantize to i16/u16 fixed-point if avatar bandwidth ever shows up in
+/// profiles; the precision needed (~cm of position, ~tenth of a degree of
+/// yaw) fits comfortably.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AvatarPose {
+    pub translation: Vec3,
+    pub yaw: f32,
+}
 
 /// Server → client: this chunk has left your AoI; despawn your local copy.
 /// The server may still hold its data (we don't evict the master record yet),

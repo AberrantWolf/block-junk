@@ -1,3 +1,5 @@
+use core::time::Duration;
+
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
@@ -5,8 +7,8 @@ use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 
 use crate::protocol::{
-    BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, PlayerPosition,
-    WorldChannel,
+    Avatar, AvatarPose, BlockEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
+    PlayerPose, WorldChannel,
 };
 use crate::voxel::{Chunk, chunk_world_transform};
 
@@ -22,7 +24,7 @@ impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::scripting::ServerScriptingPlugin);
         app.init_resource::<ChunkMap>();
-        app.init_resource::<ClientPositions>();
+        app.init_resource::<ClientAvatars>();
         app.init_resource::<ClientChunks>();
         app.init_resource::<PendingChunks>();
         // Local Bevy bus for server-internal observers (scripting, building
@@ -40,15 +42,18 @@ impl Plugin for ServerPlugin {
                 .chain()
                 .in_set(GameSet::Simulation),
         );
+        app.add_observer(install_replication_sender);
         app.add_observer(register_new_client);
         app.add_observer(forget_disconnected_client);
     }
 }
 
-/// Latest known position for each connected client, keyed by the connection
-/// (`ClientOf`) entity. Filled by `track_client_positions`, read by `update_aoi`.
+/// Connection entity → avatar entity. The avatar carries the authoritative
+/// `Transform` (driven by incoming `PlayerPosition` messages) and is the
+/// thing replicated to other clients. Both `track_client_positions` and
+/// `update_aoi` look up positions through this map.
 #[derive(Resource, Default)]
-pub struct ClientPositions(pub HashMap<Entity, Vec3>);
+pub struct ClientAvatars(pub HashMap<Entity, Entity>);
 
 /// Chunks currently believed to be loaded on each client. Used by `update_aoi`
 /// to compute deltas (which snapshots/unloads to send each tick).
@@ -68,35 +73,88 @@ pub struct PendingChunks(pub HashMap<ChunkCoord, Task<Chunk>>);
 const AOI_RADIUS_XZ: i32 = 2;
 const AOI_RADIUS_Y: i32 = 1;
 
-/// On client connect: stash a default position so AoI starts streaming
-/// chunks before the first PlayerPosition message lands. Without this the
-/// new client sees nothing until ~100 ms post-connect.
+/// How often the server pushes replication updates to each client. 20 Hz is
+/// twice the player-position ingest rate (10 Hz), so we never sit on a fresh
+/// position for more than half a tick. At ~12 B/Vec3 this stays well inside
+/// the 40 kbps/player budget even with a handful of co-located avatars.
+const REPLICATION_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Each connection entity needs a `ReplicationSender` before any `Replicate`d
+/// component on a server-side entity can be pushed to it. Insert as soon as
+/// the link appears (before the netcode handshake completes) so the sender is
+/// ready by the time we spawn an avatar in the `Connected` observer.
+fn install_replication_sender(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    commands.entity(trigger.entity).insert(ReplicationSender::new(
+        REPLICATION_INTERVAL,
+        SendUpdatesMode::SinceLastAck,
+        false,
+    ));
+}
+
+/// On client connect: spawn an avatar entity carrying the authoritative
+/// Transform for this player, replicated to every *other* connected client.
+/// We exclude the owner so their own camera Transform isn't periodically
+/// overwritten with a stale server copy of itself.
+///
+/// The avatar starts at the origin so AoI can begin streaming chunks before
+/// the first `PlayerPosition` message lands; without that the new client
+/// sees nothing for ~100 ms.
 fn register_new_client(
     trigger: On<Add, Connected>,
-    mut positions: ResMut<ClientPositions>,
+    remote_ids: Query<&RemoteId>,
+    mut commands: Commands,
+    mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
 ) {
-    positions.0.entry(trigger.entity).or_insert(Vec3::ZERO);
-    sent.0.entry(trigger.entity).or_default();
+    let connection = trigger.entity;
+    let Ok(remote) = remote_ids.get(connection) else {
+        warn!("Connected fired with no RemoteId on entity {connection:?}");
+        return;
+    };
+    let avatar = commands
+        .spawn((
+            Avatar,
+            AvatarPose::default(),
+            Replicate::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
+            Name::new(format!("avatar:{}", remote.0)),
+        ))
+        .id();
+    avatars.0.insert(connection, avatar);
+    sent.0.entry(connection).or_default();
 }
 
 fn track_client_positions(
-    mut receivers: Query<(Entity, &mut MessageReceiver<PlayerPosition>)>,
-    mut positions: ResMut<ClientPositions>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<PlayerPose>)>,
+    avatars: Res<ClientAvatars>,
+    mut poses: Query<&mut AvatarPose>,
 ) {
-    for (entity, mut receiver) in receivers.iter_mut() {
+    for (connection, mut receiver) in receivers.iter_mut() {
+        // Drain everything on this receiver, but only the latest pose
+        // matters — older ones get superseded before AoI runs anyway.
+        let mut latest: Option<PlayerPose> = None;
         for msg in receiver.receive() {
-            positions.0.insert(entity, msg.0);
+            latest = Some(msg);
+        }
+        let Some(pose) = latest else { continue };
+        let Some(&avatar) = avatars.0.get(&connection) else {
+            continue;
+        };
+        if let Ok(mut p) = poses.get_mut(avatar) {
+            p.translation = pose.translation;
+            p.yaw = pose.yaw;
         }
     }
 }
 
 fn forget_disconnected_client(
     trigger: On<Remove, ClientOf>,
-    mut positions: ResMut<ClientPositions>,
+    mut commands: Commands,
+    mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
 ) {
-    positions.0.remove(&trigger.entity);
+    if let Some(avatar) = avatars.0.remove(&trigger.entity) {
+        commands.entity(avatar).despawn();
+    }
     sent.0.remove(&trigger.entity);
 }
 
@@ -144,13 +202,17 @@ fn update_aoi(
     chunk_map: Res<ChunkMap>,
     chunks: Query<(&Chunk, Has<ChunkEdited>)>,
     mut pending: ResMut<PendingChunks>,
-    positions: Res<ClientPositions>,
+    avatars: Res<ClientAvatars>,
+    poses: Query<&AvatarPose>,
     mut sent: ResMut<ClientChunks>,
     mut snapshots: Query<&mut MessageSender<ChunkSnapshot>>,
     mut unloads: Query<&mut MessageSender<ChunkUnload>>,
 ) {
-    for (&client_entity, pos) in positions.0.iter() {
-        let player_chunk = world_to_chunk_coord(*pos);
+    for (&client_entity, &avatar_entity) in avatars.0.iter() {
+        let Ok(avatar_pose) = poses.get(avatar_entity) else {
+            continue;
+        };
+        let player_chunk = world_to_chunk_coord(avatar_pose.translation);
         let desired = aoi_around(player_chunk);
         let current = sent.0.entry(client_entity).or_default();
 
