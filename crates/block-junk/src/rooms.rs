@@ -32,9 +32,6 @@ use crate::voxel::{Chunk, chunk_local_to_world, world_to_chunk};
 /// Hard upper bound on floor-fill cells. Anything bigger is "outdoors" or
 /// "unclassifiably huge" and isn't tracked as a room.
 pub const FLOOD_CAP: u32 = 4096;
-/// Player height in cells. A floor cell needs this many cells of clear
-/// (air or `support_in_cell`) space starting at the floor cell itself.
-const PLAYER_HEIGHT: i32 = 2;
 /// Limit when probing column heights. Past this we declare the column
 /// "open to sky" and the room has no roof.
 const ROOF_PROBE_CAP: i32 = 1024;
@@ -42,13 +39,6 @@ const ROOF_PROBE_CAP: i32 = 1024;
 /// per-edit thrash from emitting `Created/Destroyed` storms during a
 /// player's place-or-break burst.
 const DEBOUNCE: Duration = Duration::from_millis(250);
-
-#[allow(dead_code)]
-const _: () = {
-    // Compile-time sanity: PLAYER_HEIGHT is used in the floor-cell predicate
-    // below; if it's not at least 1 the algorithm is meaningless.
-    assert!(PLAYER_HEIGHT >= 1);
-};
 
 // ---------- pattern registry (existing) ----------
 
@@ -480,10 +470,19 @@ fn bbox_contains(min: IVec3, max: IVec3, p: IVec3) -> bool {
     p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y && p.z >= min.z && p.z <= max.z
 }
 
-/// Cell `c` qualifies as a floor cell if a player can stand there: the
-/// cell itself is air (or carries `support_in_cell`), there are
-/// [`PLAYER_HEIGHT`] passable cells starting at `c`, and the cell below
-/// either has `support_below` or `c` itself has `support_in_cell`.
+/// Cell `c` qualifies as a floor cell if it's a passable air cell whose
+/// support comes from below (solid, water) or from in-cell traversal
+/// (ladder, rail).
+///
+/// **Headroom is not checked here.** It used to be — required 2 cells
+/// of vertical clearance — but that meant placing a head-height block
+/// inside an enclosed room would disqualify the cell below from being a
+/// floor cell, which removed it from the floor set, which made the
+/// perimeter check at floor Y see an air-perimeter cell (the now-
+/// demoted floor) and flunk the room's enclosure entirely. The room is
+/// still enclosed; the player just bumps their head. Headroom is a
+/// pathing/standability concern, not a room-detection one — it'll
+/// belong to NPC AI when that lands.
 fn is_floor_cell(
     c: IVec3,
     get_block: &impl Fn(IVec3) -> BlockSlot,
@@ -494,15 +493,6 @@ fn is_floor_cell(
     let here_passable = here_slot.is_empty() || here_def.flags.support_in_cell;
     if !here_passable {
         return false;
-    }
-    // Headroom: PLAYER_HEIGHT consecutive passable cells starting at c.
-    for dy in 1..PLAYER_HEIGHT {
-        let s = get_block(c + IVec3::new(0, dy, 0));
-        let d = reg.def(s);
-        let passable = s.is_empty() || d.flags.support_in_cell;
-        if !passable {
-            return false;
-        }
     }
     if here_def.flags.support_in_cell {
         return true;
