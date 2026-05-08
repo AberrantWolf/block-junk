@@ -113,7 +113,15 @@ pub struct BlockDef {
     /// [`TagId`] for the namespace convention.
     #[serde(default)]
     pub tags: Vec<TagId>,
-    /// Per-vertex tint for meshing and the swatch colour in the hotbar UI.
-    /// RGB only — alpha is added at the render call site.
+    /// Per-vertex tint for voxel-meshed blocks; also the swatch colour in
+    /// the hotbar UI. Ignored when `mesh` is `Some`. RGB only — alpha is
+    /// added at the render call site.
     pub color: [f32; 3],
+    /// Optional asset path for a non-cube visual. When set, the client
+    /// renders this block as a separate ECS entity loaded from the given
+    /// glTF (or scene) path, instead of baking cube faces into the chunk
+    /// mesh. Use the `mods://` asset source — e.g.
+    /// `"mods://vanilla/models/bed.glb"`. Server ignores this field.
+    #[serde(default)]
+    pub mesh: Option<String>,
 }

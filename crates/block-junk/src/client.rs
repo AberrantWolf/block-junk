@@ -1,5 +1,5 @@
 use bevy::input::mouse::AccumulatedMouseScroll;
-use bevy::platform::collections::HashMap;
+use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use lightyear::prelude::*;
@@ -29,6 +29,7 @@ impl Plugin for ClientPlugin {
         app.insert_resource(terrain_slots);
         app.init_resource::<ChunkMap>()
             .init_resource::<SelectedBlock>()
+            .init_resource::<BlockEntities>()
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
@@ -48,7 +49,8 @@ impl Plugin for ClientPlugin {
             )
             .add_systems(
                 Update,
-                (mesh_chunks, update_hotbar_highlight).in_set(GameSet::PostSimulation),
+                (mesh_chunks, refresh_block_entities, update_hotbar_highlight)
+                    .in_set(GameSet::PostSimulation),
             )
             .add_observer(attach_avatar_visuals);
     }
@@ -67,6 +69,16 @@ struct AvatarAssets {
 /// receipt; consulted when applying broadcast edits or raycasting.
 #[derive(Resource, Default)]
 pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
+
+/// Tracks the ECS entity rendering each placed block-entity (a block
+/// whose `BlockDef.mesh` is set, e.g. furniture, doors). Indexed by world
+/// cell with a parallel per-chunk set so we can despawn an entire chunk's
+/// block entities cheaply on `ChunkUnload`.
+#[derive(Resource, Default)]
+pub struct BlockEntities {
+    by_cell: HashMap<IVec3, Entity>,
+    by_chunk: HashMap<ChunkCoord, HashSet<IVec3>>,
+}
 
 /// Cached list of placeable blocks for hotbar / cycling. Built once at
 /// startup from `BlockRegistry::iter_placeable`. If/when mods can add
@@ -553,5 +565,99 @@ fn mesh_chunks(
                 ..default()
             })));
         }
+    }
+}
+
+/// Spawn / despawn ECS entities for blocks whose `BlockDef.mesh` is set
+/// (block entities — beds, doors, etc.). Two phases per tick:
+///
+/// 1. **Cleanup**: chunks tracked here that are no longer in `ChunkMap`
+///    were unloaded; despawn all their block entities in one pass.
+/// 2. **Diff per changed chunk**: rescan its interior cells, compare the
+///    new mesh-bearing set against the old, despawn the dropped, spawn
+///    the gained.
+///
+/// Runs in `PostSimulation` after the chunk-receive systems so the
+/// `Chunk` data + `ChunkMap` reflect this tick's edits and unloads.
+fn refresh_block_entities(
+    chunks_changed: Query<(&Chunk, &ChunkCoord), Changed<Chunk>>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    asset_server: Res<AssetServer>,
+    mut entities: ResMut<BlockEntities>,
+    mut commands: Commands,
+) {
+    // 1. Drop entities for chunks that no longer exist.
+    let stale: Vec<ChunkCoord> = entities
+        .by_chunk
+        .keys()
+        .copied()
+        .filter(|c| !chunk_map.0.contains_key(c))
+        .collect();
+    for coord in stale {
+        if let Some(cells) = entities.by_chunk.remove(&coord) {
+            for cell in cells {
+                if let Some(entity) = entities.by_cell.remove(&cell) {
+                    commands.entity(entity).despawn();
+                }
+            }
+        }
+    }
+
+    // 2. Per changed chunk: diff old vs new mesh cells.
+    for (chunk, coord) in chunks_changed.iter() {
+        let mut new_cells: HashSet<IVec3> = HashSet::default();
+        // Iterate interior cells only (skip the 1-cell padding ring).
+        let lo = 1i32;
+        let hi = (crate::protocol::CHUNK_PADDED - 1) as i32;
+        for x in lo..hi {
+            for y in lo..hi {
+                for z in lo..hi {
+                    let local = IVec3::new(x, y, z);
+                    let slot = chunk.get(local);
+                    if registry.def(slot).mesh.is_some() {
+                        let world = crate::voxel::chunk_local_to_world(*coord, local);
+                        new_cells.insert(world);
+                    }
+                }
+            }
+        }
+
+        let old_cells = entities
+            .by_chunk
+            .get(coord)
+            .cloned()
+            .unwrap_or_default();
+
+        for cell in old_cells.difference(&new_cells) {
+            if let Some(entity) = entities.by_cell.remove(cell) {
+                commands.entity(entity).despawn();
+            }
+        }
+
+        for cell in new_cells.difference(&old_cells) {
+            // Look up the block at this cell to get its mesh path.
+            let (cc, local) = crate::voxel::world_to_chunk(*cell);
+            debug_assert_eq!(cc, *coord);
+            let slot = chunk.get(local);
+            let def = registry.def(slot);
+            // Safe — we built `new_cells` from `def.mesh.is_some()`.
+            let mesh_path = def.mesh.as_ref().unwrap();
+            let scene: Handle<Scene> = asset_server.load(format!("{mesh_path}#Scene0"));
+            // Centre the entity horizontally in its cell, sitting on the
+            // cell's floor (Y is the cell's bottom). Mod authors model
+            // their meshes with origin at the bottom-front-left.
+            let translation = cell.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+            let entity = commands
+                .spawn((
+                    SceneRoot(scene),
+                    Transform::from_translation(translation),
+                    Name::new(format!("block_entity:{}{:?}", def.id, cell.to_array())),
+                ))
+                .id();
+            entities.by_cell.insert(*cell, entity);
+        }
+
+        entities.by_chunk.insert(*coord, new_cells);
     }
 }

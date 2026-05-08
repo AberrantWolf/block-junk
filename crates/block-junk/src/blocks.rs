@@ -180,25 +180,43 @@ pub enum SlotStatus {
     Missing,
 }
 
-// `block-mesh` requires its voxel type to expose visibility per-cell. We
-// rely on the convention "slot 0 == empty, every other slot is opaque" —
-// mirrors the previous `Block::Empty` vs `_` split. Will need a wrapper
-// that carries a per-slot visibility lookup once transparent blocks
-// (water, glass) land, since at that point opacity stops being implied
-// by "is it slot 0 or not."
-impl Voxel for BlockSlot {
+/// `block-mesh` voxel input that carries pre-computed visibility. Each
+/// chunk converts its `Vec<BlockSlot>` to `Vec<MeshVoxel>` at mesh time
+/// using the registry, so non-cube blocks (those with a custom mesh) can
+/// be excluded from the greedy cube-meshing pass while still merging
+/// correctly within their slot type.
+///
+/// We don't impl `Voxel` directly on `BlockSlot` because empty-vs-opaque
+/// isn't slot-only — a slot with a `mesh` path renders as a separate
+/// entity, so its cell should be treated as Empty for the cube mesher.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MeshVoxel {
+    pub slot: BlockSlot,
+    pub visibility: VoxelVisibility,
+}
+
+impl Voxel for MeshVoxel {
     fn get_visibility(&self) -> VoxelVisibility {
-        if self.is_empty() {
+        self.visibility
+    }
+}
+
+impl MergeVoxel for MeshVoxel {
+    type MergeValue = u16;
+    fn merge_value(&self) -> u16 {
+        self.slot.0
+    }
+}
+
+impl BlockRegistry {
+    /// Visibility a slot should have for the voxel cube mesher: Empty
+    /// for `vanilla:empty` AND for any slot with a custom mesh (those
+    /// render as ECS entities rather than as cube faces).
+    pub fn voxel_visibility(&self, slot: BlockSlot) -> VoxelVisibility {
+        if slot.is_empty() || self.def(slot).mesh.is_some() {
             VoxelVisibility::Empty
         } else {
             VoxelVisibility::Opaque
         }
-    }
-}
-
-impl MergeVoxel for BlockSlot {
-    type MergeValue = u16;
-    fn merge_value(&self) -> u16 {
-        self.0
     }
 }

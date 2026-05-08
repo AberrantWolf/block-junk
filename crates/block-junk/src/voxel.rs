@@ -5,7 +5,7 @@ use block_mesh::{GreedyQuadsBuffer, RIGHT_HANDED_Y_UP_CONFIG, greedy_quads};
 use ndshape::{ConstShape, ConstShape3u32};
 use serde::{Deserialize, Serialize};
 
-use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
+use crate::blocks::{BlockRegistry, BlockSlot, MeshVoxel, TerrainSlots};
 use crate::protocol::{CHUNK_PADDED, CHUNK_SIZE, ChunkCoord};
 
 pub type ChunkShape = ConstShape3u32<CHUNK_PADDED, CHUNK_PADDED, CHUNK_PADDED>;
@@ -88,9 +88,19 @@ impl Chunk {
     }
 
     pub fn build_mesh(&self, registry: &BlockRegistry) -> Option<Mesh> {
-        let mut buffer = GreedyQuadsBuffer::new(self.blocks.len());
+        // Convert to MeshVoxels so the greedy mesher sees mesh-bearing
+        // slots as Empty (those render as ECS entities elsewhere).
+        let voxels: Vec<MeshVoxel> = self
+            .blocks
+            .iter()
+            .map(|&slot| MeshVoxel {
+                slot,
+                visibility: registry.voxel_visibility(slot),
+            })
+            .collect();
+        let mut buffer = GreedyQuadsBuffer::new(voxels.len());
         greedy_quads(
-            &self.blocks,
+            &voxels,
             &ChunkShape {},
             [0; 3],
             [CHUNK_PADDED - 1; 3],
@@ -121,7 +131,7 @@ impl Chunk {
                 // multiplies vertex colour by base_color when ATTRIBUTE_COLOR
                 // is present).
                 let cell_idx = ChunkShape::linearize(quad.minimum) as usize;
-                let slot = self.blocks[cell_idx];
+                let slot = voxels[cell_idx].slot;
                 let [r, g, b] = registry.def(slot).color;
                 let rgba = [r, g, b, 1.0];
 

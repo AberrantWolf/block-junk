@@ -77,6 +77,14 @@ fn run_client() {
     let tick = tick_duration();
     let mut app = App::new();
 
+    // Register the `mods://` asset source so block defs can reference
+    // mod-shipped meshes by `mods://<modname>/path/to/file.glb`. Must
+    // run before `DefaultPlugins` initialises `AssetPlugin`.
+    app.register_asset_source(
+        "mods",
+        bevy::asset::io::AssetSourceBuilder::platform_default("mods", None),
+    );
+
     app.add_plugins(DefaultPlugins.set(LogPlugin {
         // gilrs_core spams "Failed to find device" on macOS — IOKit reports
         // device IDs that aren't real controllers. Silence the whole module
