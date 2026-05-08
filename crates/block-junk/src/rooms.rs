@@ -322,18 +322,28 @@ pub fn process_dirty(
         let canonical = canonical_min(&cells).expect("flood-fill produced an empty cell list");
         let signature = compute_signature(&cells, &get_block, &block_registry);
         let pattern = match_pattern(&signature, &pattern_registry);
-        // Volumetric bbox: floor footprint XZ × Y from floor to wall/roof
-        // top. enclosure_height counts the floor as layer 1; the highest
-        // bounded Y is `floor_y + enclosure_height - 1`. We extend by one
-        // more so that a roof block placed *just above* the topmost
-        // bounded layer still intersects (otherwise placing a roof on a
-        // 1-high yard wouldn't trigger re-detection).
+        // Volumetric bbox covering everything that, if edited, can affect
+        // this room's classification:
+        //   - Floor footprint extended by 1 in X and Z so the wall ring
+        //     (perimeter cells, one outside the floor in each cardinal
+        //     direction) is included. Without this, wall edits land
+        //     OUTSIDE the floor's XZ extents and never trigger
+        //     invalidation.
+        //   - One Y below the floor for the support layer (breaking the
+        //     ground under the floor invalidates the room).
+        //   - enclosure_height layers above the floor, plus 1 slack so a
+        //     roof or new wall placed just above the topmost bounded
+        //     layer still intersects.
         let height = signature.enclosure_height.unwrap_or(1).max(1);
-        let bbox_min = IVec3::new(signature.bbox.min.x, signature.bbox.min.y, signature.bbox.min.z);
+        let bbox_min = IVec3::new(
+            signature.bbox.min.x - 1,
+            signature.bbox.min.y - 1,
+            signature.bbox.min.z - 1,
+        );
         let bbox_max = IVec3::new(
-            signature.bbox.max.x,
-            signature.bbox.min.y + height as i32,
-            signature.bbox.max.z,
+            signature.bbox.max.x + 1,
+            signature.bbox.min.y + height as i32 + 1,
+            signature.bbox.max.z + 1,
         );
         pending.push(Pending {
             cells,
