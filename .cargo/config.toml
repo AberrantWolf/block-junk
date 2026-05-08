@@ -1,0 +1,10 @@
+# Point Bevy's asset loader at the workspace root so the `mods://`
+# AssetSource (declared in `crates/block-junk/src/main.rs`) resolves to
+# `<workspace>/mods/`. Without this, Bevy falls back to CARGO_MANIFEST_DIR
+# which for `cargo run --bin block-junk` is the binary's package dir
+# (`crates/block-junk/`), and `<that>/mods/` doesn't exist.
+#
+# `relative = true` makes the path relative to *this file's* parent
+# directory — i.e. the workspace root.
+[env]
+BEVY_ASSET_ROOT = { value = ".", relative = true }
