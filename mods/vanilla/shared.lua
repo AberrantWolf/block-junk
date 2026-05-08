@@ -90,6 +90,22 @@ register {
     color = { 0.40, 0.18, 0.05 },
 }
 
+-- First block-entity test: a placeholder bed mesh. The .glb is a small
+-- generated cuboid (1×0.5×2 ish, dark brown) — replace with proper art
+-- when ready. The voxel mesher skips this slot's cube faces because
+-- mesh is set; the client spawns an ECS entity with a SceneRoot loaded
+-- from the path.
+register {
+    id = "vanilla:bed",
+    display_name = "Bed",
+    flags = {
+        solid = true,
+        support_below = true,
+    },
+    color = { 0.40, 0.18, 0.05 },
+    mesh = "mods://vanilla/models/bed.glb",
+}
+
 -- Seed room patterns. The detector isn't wired yet (next chunk of work);
 -- these prove the registry's parent-chain and domain validation.
 
