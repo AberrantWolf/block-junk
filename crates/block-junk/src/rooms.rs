@@ -164,6 +164,13 @@ pub struct RoomEventMsg(pub RoomEvent);
 struct Room {
     pattern: Option<RoomPatternId>,
     floor_cells: Vec<IVec3>,
+    /// Volumetric AABB: floor footprint XZ × Y from floor up to the
+    /// ceiling (or the topmost wall layer for open-roof rooms). Used to
+    /// invalidate the room when an edit lands inside its volume — a roof
+    /// block placed at Y=floor+2 isn't in `cell_to_room` (which only
+    /// holds floor cells), so without bbox tracking we'd never re-detect.
+    bbox_min: IVec3,
+    bbox_max: IVec3,
 }
 
 #[derive(Resource, Default)]
@@ -250,14 +257,34 @@ pub fn process_dirty(
         }
     }
 
-    // Any room whose floor includes any seed cell is invalidated, then
-    // rebuilt from the new fill (if its cells are still a valid room).
+    // Any room whose floor includes any seed cell is invalidated. Plus
+    // any room whose VOLUMETRIC bbox contains any edited cell — without
+    // this, an edit above the floor (placing a roof, raising the wall a
+    // layer) wouldn't be in `cell_to_room` and the room would never be
+    // re-evaluated against deeper patterns like small_house.
     let mut to_invalidate: HashSet<RoomId> = HashSet::new();
     for s in &seeds {
         if let Some(&id) = rooms.cell_to_room.get(s) {
             to_invalidate.insert(id);
         }
     }
+    for &edit in &edited {
+        for (&id, room) in rooms.rooms.iter() {
+            if bbox_contains(room.bbox_min, room.bbox_max, edit) {
+                to_invalidate.insert(id);
+            }
+        }
+    }
+    // Re-seed from each invalidated room's floor cells so the flood-fill
+    // actually re-runs over them. Without this, an above-floor edit would
+    // invalidate the room but produce no new fill (no seed reaches the
+    // floor cells), and the room would just be Destroyed silently.
+    let invalidate_seeds: Vec<IVec3> = to_invalidate
+        .iter()
+        .filter_map(|id| rooms.rooms.get(id))
+        .flat_map(|room| room.floor_cells.iter().copied())
+        .collect();
+    seeds.extend(invalidate_seeds);
 
     // Collect the new fills before mutating `rooms`. The `visited` set is
     // shared across every seed in this batch — both as the within-fill
@@ -281,35 +308,40 @@ pub fn process_dirty(
         }
     }
 
-    // 3-way diff: a region whose floor_cells set is unchanged is the
-    // *same* room (Changed at most). Match by minimum corner — cheap and
-    // unambiguous given a fixed canonical ordering.
-    let mut survivors: HashMap<IVec3, RoomId> = HashMap::new();
-    for &id in &to_invalidate {
-        if let Some(room) = rooms.rooms.get(&id) {
-            if let Some(min) = canonical_min(&room.floor_cells) {
-                survivors.insert(min, id);
-            }
-        }
-    }
-
     // Pre-compute pattern matches & signatures for new fills, then apply.
     struct Pending {
         cells: Vec<IVec3>,
         canonical: IVec3,
         signature: RoomSignature,
         pattern: Option<RoomPatternId>,
+        bbox_min: IVec3,
+        bbox_max: IVec3,
     }
     let mut pending: Vec<Pending> = Vec::with_capacity(new_fills.len());
     for cells in new_fills {
         let canonical = canonical_min(&cells).expect("flood-fill produced an empty cell list");
         let signature = compute_signature(&cells, &get_block, &block_registry);
         let pattern = match_pattern(&signature, &pattern_registry);
+        // Volumetric bbox: floor footprint XZ × Y from floor to wall/roof
+        // top. enclosure_height counts the floor as layer 1; the highest
+        // bounded Y is `floor_y + enclosure_height - 1`. We extend by one
+        // more so that a roof block placed *just above* the topmost
+        // bounded layer still intersects (otherwise placing a roof on a
+        // 1-high yard wouldn't trigger re-detection).
+        let height = signature.enclosure_height.unwrap_or(1).max(1);
+        let bbox_min = IVec3::new(signature.bbox.min.x, signature.bbox.min.y, signature.bbox.min.z);
+        let bbox_max = IVec3::new(
+            signature.bbox.max.x,
+            signature.bbox.min.y + height as i32,
+            signature.bbox.max.z,
+        );
         pending.push(Pending {
             cells,
             canonical,
             signature,
             pattern,
+            bbox_min,
+            bbox_max,
         });
     }
 
@@ -401,6 +433,8 @@ pub fn process_dirty(
             Room {
                 pattern: p.pattern.clone(),
                 floor_cells: p.cells,
+                bbox_min: p.bbox_min,
+                bbox_max: p.bbox_max,
             },
         );
 
@@ -430,6 +464,10 @@ fn canonical_min(cells: &[IVec3]) -> Option<IVec3> {
         .iter()
         .copied()
         .min_by_key(|c| (c.y, c.x, c.z))
+}
+
+fn bbox_contains(min: IVec3, max: IVec3, p: IVec3) -> bool {
+    p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y && p.z >= min.z && p.z <= max.z
 }
 
 /// Cell `c` qualifies as a floor cell if a player can stand there: the

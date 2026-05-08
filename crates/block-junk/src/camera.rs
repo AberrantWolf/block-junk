@@ -111,6 +111,12 @@ fn fly_cam_input(
     transform.rotation =
         Quat::from_axis_angle(Vec3::Y, cam.yaw) * Quat::from_axis_angle(Vec3::X, cam.pitch);
 
+    // Movement only when the cursor is captured. With it free, the player
+    // is interacting with the desktop (screenshot shortcut, alt-tabbed
+    // chat, etc.) and W/A/S/D shouldn't drift the camera.
+    if !locked {
+        return;
+    }
     let forward = *transform.forward();
     let right = *transform.right();
     let mut delta = Vec3::ZERO;
