@@ -16,7 +16,7 @@ use block_junk_mod_api::{
     rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
 };
-use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
+use mlua::{Function, Lua, LuaSerdeExt, SerializeOptions, Table, Value};
 use thiserror::Error;
 use tracing::{error, info, warn};
 
@@ -332,13 +332,24 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     Ok(())
 }
 
+/// Serialize options used for every event we hand to a Lua callback.
+/// `serialize_none_to_null = false` makes `Option::None` arrive as Lua
+/// `nil` rather than mlua's `null` lightuserdata, so handler code can
+/// write the natural `event.field or "(none)"` instead of having to
+/// reach into mlua to compare against the null sentinel.
+fn lua_event_options() -> SerializeOptions {
+    SerializeOptions::new()
+        .serialize_none_to_null(false)
+        .serialize_unit_to_null(false)
+}
+
 fn call_block_placed(lua: &Lua, event: &BlockPlacedEvent) -> Result<(), mlua::Error> {
     let engine: Table = lua.globals().get("engine")?;
     let handler: Value = engine.get(BLOCK_PLACED_SLOT)?;
     let Value::Function(handler) = handler else {
         return Ok(());
     };
-    let event_value = lua.to_value(event)?;
+    let event_value = lua.to_value_with(event, lua_event_options())?;
     handler.call::<()>(event_value)
 }
 
@@ -348,6 +359,6 @@ fn call_room_event(lua: &Lua, event: &RoomEvent) -> Result<(), mlua::Error> {
     let Value::Function(handler) = handler else {
         return Ok(());
     };
-    let event_value = lua.to_value(event)?;
+    let event_value = lua.to_value_with(event, lua_event_options())?;
     handler.call::<()>(event_value)
 }

@@ -100,8 +100,14 @@ pub enum Constraint {
         #[serde(default)]
         max: Option<u32>,
     },
-    /// Min/max headroom in cells above the floor plane (volumetric only).
-    Headroom {
+    /// Min/max number of bounded layers above the floor plane. A layer is
+    /// "bounded" when the wall (or roof) extends to that Y — bottom-up
+    /// from the floor, the room grows by one layer per Y where every
+    /// perimeter cell is solid, and stops when the walls give out.
+    /// Replaces the older "headroom" framing, which conflated walled-yard
+    /// (no roof, infinite headroom by air-column probe) with great-hall
+    /// (no roof, but the player perceives intentional height).
+    EnclosureHeight {
         #[serde(default)]
         min: Option<u32>,
         #[serde(default)]
@@ -203,10 +209,12 @@ pub struct RoomSignature {
     // Volumetric-only fields. `None` for connective signatures.
     #[serde(default)]
     pub volume: Option<u32>,
+    /// Number of layers (Y planes) above the floor that the walls extend
+    /// to bound, computed bottom-up. Walled yard with 1-high walls has
+    /// `enclosure_height = 1`; 2-high walls = 2; small house with 2-high
+    /// walls and a roof = 2 (the roof closes the volume above layer 2).
     #[serde(default)]
-    pub min_headroom: Option<u32>,
-    #[serde(default)]
-    pub max_headroom: Option<u32>,
+    pub enclosure_height: Option<u32>,
     #[serde(default)]
     pub has_roof: Option<bool>,
     #[serde(default)]

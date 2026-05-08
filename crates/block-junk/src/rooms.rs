@@ -334,6 +334,9 @@ pub fn process_dirty(
     }
 
     // Apply Destroyed for every invalidated room that didn't survive.
+    // Only emit the public event if the room had a matched pattern —
+    // unmatched fills are tracked internally for invalidation but stay
+    // silent so mods don't see noise from in-progress geometry.
     for id in &to_invalidate {
         if changed_pairs.values().any(|v| v == id) {
             continue;
@@ -344,8 +347,10 @@ pub fn process_dirty(
                     rooms.cell_to_room.remove(c);
                 }
             }
-            events.write(RoomEventMsg(RoomEvent::Destroyed { room: *id }));
-            info!(?id, "room destroyed");
+            if room.pattern.is_some() {
+                events.write(RoomEventMsg(RoomEvent::Destroyed { room: *id }));
+                info!(?id, "room destroyed");
+            }
         }
     }
 
@@ -370,27 +375,25 @@ pub fn process_dirty(
             rooms.cell_to_room.insert(c, id);
         }
 
-        let was_changed = changed_pairs.values().any(|v| *v == id);
-        let event = if was_changed {
-            if from_pattern == p.pattern {
-                // Same cells, same matched pattern, same signature
-                // *modulo predicate fields* — we still rebuild the Room
-                // record so tag counts etc. update, but skip the event.
-                None
-            } else {
-                Some(RoomEvent::Changed {
-                    room: id,
-                    from: from_pattern.clone(),
-                    to: p.pattern.clone(),
-                    signature: p.signature.clone(),
-                })
-            }
-        } else {
-            Some(RoomEvent::Created {
+        // Pattern-transition events. We only surface a public event when
+        // the matched pattern changes (or appears, or disappears).
+        // Unmatched-only transitions (None ↔ None) and same-pattern
+        // updates stay silent — the room is tracked but mods don't care.
+        let event = match (from_pattern.as_ref(), p.pattern.as_ref()) {
+            (None, None) => None,
+            (None, Some(_)) => Some(RoomEvent::Created {
                 room: id,
                 pattern: p.pattern.clone(),
                 signature: p.signature.clone(),
-            })
+            }),
+            (Some(_), None) => Some(RoomEvent::Destroyed { room: id }),
+            (Some(f), Some(t)) if f == t => None,
+            (Some(_), Some(_)) => Some(RoomEvent::Changed {
+                room: id,
+                from: from_pattern.clone(),
+                to: p.pattern.clone(),
+                signature: p.signature.clone(),
+            }),
         };
 
         rooms.rooms.insert(
@@ -409,7 +412,9 @@ pub fn process_dirty(
                 RoomEvent::Changed { from, to, .. } => {
                     info!(?id, ?from, ?to, "room changed")
                 }
-                RoomEvent::Destroyed { .. } => unreachable!(),
+                RoomEvent::Destroyed { .. } => {
+                    info!(?id, "room destroyed (pattern lost)")
+                }
             }
             events.write(RoomEventMsg(ev));
         }
@@ -552,61 +557,79 @@ fn compute_signature(
     }
     let door_count = door_cells.len() as u32;
 
-    let mut min_hr: u32 = u32::MAX;
-    let mut max_hr: u32 = 0;
-    let mut volume: u32 = 0;
-    let mut all_roofed = true;
+    // Bottom-up enclosure walk. From the floor's Y, scan layer by layer
+    // upward. A layer counts as "enclosed" iff every perimeter cell at
+    // that Y is solid (the walls extend) AND there's still some interior
+    // air at that Y (we haven't hit the roof yet). The room ends when
+    // either the walls give out (open above) or the interior closes
+    // (capped by a roof).
+    //
+    // This replaces the older per-column headroom probe — the old way
+    // confused "walled yard, infinite air column" with "tall hall," and
+    // worse, it had no notion of "wall extends here," so a 1-high wall
+    // and a 5-high wall produced the same signature. Now the signature
+    // tells us the actual built height.
+    let floor_y = floor_cells[0].y;
+    let floor_xz: HashSet<(i32, i32)> = floor_cells.iter().map(|c| (c.x, c.z)).collect();
+    let mut perimeter_xz: HashSet<(i32, i32)> = HashSet::new();
+    for &(x, z) in &floor_xz {
+        for [dx, dz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
+            let nx = x + dx;
+            let nz = z + dz;
+            if !floor_xz.contains(&(nx, nz)) {
+                perimeter_xz.insert((nx, nz));
+            }
+        }
+    }
+    // Floor must be enclosed at its OWN Y too. Without this check, a fill
+    // that runs along a wall ring (cells whose support is the wall block
+    // below them) would count as "enclosed" — its perimeter at floor Y
+    // is air on both sides (interior + exterior), not walls. Real rooms
+    // have walls (or terrain, or other solids) directly bounding the
+    // floor cells in 4-cardinal at the floor's Y.
+    let perimeter_at_floor_solid = perimeter_xz
+        .iter()
+        .all(|&(x, z)| !get_block(IVec3::new(x, floor_y, z)).is_empty());
+    let mut enclosure_height: u32 = if perimeter_at_floor_solid { 1 } else { 0 };
+    let mut has_roof = false;
     let mut tag_counts: HashMap<_, u32> = HashMap::new();
-    for &c in floor_cells {
-        // Walk straight up from the floor cell, collecting tags as we go,
-        // stopping at the first `room_boundary` (ceiling) we hit. If we
-        // run off the probe cap, the column is open to sky.
-        let mut hr: u32 = 0;
-        let mut roofed = false;
-        for dy in 0..ROOF_PROBE_CAP {
-            let cell = c + IVec3::new(0, dy, 0);
-            let slot = get_block(cell);
+    for dy in 1..ROOF_PROBE_CAP {
+        if !perimeter_at_floor_solid {
+            // Floor isn't enclosed; don't bother probing higher layers.
+            break;
+        }
+        let y = floor_y + dy;
+        // Roof check: every interior column position is solid at this y.
+        let interior_all_solid = floor_xz
+            .iter()
+            .all(|&(x, z)| !get_block(IVec3::new(x, y, z)).is_empty());
+        if interior_all_solid {
+            has_roof = true;
+            break;
+        }
+        // Bound check: every perimeter position is solid at this y
+        // (the wall extends up to here).
+        let bounded = perimeter_xz
+            .iter()
+            .all(|&(x, z)| !get_block(IVec3::new(x, y, z)).is_empty());
+        if !bounded {
+            break;
+        }
+        // Layer is enclosed. Collect tags on any solid blocks inside the
+        // interior at this y (furniture, decorations).
+        for &(x, z) in &floor_xz {
+            let slot = get_block(IVec3::new(x, y, z));
+            if slot.is_empty() {
+                continue;
+            }
             let def = reg.def(slot);
-            // The floor cell itself counts as a passable air cell, but its
-            // tags shouldn't count (it's the floor, not the volume).
-            // Only collect tags from cells *above* the floor.
-            if dy > 0 {
-                if !slot.is_empty() {
-                    if def.flags.room_boundary {
-                        roofed = true;
-                        break;
-                    }
-                    for tag in &def.tags {
-                        *tag_counts.entry(tag.clone()).or_insert(0) += 1;
-                    }
-                    if !def.flags.support_in_cell {
-                        // A non-boundary, non-traversable block (a chair,
-                        // a chest) occupies the cell but doesn't end the
-                        // column. Continue past it.
-                    }
-                }
-            }
-            // For headroom purposes, count cells from dy=0 that are
-            // passable. The floor cell at dy=0 is passable by predicate.
-            if slot.is_empty() || def.flags.support_in_cell {
-                hr += 1;
-            } else {
-                // Hit a non-boundary, non-traversable block — counts as
-                // ceiling for column termination but doesn't increment hr.
-                roofed = true;
-                break;
+            for tag in &def.tags {
+                *tag_counts.entry(tag.clone()).or_insert(0) += 1;
             }
         }
-        if !roofed {
-            all_roofed = false;
-        }
-        min_hr = min_hr.min(hr);
-        max_hr = max_hr.max(hr);
-        volume = volume.saturating_add(hr);
+        enclosure_height += 1;
     }
-    if floor_cells.is_empty() {
-        min_hr = 0;
-    }
+    let volume = enclosure_height.saturating_mul(floor_cells.len() as u32);
 
     RoomSignature {
         domain: PatternDomain::Volumetric,
@@ -624,9 +647,8 @@ fn compute_signature(
         },
         cell_count: floor_cells.len() as u32,
         volume: Some(volume),
-        min_headroom: Some(min_hr),
-        max_headroom: Some(max_hr),
-        has_roof: Some(all_roofed),
+        enclosure_height: Some(enclosure_height),
+        has_roof: Some(has_roof),
         door_count: Some(door_count),
         floor_composition: Some(comp),
         tag_counts: tag_counts
@@ -688,10 +710,9 @@ fn evaluate_constraint(c: &Constraint, sig: &RoomSignature) -> bool {
             let v = sig.cell_count;
             min.is_none_or(|m| v >= m) && max.is_none_or(|m| v <= m)
         }
-        Constraint::Headroom { min, max } => {
-            let lo = sig.min_headroom.unwrap_or(0);
-            let hi = sig.max_headroom.unwrap_or(0);
-            min.is_none_or(|m| lo >= m) && max.is_none_or(|m| hi <= m)
+        Constraint::EnclosureHeight { min, max } => {
+            let v = sig.enclosure_height.unwrap_or(0);
+            min.is_none_or(|m| v >= m) && max.is_none_or(|m| v <= m)
         }
         Constraint::HasRoof { required } => sig.has_roof == Some(*required),
         Constraint::FloorFraction { surface, min } => {

@@ -99,7 +99,11 @@ engine.rooms.register {
     domain = "volumetric",
     constraints = {
         { kind = "floor_area", min = 4, max = 4096 },
-        { kind = "headroom", min = 2 },
+        -- enclosure_height counts the layers above the floor where the
+        -- walls actually extend. Min 1 = at least the floor layer is
+        -- bounded by walls. A 1-high wall ring satisfies this; a row of
+        -- isolated blocks does not (no perimeter coverage).
+        { kind = "enclosure_height", min = 1 },
         -- Every room needs an explicit access point. Without this,
         -- accidental enclosures (a divot in the terrain, a hole the
         -- player dug for fun) would all register as rooms. Children
@@ -127,6 +131,7 @@ engine.rooms.register {
     priority = 1,
     constraints = {
         { kind = "has_roof", required = true },
+        { kind = "enclosure_height", min = 2 },
         { kind = "floor_area", max = 50 },
         { kind = "floor_fraction", surface = "solid", min = 0.8 },
     },
