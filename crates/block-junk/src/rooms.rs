@@ -619,12 +619,29 @@ fn compute_signature(
             }
         }
     }
+    // External vs internal perimeter. A perimeter cell *outside* the
+    // floor's XZ bbox is part of the room's exterior wall ring — it must
+    // be solid at every Y for the room to be enclosed. A perimeter cell
+    // *inside* the bbox is a column / pillar the player has placed on
+    // the floor (a single block carved out of a previously-floor cell);
+    // requiring walls above it would mean every interior column kicks
+    // the room out of small_house back to walled_yard, which is
+    // surprising. So we only enforce the exterior perimeter for the
+    // bound check at higher Ys.
+    let external_perimeter: HashSet<(i32, i32)> = perimeter_xz
+        .iter()
+        .copied()
+        .filter(|&(x, z)| x < min.x || x > max.x || z < min.z || z > max.z)
+        .collect();
     // Floor must be enclosed at its OWN Y too. Without this check, a fill
     // that runs along a wall ring (cells whose support is the wall block
     // below them) would count as "enclosed" — its perimeter at floor Y
     // is air on both sides (interior + exterior), not walls. Real rooms
     // have walls (or terrain, or other solids) directly bounding the
-    // floor cells in 4-cardinal at the floor's Y.
+    // floor cells in 4-cardinal at the floor's Y. Use the *full* perimeter
+    // here (including internal columns) — at floor Y, an internal column
+    // is itself solid (it's the placed block), so this still passes for
+    // legitimate column placements.
     let perimeter_at_floor_solid = perimeter_xz
         .iter()
         .all(|&(x, z)| !get_block(IVec3::new(x, floor_y, z)).is_empty());
@@ -645,9 +662,10 @@ fn compute_signature(
             has_roof = true;
             break;
         }
-        // Bound check: every perimeter position is solid at this y
-        // (the wall extends up to here).
-        let bounded = perimeter_xz
+        // Bound check: every *exterior* perimeter position is solid at
+        // this y (the wall extends up to here). Internal column positions
+        // are exempt — they don't need walls above them.
+        let bounded = external_perimeter
             .iter()
             .all(|&(x, z)| !get_block(IVec3::new(x, y, z)).is_empty());
         if !bounded {
