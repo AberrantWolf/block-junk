@@ -209,6 +209,14 @@ pub struct RoomSignature {
     // Volumetric-only fields. `None` for connective signatures.
     #[serde(default)]
     pub volume: Option<u32>,
+    /// Subset of floor cells where the player has player-height vertical
+    /// clearance (the cell directly above is air or in-cell-traversable).
+    /// Cells with head-height obstructions stay in the floor set (so the
+    /// room's enclosure is preserved) but don't count toward this. The
+    /// `FloorArea` constraint reads from this when it's `Some` — patterns
+    /// asking "minimum room size" want walkable size, not geometric.
+    #[serde(default)]
+    pub walkable_count: Option<u32>,
     /// Number of layers (Y planes) above the floor that the walls extend
     /// to bound, computed bottom-up. Walled yard with 1-high walls has
     /// `enclosure_height = 1`; 2-high walls = 2; small house with 2-high

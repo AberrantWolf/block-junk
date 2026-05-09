@@ -669,6 +669,20 @@ fn compute_signature(
     }
     let volume = enclosure_height.saturating_mul(floor_cells.len() as u32);
 
+    // Walkable cells = floor cells with player-height clearance above.
+    // Floor set itself stays geometric (so the room stays enclosed even
+    // when the player builds something at head height); this counts the
+    // subset that's actually standable, which the FloorArea constraint
+    // reads as "minimum room size."
+    let walkable_count = floor_cells
+        .iter()
+        .filter(|&&c| {
+            let above = get_block(c + IVec3::Y);
+            let above_def = reg.def(above);
+            above.is_empty() || above_def.flags.support_in_cell
+        })
+        .count() as u32;
+
     RoomSignature {
         domain: PatternDomain::Volumetric,
         bbox: BBox {
@@ -685,6 +699,7 @@ fn compute_signature(
         },
         cell_count: floor_cells.len() as u32,
         volume: Some(volume),
+        walkable_count: Some(walkable_count),
         enclosure_height: Some(enclosure_height),
         has_roof: Some(has_roof),
         door_count: Some(door_count),
@@ -745,7 +760,9 @@ fn evaluate_constraint(c: &Constraint, sig: &RoomSignature) -> bool {
             min.is_none_or(|m| v >= m) && max.is_none_or(|m| v <= m)
         }
         Constraint::FloorArea { min, max } => {
-            let v = sig.cell_count;
+            // Walkable count when present, fall back to geometric for
+            // connective-domain signatures or older mod-emitted ones.
+            let v = sig.walkable_count.unwrap_or(sig.cell_count);
             min.is_none_or(|m| v >= m) && max.is_none_or(|m| v <= m)
         }
         Constraint::EnclosureHeight { min, max } => {
