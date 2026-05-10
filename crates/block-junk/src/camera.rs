@@ -2,6 +2,8 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
+use crate::physics::MovementMode;
+
 #[derive(Component)]
 pub struct FlyCam {
     pub speed: f32,
@@ -86,6 +88,7 @@ fn fly_cam_input(
     keys: Res<ButtonInput<KeyCode>>,
     motion: Res<AccumulatedMouseMotion>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    mode: Res<MovementMode>,
     mut cam: Query<(&mut FlyCam, &mut Transform)>,
     mut discard: ResMut<DiscardNextMotion>,
 ) {
@@ -97,6 +100,9 @@ fn fly_cam_input(
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
 
+    // Mouse-look always runs — looking around is shared between fly and
+    // walk. Translation below is gated on Fly mode; Walk mode runs its
+    // own controller in physics.rs.
     if locked && motion.delta != Vec2::ZERO {
         if discard.0 {
             // First nonzero motion since capture is the warp's phantom delta;
@@ -111,10 +117,7 @@ fn fly_cam_input(
     transform.rotation =
         Quat::from_axis_angle(Vec3::Y, cam.yaw) * Quat::from_axis_angle(Vec3::X, cam.pitch);
 
-    // Movement only when the cursor is captured. With it free, the player
-    // is interacting with the desktop (screenshot shortcut, alt-tabbed
-    // chat, etc.) and W/A/S/D shouldn't drift the camera.
-    if !locked {
+    if !locked || *mode != MovementMode::Fly {
         return;
     }
     let forward = *transform.forward();

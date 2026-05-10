@@ -9,6 +9,7 @@ use bevy::scene::SceneInstanceReady;
 
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
+use crate::physics::{PhysicsPlugin, Player};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::protocol::{
     Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
@@ -21,6 +22,7 @@ pub struct ClientPlugin;
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FlyCamPlugin)
+            .add_plugins(PhysicsPlugin)
             .add_plugins(PreviewPlugin)
             .add_plugins(crate::scripting::ClientScriptingPlugin);
         // ClientScriptingPlugin inserts BlockRegistry. Derive client-side
@@ -212,6 +214,9 @@ fn setup_scene(
         // Above the sine-wave terrain (peaks around y=16), looking down -Z.
         Transform::from_xyz(0.0, 32.0, 60.0),
         FlyCam::default(),
+        // Walk-mode physics state. Inert in Fly mode; switching to Walk
+        // (F1) starts applying gravity + collision against the chunk grid.
+        Player::default(),
         PointLight {
             intensity: 750_000.0,
             range: 60.0,
@@ -1146,6 +1151,7 @@ fn apply_broadcast_edit(
     } else {
         edit.slot
     };
+    let needs_sidecar = def.mesh.is_some();
 
     for cell in cells {
         let (coord, local) = crate::voxel::world_to_chunk(cell);
@@ -1157,8 +1163,10 @@ fn apply_broadcast_edit(
         };
         chunk.set(local, new_slot);
         if edit.slot.is_empty() {
+            // remove() is a no-op if no entry — covers both block-entity
+            // breaks and plain-cube breaks uniformly.
             entities.remove(cell);
-        } else {
+        } else if needs_sidecar {
             let kind = if cell == edit.anchor {
                 EntryKind::Anchor {
                     orientation: edit.orientation,
@@ -1265,11 +1273,20 @@ fn refresh_block_entities(
     }
 
     // 2. Per changed chunk: diff sidecar Anchor entries vs spawned set.
+    // Filter to anchors whose slot is actually a mesh block. Worlds saved
+    // before the place handler stopped writing sidecar entries for plain
+    // cubes can carry leftover Anchors on non-mesh slots; ignoring them
+    // here lets those worlds heal silently as the affected blocks get
+    // broken (which always clears the entry).
     for (chunk, sidecar, coord) in chunks_changed.iter() {
         let mut new_anchors: HashSet<IVec3> = HashSet::default();
         for entry in &sidecar.entries {
             if let EntryKind::Anchor { .. } = entry.kind {
-                new_anchors.insert(entry.cell);
+                let (cc, local) = crate::voxel::world_to_chunk(entry.cell);
+                debug_assert_eq!(cc, *coord);
+                if registry.def(chunk.get(local)).mesh.is_some() {
+                    new_anchors.insert(entry.cell);
+                }
             }
         }
 
@@ -1284,17 +1301,13 @@ fn refresh_block_entities(
         for cell in new_anchors.difference(&old_anchors) {
             // Resolve the slot + orientation. Slot via the chunk grid
             // (the anchor cell holds the block-entity's slot); orientation
-            // via the sidecar entry we just iterated.
+            // via the sidecar entry we just iterated. `new_anchors` was
+            // already filtered to mesh slots, so `def.mesh` is Some here.
             let (cc, local) = crate::voxel::world_to_chunk(*cell);
             debug_assert_eq!(cc, *coord);
             let slot = chunk.get(local);
             let def = registry.def(slot);
-            let Some(mesh_path) = def.mesh.as_ref() else {
-                // Sidecar says anchor here but the slot isn't a mesh
-                // block. Bug somewhere upstream; warn and skip.
-                warn!(?cell, "anchor entry on non-mesh slot; skipping render");
-                continue;
-            };
+            let mesh_path = def.mesh.as_ref().expect("non-mesh slot filtered above");
             let orientation = match sidecar.get(*cell) {
                 Some(EntryKind::Anchor { orientation }) => orientation,
                 _ => Cardinal::default(),

@@ -445,6 +445,12 @@ fn apply_place(
         }
     }
 
+    // Sidecar entries describe block-entity geometry — anchors track the
+    // entity's orientation, ghosts point footprint cells back at their
+    // anchor. Plain cube blocks need none of that: the slot grid alone
+    // tells the full story. So only mesh blocks get sidecar entries.
+    let needs_sidecar = def.mesh.is_some();
+
     // Apply pass. One chunk at a time so the borrow scope is clean.
     for (coord, cells_in_chunk) in &cells_by_chunk {
         let chunk_entity = map.0[coord];
@@ -456,16 +462,18 @@ fn apply_place(
             // Padding cells aren't part of `world_to_chunk`'s output for
             // interior coords, so set() returns true on the real edits.
             chunk.set(local, edit.slot);
-            let kind = if world == edit.anchor {
-                EntryKind::Anchor {
-                    orientation: edit.orientation,
-                }
-            } else {
-                EntryKind::Ghost {
-                    anchor: edit.anchor,
-                }
-            };
-            entities.insert(world, kind);
+            if needs_sidecar {
+                let kind = if world == edit.anchor {
+                    EntryKind::Anchor {
+                        orientation: edit.orientation,
+                    }
+                } else {
+                    EntryKind::Ghost {
+                        anchor: edit.anchor,
+                    }
+                };
+                entities.insert(world, kind);
+            }
             bus.write(CellEdit {
                 world,
                 slot: edit.slot,

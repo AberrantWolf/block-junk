@@ -2,6 +2,7 @@ mod blocks;
 mod camera;
 mod client;
 mod network;
+mod physics;
 mod preview;
 mod protocol;
 mod rooms;
