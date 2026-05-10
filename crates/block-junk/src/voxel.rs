@@ -1,5 +1,6 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::Cardinal;
 use block_mesh::{GreedyQuadsBuffer, RIGHT_HANDED_Y_UP_CONFIG, greedy_quads};
@@ -10,6 +11,13 @@ use crate::blocks::{BlockRegistry, BlockSlot, MeshVoxel, TerrainSlots};
 use crate::protocol::{CHUNK_PADDED, CHUNK_SIZE, ChunkCoord};
 
 pub type ChunkShape = ConstShape3u32<CHUNK_PADDED, CHUNK_PADDED, CHUNK_PADDED>;
+
+/// `ChunkCoord → Entity` lookup for the chunk holding that coord. Both
+/// client and server initialise their own copy of this resource — same
+/// type, separate worlds. Sharing the type means collision/raycast code
+/// that takes `&ChunkMap` works identically on either side.
+#[derive(Resource, Default)]
+pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
 
 #[derive(Component, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chunk {

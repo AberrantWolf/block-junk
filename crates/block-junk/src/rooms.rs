@@ -26,8 +26,7 @@ use thiserror::Error;
 
 use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::protocol::CellEdit;
-use crate::server::ChunkMap;
-use crate::voxel::{Chunk, world_to_chunk};
+use crate::voxel::{Chunk, ChunkMap, world_to_chunk};
 
 /// Hard upper bound on floor-fill cells. Anything bigger is "outdoors" or
 /// "unclassifiably huge" and isn't tracked as a room.

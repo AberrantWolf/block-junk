@@ -1,6 +1,7 @@
 mod blocks;
 mod camera;
 mod client;
+mod collision;
 mod network;
 mod physics;
 mod preview;

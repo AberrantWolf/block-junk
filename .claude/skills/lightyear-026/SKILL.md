@@ -221,6 +221,161 @@ The prelude is split into a top-level part and `client`/`server` submodules. Ite
 
 When `NetcodeConfig` ambiguity bites, use scoped function-local imports: `use lightyear::prelude::server::NetcodeConfig;` inside `start_netcode_server`, etc.
 
+## Prediction + interpolation + input replication (the simple_box pattern)
+
+This is the canonical shape for "owner predicts, others interpolate, server is authority." Source: upstream `examples/simple_box`. Verify against that example if anything below stops compiling.
+
+### 1. Define an input type
+
+```rust
+use bevy::ecs::entity::MapEntities;
+use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, Reflect)]
+pub struct MyInput { up: bool, down: bool, jump: bool /* ... */ }
+
+impl MapEntities for MyInput {
+    fn map_entities<M: EntityMapper>(&mut self, _: &mut M) {}
+}
+```
+
+Required derives: `Serialize, Deserialize, Clone, PartialEq, Reflect, Debug, Default, MapEntities`. The `Default` value MUST mean "no input held" — the buffer distinguishes that from "missing packet."
+
+### 2. Define a replicated state component
+
+Keep it minimal. **Don't** replicate `Transform` if you only need a 2D position — its 40-byte rotation+scale baggage is dead weight. Implement `Ease` for components that interpolate:
+
+```rust
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
+pub struct PlayerPosition(pub Vec3);
+
+impl Ease for PlayerPosition {
+    fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
+        FunctionCurve::new(Interval::UNIT, move |t| {
+            PlayerPosition(Vec3::lerp(start.0, end.0, t))
+        })
+    }
+}
+```
+
+Components that drive prediction-only state (velocity, `on_ground`) can register without `Ease` — register them with `.add_prediction()` only, no `.add_linear_interpolation()`.
+
+### 3. Protocol registration
+
+```rust
+use lightyear::prelude::*;
+
+impl Plugin for ProtocolPlugin {
+    fn build(&self, app: &mut App) {
+        // input plugin (REQUIRES the `input_native` cargo feature on lightyear)
+        app.add_plugins(input::native::InputPlugin::<MyInput>::default());
+
+        // components — chained methods register prediction/interpolation
+        app.register_component::<PlayerPosition>()
+            .add_prediction()
+            .add_linear_interpolation();
+
+        // velocity — predicted but not interpolated (remote viewers don't need it)
+        app.register_component::<Velocity>().add_prediction();
+    }
+}
+```
+
+### 4. Server: spawn the controlled entity
+
+In the `Connected` observer:
+
+```rust
+use lightyear::prelude::server::*;
+
+let avatar = commands.spawn((
+    PlayerPosition(Vec3::ZERO),
+    Replicate::to_clients(NetworkTarget::All),
+    PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
+    InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
+    ControlledBy { owner: link_entity, lifetime: Default::default() },
+)).id();
+```
+
+`PredictionTarget` puts `Predicted` on the owner's copy; `InterpolationTarget` puts `Interpolated` on every other client's copy.
+
+### 5. Server: consume inputs in FixedUpdate
+
+```rust
+use lightyear::prelude::input::native::*;
+
+fn server_movement(
+    mut q: Query<
+        (&mut PlayerPosition, &ActionState<MyInput>),
+        Without<Predicted>, // host-mode safety: skip the local-client copy
+    >,
+) {
+    for (pos, input) in q.iter_mut() {
+        shared_movement(pos, &input.0);
+    }
+}
+
+app.add_systems(FixedUpdate, server_movement);
+```
+
+The `ActionState<MyInput>` component appears automatically on the server's avatar entity once `InputPlugin` is registered.
+
+### 6. Client: write inputs in FixedPreUpdate
+
+```rust
+use lightyear::prelude::client::input::*;
+use lightyear::prelude::input::native::*;
+
+fn buffer_input(
+    mut q: Query<&mut ActionState<MyInput>, With<InputMarker<MyInput>>>,
+    keys: Res<ButtonInput<KeyCode>>,
+) {
+    let Ok(mut state) = q.single_mut() else { return };
+    state.0 = MyInput { /* read keys */ };
+}
+
+app.add_systems(
+    FixedPreUpdate,
+    buffer_input.in_set(InputSystems::WriteClientInputs),
+);
+```
+
+`InputMarker<MyInput>` is what tells the input plugin "this client is the one writing inputs to this entity." Add it in the `Add<Predicted>` observer below.
+
+### 7. Client: predict in FixedUpdate
+
+```rust
+fn client_movement(
+    mut q: Query<(&mut PlayerPosition, &ActionState<MyInput>), With<Predicted>>,
+) {
+    for (pos, input) in q.iter_mut() {
+        shared_movement(pos, &input.0);
+    }
+}
+```
+
+Same function the server calls. Identical inputs → identical outputs ⇒ no rollback. When server disagrees, lightyear rolls the predicted entity back and replays.
+
+### 8. Client: tag the predicted entity as input source
+
+```rust
+fn handle_predicted_spawn(
+    trigger: On<Add, Predicted>,
+    mut commands: Commands,
+) {
+    commands.entity(trigger.entity).insert(InputMarker::<MyInput>::default());
+}
+
+app.add_observer(handle_predicted_spawn);
+```
+
+### 9. Cargo features
+
+`input_native` is **not** in `default`. Add it explicitly: `lightyear = { version = "0.26", features = ["netcode", "udp", "input_native"] }`.
+
+For frame-smooth render of the owner camera (60 Hz physics → variable render rate), also enable `frame_interpolation` and use `lightyear_frame_interpolation` to lerp Transform between FixedUpdate ticks.
+
 ## Common gotchas
 
 - **`ProtocolPlugin` registered before `ClientPlugins`/`ServerPlugins`**: silent breakage. Required order.

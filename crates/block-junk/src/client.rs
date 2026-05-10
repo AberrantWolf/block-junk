@@ -15,7 +15,7 @@ use crate::protocol::{
     Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
     ChunkUnload, GameSet, PlayerPose, WorldChannel,
 };
-use crate::voxel::{Chunk, ChunkEntities, EntryKind};
+use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
 pub struct ClientPlugin;
 
@@ -92,11 +92,6 @@ struct AvatarAssets {
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
 }
-
-/// Client-side chunk lookup, parallel to the server's. Filled by snapshot
-/// receipt; consulted when applying broadcast edits or raycasting.
-#[derive(Resource, Default)]
-pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
 
 /// Tracks the ECS entity rendering each placed block-entity (a block
 /// whose `BlockDef.mesh` is set, e.g. furniture, doors). Indexed by world

@@ -13,7 +13,7 @@ use crate::protocol::{
     ChunkUnload, GameSet, PlayerPose, WorldChannel,
 };
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::voxel::{Chunk, ChunkEntities, EntryKind, chunk_world_transform, world_to_chunk};
+use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_world_transform, world_to_chunk};
 
 /// Marker on chunks whose state has diverged from the deterministic terrain
 /// function. Server uses it to decide whether to ship the bytes or just
@@ -80,10 +80,6 @@ pub struct ClientAvatars(pub HashMap<Entity, Entity>);
 /// to compute deltas (which snapshots/unloads to send each tick).
 #[derive(Resource, Default)]
 pub struct ClientChunks(pub HashMap<Entity, HashSet<ChunkCoord>>);
-
-/// Authoritative map of chunk coords to their entity in this world.
-#[derive(Resource, Default)]
-pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
 
 /// Chunks whose generation is currently in flight on a worker thread.
 /// `update_aoi` skips coords already in here so we don't queue duplicate
