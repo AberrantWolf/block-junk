@@ -17,8 +17,8 @@ use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
 use crate::protocol::{
-    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkSnapshot, ChunkUnload, PlayerPose,
-    WorldChannel,
+    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkSnapshot, ChunkUnload, PlayerInput,
+    PlayerPose, WorldChannel,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +74,11 @@ impl Plugin for ProtocolPlugin {
         // See networking-design: state for entities, events for the grid.
         app.register_component::<Avatar>();
         app.register_component::<AvatarPose>();
+
+        // Per-tick input replication. Adds `ActionState<PlayerInput>` and
+        // the buffering machinery on both sides. Phase 2.4 hangs the
+        // avatar entity off this; this registration alone is inert.
+        app.add_plugins(input::native::InputPlugin::<PlayerInput>::default());
     }
 }
 

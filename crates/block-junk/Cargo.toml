@@ -11,9 +11,11 @@ ndshape = "0.3"
 # Features:
 # - default brings client/server/replication/prediction/interpolation
 # - netcode + udp wire up real network transport for split mode
-# - Note we do NOT enable crossbeam: host mode uses lightyear's built-in
-#   HostClient pattern (shared world), not in-process channels.
-lightyear = { version = "0.26", features = ["netcode", "udp"] }
+# - input_native enables the per-tick PlayerInput replication pipeline
+#   (sequence-numbered input replay for prediction rollback)
+# - Note we do NOT enable crossbeam: solo play runs a server thread +
+#   client App talking via UDP-localhost (always-client architecture).
+lightyear = { version = "0.26", features = ["netcode", "udp", "input_native"] }
 avian3d = "0.6"
 bevy-inspector-egui = "0.36"
 serde = { version = "1", features = ["derive"] }

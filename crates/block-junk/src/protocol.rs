@@ -1,3 +1,4 @@
+use bevy::ecs::entity::{EntityMapper, MapEntities};
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::{BlockId, Cardinal};
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,43 @@ pub struct ChunkUnload {
 /// (BlockEdit, ChunkSnapshot, building events…). Future work may split
 /// priorities; for now KISS.
 pub struct WorldChannel;
+
+/// Per-tick player input. Replicated client→server by lightyear's input
+/// pipeline (`input_native`), with sequence-numbered redundancy so a
+/// dropped UDP packet doesn't drop a tick of input. Both server (authority)
+/// and the owning client (prediction) run the same controller against
+/// these inputs in `FixedUpdate`.
+///
+/// Wishdir is encoded as three i8s (-1/0/+1 per axis) — fits in 3 bytes
+/// where a Vec3 would take 12. Yaw is sent every tick because the avatar's
+/// body orientation tracks the camera; pitch isn't here yet (no head/torso
+/// split, the avatar is a single yaw-rotated cuboid).
+///
+/// `Default` MUST mean "no keys held, last known yaw" so missing-input
+/// vs no-input stays distinguishable. The buffer treats a missing
+/// per-tick input as "use the previous one"; a `Default` value means
+/// "the player explicitly pressed nothing this tick."
+#[derive(Component, Clone, Debug, Default, PartialEq, Serialize, Deserialize, Reflect)]
+pub struct PlayerInput {
+    /// Per-axis -1, 0, or +1. X is strafe (right/left), Y is fly up/down,
+    /// Z is forward/back. Server interprets these per `MovementMode`.
+    pub wishdir: [i8; 3],
+    /// Held this tick — jump in walk mode, ascend in fly mode (redundant
+    /// with `wishdir.y` but kept separate so the controller can tell
+    /// "jump just-pressed" from "fly-up held").
+    pub jump: bool,
+    /// Just-pressed this tick — server flips `MovementMode` on the avatar.
+    /// Later this gets gated on creative-mode permissions.
+    pub toggle_mode: bool,
+    /// Camera yaw in radians (rotation around +Y). Sets the avatar's
+    /// body orientation; also drives the wishdir basis on the server's
+    /// controller side.
+    pub yaw: f32,
+}
+
+impl MapEntities for PlayerInput {
+    fn map_entities<M: EntityMapper>(&mut self, _: &mut M) {}
+}
 
 /// Game-wide schedule ordering. Plugins assign their systems to one of these
 /// sets so input → simulation → re-mesh runs in one frame in the right order,
