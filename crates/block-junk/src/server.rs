@@ -3,16 +3,17 @@ use core::time::Duration;
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
+use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 
-use crate::blocks::{BlockRegistry, TerrainSlots};
+use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::protocol::{
-    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
+    Avatar, AvatarPose, BlockEdit, BlockManifest, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot,
     ChunkUnload, GameSet, PlayerPose, WorldChannel,
 };
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::voxel::{Chunk, chunk_world_transform};
+use crate::voxel::{Chunk, ChunkEntities, EntryKind, chunk_world_transform, world_to_chunk};
 
 /// Marker on chunks whose state has diverged from the deterministic terrain
 /// function. Server uses it to decide whether to ship the bytes or just
@@ -38,7 +39,12 @@ impl Plugin for ServerPlugin {
         // Local Bevy bus for server-internal observers (scripting, building
         // detection, etc.). Not what crosses the wire — that's lightyear's
         // MessageSender/Receiver. Server-only.
-        app.add_message::<BlockEdit>();
+        //
+        // CellEdit is the per-cell shape; an incoming wire `BlockEdit`
+        // (anchor + slot + orientation) gets expanded into one CellEdit
+        // per footprint cell so existing per-cell consumers don't need to
+        // know about block-entity footprints.
+        app.add_message::<CellEdit>();
         app.add_message::<RoomEventMsg>();
         // Two chained groups in Simulation. Splitting into two `add_systems`
         // calls works around a Bevy 0.18 trait-resolution wall on chained
@@ -206,6 +212,7 @@ fn poll_chunk_gen(
             .spawn((
                 chunk,
                 coord,
+                ChunkEntities::default(),
                 Name::new(format!("chunk{:?}", coord.0.to_array())),
                 chunk_world_transform(coord),
             ))
@@ -226,7 +233,7 @@ fn poll_chunk_gen(
 /// we don't lose player edits when the last viewer wanders off.
 fn update_aoi(
     chunk_map: Res<ChunkMap>,
-    chunks: Query<(&Chunk, Has<ChunkEdited>)>,
+    chunks: Query<(&Chunk, &ChunkEntities, Has<ChunkEdited>)>,
     mut pending: ResMut<PendingChunks>,
     avatars: Res<ClientAvatars>,
     poses: Query<&AvatarPose>,
@@ -248,35 +255,41 @@ fn update_aoi(
 
         for coord in &candidates {
             // Resolve the chunk's wire payload. Three states:
-            //   - server has the chunk, edited: send the bytes
+            //   - server has the chunk, edited: send the bytes + sidecar
             //   - server has the chunk, never edited: send Procedural (tiny)
             //   - server doesn't have the chunk yet: queue async gen and skip
-            let data: Option<ChunkData> = if let Some(&entity) = chunk_map.0.get(coord) {
-                chunks.get(entity).ok().map(|(chunk, edited)| {
-                    if edited {
-                        ChunkData::Edited(chunk.blocks.clone())
-                    } else {
-                        ChunkData::Procedural
+            let payload: Option<(ChunkData, Vec<crate::voxel::EntityEntry>)> =
+                if let Some(&entity) = chunk_map.0.get(coord) {
+                    chunks.get(entity).ok().map(|(chunk, entities, edited)| {
+                        let data = if edited {
+                            ChunkData::Edited(chunk.blocks.clone())
+                        } else {
+                            ChunkData::Procedural
+                        };
+                        // Procedural chunks have no entities by construction, but
+                        // ship the sidecar regardless — empty in that case, so
+                        // the wire cost is one varint.
+                        (data, entities.entries.clone())
+                    })
+                } else {
+                    if !pending.0.contains_key(coord) {
+                        let coord_for_task = *coord;
+                        let slots = *terrain_slots;
+                        let task = AsyncComputeTaskPool::get()
+                            .spawn(async move { Chunk::from_terrain(coord_for_task, &slots) });
+                        pending.0.insert(*coord, task);
                     }
-                })
-            } else {
-                if !pending.0.contains_key(coord) {
-                    let coord_for_task = *coord;
-                    let slots = *terrain_slots;
-                    let task = AsyncComputeTaskPool::get()
-                        .spawn(async move { Chunk::from_terrain(coord_for_task, &slots) });
-                    pending.0.insert(*coord, task);
-                }
-                None
-            };
+                    None
+                };
 
-            let Some(data) = data else {
+            let Some((data, entities)) = payload else {
                 continue; // still generating; try again next tick
             };
             if let Ok(mut sender) = snapshots.get_mut(client_entity) {
                 sender.send::<WorldChannel>(ChunkSnapshot {
                     coord: *coord,
                     data,
+                    entities,
                 });
                 current.insert(*coord);
             }
@@ -317,41 +330,273 @@ fn aoi_around(centre: ChunkCoord) -> HashSet<ChunkCoord> {
 fn receive_block_edits(
     mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
-    mut chunks: Query<&mut Chunk>,
+    mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
-    mut bus: MessageWriter<BlockEdit>,
+    mut bus: MessageWriter<CellEdit>,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
     for mut receiver in receivers.iter_mut() {
-        for edit in receiver.receive() {
-            let Some(&entity) = map.0.get(&edit.coord) else {
-                continue;
-            };
-            let Ok(mut chunk) = chunks.get_mut(entity) else {
-                continue;
-            };
-            if !chunk.set(edit.pos, edit.block) {
-                continue;
-            }
-
-            // Mark the chunk as having diverged from procedural terrain —
-            // future AoI snapshots for it ship bytes, not the regen hint.
-            // No-op insert if already present.
-            commands.entity(entity).insert(ChunkEdited);
-
-            // Broadcast the applied edit to every connected client.
-            if let Err(err) =
-                broadcast.send::<BlockEdit, WorldChannel>(&edit, server, &NetworkTarget::All)
-            {
-                warn!("BlockEdit broadcast failed: {err}");
-            }
-
-            // Local bus so scripting/other server-side hooks see it.
-            bus.write(edit);
+        let edits: Vec<BlockEdit> = receiver.receive().collect();
+        for edit in edits {
+            apply_block_edit(
+                edit,
+                &mut commands,
+                &mut chunks,
+                &map,
+                &registry,
+                server,
+                &mut broadcast,
+                &mut bus,
+            );
         }
     }
+}
+
+/// Validate + apply a single client request, then broadcast the canonical
+/// applied event. On a place: expand the footprint, check every cell is
+/// empty, write all cells + sidecar entries. On a break: resolve the
+/// clicked cell to its entity's anchor (single-cell breaks resolve
+/// trivially), clear all footprint cells + sidecar entries.
+fn apply_block_edit(
+    edit: BlockEdit,
+    commands: &mut Commands,
+    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+    server: &Server,
+    broadcast: &mut ServerMultiMessageSender,
+    bus: &mut MessageWriter<CellEdit>,
+) {
+    if edit.slot.is_empty() {
+        apply_break(edit, commands, chunks, map, registry, server, broadcast, bus);
+    } else {
+        apply_place(edit, commands, chunks, map, registry, server, broadcast, bus);
+    }
+}
+
+/// Place path. Resolves the rotated footprint, validates every cell is
+/// empty (and its chunk is loaded), writes the slot to each cell, adds an
+/// `Anchor` entry at the anchor cell + `Ghost` entries at every other
+/// footprint cell. Cross-chunk footprints are handled naturally — each
+/// affected chunk gets the cells that fall inside it.
+fn apply_place(
+    edit: BlockEdit,
+    commands: &mut Commands,
+    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+    server: &Server,
+    broadcast: &mut ServerMultiMessageSender,
+    bus: &mut MessageWriter<CellEdit>,
+) {
+    let def = registry.def(edit.slot);
+    let cells = world_footprint(edit.anchor, &def.footprint, edit.orientation);
+    if cells.is_empty() {
+        return;
+    }
+
+    // Group cells by their owning chunk + verify each chunk is loaded.
+    let mut cells_by_chunk: HashMap<ChunkCoord, Vec<(IVec3, IVec3)>> = HashMap::default();
+    for cell in &cells {
+        let (coord, local) = world_to_chunk(*cell);
+        cells_by_chunk.entry(coord).or_default().push((*cell, local));
+    }
+    for coord in cells_by_chunk.keys() {
+        if !map.0.contains_key(coord) {
+            // A footprint cell falls in a chunk the server hasn't
+            // generated yet. Reject the placement; the client retries
+            // when AoI brings the chunk online. Loud log so this surfaces
+            // if it happens often in practice (suggests the placement UX
+            // is letting players aim past their AoI).
+            warn!(
+                anchor = ?edit.anchor,
+                slot = %def.id,
+                missing_chunk = ?coord,
+                "rejecting cross-chunk place: chunk not loaded server-side",
+            );
+            return;
+        }
+    }
+
+    // Validation pass: every footprint cell must currently be empty.
+    // Split borrow trick — we can't both `.iter` and `.get_mut` the same
+    // query, so do validation against the *immutable* view via a per-
+    // chunk lookup that reborrows the query each time.
+    for (coord, cells_in_chunk) in &cells_by_chunk {
+        let chunk_entity = map.0[coord];
+        let Ok((chunk, _)) = chunks.get(chunk_entity) else {
+            return;
+        };
+        for &(_world, local) in cells_in_chunk {
+            if !chunk.get(local).is_empty() {
+                info!(
+                    anchor = ?edit.anchor,
+                    slot = %def.id,
+                    blocked = ?_world,
+                    "rejecting place: footprint cell already occupied",
+                );
+                return;
+            }
+        }
+    }
+
+    // Apply pass. One chunk at a time so the borrow scope is clean.
+    for (coord, cells_in_chunk) in &cells_by_chunk {
+        let chunk_entity = map.0[coord];
+        let Ok((mut chunk, mut entities)) = chunks.get_mut(chunk_entity) else {
+            continue;
+        };
+        for &(world, local) in cells_in_chunk {
+            // is_empty was checked above; set should always succeed.
+            // Padding cells aren't part of `world_to_chunk`'s output for
+            // interior coords, so set() returns true on the real edits.
+            chunk.set(local, edit.slot);
+            let kind = if world == edit.anchor {
+                EntryKind::Anchor {
+                    orientation: edit.orientation,
+                }
+            } else {
+                EntryKind::Ghost {
+                    anchor: edit.anchor,
+                }
+            };
+            entities.insert(world, kind);
+            bus.write(CellEdit {
+                world,
+                slot: edit.slot,
+            });
+        }
+        commands.entity(chunk_entity).insert(ChunkEdited);
+    }
+
+    if let Err(err) = broadcast.send::<BlockEdit, WorldChannel>(&edit, server, &NetworkTarget::All)
+    {
+        warn!("BlockEdit broadcast failed: {err}");
+    }
+}
+
+/// Break path. Resolves the clicked cell to its entity's anchor (single-
+/// cell blocks resolve to themselves with default orientation; multi-
+/// cell entities walk the chunk sidecar). Clears every footprint cell
+/// in the affected chunks + drops the entries.
+fn apply_break(
+    edit: BlockEdit,
+    commands: &mut Commands,
+    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+    server: &Server,
+    broadcast: &mut ServerMultiMessageSender,
+    bus: &mut MessageWriter<CellEdit>,
+) {
+    let click_cell = edit.anchor;
+    let (click_coord, click_local) = world_to_chunk(click_cell);
+    let Some(&click_entity) = map.0.get(&click_coord) else {
+        return;
+    };
+
+    // Resolve clicked cell → anchor cell + slot + orientation.
+    let (anchor, slot, orientation) = {
+        let Ok((chunk, entities)) = chunks.get(click_entity) else {
+            return;
+        };
+        let click_slot = chunk.get(click_local);
+        if click_slot.is_empty() {
+            return;
+        }
+        match entities.get(click_cell) {
+            Some(EntryKind::Anchor { orientation }) => (click_cell, click_slot, orientation),
+            Some(EntryKind::Ghost { anchor }) => {
+                // Anchor lives in the same or another chunk. Look it up.
+                let (anchor_coord, anchor_local) = world_to_chunk(anchor);
+                let Some(&anchor_entity) = map.0.get(&anchor_coord) else {
+                    warn!(
+                        clicked = ?click_cell,
+                        anchor = ?anchor,
+                        "ghost cell points at unloaded anchor chunk; ignoring break",
+                    );
+                    return;
+                };
+                let Ok((anchor_chunk, anchor_entities)) = chunks.get(anchor_entity) else {
+                    return;
+                };
+                let anchor_slot = anchor_chunk.get(anchor_local);
+                let orientation = match anchor_entities.get(anchor) {
+                    Some(EntryKind::Anchor { orientation }) => orientation,
+                    _ => {
+                        // Sidecar inconsistency — anchor entry missing or
+                        // a ghost. Loud log; bail without mutating.
+                        error!(
+                            clicked = ?click_cell,
+                            anchor = ?anchor,
+                            "ghost->anchor resolution failed; sidecar inconsistent",
+                        );
+                        return;
+                    }
+                };
+                (anchor, anchor_slot, orientation)
+            }
+            None => {
+                // No sidecar entry: a plain single-cell block. Resolve
+                // trivially.
+                (click_cell, click_slot, Cardinal::default())
+            }
+        }
+    };
+
+    // Compute footprint cells from the resolved entity.
+    let def = registry.def(slot);
+    let cells = world_footprint(anchor, &def.footprint, orientation);
+    let mut cells_by_chunk: HashMap<ChunkCoord, Vec<(IVec3, IVec3)>> = HashMap::default();
+    for cell in &cells {
+        let (coord, local) = world_to_chunk(*cell);
+        cells_by_chunk.entry(coord).or_default().push((*cell, local));
+    }
+
+    // Apply: clear each cell + drop the entry.
+    for (coord, cells_in_chunk) in &cells_by_chunk {
+        let Some(&chunk_entity) = map.0.get(coord) else {
+            continue;
+        };
+        let Ok((mut chunk, mut entities)) = chunks.get_mut(chunk_entity) else {
+            continue;
+        };
+        for &(world, local) in cells_in_chunk {
+            chunk.set(local, BlockSlot::EMPTY);
+            entities.remove(world);
+            bus.write(CellEdit {
+                world,
+                slot: BlockSlot::EMPTY,
+            });
+        }
+        commands.entity(chunk_entity).insert(ChunkEdited);
+    }
+
+    // Broadcast the canonical applied break with the resolved anchor +
+    // orientation, so other clients can compute the footprint themselves.
+    let applied = BlockEdit {
+        anchor,
+        slot: BlockSlot::EMPTY,
+        orientation,
+    };
+    if let Err(err) =
+        broadcast.send::<BlockEdit, WorldChannel>(&applied, server, &NetworkTarget::All)
+    {
+        warn!("BlockEdit broadcast failed: {err}");
+    }
+}
+
+/// Resolve a default-orientation footprint into world cells. Same shape
+/// as the client-side helper — pulled into the server module so we don't
+/// reach across the client/server split.
+fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardinal) -> Vec<IVec3> {
+    def_footprint
+        .iter()
+        .map(|&offset| anchor + IVec3::from_array(orientation.rotate_offset(offset)))
+        .collect()
 }

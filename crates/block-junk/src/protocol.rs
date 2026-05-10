@@ -1,8 +1,9 @@
 use bevy::prelude::*;
-use block_junk_mod_api::blocks::BlockId;
+use block_junk_mod_api::blocks::{BlockId, Cardinal};
 use serde::{Deserialize, Serialize};
 
 use crate::blocks::BlockSlot;
+use crate::voxel::EntityEntry;
 
 pub const CHUNK_SIZE: u32 = 32;
 pub const CHUNK_PADDED: u32 = CHUNK_SIZE + 2;
@@ -13,13 +14,39 @@ pub const CHUNK_PADDED: u32 = CHUNK_SIZE + 2;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkCoord(pub IVec3);
 
-/// Client → server: an edit request. Server → client (after validation):
-/// the applied edit broadcast to everyone in the chunk's AoI.
+/// Client → server: a place-or-break request. Server → client (after
+/// validation): the applied edit broadcast to everyone in AoI.
+///
+/// On a request:
+///   - `slot != EMPTY` → place this block at `anchor`, rotated by `orientation`.
+///     The server expands the def's footprint, validates every footprint
+///     cell is empty (and chunks loaded), and applies atomically.
+///   - `slot == EMPTY` → break. `anchor` is the cell the player clicked,
+///     which may be any cell of a multi-cell entity; the server resolves
+///     to the entity's anchor via the chunk sidecar before clearing.
+///
+/// On a broadcast:
+///   - `slot != EMPTY` → a place was applied; `anchor` is authoritative
+///     and `orientation` is the placed orientation.
+///   - `slot == EMPTY` → a break was applied; `anchor` is the resolved
+///     anchor of whatever was removed (single-cell or entity), and
+///     `orientation` is the removed entity's orientation. Recipients use
+///     this to rotate the def's footprint and clear all of its cells.
 #[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BlockEdit {
-    pub coord: ChunkCoord,
-    pub pos: IVec3,
-    pub block: BlockSlot,
+    pub anchor: IVec3,
+    pub slot: BlockSlot,
+    pub orientation: Cardinal,
+}
+
+/// Server-internal local-bus event, NOT a wire message. Emitted once per
+/// world cell whose slot changed. Subscribers (room dirty-marking, mod
+/// scripting hooks) react cell-by-cell without needing to know about
+/// block-entity footprints.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct CellEdit {
+    pub world: IVec3,
+    pub slot: BlockSlot,
 }
 
 /// Server → client on connect: the slot ↔ id table the server is using.
@@ -35,10 +62,16 @@ pub struct BlockManifest {
 /// entered AoI of. Two payload variants — see `ChunkData`. Subsequent
 /// changes arrive as `BlockEdit` broadcasts; this message fires once
 /// per (chunk, client) pair on AoI entry.
+///
+/// Unedited chunks travel with `entities` empty — terrain has no
+/// block-entities. Edited chunks ship the sidecar so anchors/ghosts
+/// arrive atomically with the slot grid.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkSnapshot {
     pub coord: ChunkCoord,
     pub data: ChunkData,
+    #[serde(default)]
+    pub entities: Vec<EntityEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

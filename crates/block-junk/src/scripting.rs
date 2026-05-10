@@ -13,7 +13,7 @@ use block_junk_mod_api::shared::BlockPos;
 use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
 use crate::blocks::{BlockRegistry, WorldSlots};
-use crate::protocol::{BlockEdit, GameSet};
+use crate::protocol::{CellEdit, GameSet};
 use crate::rooms::{RoomEventMsg, RoomPatternRegistry};
 
 const MODS_DIR: &str = "./mods";
@@ -111,18 +111,18 @@ fn load_side(side: Side) -> LoadResult {
 }
 
 fn dispatch_block_placed(
-    mut reader: MessageReader<BlockEdit>,
+    mut reader: MessageReader<CellEdit>,
     mut mods: ResMut<ServerMods>,
     registry: Res<BlockRegistry>,
 ) {
     for edit in reader.read() {
         let event = BlockPlacedEvent {
             pos: BlockPos {
-                x: edit.pos.x,
-                y: edit.pos.y,
-                z: edit.pos.z,
+                x: edit.world.x,
+                y: edit.world.y,
+                z: edit.world.z,
             },
-            block: registry.id_of(edit.block).clone(),
+            block: registry.id_of(edit.slot).clone(),
         };
         mods.0.dispatch_block_placed(event);
     }

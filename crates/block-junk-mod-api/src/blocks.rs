@@ -124,4 +124,257 @@ pub struct BlockDef {
     /// `"mods://vanilla/models/bed.glb"`. Server ignores this field.
     #[serde(default)]
     pub mesh: Option<String>,
+    /// Cell offsets occupied by this block in default ([`Cardinal::East`])
+    /// orientation. The anchor cell is `[0,0,0]`; additional cells extend
+    /// into +X (east) and may use +Y (tall fixtures) or +Z (wide).
+    /// Defaults to a single-cell footprint when the field is omitted, so
+    /// existing single-cell blocks register unchanged.
+    #[serde(default = "default_footprint")]
+    pub footprint: Vec<[i32; 3]>,
+    /// Tight model-space bounding box used by the raycast to skip past
+    /// block-entities whose mesh doesn't fill its footprint cells. Local
+    /// origin is the bottom-centre of the anchor cell (matching the
+    /// modeling guide); the AABB is in default orientation. `None` means
+    /// "use the union of cube cells covered by `footprint`," which is the
+    /// safe fallback for cube-shaped blocks.
+    #[serde(default)]
+    pub entity_aabb: Option<EntityAabb>,
+}
+
+/// Default footprint helper for serde. A single cell at the anchor.
+fn default_footprint() -> Vec<[i32; 3]> {
+    vec![[0, 0, 0]]
+}
+
+/// Local-space AABB of a block-entity model in default orientation.
+///
+/// Coordinates are in the model frame: `(0, 0, 0)` is the bottom-centre of
+/// the anchor cell (the same origin convention the modeling guide tells
+/// authors to model against). Y is up; +X is the default-orientation
+/// "extends" direction. The box is inclusive on both ends — points on a
+/// face count as inside.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EntityAabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+/// Cardinal placement orientation for a block entity. East is the default
+/// — that's the direction a multi-cell footprint extends in unrotated
+/// model space, per the modeling guide. Rotations are 90° steps around +Y.
+///
+/// Stored as a single byte on disk and on the wire (one entry per anchored
+/// block-entity in a chunk's sidecar).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum Cardinal {
+    #[default]
+    East = 0,
+    North = 1,
+    West = 2,
+    South = 3,
+}
+
+impl Cardinal {
+    pub const ALL: [Cardinal; 4] = [
+        Cardinal::East,
+        Cardinal::North,
+        Cardinal::West,
+        Cardinal::South,
+    ];
+
+    /// Snap a yaw (radians, body rotation around +Y) to the nearest
+    /// cardinal. Bevy convention: yaw=0 looks toward -Z (north), so a
+    /// player *facing* north should place a bed extending into their
+    /// forward direction… but the orientation convention here is which way
+    /// the entity *itself* extends from its anchor. We pick orientation to
+    /// match the player's facing: facing east → entity extends east, etc.
+    pub fn from_yaw_facing(yaw: f32) -> Self {
+        let two_pi = std::f32::consts::TAU;
+        let frac = std::f32::consts::FRAC_PI_2;
+        let normalised = yaw.rem_euclid(two_pi);
+        // Bevy yaw=0 → forward is -Z (north), yaw=PI/2 → forward is -X
+        // (west), etc. Map yaw to the cardinal whose extends-direction
+        // matches the forward vector.
+        // forward = (sin(-yaw), 0, -cos(yaw)) for yaw applied as
+        // Quat::from_rotation_y(yaw) on -Z. At yaw=0: (0,0,-1)=N.
+        // At yaw=-PI/2: (1,0,0)=E. So:
+        //   yaw ≈ -PI/2 → East
+        //   yaw ≈ 0     → North
+        //   yaw ≈ +PI/2 → West
+        //   yaw ≈ ±PI   → South
+        // Quantise: ((yaw + PI/4) / (PI/2)) floored, mod 4, indexed into
+        // [North, West, South, East].
+        let bucket = ((normalised + frac * 0.5) / frac).floor() as i32 & 3;
+        match bucket {
+            0 => Cardinal::North,
+            1 => Cardinal::West,
+            2 => Cardinal::South,
+            _ => Cardinal::East,
+        }
+    }
+
+    /// Rotate by 90° steps. `+1` = one step counter-clockwise viewed from
+    /// above (E → N → W → S → E). Used by the rotate-during-placement
+    /// hotkey so the user can override the auto-snapped orientation.
+    pub fn rotated(self, steps: i32) -> Self {
+        let i = ((self as i32) + steps).rem_euclid(4) as u8;
+        match i {
+            0 => Cardinal::East,
+            1 => Cardinal::North,
+            2 => Cardinal::West,
+            _ => Cardinal::South,
+        }
+    }
+
+    /// Yaw in radians for rendering: rotate the model's `SceneRoot` by
+    /// `Quat::from_rotation_y(self.yaw())`. Composes with the modeling
+    /// guide's default-east convention so rotating produces the right
+    /// visual orientation in world space.
+    pub fn yaw(self) -> f32 {
+        let frac = std::f32::consts::FRAC_PI_2;
+        match self {
+            Cardinal::East => 0.0,
+            Cardinal::North => frac,
+            Cardinal::West => std::f32::consts::PI,
+            Cardinal::South => -frac,
+        }
+    }
+
+    /// Rotate a default-orientation cell offset to this orientation. Y is
+    /// preserved; the rotation is in the X/Z plane around the anchor cell.
+    pub fn rotate_offset(self, offset: [i32; 3]) -> [i32; 3] {
+        let [x, y, z] = offset;
+        match self {
+            // Derived from the standard right-handed Y-up rotation matrix
+            // R_y(θ): (x, z) ↦ (x cos θ + z sin θ, -x sin θ + z cos θ).
+            Cardinal::East => [x, y, z],
+            Cardinal::North => [z, y, -x],
+            Cardinal::West => [-x, y, -z],
+            Cardinal::South => [-z, y, x],
+        }
+    }
+
+    /// Rotate a default-orientation model-space point. Same X/Z rotation as
+    /// `rotate_offset` but in floats — used for AABB ray tests.
+    pub fn rotate_point(self, p: [f32; 3]) -> [f32; 3] {
+        let [x, y, z] = p;
+        match self {
+            Cardinal::East => [x, y, z],
+            Cardinal::North => [z, y, -x],
+            Cardinal::West => [-x, y, -z],
+            Cardinal::South => [-z, y, x],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default-east extends +X by 1; rotating to North should put the
+    /// extension at -Z (north of anchor). Other cardinals symmetric.
+    #[test]
+    fn cardinal_rotate_offset_extends_correctly() {
+        let head = [1, 0, 0]; // bed head in default east orientation
+        assert_eq!(Cardinal::East.rotate_offset(head), [1, 0, 0]);
+        assert_eq!(Cardinal::North.rotate_offset(head), [0, 0, -1]);
+        assert_eq!(Cardinal::West.rotate_offset(head), [-1, 0, 0]);
+        assert_eq!(Cardinal::South.rotate_offset(head), [0, 0, 1]);
+    }
+
+    /// Y is preserved by all cardinal rotations.
+    #[test]
+    fn cardinal_rotate_offset_preserves_y() {
+        for c in Cardinal::ALL {
+            assert_eq!(c.rotate_offset([0, 5, 0])[1], 5);
+            assert_eq!(c.rotate_offset([2, -3, 4])[1], -3);
+        }
+    }
+
+    /// Two CCW steps from East lands on West.
+    #[test]
+    fn cardinal_rotated_steps() {
+        assert_eq!(Cardinal::East.rotated(1), Cardinal::North);
+        assert_eq!(Cardinal::East.rotated(2), Cardinal::West);
+        assert_eq!(Cardinal::East.rotated(-1), Cardinal::South);
+        assert_eq!(Cardinal::East.rotated(4), Cardinal::East);
+    }
+
+    /// Bevy yaw=0 → camera forward is -Z (north); facing-derived
+    /// orientation should then place an entity extending North.
+    #[test]
+    fn from_yaw_facing_picks_natural_cardinal() {
+        let f = std::f32::consts::FRAC_PI_2;
+        assert_eq!(Cardinal::from_yaw_facing(0.0), Cardinal::North);
+        assert_eq!(Cardinal::from_yaw_facing(f), Cardinal::West);
+        assert_eq!(Cardinal::from_yaw_facing(-f), Cardinal::East);
+        assert_eq!(
+            Cardinal::from_yaw_facing(std::f32::consts::PI),
+            Cardinal::South,
+        );
+    }
+
+    /// AABB rotation flips min/max as expected. A bed-shaped AABB
+    /// rotated North should have its X extent become -Z extent.
+    #[test]
+    fn entity_aabb_rotation() {
+        let bed = EntityAabb {
+            min: [-0.5, 0.0, -0.5],
+            max: [1.5, 0.5, 0.5],
+        };
+        let rotated = bed.rotated(Cardinal::North);
+        // Original X spanned [-0.5, 1.5]; under R_y(+90°) the X axis
+        // rotates into -Z, so the new Z bounds should be [-1.5, 0.5].
+        assert_eq!(rotated.min[2], -1.5);
+        assert_eq!(rotated.max[2], 0.5);
+        // Y is preserved.
+        assert_eq!(rotated.min[1], 0.0);
+        assert_eq!(rotated.max[1], 0.5);
+    }
+}
+
+impl EntityAabb {
+    /// Default-orientation AABB derived from a footprint. Each cell covers
+    /// `[cx - 0.5, cx + 0.5] × [cy, cy + 1] × [cz - 0.5, cz + 0.5]` in model
+    /// space (origin at anchor's bottom-centre). The cube-cell union is the
+    /// safe fallback when a `BlockDef` doesn't declare a tighter box.
+    pub fn cube_union(footprint: &[[i32; 3]]) -> Self {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for &[cx, cy, cz] in footprint {
+            let lo = [cx as f32 - 0.5, cy as f32, cz as f32 - 0.5];
+            let hi = [cx as f32 + 0.5, cy as f32 + 1.0, cz as f32 + 0.5];
+            for axis in 0..3 {
+                if lo[axis] < min[axis] {
+                    min[axis] = lo[axis];
+                }
+                if hi[axis] > max[axis] {
+                    max[axis] = hi[axis];
+                }
+            }
+        }
+        Self { min, max }
+    }
+
+    /// AABB after rotating by `orientation`. Because rotations are 90°
+    /// multiples the result is still axis-aligned; we just rotate the
+    /// corners and recompute min/max.
+    pub fn rotated(self, orientation: Cardinal) -> Self {
+        let mins = orientation.rotate_point(self.min);
+        let maxs = orientation.rotate_point(self.max);
+        Self {
+            min: [
+                mins[0].min(maxs[0]),
+                mins[1].min(maxs[1]),
+                mins[2].min(maxs[2]),
+            ],
+            max: [
+                mins[0].max(maxs[0]),
+                mins[1].max(maxs[1]),
+                mins[2].max(maxs[2]),
+            ],
+        }
+    }
 }

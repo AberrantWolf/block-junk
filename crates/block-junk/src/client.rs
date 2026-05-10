@@ -2,6 +2,7 @@ use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::*;
 
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
@@ -10,7 +11,7 @@ use crate::protocol::{
     Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
     ChunkUnload, GameSet, PlayerPose, WorldChannel,
 };
-use crate::voxel::Chunk;
+use crate::voxel::{Chunk, ChunkEntities, EntryKind};
 
 pub struct ClientPlugin;
 
@@ -29,13 +30,26 @@ impl Plugin for ClientPlugin {
         app.insert_resource(terrain_slots);
         app.init_resource::<ChunkMap>()
             .init_resource::<SelectedBlock>()
+            .init_resource::<PlacementRotation>()
             .init_resource::<BlockEntities>()
             .add_systems(Startup, setup_scene)
             .add_systems(
                 Update,
-                (place_break_input, send_player_pose, cycle_selected_block)
+                (
+                    place_break_input,
+                    send_player_pose,
+                    cycle_selected_or_rotation,
+                    reset_rotation_on_selection_change,
+                )
                     .in_set(GameSet::Input),
             )
+            // Chained: receive_snapshots inserts new chunks via Commands;
+            // receive_block_edit_broadcasts queries those chunks. Without
+            // a sync point between them an edit landing in the same tick
+            // as its chunk snapshot can fall through (chunk not yet in
+            // the world). `.chain()` inserts the apply_deferred between
+            // each pair, which is overkill for the avatar/manifest
+            // systems but cheap.
             .add_systems(
                 Update,
                 (
@@ -45,11 +59,17 @@ impl Plugin for ClientPlugin {
                     receive_chunk_unloads,
                     sync_avatar_transforms,
                 )
+                    .chain()
                     .in_set(GameSet::Simulation),
             )
             .add_systems(
                 Update,
-                (mesh_chunks, refresh_block_entities, update_hotbar_highlight)
+                (
+                    mesh_chunks,
+                    refresh_block_entities,
+                    update_hotbar_highlight,
+                    update_placement_preview,
+                )
                     .in_set(GameSet::PostSimulation),
             )
             .add_observer(attach_avatar_visuals);
@@ -97,8 +117,32 @@ impl SelectedBlock {
     }
 }
 
+/// Manual orientation offset applied on top of the player's facing-derived
+/// orientation at place time. Ctrl+MouseWheel advances/retreats one
+/// cardinal step. Reset to the default ([`Cardinal::East`]) whenever the
+/// hotbar selection changes — orientation context is per-item, so picking
+/// a new item shouldn't carry forward the previous item's rotation.
+#[derive(Resource, Default)]
+pub struct PlacementRotation(pub Cardinal);
+
 #[derive(Component)]
 struct HotbarSlot(usize);
+
+/// Marker for the translucent ghost-cuboid the player sees at the
+/// placement target. Always exactly one in the world; visibility toggles
+/// based on whether a placement target exists.
+#[derive(Component)]
+struct PlacementPreview;
+
+/// Cached material handles for the placement preview. The valid material's
+/// `base_color` is rewritten each frame from the selected block's swatch
+/// so the cube reads as a tinted version of what would land. Invalid
+/// stays a fixed red — that's a "stop" colour, no need to tint.
+#[derive(Resource)]
+struct PreviewAssets {
+    valid: Handle<StandardMaterial>,
+    invalid: Handle<StandardMaterial>,
+}
 
 fn setup_scene(
     mut commands: Commands,
@@ -123,6 +167,37 @@ fn setup_scene(
             perceptual_roughness: 0.6,
             ..default()
         }),
+    });
+
+    // Translucent placement-preview cuboid. Its Mesh is a unit cube; the
+    // update system rewrites translation+scale to span the rotated
+    // footprint. Two materials so we can flag invalid placements with a
+    // distinct red tint without ever blocking the click — the player still
+    // gets clear feedback before they release the button.
+    let preview_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let valid_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 1.0, 1.0, 0.35),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    let invalid_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.2, 0.2, 0.45),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    commands.spawn((
+        PlacementPreview,
+        Mesh3d(preview_cube),
+        MeshMaterial3d(valid_material.clone()),
+        Visibility::Hidden,
+        Transform::default(),
+        Name::new("placement_preview"),
+    ));
+    commands.insert_resource(PreviewAssets {
+        valid: valid_material,
+        invalid: invalid_material,
     });
 
     // Camera + a point "headlamp" so the player can read shapes in the
@@ -241,10 +316,17 @@ fn setup_scene(
         });
 }
 
-fn cycle_selected_block(
+/// One scroll handler covers both jobs because Ctrl gates which one fires:
+///   - Plain wheel cycles the selected block in the hotbar.
+///   - Ctrl+wheel rotates the manual placement orientation 90° per click.
+/// We keep them in one system so the wheel never double-fires (rotating
+/// AND cycling) on a frame where the modifier flips mid-scroll.
+fn cycle_selected_or_rotation(
     scroll: Res<AccumulatedMouseScroll>,
+    keys: Res<ButtonInput<KeyCode>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
     mut selected: ResMut<SelectedBlock>,
+    mut rotation: ResMut<PlacementRotation>,
     palette: Res<PlaceablePalette>,
 ) {
     // Don't steal scrolls from menus / unlocked cursor states.
@@ -255,16 +337,42 @@ fn cycle_selected_block(
     if !locked {
         return;
     }
+    let dy = scroll.delta.y;
+    if dy.abs() < 0.5 {
+        return;
+    }
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if ctrl {
+        // CCW step on scroll-up matches the right-hand rule for +Y rotation
+        // (positive yaw is CCW viewed from above) — rotating "up the wheel"
+        // turns the bed's head left, which is the natural feel.
+        let step = if dy > 0.0 { 1 } else { -1 };
+        rotation.0 = rotation.0.rotated(step);
+        return;
+    }
     let n = palette.0.len();
     if n == 0 {
         return;
     }
     // Hotbar is laid out top→bottom (index 0 at top). Scroll up moves the
     // highlight to the slot *above* the current one, i.e. toward index 0.
-    if scroll.delta.y > 0.5 {
+    if dy > 0.0 {
         selected.0 = (selected.0 + n - 1) % n;
-    } else if scroll.delta.y < -0.5 {
+    } else {
         selected.0 = (selected.0 + 1) % n;
+    }
+}
+
+/// Snap rotation back to the default whenever the selected block changes,
+/// so the user never gets a "why is this rotated weird" surprise after
+/// switching items in the hotbar. Bevy's resource change-detection tick
+/// makes this a one-liner.
+fn reset_rotation_on_selection_change(
+    selected: Res<SelectedBlock>,
+    mut rotation: ResMut<PlacementRotation>,
+) {
+    if selected.is_changed() {
+        rotation.0 = Cardinal::default();
     }
 }
 
@@ -288,14 +396,32 @@ fn update_hotbar_highlight(
 /// real survival reach (Minecraft-y ~5 blocks) lands when there's an avatar.
 const RAYCAST_REACH: f32 = 256.0;
 
+/// Convenience: compose the player's facing-derived orientation with the
+/// manual rotation offset to get the orientation a place action would use.
+fn placement_orientation(player_yaw: f32, manual: Cardinal) -> Cardinal {
+    Cardinal::from_yaw_facing(player_yaw).rotated(manual as i32)
+}
+
+/// Resolve a default-orientation footprint into world cells given an
+/// anchor cell and the current orientation. Single-cell footprints fall
+/// out trivially as `[anchor]`; multi-cell ones get rotated.
+fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardinal) -> Vec<IVec3> {
+    def_footprint
+        .iter()
+        .map(|&offset| anchor + IVec3::from_array(orientation.rotate_offset(offset)))
+        .collect()
+}
+
 fn place_break_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
-    cam: Query<&GlobalTransform, With<FlyCam>>,
-    chunks: Query<&Chunk>,
+    cam: Query<(&GlobalTransform, &FlyCam)>,
+    chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
+    rotation: Res<PlacementRotation>,
+    registry: Res<BlockRegistry>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
     let break_click = mouse.just_pressed(MouseButton::Left);
@@ -311,7 +437,7 @@ fn place_break_input(
         return;
     }
 
-    let Ok(cam_t) = cam.single() else {
+    let Ok((cam_t, fly)) = cam.single() else {
         return;
     };
     // MessageSender lives on the connection entity; exactly one in any
@@ -322,49 +448,353 @@ fn place_break_input(
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
 
-    // World-space raycast: walk world cells, dispatch each to its owning
-    // chunk via the ChunkMap. Avoids per-chunk iteration order dependence
-    // and the padding-vs-interior ambiguity that plagued the per-chunk
-    // approach.
     let get_block = |world: IVec3| -> BlockSlot {
         let (coord, local) = crate::voxel::world_to_chunk(world);
         chunk_map
             .0
             .get(&coord)
             .and_then(|&entity| chunks.get(entity).ok())
-            .map(|chunk| chunk.get(local))
+            .map(|(chunk, _)| chunk.get(local))
             .unwrap_or(BlockSlot::EMPTY)
     };
-    let Some(hit) = crate::voxel::world_raycast(cam_pos, cam_dir, RAYCAST_REACH, get_block) else {
+    let Some(hit) = entity_aware_raycast(
+        cam_pos,
+        cam_dir,
+        RAYCAST_REACH,
+        &chunks,
+        &chunk_map,
+        &registry,
+    ) else {
         return;
     };
 
-    let world_target = if break_click {
-        hit.hit
+    if break_click {
+        // Server resolves anchor + footprint via the chunk sidecar.
+        // Orientation is irrelevant on a break request; default is fine.
+        let _ = get_block; // consumed via the raycast
+        sender.send::<WorldChannel>(BlockEdit {
+            anchor: hit.cell,
+            slot: BlockSlot::EMPTY,
+            orientation: Cardinal::default(),
+        });
     } else {
-        hit.hit + hit.face_normal
+        let anchor = hit.cell + hit.face_normal;
+        let slot = selected.current(&palette);
+        let orientation = placement_orientation(fly.yaw, rotation.0);
+        sender.send::<WorldChannel>(BlockEdit {
+            anchor,
+            slot,
+            orientation,
+        });
+    }
+}
+
+/// Raycast hit for the place/break path. `cell` is the world cell that
+/// would receive the action: for break, the cell whose block should be
+/// affected; for place, the cell adjacent to the hit face.
+struct EntityAwareHit {
+    cell: IVec3,
+    face_normal: IVec3,
+}
+
+/// Walks world cells like the plain voxel raycast, but treats block-entity
+/// cells specially: when the ray enters an entity cell, AABB-test against
+/// the entity's declared (rotated) bounds. On miss, keep stepping past so
+/// the ray "sees through" the airspace inside a partial-cell mesh and can
+/// land on whatever is behind it. On hit, return the entity cell.
+///
+/// For non-entity cells the behaviour is identical to `world_raycast`.
+fn entity_aware_raycast(
+    origin: Vec3,
+    dir: Vec3,
+    max_distance: f32,
+    chunks: &Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: &ChunkMap,
+    registry: &BlockRegistry,
+) -> Option<EntityAwareHit> {
+    let lookup = |world: IVec3| -> (BlockSlot, Option<EntryKind>) {
+        let (coord, local) = crate::voxel::world_to_chunk(world);
+        let Some(&entity) = chunk_map.0.get(&coord) else {
+            return (BlockSlot::EMPTY, None);
+        };
+        let Ok((chunk, entities)) = chunks.get(entity) else {
+            return (BlockSlot::EMPTY, None);
+        };
+        (chunk.get(local), entities.get(world))
     };
-    let (target_coord, target_local) = crate::voxel::world_to_chunk(world_target);
-    let block = if break_click {
-        BlockSlot::EMPTY
+
+    // Two-pass: first find the nearest cell whose block-entity AABB
+    // genuinely contains the ray, OR a non-entity solid cell (cube AABB).
+    // Reuse the cube-stepping core; for each non-empty cell, decide
+    // whether to accept based on entity kind + AABB test.
+    let mut cell = origin.floor().as_ivec3();
+    let mut entered_face = IVec3::ZERO;
+
+    let (slot, kind) = lookup(cell);
+    if !slot.is_empty()
+        && cell_passes_test(
+            origin,
+            dir,
+            cell,
+            slot,
+            kind,
+            registry,
+            chunks,
+            chunk_map,
+            max_distance,
+        )
+    {
+        // Origin already inside a hit-tested entity / non-entity solid.
+        return Some(EntityAwareHit {
+            cell,
+            face_normal: -entered_face,
+        });
+    }
+
+    let step = dir.signum().as_ivec3();
+    let next = cell.as_vec3() + dir.signum().max(Vec3::ZERO);
+    let mut t_max = Vec3::select(
+        dir.cmpeq(Vec3::ZERO),
+        Vec3::INFINITY,
+        (next - origin) / dir,
+    );
+    let t_delta = dir.abs().recip();
+
+    loop {
+        let axis = if t_max.x <= t_max.y && t_max.x <= t_max.z {
+            0
+        } else if t_max.y <= t_max.z {
+            1
+        } else {
+            2
+        };
+        let t = t_max[axis];
+        if t > max_distance {
+            return None;
+        }
+        cell[axis] += step[axis];
+        entered_face = IVec3::ZERO;
+        entered_face[axis] = step[axis];
+        let _ = t;
+        t_max[axis] += t_delta[axis];
+
+        let (slot, kind) = lookup(cell);
+        if slot.is_empty() {
+            continue;
+        }
+        if cell_passes_test(
+            origin,
+            dir,
+            cell,
+            slot,
+            kind,
+            registry,
+            chunks,
+            chunk_map,
+            max_distance,
+        ) {
+            return Some(EntityAwareHit {
+                cell,
+                face_normal: -entered_face,
+            });
+        }
+    }
+}
+
+/// Decide whether a non-empty cell counts as a hit. Plain solid blocks
+/// always do. Block-entity cells (anchor or ghost) defer to the entity's
+/// rotated AABB so the ray walks past airspace inside a partial mesh.
+#[allow(clippy::too_many_arguments, reason = "raycast helper is naturally chunky")]
+fn cell_passes_test(
+    origin: Vec3,
+    dir: Vec3,
+    cell: IVec3,
+    slot: BlockSlot,
+    kind: Option<EntryKind>,
+    registry: &BlockRegistry,
+    chunks: &Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: &ChunkMap,
+    max_distance: f32,
+) -> bool {
+    let def = registry.def(slot);
+    if def.mesh.is_none() {
+        // Non-entity solid: accept the cube hit unconditionally.
+        return true;
+    }
+    // Block-entity cell. Resolve to the anchor + orientation, then
+    // ray-AABB test.
+    let (anchor, orientation) = match kind {
+        Some(EntryKind::Anchor { orientation }) => (cell, orientation),
+        Some(EntryKind::Ghost { anchor }) => {
+            // Look up the anchor's orientation via its chunk's sidecar.
+            let (coord, _) = crate::voxel::world_to_chunk(anchor);
+            let Some(&entity) = chunk_map.0.get(&coord) else {
+                return true; // anchor not loaded; conservative — accept hit
+            };
+            let Ok((_, entities)) = chunks.get(entity) else {
+                return true;
+            };
+            match entities.get(anchor) {
+                Some(EntryKind::Anchor { orientation }) => (anchor, orientation),
+                _ => return true, // sidecar inconsistency; accept
+            }
+        }
+        None => return true, // entity flagged in def but no sidecar yet
+    };
+
+    let aabb = def
+        .entity_aabb
+        .unwrap_or_else(|| block_junk_mod_api::blocks::EntityAabb::cube_union(&def.footprint))
+        .rotated(orientation);
+    // World-space AABB: relative to anchor's bottom-centre.
+    let anchor_origin = anchor.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+    let world_min = anchor_origin + Vec3::from_array(aabb.min);
+    let world_max = anchor_origin + Vec3::from_array(aabb.max);
+    ray_aabb_within(origin, dir, world_min, world_max, max_distance)
+}
+
+/// Slab test: does the ray hit the AABB anywhere along [0, max_distance]?
+fn ray_aabb_within(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3, max_distance: f32) -> bool {
+    let inv = Vec3::select(dir.cmpeq(Vec3::ZERO), Vec3::INFINITY, dir.recip());
+    let t1 = (min - origin) * inv;
+    let t2 = (max - origin) * inv;
+    let tmin = t1.min(t2);
+    let tmax = t1.max(t2);
+    let t_enter = tmin.x.max(tmin.y).max(tmin.z);
+    let t_exit = tmax.x.min(tmax.y).min(tmax.z);
+    t_enter <= t_exit && t_exit >= 0.0 && t_enter <= max_distance
+}
+
+/// Repaint the placement preview each frame: aim the cuboid at the cell
+/// the player would place into, scale it to span the rotated footprint,
+/// and tint it valid/invalid based on whether every footprint cell is
+/// empty. Hidden when the cursor is unlocked or the ray misses the world.
+///
+/// The preview reads the current selection's footprint from the registry,
+/// so single-cell blocks naturally render as a unit cube and multi-cell
+/// blocks (the bed) render as a 2-long cuboid that follows the player's
+/// orientation.
+fn update_placement_preview(
+    cam: Query<(&GlobalTransform, &FlyCam)>,
+    chunks: Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    selected: Res<SelectedBlock>,
+    palette: Res<PlaceablePalette>,
+    rotation: Res<PlacementRotation>,
+    registry: Res<BlockRegistry>,
+    preview_assets: Res<PreviewAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut preview: Query<
+        (
+            &mut Visibility,
+            &mut Transform,
+            &mut MeshMaterial3d<StandardMaterial>,
+        ),
+        With<PlacementPreview>,
+    >,
+) {
+    let Ok((mut visibility, mut transform, mut mat_handle)) = preview.single_mut() else {
+        return;
+    };
+
+    let locked = cursors
+        .single()
+        .map(|c| c.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+    if !locked {
+        *visibility = Visibility::Hidden;
+        return;
+    }
+
+    let Ok((cam_t, fly)) = cam.single() else {
+        *visibility = Visibility::Hidden;
+        return;
+    };
+    let cam_pos = cam_t.translation();
+    let cam_dir = *cam_t.forward();
+
+    // Same raycast as the actual click path so the preview never lies
+    // about where the place would land — including walking past the
+    // airspace inside a partial-cell block-entity.
+    let Some(hit) = entity_aware_raycast(
+        cam_pos,
+        cam_dir,
+        RAYCAST_REACH,
+        &chunks,
+        &chunk_map,
+        &registry,
+    ) else {
+        *visibility = Visibility::Hidden;
+        return;
+    };
+    let anchor = hit.cell + hit.face_normal;
+    let get_block = |world: IVec3| -> BlockSlot {
+        let (coord, local) = crate::voxel::world_to_chunk(world);
+        chunk_map
+            .0
+            .get(&coord)
+            .and_then(|&entity| chunks.get(entity).ok())
+            .map(|(chunk, _)| chunk.get(local))
+            .unwrap_or(BlockSlot::EMPTY)
+    };
+
+    let slot = selected.current(&palette);
+    let def = registry.def(slot);
+    let orientation = placement_orientation(fly.yaw, rotation.0);
+    let cells = world_footprint(anchor, &def.footprint, orientation);
+    if cells.is_empty() {
+        // A mod registered an empty footprint — degenerate, but don't
+        // panic the renderer. Hide and bail.
+        *visibility = Visibility::Hidden;
+        return;
+    }
+
+    // Validation: every footprint cell must currently be empty. For
+    // single-cell blocks this is "is the target air?"; for multi-cell
+    // blocks (the bed) it's the same check across each occupied cell.
+    let valid = cells.iter().all(|&c| get_block(c).is_empty());
+
+    let mut min = cells[0];
+    let mut max = cells[0];
+    for &c in &cells[1..] {
+        min = min.min(c);
+        max = max.max(c);
+    }
+    let extents = (max - min + IVec3::ONE).as_vec3();
+    let centre = min.as_vec3() + extents * 0.5;
+    *transform = Transform::from_translation(centre).with_scale(extents);
+
+    let want = if valid {
+        preview_assets.valid.clone()
     } else {
-        selected.current(&palette)
+        preview_assets.invalid.clone()
     };
-    sender.send::<WorldChannel>(BlockEdit {
-        coord: target_coord,
-        pos: target_local,
-        block,
-    });
+    if mat_handle.0 != want {
+        mat_handle.0 = want;
+    }
+
+    // Re-tint the valid material from the selected block's swatch each
+    // frame. Cheap and saves us from caching per-block material handles
+    // for every placeable. The invalid material stays a fixed red.
+    if let Some(mat) = materials.get_mut(&preview_assets.valid) {
+        let [r, g, b] = def.color;
+        mat.base_color = Color::srgba(r, g, b, 0.35);
+    }
+
+    *visibility = Visibility::Visible;
 }
 
 /// Snapshot from server → spawn (or replace) the corresponding local chunk.
 /// `ChunkData::Procedural` means "regenerate from the shared terrain
 /// function locally" — server didn't ship the bytes because the chunk
-/// has never been edited.
+/// has never been edited. Entity sidecars travel alongside; an empty
+/// sidecar (procedural chunks) is still applied so a stale sidecar from
+/// a previous load doesn't survive an unload+reload.
 fn receive_snapshots(
     mut commands: Commands,
     mut receivers: Query<&mut MessageReceiver<ChunkSnapshot>>,
-    mut chunks: Query<&mut Chunk>,
+    mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     mut map: ResMut<ChunkMap>,
     terrain_slots: Res<TerrainSlots>,
 ) {
@@ -374,16 +804,22 @@ fn receive_snapshots(
                 ChunkData::Procedural => Chunk::from_terrain(snapshot.coord, &terrain_slots),
                 ChunkData::Edited(blocks) => Chunk { blocks },
             };
+            let entities = ChunkEntities {
+                entries: snapshot.entities,
+            };
             match map.0.get(&snapshot.coord).copied() {
                 Some(entity) => {
-                    if let Ok(mut existing) = chunks.get_mut(entity) {
-                        *existing = chunk;
+                    if let Ok((mut existing_chunk, mut existing_entities)) = chunks.get_mut(entity)
+                    {
+                        *existing_chunk = chunk;
+                        *existing_entities = entities;
                     }
                 }
                 None => {
                     let entity = commands
                         .spawn((
                             chunk,
+                            entities,
                             snapshot.coord,
                             Name::new(format!("chunk{:?}", snapshot.coord.0.to_array())),
                             crate::voxel::chunk_world_transform(snapshot.coord),
@@ -501,21 +937,89 @@ fn receive_chunk_unloads(
     }
 }
 
-/// Server broadcast of an applied edit → apply it to our local chunk so the
-/// client view stays in sync.
+/// Server broadcast of an applied edit → mirror it into the local chunk
+/// state so this client's view stays in sync. Both place and break
+/// expand the def's footprint locally; the broadcast carries the anchor +
+/// orientation and we derive cells the same way the server did.
+///
+/// For breaks, we read the slot at the anchor *before* clearing so we
+/// know which footprint to expand (the broadcast doesn't include it —
+/// the client is expected to read it from local state). Cells that fall
+/// in unloaded chunks are silently skipped; their sidecar will arrive
+/// via `ChunkSnapshot` whenever the chunk enters AoI.
 fn receive_block_edit_broadcasts(
     mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
-    mut chunks: Query<&mut Chunk>,
+    mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
 ) {
     for mut receiver in receivers.iter_mut() {
-        for edit in receiver.receive() {
-            let Some(&entity) = map.0.get(&edit.coord) else {
-                continue;
+        let edits: Vec<BlockEdit> = receiver.receive().collect();
+        for edit in edits {
+            apply_broadcast_edit(edit, &mut chunks, &map, &registry);
+        }
+    }
+}
+
+fn apply_broadcast_edit(
+    edit: BlockEdit,
+    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+) {
+    // For a break we need the slot that *was* at the anchor — the wire
+    // doesn't carry it (the broadcast says "anchor + EMPTY"), so we read
+    // it from the local chunk. The wire DOES carry `orientation` (the
+    // orientation the entity had at the time of the break), so we trust
+    // that directly rather than re-deriving it from our sidecar.
+    let slot = if edit.slot.is_empty() {
+        let (anchor_coord, anchor_local) = crate::voxel::world_to_chunk(edit.anchor);
+        let Some(&anchor_entity) = map.0.get(&anchor_coord) else {
+            return;
+        };
+        let Ok((chunk, _)) = chunks.get(anchor_entity) else {
+            return;
+        };
+        let anchor_slot = chunk.get(anchor_local);
+        if anchor_slot.is_empty() {
+            // Already cleared (a previous broadcast applied). No-op.
+            return;
+        }
+        anchor_slot
+    } else {
+        edit.slot
+    };
+
+    let def = registry.def(slot);
+    let cells = world_footprint(edit.anchor, &def.footprint, edit.orientation);
+    let new_slot = if edit.slot.is_empty() {
+        BlockSlot::EMPTY
+    } else {
+        edit.slot
+    };
+
+    for cell in cells {
+        let (coord, local) = crate::voxel::world_to_chunk(cell);
+        let Some(&entity) = map.0.get(&coord) else {
+            continue;
+        };
+        let Ok((mut chunk, mut entities)) = chunks.get_mut(entity) else {
+            continue;
+        };
+        chunk.set(local, new_slot);
+        if edit.slot.is_empty() {
+            entities.remove(cell);
+        } else {
+            let kind = if cell == edit.anchor {
+                EntryKind::Anchor {
+                    orientation: edit.orientation,
+                }
+            } else {
+                EntryKind::Ghost {
+                    anchor: edit.anchor,
+                }
             };
-            if let Ok(mut chunk) = chunks.get_mut(entity) {
-                chunk.set(edit.pos, edit.block);
-            }
+            entities.insert(cell, kind);
         }
     }
 }
@@ -569,18 +1073,25 @@ fn mesh_chunks(
 }
 
 /// Spawn / despawn ECS entities for blocks whose `BlockDef.mesh` is set
-/// (block entities — beds, doors, etc.). Two phases per tick:
+/// (block entities — beds, doors, etc.). Anchors drive rendering; ghost
+/// cells live only in the chunk's slot grid + sidecar so the cube mesher
+/// skips them but no duplicate scene is spawned.
 ///
-/// 1. **Cleanup**: chunks tracked here that are no longer in `ChunkMap`
-///    were unloaded; despawn all their block entities in one pass.
-/// 2. **Diff per changed chunk**: rescan its interior cells, compare the
-///    new mesh-bearing set against the old, despawn the dropped, spawn
-///    the gained.
+/// Two phases per tick:
+///   1. **Cleanup**: chunks tracked here that are no longer in
+///      `ChunkMap` were unloaded; despawn all their block entities.
+///   2. **Diff per changed chunk** (chunk's `Chunk` *or* `ChunkEntities`
+///      mutated this tick): rescan the sidecar's anchor entries against
+///      what we've spawned. Despawn dropped, spawn new with the
+///      orientation rotation baked into the Transform.
 ///
 /// Runs in `PostSimulation` after the chunk-receive systems so the
-/// `Chunk` data + `ChunkMap` reflect this tick's edits and unloads.
+/// `Chunk` data, sidecar, and `ChunkMap` reflect this tick's events.
 fn refresh_block_entities(
-    chunks_changed: Query<(&Chunk, &ChunkCoord), Changed<Chunk>>,
+    chunks_changed: Query<
+        (&Chunk, &ChunkEntities, &ChunkCoord),
+        Or<(Changed<Chunk>, Changed<ChunkEntities>)>,
+    >,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
     asset_server: Res<AssetServer>,
@@ -604,60 +1115,58 @@ fn refresh_block_entities(
         }
     }
 
-    // 2. Per changed chunk: diff old vs new mesh cells.
-    for (chunk, coord) in chunks_changed.iter() {
-        let mut new_cells: HashSet<IVec3> = HashSet::default();
-        // Iterate interior cells only (skip the 1-cell padding ring).
-        let lo = 1i32;
-        let hi = (crate::protocol::CHUNK_PADDED - 1) as i32;
-        for x in lo..hi {
-            for y in lo..hi {
-                for z in lo..hi {
-                    let local = IVec3::new(x, y, z);
-                    let slot = chunk.get(local);
-                    if registry.def(slot).mesh.is_some() {
-                        let world = crate::voxel::chunk_local_to_world(*coord, local);
-                        new_cells.insert(world);
-                    }
-                }
+    // 2. Per changed chunk: diff sidecar Anchor entries vs spawned set.
+    for (chunk, sidecar, coord) in chunks_changed.iter() {
+        let mut new_anchors: HashSet<IVec3> = HashSet::default();
+        for entry in &sidecar.entries {
+            if let EntryKind::Anchor { .. } = entry.kind {
+                new_anchors.insert(entry.cell);
             }
         }
 
-        let old_cells = entities
-            .by_chunk
-            .get(coord)
-            .cloned()
-            .unwrap_or_default();
+        let old_anchors = entities.by_chunk.get(coord).cloned().unwrap_or_default();
 
-        for cell in old_cells.difference(&new_cells) {
+        for cell in old_anchors.difference(&new_anchors) {
             if let Some(entity) = entities.by_cell.remove(cell) {
                 commands.entity(entity).despawn();
             }
         }
 
-        for cell in new_cells.difference(&old_cells) {
-            // Look up the block at this cell to get its mesh path.
+        for cell in new_anchors.difference(&old_anchors) {
+            // Resolve the slot + orientation. Slot via the chunk grid
+            // (the anchor cell holds the block-entity's slot); orientation
+            // via the sidecar entry we just iterated.
             let (cc, local) = crate::voxel::world_to_chunk(*cell);
             debug_assert_eq!(cc, *coord);
             let slot = chunk.get(local);
             let def = registry.def(slot);
-            // Safe — we built `new_cells` from `def.mesh.is_some()`.
-            let mesh_path = def.mesh.as_ref().unwrap();
+            let Some(mesh_path) = def.mesh.as_ref() else {
+                // Sidecar says anchor here but the slot isn't a mesh
+                // block. Bug somewhere upstream; warn and skip.
+                warn!(?cell, "anchor entry on non-mesh slot; skipping render");
+                continue;
+            };
+            let orientation = match sidecar.get(*cell) {
+                Some(EntryKind::Anchor { orientation }) => orientation,
+                _ => Cardinal::default(),
+            };
             let scene: Handle<Scene> = asset_server.load(format!("{mesh_path}#Scene0"));
-            // Centre the entity horizontally in its cell, sitting on the
-            // cell's floor (Y is the cell's bottom). Mod authors model
-            // their meshes with origin at the bottom-front-left.
             let translation = cell.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+            let rotation = Quat::from_rotation_y(orientation.yaw());
             let entity = commands
                 .spawn((
                     SceneRoot(scene),
-                    Transform::from_translation(translation),
+                    Transform {
+                        translation,
+                        rotation,
+                        ..default()
+                    },
                     Name::new(format!("block_entity:{}{:?}", def.id, cell.to_array())),
                 ))
                 .id();
             entities.by_cell.insert(*cell, entity);
         }
 
-        entities.by_chunk.insert(*coord, new_cells);
+        entities.by_chunk.insert(*coord, new_anchors);
     }
 }

@@ -95,6 +95,15 @@ register {
 -- when ready. The voxel mesher skips this slot's cube faces because
 -- mesh is set; the client spawns an ECS entity with a SceneRoot loaded
 -- from the path.
+--
+-- footprint = two cells extending east of the anchor: anchor (foot) at
+-- {0,0,0}, head at {1,0,0}. The engine rotates this when the player
+-- places at non-default orientations.
+--
+-- entity_aabb tracks the visible mesh's actual extent so ray tests that
+-- pass above the low bed (it's roughly half-cell tall) don't break it.
+-- Tune this when the real bed mesh lands. Coordinates are model-space:
+-- anchor's bottom-centre at (0,0,0), +X = head, +Y = up.
 register {
     id = "vanilla:bed",
     display_name = "Bed",
@@ -104,6 +113,11 @@ register {
     },
     color = { 0.40, 0.18, 0.05 },
     mesh = "mods://vanilla/models/bed.glb",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.5 },
+        max = {  1.5, 0.5,  0.5 },
+    },
 }
 
 -- Seed room patterns. The detector isn't wired yet (next chunk of work);

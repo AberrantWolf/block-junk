@@ -25,9 +25,9 @@ use block_junk_mod_api::shared::BlockPos;
 use thiserror::Error;
 
 use crate::blocks::{BlockRegistry, BlockSlot};
-use crate::protocol::BlockEdit;
+use crate::protocol::CellEdit;
 use crate::server::ChunkMap;
-use crate::voxel::{Chunk, chunk_local_to_world, world_to_chunk};
+use crate::voxel::{Chunk, world_to_chunk};
 
 /// Hard upper bound on floor-fill cells. Anything bigger is "outdoors" or
 /// "unclassifiably huge" and isn't tracked as a room.
@@ -185,17 +185,18 @@ pub struct DetectionDirty {
 
 // ---------- systems ----------
 
-/// Reads applied `BlockEdit`s from the local server bus and pushes the
+/// Reads applied per-cell edits from the local server bus and pushes the
 /// edited world cells onto the dirty queue. Runs after `receive_block_edits`
-/// so it sees fully-applied state.
+/// so it sees fully-applied state. A multi-cell place fires multiple
+/// CellEdits in a single tick, all of which land in this debounced
+/// queue and resolve into one detection pass.
 pub fn mark_dirty_from_edits(
-    mut reader: MessageReader<BlockEdit>,
+    mut reader: MessageReader<CellEdit>,
     mut dirty: ResMut<DetectionDirty>,
 ) {
     let now = Instant::now();
     for edit in reader.read() {
-        let world = chunk_local_to_world(edit.coord, edit.pos);
-        dirty.cells.push((world, now));
+        dirty.cells.push((edit.world, now));
     }
 }
 

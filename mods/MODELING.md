@@ -61,16 +61,20 @@ You can use less than the full cube; the voxel mesher skips the cube
 faces of *that cell only*, so adjacent blocks render normally next to
 your model.
 
-## Multi-cell models (phase 2 — not implemented yet)
+## Multi-cell models
 
-Multi-cell support is planned but not built. This is the convention so
-your models age well:
+Multi-cell entities are supported. Declare which cells they occupy with
+`footprint` in `register{}`, and the engine will rotate the model + the
+occupancy footprint together based on the player's facing (with an
+optional Ctrl+MouseWheel manual rotation override at place time).
 
-- The **anchor** cell is where the player clicks. For furniture it's
-  the **foot** (bed foot, chair-anchor cell, etc.).
-- In default (unrotated) orientation, the model extends in **+X**
-  (east). The engine will rotate the entity in 90° steps for the four
-  cardinal placements based on player facing.
+- The **anchor** cell is where the player clicks (`footprint` entry
+  `{0,0,0}`). For furniture it's the **foot** (bed foot, chair anchor,
+  etc.).
+- In default (unrotated, "east") orientation, the model extends in
+  **+X** (east). The engine rotates 90° per cardinal step at place time.
+- The cube voxel mesher skips faces of every footprint cell, so the
+  model has clean airspace to sit in even at non-anchor cells.
 
 For a **2-long bed** (default orientation, foot at anchor):
 
@@ -80,10 +84,43 @@ For a **2-long bed** (default orientation, foot at anchor):
 | Y    |  0   to +1     |
 | Z    | −0.5 to +0.5   |
 
-Until phase 2 lands, a 2-long bed will visually overflow into the +X
-neighbour cell. The voxel mesher won't skip that neighbour's faces, so
-if the neighbour cell isn't empty (e.g. there's a wall there), the bed
-will clip through it. Place beds with empty space in +X for now.
+```lua
+register {
+    id = "yourmod:bed",
+    -- ...
+    mesh = "mods://yourmod/models/bed.glb",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+}
+```
+
+## entity_aabb (optional but recommended for partial-cell models)
+
+A model that doesn't fill its full footprint cells (a bed that's only
+half the cell tall, a chair, a shrine) should declare a tight bounding
+box. The raycast does ray-AABB tests on entity cells, so a tight AABB
+means a click *above* a half-height bed passes through to whatever's
+behind it instead of breaking the bed.
+
+`entity_aabb` is in the same model frame as the geometry: origin at the
+anchor's bottom-centre, +X = the default-orientation extends direction,
++Y = up. The engine rotates it together with `footprint` at place time.
+
+```lua
+register {
+    id = "yourmod:bed",
+    -- ...
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.5 },
+        max = {  1.5, 0.5,  0.5 },  -- 2-long, half-height
+    },
+}
+```
+
+If you omit `entity_aabb`, the engine falls back to the cube union of
+the footprint (the model is treated as filling every cell completely,
+which is the right default for cube-shaped multi-block entities like a
+crate stack but wrong for furniture). When in doubt, declare it.
 
 ## Materials
 

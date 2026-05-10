@@ -1,6 +1,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::prelude::*;
+use block_junk_mod_api::blocks::Cardinal;
 use block_mesh::{GreedyQuadsBuffer, RIGHT_HANDED_Y_UP_CONFIG, greedy_quads};
 use ndshape::{ConstShape, ConstShape3u32};
 use serde::{Deserialize, Serialize};
@@ -17,13 +18,74 @@ pub struct Chunk {
     pub blocks: Vec<BlockSlot>,
 }
 
-pub struct RayHit {
-    /// World cell containing the solid block that was hit.
-    pub hit: IVec3,
-    /// Outward normal of the face the ray entered through (unit vector along
-    /// one axis, e.g. `(0, 1, 0)` for the +Y face). `hit + face_normal` is
-    /// the world cell where a "place" action would put a new block.
-    pub face_normal: IVec3,
+/// Per-chunk sidecar describing block-entity metadata at specific cells.
+/// One entry per cell *inside this chunk* that participates in a
+/// block-entity (anchor or ghost). Cross-chunk footprints are encoded with
+/// a `Ghost` entry pointing at an `Anchor` entry that may live in a
+/// neighbouring chunk — until both chunks have arrived at the client,
+/// orphan ghosts are non-rendering placeholders.
+///
+/// Cells that hold a single-cell non-mesh block (stone, dirt, etc.) have
+/// no entry here; the slot grid alone tells the full story for them.
+///
+/// Stored as a flat `Vec` because the entry count per chunk is small in
+/// practice (most chunks have zero) and a linear scan is faster than a
+/// hashmap lookup at that size. Cell coords are world-space — same key
+/// used by the placement / break protocol — so no chunk-local conversion
+/// is needed when looking up an entry.
+#[derive(Component, Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChunkEntities {
+    pub entries: Vec<EntityEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntityEntry {
+    /// World-space cell this entry describes.
+    pub cell: IVec3,
+    pub kind: EntryKind,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EntryKind {
+    /// The anchor cell of a block-entity. Carries the orientation the
+    /// entity was placed at; the slot at this cell tells you which entity.
+    Anchor { orientation: Cardinal },
+    /// A non-anchor cell of a block-entity whose anchor is at `anchor`
+    /// (world cell). The slot at this cell echoes the anchor's slot —
+    /// that's how the cube mesher knows to skip these cells (their slot's
+    /// `def.mesh.is_some()`).
+    Ghost { anchor: IVec3 },
+}
+
+impl ChunkEntities {
+    /// Linear lookup. O(n) but n is tiny in practice.
+    pub fn get(&self, cell: IVec3) -> Option<EntryKind> {
+        self.entries
+            .iter()
+            .find(|e| e.cell == cell)
+            .map(|e| e.kind)
+    }
+
+    /// Set or replace the entry at `cell`. Returns the previous entry if
+    /// any.
+    pub fn insert(&mut self, cell: IVec3, kind: EntryKind) -> Option<EntryKind> {
+        let prev = self
+            .entries
+            .iter()
+            .position(|e| e.cell == cell)
+            .map(|i| self.entries.swap_remove(i).kind);
+        self.entries.push(EntityEntry { cell, kind });
+        prev
+    }
+
+    /// Remove and return the entry at `cell`.
+    pub fn remove(&mut self, cell: IVec3) -> Option<EntryKind> {
+        self.entries
+            .iter()
+            .position(|e| e.cell == cell)
+            .map(|i| self.entries.swap_remove(i).kind)
+    }
+
 }
 
 impl Chunk {
@@ -151,66 +213,6 @@ impl Chunk {
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         mesh.insert_indices(Indices::U32(indices));
         Some(mesh)
-    }
-}
-
-/// Index of the smallest component of `v`; ties go to the lower axis.
-fn argmin3(v: Vec3) -> usize {
-    if v.x <= v.y && v.x <= v.z {
-        0
-    } else if v.y <= v.z {
-        1
-    } else {
-        2
-    }
-}
-
-/// World-space Amanatides–Woo voxel raycast. Steps cells in world coords;
-/// each cell is looked up via `get_block`, which is responsible for
-/// resolving the world cell to its owning chunk and returning the slot.
-///
-/// Returning `BlockSlot::EMPTY` for unloaded chunks is fine — the ray
-/// just walks past them. `max_distance` is in world cells.
-pub fn world_raycast(
-    origin: Vec3,
-    dir: Vec3,
-    max_distance: f32,
-    get_block: impl Fn(IVec3) -> BlockSlot,
-) -> Option<RayHit> {
-    let mut cell = origin.floor().as_ivec3();
-    if !get_block(cell).is_empty() {
-        return None;
-    }
-
-    let step = dir.signum().as_ivec3();
-    let next = cell.as_vec3() + dir.signum().max(Vec3::ZERO);
-    // Per-axis t to the next voxel boundary. NaN-safe: when dir==0 the
-    // division yields ±inf or NaN; select replaces it with +inf so that
-    // axis is never picked.
-    let mut t_max = Vec3::select(
-        dir.cmpeq(Vec3::ZERO),
-        Vec3::INFINITY,
-        (next - origin) / dir,
-    );
-    let t_delta = dir.abs().recip();
-
-    loop {
-        let axis = argmin3(t_max);
-        let t = t_max[axis];
-        if t > max_distance {
-            return None;
-        }
-        cell[axis] += step[axis];
-        t_max[axis] += t_delta[axis];
-
-        if !get_block(cell).is_empty() {
-            let mut face_normal = IVec3::ZERO;
-            face_normal[axis] = -step[axis];
-            return Some(RayHit {
-                hit: cell,
-                face_normal,
-            });
-        }
     }
 }
 
