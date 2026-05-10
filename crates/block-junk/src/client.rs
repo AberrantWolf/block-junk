@@ -5,8 +5,11 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::*;
 
+use bevy::scene::SceneInstanceReady;
+
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
+use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::protocol::{
     Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
     ChunkUnload, GameSet, PlayerPose, WorldChannel,
@@ -18,6 +21,7 @@ pub struct ClientPlugin;
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FlyCamPlugin)
+            .add_plugins(PreviewPlugin)
             .add_plugins(crate::scripting::ClientScriptingPlugin);
         // ClientScriptingPlugin inserts BlockRegistry. Derive client-side
         // resources from it.
@@ -32,7 +36,9 @@ impl Plugin for ClientPlugin {
             .init_resource::<SelectedBlock>()
             .init_resource::<PlacementRotation>()
             .init_resource::<BlockEntities>()
-            .add_systems(Startup, setup_scene)
+            .init_resource::<PreviewState>()
+            .add_observer(swap_preview_scene_materials)
+            .add_systems(Startup, (setup_scene, setup_placement_preview))
             .add_systems(
                 Update,
                 (
@@ -128,20 +134,48 @@ pub struct PlacementRotation(pub Cardinal);
 #[derive(Component)]
 struct HotbarSlot(usize);
 
-/// Marker for the translucent ghost-cuboid the player sees at the
-/// placement target. Always exactly one in the world; visibility toggles
-/// based on whether a placement target exists.
+/// Root of the cube-style preview (used when the selected block is a
+/// plain voxel block — no glTF mesh). Holds the world Transform and
+/// Visibility; child entities carry the front+back-pass mesh draws.
 #[derive(Component)]
-struct PlacementPreview;
+struct PreviewCubeRoot;
 
-/// Cached material handles for the placement preview. The valid material's
-/// `base_color` is rewritten each frame from the selected block's swatch
-/// so the cube reads as a tinted version of what would land. Invalid
-/// stays a fixed red — that's a "stop" colour, no need to tint.
+/// Marker on the SceneRoot entity used when the selected block has a
+/// glTF mesh. Spawned lazily when a mesh block is selected; despawned
+/// when the slot changes back to non-mesh or to a different mesh slot.
+#[derive(Component)]
+struct PreviewSceneRoot;
+
+/// Set on a `PreviewSceneRoot` after we've finished walking its
+/// descendants and replaced their materials with our preview pair. Until
+/// this marker is present the scene is kept hidden — we don't want the
+/// player to see one frame of the bed at full opacity with original
+/// materials before the swap completes.
+#[derive(Component)]
+struct PreviewSceneReady;
+
+/// Shared material handles for every preview draw. Two materials
+/// (front, back) get re-tinted each frame from the selected block's
+/// swatch + a validity flag, so a single pair covers every block. The
+/// cube mesh is held alive via the cube preview's `Mesh3d` child
+/// entities, no separate handle needed here.
 #[derive(Resource)]
-struct PreviewAssets {
-    valid: Handle<StandardMaterial>,
-    invalid: Handle<StandardMaterial>,
+struct PreviewMaterials {
+    front: Handle<PreviewFront>,
+    back: Handle<PreviewBack>,
+}
+
+/// Live state for the preview pipeline. `cube_root` is spawned once at
+/// startup; `scene_root` is spawned/despawned lazily as the player
+/// cycles between mesh and non-mesh selections.
+#[derive(Resource, Default)]
+struct PreviewState {
+    cube_root: Option<Entity>,
+    scene_root: Option<Entity>,
+    /// Slot the current `scene_root` was spawned for. When the player
+    /// switches to a different mesh block we have to despawn + respawn
+    /// to load the new glTF.
+    scene_slot: Option<BlockSlot>,
 }
 
 fn setup_scene(
@@ -169,36 +203,6 @@ fn setup_scene(
         }),
     });
 
-    // Translucent placement-preview cuboid. Its Mesh is a unit cube; the
-    // update system rewrites translation+scale to span the rotated
-    // footprint. Two materials so we can flag invalid placements with a
-    // distinct red tint without ever blocking the click — the player still
-    // gets clear feedback before they release the button.
-    let preview_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-    let valid_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 1.0, 1.0, 0.35),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        ..default()
-    });
-    let invalid_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 0.2, 0.2, 0.45),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        ..default()
-    });
-    commands.spawn((
-        PlacementPreview,
-        Mesh3d(preview_cube),
-        MeshMaterial3d(valid_material.clone()),
-        Visibility::Hidden,
-        Transform::default(),
-        Name::new("placement_preview"),
-    ));
-    commands.insert_resource(PreviewAssets {
-        valid: valid_material,
-        invalid: invalid_material,
-    });
 
     // Camera + a point "headlamp" so the player can read shapes in the
     // shadow of nearby geometry without needing to fly around to find
@@ -665,15 +669,66 @@ fn ray_aabb_within(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3, max_distance: 
     t_enter <= t_exit && t_exit >= 0.0 && t_enter <= max_distance
 }
 
-/// Repaint the placement preview each frame: aim the cuboid at the cell
-/// the player would place into, scale it to span the rotated footprint,
-/// and tint it valid/invalid based on whether every footprint cell is
-/// empty. Hidden when the cursor is unlocked or the ray misses the world.
+/// Build the preview pipeline: a single shared cube mesh, one front
+/// material, one back material, and a `PreviewCubeRoot` parent with
+/// front + back-pass mesh draws as children. The scene path is created
+/// lazily by `update_placement_preview` when the player picks a mesh
+/// block, since it needs an asset path that we only know at that point.
+fn setup_placement_preview(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut front_mats: ResMut<Assets<PreviewFront>>,
+    mut back_mats: ResMut<Assets<PreviewBack>>,
+    mut state: ResMut<PreviewState>,
+) {
+    let cube_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let front = front_mats.add(PreviewFront {
+        color: LinearRgba::new(1.0, 1.0, 1.0, 0.4),
+    });
+    let back = back_mats.add(PreviewBack {
+        // Default darken factor; valid placements re-tint to neutral
+        // grey, invalid to a red shade.
+        color: LinearRgba::new(0.6, 0.6, 0.6, 1.0),
+    });
+
+    let root = commands
+        .spawn((
+            PreviewCubeRoot,
+            Transform::default(),
+            Visibility::Hidden,
+            Name::new("preview_cube_root"),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Mesh3d(cube_mesh.clone()),
+                MeshMaterial3d(front.clone()),
+                Name::new("preview_cube_front"),
+            ));
+            parent.spawn((
+                Mesh3d(cube_mesh.clone()),
+                MeshMaterial3d(back.clone()),
+                Name::new("preview_cube_back"),
+            ));
+        })
+        .id();
+    state.cube_root = Some(root);
+
+    let _ = cube_mesh; // strong handle is now held by the spawned children
+    commands.insert_resource(PreviewMaterials { front, back });
+}
+
+/// Repaint the placement preview each frame. Routes between two render
+/// paths based on the selected block:
+///   - Voxel block (no `def.mesh`) → the pre-built cube preview, scaled
+///     to span the rotated footprint.
+///   - Mesh block (e.g. the bed) → a `PreviewSceneRoot` with the actual
+///     glTF; its materials are swapped to the front+back preview pair
+///     by `swap_preview_scene_materials` once the scene populates.
 ///
-/// The preview reads the current selection's footprint from the registry,
-/// so single-cell blocks naturally render as a unit cube and multi-cell
-/// blocks (the bed) render as a 2-long cuboid that follows the player's
-/// orientation.
+/// In both cases the front + back-pass draws come for free — both sit
+/// under the root entity and pick up its world transform via Bevy's
+/// hierarchy.
+#[allow(clippy::too_many_arguments, reason = "preview spans many subsystems")]
 fn update_placement_preview(
     cam: Query<(&GlobalTransform, &FlyCam)>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
@@ -683,19 +738,21 @@ fn update_placement_preview(
     palette: Res<PlaceablePalette>,
     rotation: Res<PlacementRotation>,
     registry: Res<BlockRegistry>,
-    preview_assets: Res<PreviewAssets>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut preview: Query<
-        (
-            &mut Visibility,
-            &mut Transform,
-            &mut MeshMaterial3d<StandardMaterial>,
-        ),
-        With<PlacementPreview>,
-    >,
+    asset_server: Res<AssetServer>,
+    materials_handles: Res<PreviewMaterials>,
+    mut front_mats: ResMut<Assets<PreviewFront>>,
+    mut back_mats: ResMut<Assets<PreviewBack>>,
+    mut state: ResMut<PreviewState>,
+    mut commands: Commands,
+    mut roots: Query<(&mut Visibility, &mut Transform)>,
+    scene_ready: Query<(), With<PreviewSceneReady>>,
 ) {
-    let Ok((mut visibility, mut transform, mut mat_handle)) = preview.single_mut() else {
-        return;
+    let hide = |entity: Option<Entity>, q: &mut Query<(&mut Visibility, &mut Transform)>| {
+        if let Some(e) = entity {
+            if let Ok((mut v, _)) = q.get_mut(e) {
+                *v = Visibility::Hidden;
+            }
+        }
     };
 
     let locked = cursors
@@ -703,20 +760,19 @@ fn update_placement_preview(
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
     if !locked {
-        *visibility = Visibility::Hidden;
+        hide(state.cube_root, &mut roots);
+        hide(state.scene_root, &mut roots);
         return;
     }
 
     let Ok((cam_t, fly)) = cam.single() else {
-        *visibility = Visibility::Hidden;
+        hide(state.cube_root, &mut roots);
+        hide(state.scene_root, &mut roots);
         return;
     };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
 
-    // Same raycast as the actual click path so the preview never lies
-    // about where the place would land — including walking past the
-    // airspace inside a partial-cell block-entity.
     let Some(hit) = entity_aware_raycast(
         cam_pos,
         cam_dir,
@@ -725,7 +781,8 @@ fn update_placement_preview(
         &chunk_map,
         &registry,
     ) else {
-        *visibility = Visibility::Hidden;
+        hide(state.cube_root, &mut roots);
+        hide(state.scene_root, &mut roots);
         return;
     };
     let anchor = hit.cell + hit.face_normal;
@@ -744,45 +801,137 @@ fn update_placement_preview(
     let orientation = placement_orientation(fly.yaw, rotation.0);
     let cells = world_footprint(anchor, &def.footprint, orientation);
     if cells.is_empty() {
-        // A mod registered an empty footprint — degenerate, but don't
-        // panic the renderer. Hide and bail.
-        *visibility = Visibility::Hidden;
+        hide(state.cube_root, &mut roots);
+        hide(state.scene_root, &mut roots);
         return;
     }
-
-    // Validation: every footprint cell must currently be empty. For
-    // single-cell blocks this is "is the target air?"; for multi-cell
-    // blocks (the bed) it's the same check across each occupied cell.
     let valid = cells.iter().all(|&c| get_block(c).is_empty());
 
-    let mut min = cells[0];
-    let mut max = cells[0];
-    for &c in &cells[1..] {
-        min = min.min(c);
-        max = max.max(c);
-    }
-    let extents = (max - min + IVec3::ONE).as_vec3();
-    let centre = min.as_vec3() + extents * 0.5;
-    *transform = Transform::from_translation(centre).with_scale(extents);
-
-    let want = if valid {
-        preview_assets.valid.clone()
+    // Re-tint shared materials from the selection swatch + validity.
+    // Front: tinted with alpha so the ghost reads as the chosen block;
+    // a red override tells the player "no" without hiding the preview.
+    // Back: a near-grey multiply factor; for invalid we shift it warm
+    // so the X-ray shadow on the wall behind also reads "no".
+    let [r, g, b] = def.color;
+    let front_color = if valid {
+        LinearRgba::new(r, g, b, 0.4)
     } else {
-        preview_assets.invalid.clone()
+        LinearRgba::new(1.0, 0.2, 0.2, 0.55)
     };
-    if mat_handle.0 != want {
-        mat_handle.0 = want;
+    let back_color = if valid {
+        LinearRgba::new(0.55, 0.55, 0.55, 1.0)
+    } else {
+        LinearRgba::new(0.7, 0.4, 0.4, 1.0)
+    };
+    if let Some(m) = front_mats.get_mut(&materials_handles.front) {
+        m.color = front_color;
+    }
+    if let Some(m) = back_mats.get_mut(&materials_handles.back) {
+        m.color = back_color;
     }
 
-    // Re-tint the valid material from the selected block's swatch each
-    // frame. Cheap and saves us from caching per-block material handles
-    // for every placeable. The invalid material stays a fixed red.
-    if let Some(mat) = materials.get_mut(&preview_assets.valid) {
-        let [r, g, b] = def.color;
-        mat.base_color = Color::srgba(r, g, b, 0.35);
+    if def.mesh.is_some() {
+        // Mesh path. Spawn / replace the SceneRoot if we don't already
+        // have one for this slot. Spawning is cheap on the second hit
+        // (asset cache); the SceneInstanceReady observer handles the
+        // material swap a frame or two later.
+        if state.scene_slot != Some(slot) {
+            if let Some(old) = state.scene_root.take() {
+                commands.entity(old).despawn();
+            }
+            let mesh_path = def.mesh.as_ref().unwrap();
+            let scene: Handle<Scene> = asset_server.load(format!("{mesh_path}#Scene0"));
+            let entity = commands
+                .spawn((
+                    PreviewSceneRoot,
+                    SceneRoot(scene),
+                    Transform::default(),
+                    Visibility::Hidden,
+                    Name::new(format!("preview_scene:{}", def.id)),
+                ))
+                .id();
+            state.scene_root = Some(entity);
+            state.scene_slot = Some(slot);
+        }
+        if let Some(scene_entity) = state.scene_root {
+            if let Ok((mut vis, mut transform)) = roots.get_mut(scene_entity) {
+                transform.translation = anchor.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+                transform.rotation = Quat::from_rotation_y(orientation.yaw());
+                transform.scale = Vec3::ONE;
+                *vis = if scene_ready.contains(scene_entity) {
+                    Visibility::Visible
+                } else {
+                    // Materials haven't been swapped yet — don't flash
+                    // the original glTF materials at the player.
+                    Visibility::Hidden
+                };
+            }
+        }
+        hide(state.cube_root, &mut roots);
+    } else {
+        // Voxel path. Position+scale the cube to span the footprint.
+        let mut min = cells[0];
+        let mut max = cells[0];
+        for &c in &cells[1..] {
+            min = min.min(c);
+            max = max.max(c);
+        }
+        let extents = (max - min + IVec3::ONE).as_vec3();
+        let centre = min.as_vec3() + extents * 0.5;
+        if let Some(cube) = state.cube_root {
+            if let Ok((mut vis, mut transform)) = roots.get_mut(cube) {
+                transform.translation = centre;
+                transform.rotation = Quat::IDENTITY;
+                transform.scale = extents;
+                *vis = Visibility::Visible;
+            }
+        }
+        hide(state.scene_root, &mut roots);
     }
+}
 
-    *visibility = Visibility::Visible;
+/// Walk a freshly-spawned preview SceneRoot's descendants and replace
+/// every `Mesh3d` entity's material with our `PreviewFront` handle, plus
+/// add a sibling-as-child carrying `PreviewBack` for the depth-flipped
+/// X-ray pass. Marker swap completes by inserting `PreviewSceneReady`
+/// on the root, which `update_placement_preview` reads to decide when
+/// the scene can finally be made visible.
+fn swap_preview_scene_materials(
+    trigger: On<SceneInstanceReady>,
+    scene_roots: Query<(), With<PreviewSceneRoot>>,
+    children_q: Query<&Children>,
+    meshes: Query<&Mesh3d>,
+    materials: Res<PreviewMaterials>,
+    mut commands: Commands,
+) {
+    let root = trigger.event_target();
+    if !scene_roots.contains(root) {
+        return;
+    }
+    // BFS through descendants. For each Mesh3d we find: install our
+    // front material (replacing whatever StandardMaterial the glTF
+    // shipped with) and parent a back-pass twin underneath it.
+    let mut stack: Vec<Entity> = vec![root];
+    while let Some(entity) = stack.pop() {
+        if let Ok(children) = children_q.get(entity) {
+            stack.extend(children.iter());
+        }
+        let Ok(mesh) = meshes.get(entity) else {
+            continue;
+        };
+        let mesh_handle = mesh.0.clone();
+        commands
+            .entity(entity)
+            .remove::<MeshMaterial3d<StandardMaterial>>()
+            .insert(MeshMaterial3d(materials.front.clone()))
+            .with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(mesh_handle),
+                    MeshMaterial3d(materials.back.clone()),
+                ));
+            });
+    }
+    commands.entity(root).insert(PreviewSceneReady);
 }
 
 /// Snapshot from server → spawn (or replace) the corresponding local chunk.
