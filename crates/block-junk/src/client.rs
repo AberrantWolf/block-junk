@@ -7,13 +7,16 @@ use lightyear::prelude::*;
 
 use bevy::scene::SceneInstanceReady;
 
+use lightyear::input::native::prelude::*;
+
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
-use crate::physics::{PhysicsPlugin, Player};
+use crate::collision::WorldCollision;
+use crate::physics::apply_walk_step;
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::protocol::{
-    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkCoord, ChunkData, ChunkSnapshot,
-    ChunkUnload, GameSet, PlayerPose, WorldChannel,
+    Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
+    ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementMode, PlayerInput, WorldChannel,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -22,7 +25,6 @@ pub struct ClientPlugin;
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FlyCamPlugin)
-            .add_plugins(PhysicsPlugin)
             .add_plugins(PreviewPlugin)
             .add_plugins(crate::scripting::ClientScriptingPlugin);
         // ClientScriptingPlugin inserts BlockRegistry. Derive client-side
@@ -45,12 +47,24 @@ impl Plugin for ClientPlugin {
                 Update,
                 (
                     place_break_input,
-                    send_player_pose,
                     cycle_selected_or_rotation,
                     reset_rotation_on_selection_change,
                 )
                     .in_set(GameSet::Input),
             )
+            // Input replication: ActionState<PlayerInput> on the predicted
+            // avatar gets written from the keyboard each fixed tick.
+            // WriteClientInputs is the lightyear-defined set that ensures
+            // the input is buffered before the simulation reads it.
+            .add_systems(
+                FixedPreUpdate,
+                buffer_input.in_set(client::input::InputSystems::WriteClientInputs),
+            )
+            // Owner-side prediction: run the same controller the server
+            // runs, against the same inputs, so we don't wait for the
+            // server's reply to see ourselves move. Lightyear rolls back
+            // and replays this when it receives a server correction.
+            .add_systems(FixedUpdate, client_player_step)
             // Chained: receive_snapshots inserts new chunks via Commands;
             // receive_block_edit_broadcasts queries those chunks. Without
             // a sync point between them an edit landing in the same tick
@@ -80,7 +94,11 @@ impl Plugin for ClientPlugin {
                     attach_avatar_visuals,
                 )
                     .in_set(GameSet::PostSimulation),
-            );
+            )
+            // The owner's predicted avatar arrives via replication after
+            // connect; this observer wires its camera, input marker, and
+            // headlamp once it's there.
+            .add_observer(handle_predicted_spawn);
     }
 }
 
@@ -204,21 +222,10 @@ fn setup_scene(
     // Camera + a point "headlamp" so the player can read shapes in the
     // shadow of nearby geometry without needing to fly around to find
     // a light angle that works.
-    commands.spawn((
-        Camera3d::default(),
-        // Above the sine-wave terrain (peaks around y=16), looking down -Z.
-        Transform::from_xyz(0.0, 32.0, 60.0),
-        FlyCam::default(),
-        // Walk-mode physics state. Inert in Fly mode; switching to Walk
-        // (F1) starts applying gravity + collision against the chunk grid.
-        Player::default(),
-        PointLight {
-            intensity: 750_000.0,
-            range: 60.0,
-            shadows_enabled: false,
-            ..default()
-        },
-    ));
+    // The camera is no longer a free-floating local entity — it's
+    // attached to the predicted avatar via `handle_predicted_spawn` once
+    // the server replicates it. Until then (a few ms in solo mode, up
+    // to ~200 ms over the network) the screen has no active 3D camera.
 
     // Two directional lights from opposite angles. The key light casts
     // shadows; the back light only fills (no shadow map) so it doesn't
@@ -981,38 +988,96 @@ fn receive_snapshots(
     }
 }
 
-/// Period (seconds) between player-pose updates sent to the server. 10 Hz
-/// is plenty for AoI streaming decisions and stays under 200 B/s.
-const POSE_SEND_PERIOD: f32 = 0.1;
-
-fn send_player_pose(
-    time: Res<Time>,
-    mut accum: Local<f32>,
-    cam: Query<(&GlobalTransform, &FlyCam)>,
-    mut sender: Query<&mut MessageSender<PlayerPose>>,
+/// Read keyboard + camera yaw and write the next `PlayerInput` to the
+/// owner's predicted avatar. Runs in `FixedPreUpdate` (the
+/// WriteClientInputs set ensures the input is buffered before the
+/// simulation reads it). Lightyear takes care of replicating the buffer
+/// to the server with sequence-numbered redundancy so a dropped UDP
+/// packet doesn't drop a tick of input.
+///
+/// `prev_toggle` is a tiny rising-edge tracker — `ButtonInput.just_pressed`
+/// is set once per Update tick, but FixedPreUpdate may run multiple times
+/// per Update; without the latch we'd toggle the mode N times per actual
+/// keypress.
+fn buffer_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    flycam: Query<&FlyCam>,
+    mut q: Query<&mut ActionState<PlayerInput>, With<InputMarker<PlayerInput>>>,
+    mut prev_toggle: Local<bool>,
 ) {
-    *accum += time.delta_secs();
-    if *accum < POSE_SEND_PERIOD {
+    let Ok(mut state) = q.single_mut() else {
         return;
-    }
-    *accum = 0.0;
+    };
 
-    let Ok((cam_t, fly)) = cam.single() else {
-        return;
+    // Skip input while the cursor is free (alt-tabbed, settings menu);
+    // keep yaw in sync via the FlyCam value. A zero-input ActionState
+    // is what the controller treats as "no keys held."
+    let locked = cursors
+        .single()
+        .map(|c| c.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+    let yaw = flycam.single().map(|f| f.yaw).unwrap_or(0.0);
+
+    let mut input = PlayerInput {
+        yaw,
+        ..Default::default()
     };
-    let Ok(mut sender) = sender.single_mut() else {
-        return;
-    };
-    sender.send::<WorldChannel>(PlayerPose {
-        translation: cam_t.translation(),
-        yaw: fly.yaw,
-    });
+    if locked {
+        let mut wd = [0i8; 3];
+        // Convention: forward = -Z (matches Bevy yaw=0), right = +X, up = +Y.
+        if keys.pressed(KeyCode::KeyW) { wd[2] -= 1; }
+        if keys.pressed(KeyCode::KeyS) { wd[2] += 1; }
+        if keys.pressed(KeyCode::KeyA) { wd[0] -= 1; }
+        if keys.pressed(KeyCode::KeyD) { wd[0] += 1; }
+        if keys.pressed(KeyCode::Space) { wd[1] += 1; }
+        if keys.pressed(KeyCode::ShiftLeft) { wd[1] -= 1; }
+        input.wishdir = wd;
+        input.jump = keys.pressed(KeyCode::Space);
+
+        let toggle_now = keys.pressed(KeyCode::F1);
+        if toggle_now && !*prev_toggle {
+            input.toggle_mode = true;
+        }
+        *prev_toggle = toggle_now;
+    }
+
+    state.0 = input;
 }
 
-/// Replicated `AvatarPose` is the authoritative state for remote players;
-/// Bevy's renderer reads `Transform`. Copy across whenever the pose changes.
-/// Yaw rotates the body around +Y; pitch is intentionally not applied —
-/// when we add a head/torso split the head will get its own component.
+/// Owner-side prediction tick: run the same controller the server runs,
+/// against the same input buffered above. Lightyear rolls back and
+/// replays this when the server sends a position correction.
+fn client_player_step(
+    time: Res<Time>,
+    chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut avatars: Query<
+        (
+            &mut AvatarPose,
+            &mut AvatarVelocity,
+            &mut AvatarOnGround,
+            &mut MovementMode,
+            &ActionState<PlayerInput>,
+        ),
+        With<Predicted>,
+    >,
+) {
+    let dt = time.delta_secs();
+    let world = WorldCollision {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    for (mut pose, mut vel, mut on_ground, mut mode, input) in avatars.iter_mut() {
+        apply_walk_step(&mut pose, &mut vel, &mut on_ground, &mut mode, &input.0, dt, &world);
+    }
+}
+
+/// Replicated `AvatarPose` is the authoritative state; Bevy's renderer
+/// reads `Transform`. Copy across whenever the pose changes — covers
+/// owner (predicted) and remote (interpolated) entities uniformly.
 fn sync_avatar_transforms(
     mut avatars: Query<(&AvatarPose, &mut Transform), Changed<AvatarPose>>,
 ) {
@@ -1020,6 +1085,36 @@ fn sync_avatar_transforms(
         transform.translation = pose.translation;
         transform.rotation = Quat::from_rotation_y(pose.yaw);
     }
+}
+
+/// Wire the owner's predicted avatar with everything that makes it
+/// playable: a camera, the FlyCam yaw/pitch state for mouse-look, an
+/// input marker so `buffer_input` knows where to write, an initial
+/// `ActionState`, and the headlamp PointLight that used to live on the
+/// standalone camera.
+fn handle_predicted_spawn(
+    trigger: On<Add, (Avatar, Predicted)>,
+    avatars: Query<(), (With<Avatar>, With<Predicted>)>,
+    mut commands: Commands,
+) {
+    let entity = trigger.entity;
+    if avatars.get(entity).is_err() {
+        return;
+    }
+    info!("predicted avatar arrived: {entity:?}");
+    commands.entity(entity).insert((
+        Camera3d::default(),
+        Transform::default(),
+        FlyCam::default(),
+        ActionState::<PlayerInput>::default(),
+        InputMarker::<PlayerInput>::default(),
+        PointLight {
+            intensity: 750_000.0,
+            range: 60.0,
+            shadows_enabled: false,
+            ..default()
+        },
+    ));
 }
 
 /// Server's slot ↔ id table arrives once on connect. Compare against our

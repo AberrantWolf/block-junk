@@ -86,23 +86,37 @@ pub enum ChunkData {
     Edited(Vec<BlockSlot>),
 }
 
-/// Client → server: where this client's avatar is and which way they're
-/// facing. Translation drives AoI; yaw drives the body orientation other
-/// clients see. Sent at ≈10 Hz; server tick interpolates between updates.
-/// Pitch isn't included — the visible avatar is a single block-shape with
-/// no separate head, so head pitch buys nothing on the wire today.
-#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct PlayerPose {
-    pub translation: Vec3,
-    /// Body yaw in radians (rotation around +Y).
-    pub yaw: f32,
-}
-
 /// Marker component on the server-side player-avatar entity. Replicated to
-/// every *other* client so they get a visible body for that player. Paired
-/// with `AvatarPose`, which carries the per-tick state.
+/// every client so they can render a body (or, on the owner side, attach a
+/// camera). Paired with the predicted state components below.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Avatar;
+
+/// Per-avatar movement mode. Server-authoritative — the server decides
+/// when a creative-mode toggle is allowed; today the request is granted
+/// unconditionally. Replicated + predicted so the owner client stays in
+/// sync without needing to wait a round-trip after pressing F1.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+pub enum MovementMode {
+    /// Walking: gravity, jump, AABB collision against the world.
+    #[default]
+    Walk,
+    /// Creative-mode flight: 6-dof, no gravity, no collision.
+    Fly,
+}
+
+/// Horizontal + vertical velocity. Predicted state — needs to roll back
+/// with the rest of the simulation so the owner restarts from the
+/// authoritative velocity after a server correction. Not interpolated:
+/// remote viewers don't need it (they render position only).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Reflect)]
+pub struct AvatarVelocity(pub Vec3);
+
+/// True if the controller's last sweep ended on a downward Y contact.
+/// Read by the controller to gate jumps and ground friction. Predicted
+/// state for the same reason as `AvatarVelocity`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Reflect)]
+pub struct AvatarOnGround(pub bool);
 
 /// Authoritative pose of an `Avatar`, written on the server from `PlayerPose`
 /// ingests and replicated out as state. Sixteen bytes (Vec3 + yaw f32) vs

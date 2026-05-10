@@ -7,10 +7,15 @@ use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::server::ClientOf;
 use lightyear::prelude::*;
 
+use lightyear::input::native::prelude::*;
+
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
+use crate::collision::WorldCollision;
+use crate::physics::apply_walk_step;
 use crate::protocol::{
-    Avatar, AvatarPose, BlockEdit, BlockManifest, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot,
-    ChunkUnload, GameSet, PlayerPose, WorldChannel,
+    Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, CellEdit,
+    ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementMode, PlayerInput,
+    WorldChannel,
 };
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_world_transform, world_to_chunk};
@@ -59,10 +64,16 @@ impl Plugin for ServerPlugin {
         );
         app.add_systems(
             Update,
-            (track_client_positions, poll_chunk_gen, update_aoi)
+            (poll_chunk_gen, update_aoi)
                 .chain()
                 .in_set(GameSet::Simulation),
         );
+        // Server-authoritative player simulation: read replicated inputs,
+        // run the same controller the predicted client runs, write the
+        // authoritative AvatarPose back. Lightyear's prediction layer
+        // compares this against the client's predicted state and replays
+        // unacked inputs on disagreement.
+        app.add_systems(FixedUpdate, server_player_step);
         app.add_observer(install_replication_sender);
         app.add_observer(register_new_client);
         app.add_observer(forget_disconnected_client);
@@ -136,10 +147,21 @@ fn register_new_client(
     // owner's client gets `Predicted` on its copy; remote clients get
     // `Interpolated`. ControlledBy ties the entity back to its
     // connection so input replication knows where to deliver the inputs.
+    // Spawn position: above the sine-wave terrain (peaks ~y=16) so the
+    // first physics tick lands the player on the surface rather than
+    // inside it. Eye height = AvatarPose.translation by convention.
+    let spawn_pose = AvatarPose {
+        translation: Vec3::new(0.0, 32.0, 60.0),
+        yaw: 0.0,
+    };
     let avatar = commands
         .spawn((
             Avatar,
-            AvatarPose::default(),
+            spawn_pose,
+            AvatarVelocity::default(),
+            AvatarOnGround::default(),
+            MovementMode::default(),
+            ActionState::<PlayerInput>::default(),
             Replicate::to_clients(NetworkTarget::All),
             PredictionTarget::to_clients(NetworkTarget::Single(remote.0)),
             InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
@@ -163,26 +185,32 @@ fn register_new_client(
     }
 }
 
-fn track_client_positions(
-    mut receivers: Query<(Entity, &mut MessageReceiver<PlayerPose>)>,
-    avatars: Res<ClientAvatars>,
-    mut poses: Query<&mut AvatarPose>,
+/// Server-authoritative simulation tick. Reads each avatar's current
+/// `ActionState<PlayerInput>` (filled by lightyear's input replication)
+/// and runs the same controller the predicted client runs. The resulting
+/// AvatarPose is what gets replicated back; the predicted client compares
+/// against it and rolls back on disagreement.
+fn server_player_step(
+    time: Res<Time>,
+    chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut avatars: Query<(
+        &mut AvatarPose,
+        &mut AvatarVelocity,
+        &mut AvatarOnGround,
+        &mut MovementMode,
+        &ActionState<PlayerInput>,
+    )>,
 ) {
-    for (connection, mut receiver) in receivers.iter_mut() {
-        // Drain everything on this receiver, but only the latest pose
-        // matters — older ones get superseded before AoI runs anyway.
-        let mut latest: Option<PlayerPose> = None;
-        for msg in receiver.receive() {
-            latest = Some(msg);
-        }
-        let Some(pose) = latest else { continue };
-        let Some(&avatar) = avatars.0.get(&connection) else {
-            continue;
-        };
-        if let Ok(mut p) = poses.get_mut(avatar) {
-            p.translation = pose.translation;
-            p.yaw = pose.yaw;
-        }
+    let dt = time.delta_secs();
+    let world = WorldCollision {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    for (mut pose, mut vel, mut on_ground, mut mode, input) in avatars.iter_mut() {
+        apply_walk_step(&mut pose, &mut vel, &mut on_ground, &mut mode, &input.0, dt, &world);
     }
 }
 

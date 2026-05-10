@@ -2,11 +2,12 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
-use crate::physics::MovementMode;
-
+/// Per-camera mouse-look state. Translation is no longer FlyCam's job —
+/// it goes through the shared physics controller via PlayerInput. This
+/// component just holds yaw/pitch so the controller has a place to
+/// read facing from and `fly_cam_input` has a place to write.
 #[derive(Component)]
 pub struct FlyCam {
-    pub speed: f32,
     pub sensitivity: f32,
     pub yaw: f32,
     pub pitch: f32,
@@ -15,7 +16,6 @@ pub struct FlyCam {
 impl Default for FlyCam {
     fn default() -> Self {
         Self {
-            speed: 16.0,
             sensitivity: 0.002,
             yaw: 0.0,
             pitch: 0.0,
@@ -84,11 +84,8 @@ fn capture(window: &mut Window, cursor: &mut CursorOptions, discard: &mut Discar
 }
 
 fn fly_cam_input(
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
     motion: Res<AccumulatedMouseMotion>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
-    mode: Res<MovementMode>,
     mut cam: Query<(&mut FlyCam, &mut Transform)>,
     mut discard: ResMut<DiscardNextMotion>,
 ) {
@@ -100,9 +97,9 @@ fn fly_cam_input(
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
 
-    // Mouse-look always runs — looking around is shared between fly and
-    // walk. Translation below is gated on Fly mode; Walk mode runs its
-    // own controller in physics.rs.
+    // Mouse-look only — translation goes through PlayerInput → the shared
+    // controller now, so WASD / Space / Shift drive the avatar in both
+    // walk and fly modes via the input pipeline.
     if locked && motion.delta != Vec2::ZERO {
         if discard.0 {
             // First nonzero motion since capture is the warp's phantom delta;
@@ -116,32 +113,4 @@ fn fly_cam_input(
 
     transform.rotation =
         Quat::from_axis_angle(Vec3::Y, cam.yaw) * Quat::from_axis_angle(Vec3::X, cam.pitch);
-
-    if !locked || *mode != MovementMode::Fly {
-        return;
-    }
-    let forward = *transform.forward();
-    let right = *transform.right();
-    let mut delta = Vec3::ZERO;
-    if keys.pressed(KeyCode::KeyW) {
-        delta += forward;
-    }
-    if keys.pressed(KeyCode::KeyS) {
-        delta -= forward;
-    }
-    if keys.pressed(KeyCode::KeyD) {
-        delta += right;
-    }
-    if keys.pressed(KeyCode::KeyA) {
-        delta -= right;
-    }
-    if keys.pressed(KeyCode::Space) {
-        delta += Vec3::Y;
-    }
-    if keys.pressed(KeyCode::ShiftLeft) {
-        delta -= Vec3::Y;
-    }
-    if delta != Vec3::ZERO {
-        transform.translation += delta.normalize() * cam.speed * time.delta_secs();
-    }
 }

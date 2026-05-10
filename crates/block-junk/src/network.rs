@@ -17,8 +17,8 @@ use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
 use crate::protocol::{
-    Avatar, AvatarPose, BlockEdit, BlockManifest, ChunkSnapshot, ChunkUnload, PlayerInput,
-    PlayerPose, WorldChannel,
+    Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkSnapshot,
+    ChunkUnload, MovementMode, PlayerInput, WorldChannel,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +64,6 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<BlockManifest>()
             .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<PlayerPose>()
-            .add_direction(NetworkDirection::ClientToServer);
 
         // Player-avatar replication. Server owns the avatar entities; the
         // marker tells receivers "attach a mesh," and `AvatarPose` is the
@@ -75,12 +73,17 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<Avatar>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between
-        // server samples instead of snapping every 50 ms). Phase 2.4
-        // step A: registration only — owner-side prediction will become
-        // meaningful once the controller runs from PlayerInput.
+        // server samples instead of snapping every 50 ms).
         app.register_component::<AvatarPose>()
             .add_prediction()
             .add_linear_interpolation();
+        // Velocity, ground state, and movement mode are simulation-only —
+        // remote viewers don't need them, but the predicted owner does
+        // (rollback restarts the controller from these values, so they
+        // must be in the prediction history).
+        app.register_component::<AvatarVelocity>().add_prediction();
+        app.register_component::<AvatarOnGround>().add_prediction();
+        app.register_component::<MovementMode>().add_prediction();
 
         // Per-tick input replication. Adds `ActionState<PlayerInput>` and
         // the buffering machinery on both sides. Phase 2.4 hangs the
