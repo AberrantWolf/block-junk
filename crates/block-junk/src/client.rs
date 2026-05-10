@@ -77,10 +77,10 @@ impl Plugin for ClientPlugin {
                     refresh_block_entities,
                     update_hotbar_highlight,
                     update_placement_preview,
+                    attach_avatar_visuals,
                 )
                     .in_set(GameSet::PostSimulation),
-            )
-            .add_observer(attach_avatar_visuals);
+            );
     }
 }
 
@@ -1176,19 +1176,25 @@ fn apply_broadcast_edit(
     }
 }
 
-/// A replicated avatar entity arrived from the server — paint it with the
-/// shared mesh + material so the player has something to look at. The
-/// entity already has a Transform from replication; Mesh3d won't override it.
+/// Paint replicated avatar entities with the shared cuboid mesh, EXCEPT
+/// the owner's own avatar — they'd see the cuboid filling their view.
+/// We use a regular system rather than an `On<Add, Avatar>` observer
+/// because lightyear's `Predicted`/`Interpolated` markers may arrive in a
+/// later replication tick than the `Avatar` component itself; an observer
+/// firing on `Avatar` alone would happily mesh up the owner's predicted
+/// entity before the marker showed up.
 fn attach_avatar_visuals(
-    trigger: On<Add, Avatar>,
+    avatars: Query<Entity, (With<Avatar>, Without<Mesh3d>, Without<Predicted>)>,
     assets: Res<AvatarAssets>,
     mut commands: Commands,
 ) {
-    info!("remote avatar entered view: {:?}", trigger.entity);
-    commands.entity(trigger.entity).insert((
-        Mesh3d(assets.mesh.clone()),
-        MeshMaterial3d(assets.material.clone()),
-    ));
+    for entity in avatars.iter() {
+        info!("remote avatar entered view: {entity:?}");
+        commands.entity(entity).insert((
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(assets.material.clone()),
+        ));
+    }
 }
 
 fn mesh_chunks(

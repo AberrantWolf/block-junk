@@ -73,7 +73,14 @@ impl Plugin for ProtocolPlugin {
         // 40-byte rotation+scale baggage isn't used.
         // See networking-design: state for entities, events for the grid.
         app.register_component::<Avatar>();
-        app.register_component::<AvatarPose>();
+        // AvatarPose participates in both prediction (owner rolls back when
+        // server disagrees) and interpolation (remote viewers lerp between
+        // server samples instead of snapping every 50 ms). Phase 2.4
+        // step A: registration only — owner-side prediction will become
+        // meaningful once the controller runs from PlayerInput.
+        app.register_component::<AvatarPose>()
+            .add_prediction()
+            .add_linear_interpolation();
 
         // Per-tick input replication. Adds `ActionState<PlayerInput>` and
         // the buffering machinery on both sides. Phase 2.4 hangs the

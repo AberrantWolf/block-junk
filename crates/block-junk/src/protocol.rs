@@ -111,10 +111,36 @@ pub struct Avatar;
 /// Quantize to i16/u16 fixed-point if avatar bandwidth ever shows up in
 /// profiles; the precision needed (~cm of position, ~tenth of a degree of
 /// yaw) fits comfortably.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+///
+/// Registered with `.add_prediction().add_linear_interpolation()` (see
+/// network.rs) so the owner's copy is predicted-with-rollback and remote
+/// copies are interpolated between server samples — `Ease` below defines
+/// the lerp.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Reflect)]
 pub struct AvatarPose {
     pub translation: Vec3,
     pub yaw: f32,
+}
+
+impl Ease for AvatarPose {
+    fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
+        FunctionCurve::new(Interval::UNIT, move |t| {
+            // Yaw lerp via shortest arc: wrap the delta to [-π, π] before
+            // scaling so a yaw going from +175° to -175° interpolates the
+            // 10° short way, not the 350° long way around.
+            let two_pi = std::f32::consts::TAU;
+            let mut d = (end.yaw - start.yaw) % two_pi;
+            if d > std::f32::consts::PI {
+                d -= two_pi;
+            } else if d < -std::f32::consts::PI {
+                d += two_pi;
+            }
+            AvatarPose {
+                translation: Vec3::lerp(start.translation, end.translation, t),
+                yaw: start.yaw + d * t,
+            }
+        })
+    }
 }
 
 /// Server → client: this chunk has left your AoI; despawn your local copy.

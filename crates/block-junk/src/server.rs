@@ -130,11 +130,23 @@ fn register_new_client(
         warn!("Connected fired with no RemoteId on entity {connection:?}");
         return;
     };
+    // Replicated to ALL clients (owner included), with the targets
+    // splitting prediction (owner rolls back on disagreement) from
+    // interpolation (everyone else lerps between server samples). The
+    // owner's client gets `Predicted` on its copy; remote clients get
+    // `Interpolated`. ControlledBy ties the entity back to its
+    // connection so input replication knows where to deliver the inputs.
     let avatar = commands
         .spawn((
             Avatar,
             AvatarPose::default(),
-            Replicate::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::Single(remote.0)),
+            InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
+            ControlledBy {
+                owner: connection,
+                lifetime: Default::default(),
+            },
             Name::new(format!("avatar:{}", remote.0)),
         ))
         .id();
