@@ -16,7 +16,11 @@
 
 #import bevy_pbr::forward_io::VertexOutput
 
-@group(2) @binding(0) var<uniform> color: vec4<f32>;
+// `MATERIAL_BIND_GROUP` is a shader-def Bevy injects per-material — its
+// value is `MATERIAL_BIND_GROUP_INDEX` from `bevy_pbr` (3 in 0.18).
+// Hardcoding `@group(2)` works on toy builds but bites here, where the
+// pipeline layout reserves group 2 for mesh bindings.
+@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> color: vec4<f32>;
 
 @fragment
 fn fragment(_in: VertexOutput) -> @location(0) vec4<f32> {

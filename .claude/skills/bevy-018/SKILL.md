@@ -120,6 +120,32 @@ mesh.insert_indices(Indices::U32(indices));
 
 Note: in 0.18, `Assets<Mesh>` retains `RENDER_WORLD`-only meshes after data extraction — you don't need to keep `MAIN_WORLD` set unless you actually read mesh data CPU-side.
 
+## Custom `Material` shaders: bind group is **3**, not 2
+
+Pre-0.17 cheat sheets and most blog posts say "material bindings live at `@group(2)`." In 0.18 the index is **3** (`MATERIAL_BIND_GROUP_INDEX = 3` in `bevy_pbr`). Hardcoding `@group(2)` builds fine but blows up at first draw with:
+
+```
+Shader global ResourceBinding { group: 2, binding: 0 } is not available in the pipeline layout
+Storage class Storage { access: StorageAccess(LOAD) } doesn't match the shader Uniform
+```
+
+…because group 2 is now the mesh storage bind group. Fix: use the shader-def Bevy injects per material, which is set to the correct index automatically.
+
+```wgsl
+#import bevy_pbr::forward_io::VertexOutput
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> color: vec4<f32>;
+
+@fragment
+fn fragment(_in: VertexOutput) -> @location(0) vec4<f32> {
+    return color;
+}
+```
+
+Bevy's preprocessor replaces `#{MATERIAL_BIND_GROUP}` at compile time. This is the only correct way — there is no const value you can `@group(N)` directly.
+
+Also note: Bevy uses **reversed-Z depth**. Default `depth_compare` is `CompareFunction::GreaterEqual` — closer to camera = larger depth value. To pick out fragments BEHIND existing geometry (X-ray / blueprint effects), flip to `Less`, not `Greater`.
+
 ## DirectionalLight as component
 
 ```rust
