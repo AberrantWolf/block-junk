@@ -15,7 +15,7 @@ ndshape = "0.3"
 #   (sequence-numbered input replay for prediction rollback)
 # - Note we do NOT enable crossbeam: solo play runs a server thread +
 #   client App talking via UDP-localhost (always-client architecture).
-lightyear = { version = "0.26", features = ["netcode", "udp", "input_native"] }
+lightyear = { version = "0.26", features = ["netcode", "udp", "input_native", "frame_interpolation"] }
 avian3d = "0.6"
 bevy-inspector-egui = "0.36"
 serde = { version = "1", features = ["derive"] }

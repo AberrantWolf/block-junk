@@ -7,6 +7,7 @@ use lightyear::prelude::*;
 
 use bevy::scene::SceneInstanceReady;
 
+use lightyear::frame_interpolation::prelude::*;
 use lightyear::input::native::prelude::*;
 
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
@@ -26,6 +27,11 @@ impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FlyCamPlugin)
             .add_plugins(PreviewPlugin)
+            // Frame interpolation smooths AvatarPose between FixedUpdate
+            // ticks during PostUpdate render. Without it, on a high-refresh
+            // display you see 64 Hz physics steps with the renderer drawing
+            // the same position for multiple frames between ticks.
+            .add_plugins(FrameInterpolationPlugin::<AvatarPose>::default())
             .add_plugins(crate::scripting::ClientScriptingPlugin);
         // ClientScriptingPlugin inserts BlockRegistry. Derive client-side
         // resources from it.
@@ -79,10 +85,17 @@ impl Plugin for ClientPlugin {
                     receive_snapshots,
                     receive_block_edit_broadcasts,
                     receive_chunk_unloads,
-                    sync_avatar_transforms,
                 )
                     .chain()
                     .in_set(GameSet::Simulation),
+            )
+            // Avatar transform sync runs in PostUpdate after frame
+            // interpolation, so the camera Transform we hand to the
+            // renderer is the smoothed value (lerped between the prior
+            // and current fixed tick by the render-frame overstep).
+            .add_systems(
+                PostUpdate,
+                sync_avatar_transforms.after(FrameInterpolationSystems::Interpolate),
             )
             .add_systems(
                 Update,
@@ -1115,6 +1128,10 @@ fn handle_predicted_spawn(
         FlyCam::default(),
         ActionState::<PlayerInput>::default(),
         InputMarker::<PlayerInput>::default(),
+        // Smooth AvatarPose between FixedUpdate ticks at render-frame
+        // resolution. Without this the camera position only changes 64×/s
+        // even on a 144Hz display.
+        FrameInterpolate::<AvatarPose>::default(),
         PointLight {
             intensity: 750_000.0,
             range: 60.0,
