@@ -1076,14 +1076,21 @@ fn client_player_step(
 }
 
 /// Replicated `AvatarPose` is the authoritative state; Bevy's renderer
-/// reads `Transform`. Copy across whenever the pose changes — covers
-/// owner (predicted) and remote (interpolated) entities uniformly.
+/// reads `Transform`. Translation always syncs. Rotation syncs only for
+/// non-owner avatars — the owner's predicted avatar has a `FlyCam` that
+/// owns the full camera rotation (yaw from input *plus* pitch, which
+/// isn't on the wire because the avatar body is a single yaw-rotated
+/// cuboid with no head pitch). Without the filter, `sync_avatar_transforms`
+/// would clobber pitch every tick when the server-authoritative pose
+/// arrives, causing the visible "snap-to-horizon" judder.
 fn sync_avatar_transforms(
-    mut avatars: Query<(&AvatarPose, &mut Transform), Changed<AvatarPose>>,
+    mut avatars: Query<(&AvatarPose, &mut Transform, Has<FlyCam>), Changed<AvatarPose>>,
 ) {
-    for (pose, mut transform) in avatars.iter_mut() {
+    for (pose, mut transform, has_flycam) in avatars.iter_mut() {
         transform.translation = pose.translation;
-        transform.rotation = Quat::from_rotation_y(pose.yaw);
+        if !has_flycam {
+            transform.rotation = Quat::from_rotation_y(pose.yaw);
+        }
     }
 }
 
