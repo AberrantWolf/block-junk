@@ -11,7 +11,7 @@
 use bevy::prelude::*;
 
 use crate::collision::{Aabb, WorldCollision, sweep_axis};
-use crate::protocol::{AvatarOnGround, AvatarPose, AvatarVelocity, MovementMode, PlayerInput};
+use crate::protocol::{AvatarOnGround, AvatarPose, AvatarVelocity, MovementMode, MovementIntent};
 
 /// Player AABB half-extents. 0.6 × 1.8 × 0.6 matches the avatar mesh and
 /// is close to Minecraft's player hitbox.
@@ -70,7 +70,7 @@ pub fn apply_walk_step(
     velocity: &mut AvatarVelocity,
     on_ground: &mut AvatarOnGround,
     mode: &mut MovementMode,
-    input: &PlayerInput,
+    input: &MovementIntent,
     dt: f32,
     world: &WorldCollision,
 ) {
@@ -87,9 +87,12 @@ pub fn apply_walk_step(
         };
     }
 
-    // Yaw mirrors the camera; servers use it as the basis for wishdir
-    // resolution and remote clients render the body rotated to it.
-    pose.yaw = input.yaw;
+    // Yaw is owned by the pose; input contributes a delta (mouse motion
+    // since the previous tick). Keeping pose.yaw authoritative lets the
+    // saved spawn yaw survive — a default input means "no rotation" rather
+    // than "snap to 0." Wrap to keep the running value bounded after a
+    // long session of looking around.
+    pose.yaw = (pose.yaw + input.dyaw).rem_euclid(core::f32::consts::TAU);
 
     // Wishdir basis from current yaw. In FPV terms: forward = -Z when
     // yaw = 0, right = +X. WASD packs into wishdir as i8s on the wire.
@@ -120,7 +123,7 @@ fn walk_step(
     velocity: &mut AvatarVelocity,
     on_ground: &mut AvatarOnGround,
     wish_horizontal: Vec3,
-    input: &PlayerInput,
+    input: &MovementIntent,
     dt: f32,
     world: &WorldCollision,
 ) {

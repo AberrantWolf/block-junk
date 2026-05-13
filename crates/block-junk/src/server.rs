@@ -11,13 +11,15 @@ use lightyear::input::native::prelude::*;
 
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::collision::WorldCollision;
+use crate::menu::{ServerSaveConfig, ServerSaveRequestFlag, ServerShutdownFlag};
 use crate::physics::apply_walk_step;
 use crate::protocol::{
-    Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, CellEdit,
-    ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementMode, PlayerInput,
+    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, CellEdit,
+    ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode,
     WorldChannel,
 };
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
+use crate::save::{SAVE_VERSION, SaveFile, SavedChunk, read_save, write_save};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_world_transform, world_to_chunk};
 
 /// Marker on chunks whose state has diverged from the deterministic terrain
@@ -31,6 +33,7 @@ pub struct ServerPlugin;
 impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::scripting::ServerScriptingPlugin);
+        app.add_plugins(crate::npc::NpcServerPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
@@ -39,6 +42,7 @@ impl Plugin for ServerPlugin {
         app.init_resource::<ClientAvatars>();
         app.init_resource::<ClientChunks>();
         app.init_resource::<PendingChunks>();
+        app.init_resource::<PendingSpawnPose>();
         app.init_resource::<RoomMap>();
         app.init_resource::<DetectionDirty>();
         // Local Bevy bus for server-internal observers (scripting, building
@@ -74,10 +78,182 @@ impl Plugin for ServerPlugin {
         // compares this against the client's predicted state and replays
         // unacked inputs on disagreement.
         app.add_systems(FixedUpdate, server_player_step);
+        // Save/load wiring. `load_from_save` runs before any other Startup
+        // system that touches ChunkMap so loaded chunks beat AoI's
+        // procedural fallback. `save_then_shutdown` polls the shutdown flag
+        // every tick — when it fires, writes the world and exits the App.
+        app.add_systems(Startup, load_from_save);
+        app.add_systems(Update, (save_then_shutdown, save_on_request));
         app.add_observer(install_replication_sender);
         app.add_observer(register_new_client);
         app.add_observer(forget_disconnected_client);
     }
+}
+
+/// Held on the server App after a successful load. Consumed once by the
+/// first `register_new_client` invocation, so the client that triggered
+/// the load lands back where they left off. Subsequent connections (in a
+/// multi-host scenario) get the default spawn. Per-player persistence
+/// requires a stable client identity we don't have yet — tracked as
+/// follow-up.
+#[derive(Resource, Default)]
+pub struct PendingSpawnPose(pub Option<AvatarPose>);
+
+/// Server App Startup: if `ServerSaveConfig::load_existing`, read the save
+/// file and pre-populate `ChunkMap` with the persisted edited chunks. They
+/// land with the `ChunkEdited` marker so subsequent AoI sends ship the
+/// bytes rather than the procedural shortcut. Procedural chunks aren't
+/// persisted (`Chunk::from_terrain` regenerates them on demand).
+///
+/// A load failure does NOT abort startup — we log and continue with an
+/// empty world. Better than an unbootable session if a save is corrupt.
+fn load_from_save(
+    mut commands: Commands,
+    mut chunk_map: ResMut<ChunkMap>,
+    mut pending_pose: ResMut<PendingSpawnPose>,
+    config: Option<Res<ServerSaveConfig>>,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    if !config.load_existing {
+        return;
+    }
+    let Some(name) = config.save_name.as_deref() else {
+        return;
+    };
+    let save = match read_save(name) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("load save {name:?} failed: {e}; continuing with empty world");
+            return;
+        }
+    };
+    info!(
+        "loading {} edited chunks from save {name:?}",
+        save.edited_chunks.len()
+    );
+    pending_pose.0 = save.last_player_pose;
+    for SavedChunk {
+        coord,
+        chunk,
+        entities,
+    } in save.edited_chunks
+    {
+        let entity = commands
+            .spawn((
+                chunk,
+                coord,
+                entities,
+                ChunkEdited,
+                Name::new(format!("chunk{:?}", coord.0.to_array())),
+                chunk_world_transform(coord),
+            ))
+            .id();
+        chunk_map.0.insert(coord, entity);
+    }
+}
+
+/// Polled each tick. When the client flips the save-request atomic, write
+/// the world to disk and clear the flag. Unlike `save_then_shutdown` this
+/// is multi-shot (the user might "Save Now" several times per session) so
+/// no Local guard.
+fn save_on_request(
+    flag: Option<Res<ServerSaveRequestFlag>>,
+    config: Option<Res<ServerSaveConfig>>,
+    chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
+    avatars: Query<&AvatarPose, With<Avatar>>,
+) {
+    let Some(flag) = flag else {
+        return;
+    };
+    if !flag.0.swap(false, core::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(config) = config else {
+        return;
+    };
+    let Some(name) = &config.save_name else {
+        return;
+    };
+    let edited: Vec<SavedChunk> = chunks
+        .iter()
+        .map(|(coord, ch, ce)| SavedChunk {
+            coord: *coord,
+            chunk: ch.clone(),
+            entities: ce.clone(),
+        })
+        .collect();
+    let count = edited.len();
+    let save = SaveFile {
+        version: SAVE_VERSION,
+        edited_chunks: edited,
+        last_player_pose: avatars.iter().next().copied(),
+    };
+    match write_save(name, &save) {
+        Ok(()) => info!("save-on-request: wrote {count} chunks to {name:?}"),
+        Err(e) => error!("save-on-request to {name:?} failed: {e}"),
+    }
+}
+
+/// Drives the server App's shutdown lifecycle. Each tick:
+///   1. If the shutdown flag isn't set, do nothing.
+///   2. Once it's set: collect every chunk with `ChunkEdited`, serialize
+///      to the configured save path (unless save is disabled), then emit
+///      `AppExit`.
+///
+/// The `Local<bool>` guards against running the save loop more than once
+/// per session; the runner won't actually exit until the next tick reads
+/// the AppExit message.
+fn save_then_shutdown(
+    flag: Option<Res<ServerShutdownFlag>>,
+    config: Option<Res<ServerSaveConfig>>,
+    chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
+    avatars: Query<&AvatarPose, With<Avatar>>,
+    mut exit: MessageWriter<AppExit>,
+    mut handled: Local<bool>,
+) {
+    if *handled {
+        return;
+    }
+    let Some(flag) = flag else {
+        return;
+    };
+    if !flag.0.load(core::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    *handled = true;
+
+    if let Some(config) = config {
+        match (&config.save_name, config.no_save_on_exit) {
+            (Some(name), false) => {
+                let edited: Vec<SavedChunk> = chunks
+                    .iter()
+                    .map(|(coord, ch, ce)| SavedChunk {
+                        coord: *coord,
+                        chunk: ch.clone(),
+                        entities: ce.clone(),
+                    })
+                    .collect();
+                let count = edited.len();
+                let save = SaveFile {
+                    version: SAVE_VERSION,
+                    edited_chunks: edited,
+                    last_player_pose: avatars.iter().next().copied(),
+                };
+                match write_save(name, &save) {
+                    Ok(()) => info!("saved {count} edited chunks to {name:?}"),
+                    Err(e) => error!("save to {name:?} failed: {e}"),
+                }
+            }
+            (Some(name), true) => {
+                info!("DebugNoSaveOnExit set; skipping save to {name:?}");
+            }
+            (None, _) => {}
+        }
+    }
+
+    exit.write(AppExit::Success);
 }
 
 /// Connection entity → avatar entity. The avatar carries the authoritative
@@ -133,6 +309,7 @@ fn register_new_client(
     mut commands: Commands,
     mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
+    mut pending_pose: ResMut<PendingSpawnPose>,
     registry: Res<BlockRegistry>,
     mut manifests: Query<&mut MessageSender<BlockManifest>>,
 ) {
@@ -147,21 +324,24 @@ fn register_new_client(
     // owner's client gets `Predicted` on its copy; remote clients get
     // `Interpolated`. ControlledBy ties the entity back to its
     // connection so input replication knows where to deliver the inputs.
-    // Spawn position: above the sine-wave terrain (peaks ~y=16) so the
-    // first physics tick lands the player on the surface rather than
-    // inside it. Eye height = AvatarPose.translation by convention.
-    let spawn_pose = AvatarPose {
+    // Spawn position: if the save provided a persisted pose, consume it
+    // (one-shot — see `PendingSpawnPose`). Otherwise spawn above the
+    // sine-wave terrain (peaks ~y=16) so the first physics tick lands
+    // the player on the surface rather than inside it. Eye height =
+    // AvatarPose.translation by convention.
+    let spawn_pose = pending_pose.0.take().unwrap_or(AvatarPose {
         translation: Vec3::new(0.0, 32.0, 60.0),
         yaw: 0.0,
-    };
+    });
     let avatar = commands
         .spawn((
+            Actor,
             Avatar,
             spawn_pose,
             AvatarVelocity::default(),
             AvatarOnGround::default(),
             MovementMode::default(),
-            ActionState::<PlayerInput>::default(),
+            ActionState::<MovementIntent>::default(),
             Replicate::to_clients(NetworkTarget::All),
             PredictionTarget::to_clients(NetworkTarget::Single(remote.0)),
             InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
@@ -186,7 +366,7 @@ fn register_new_client(
 }
 
 /// Server-authoritative simulation tick. Reads each avatar's current
-/// `ActionState<PlayerInput>` (filled by lightyear's input replication)
+/// `ActionState<MovementIntent>` (filled by lightyear's input replication)
 /// and runs the same controller the predicted client runs. The resulting
 /// AvatarPose is what gets replicated back; the predicted client compares
 /// against it and rolls back on disagreement.
@@ -200,7 +380,7 @@ fn server_player_step(
         &mut AvatarVelocity,
         &mut AvatarOnGround,
         &mut MovementMode,
-        &ActionState<PlayerInput>,
+        &ActionState<MovementIntent>,
     )>,
 ) {
     let dt = time.delta_secs();

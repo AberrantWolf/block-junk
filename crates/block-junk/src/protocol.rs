@@ -86,9 +86,25 @@ pub enum ChunkData {
     Edited(Vec<BlockSlot>),
 }
 
+/// Marker component for "thing with a body that can move and interact" —
+/// the shared DNA between player avatars and NPCs. Carries the same
+/// physics state (`AvatarPose`, `AvatarVelocity`, `AvatarOnGround`,
+/// `MovementMode`) and consumes the same `MovementIntent` regardless of
+/// whether the intent comes from a connected client or a brain.
+///
+/// Replicated so the client side can render and (future) interact with
+/// any actor uniformly. Specialised markers like `Avatar` (player) and
+/// `Npc` (mob) ride alongside to disambiguate when needed — "give every
+/// actor a name tag" wants `Actor`, "attach a camera to my own avatar"
+/// wants `Avatar` + `Predicted`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Actor;
+
 /// Marker component on the server-side player-avatar entity. Replicated to
 /// every client so they can render a body (or, on the owner side, attach a
-/// camera). Paired with the predicted state components below.
+/// camera). Paired with the predicted state components below. Coexists
+/// with `Actor` — every Avatar is also an Actor, but not every Actor is
+/// an Avatar (NPCs are Actors without `Avatar`).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Avatar;
 
@@ -170,40 +186,55 @@ pub struct ChunkUnload {
 /// priorities; for now KISS.
 pub struct WorldChannel;
 
-/// Per-tick player input. Replicated client→server by lightyear's input
-/// pipeline (`input_native`), with sequence-numbered redundancy so a
-/// dropped UDP packet doesn't drop a tick of input. Both server (authority)
-/// and the owning client (prediction) run the same controller against
-/// these inputs in `FixedUpdate`.
+/// Per-tick movement intent. The unified input vocabulary for *anything*
+/// with a body — players via lightyear's input pipeline (`input_native`,
+/// sequence-numbered redundancy so a dropped UDP packet doesn't drop a
+/// tick), NPCs via their brain writing the component directly. Both server
+/// (authority) and the owning client (prediction) run the same controller
+/// against this in `FixedUpdate`.
 ///
 /// Wishdir is encoded as three i8s (-1/0/+1 per axis) — fits in 3 bytes
-/// where a Vec3 would take 12. Yaw is sent every tick because the avatar's
-/// body orientation tracks the camera; pitch isn't here yet (no head/torso
-/// split, the avatar is a single yaw-rotated cuboid).
+/// where a Vec3 would take 12. `dyaw` is the *change* in yaw since the
+/// last tick (radians), not the absolute yaw — the actor's pose owns the
+/// running yaw, the source (player input or brain steering) just reports
+/// motion. Pitch isn't here yet (no head/torso split, the avatar is a
+/// single yaw-rotated cuboid).
 ///
-/// `Default` MUST mean "no keys held, last known yaw" so missing-input
-/// vs no-input stays distinguishable. The buffer treats a missing
-/// per-tick input as "use the previous one"; a `Default` value means
-/// "the player explicitly pressed nothing this tick."
+/// `Default` means "no movement, no rotation this tick." The lightyear
+/// input buffer treats a missing per-tick input as "use the previous
+/// one"; with delta-yaw a duplicated tick over-rotates, but the buffer
+/// only duplicates when packets drop entirely, which is rare and a 10 ms
+/// slice of mouse motion at the wrist isn't catastrophic.
+///
+/// Field set is the union of "player keys" and "NPC brain output." NPCs
+/// leave `toggle_mode` alone (no fly mode for them) and use `wishdir[0]`
+/// + `wishdir[2]` only — the y axis is for player fly mode.
 #[derive(Component, Clone, Debug, Default, PartialEq, Serialize, Deserialize, Reflect)]
-pub struct PlayerInput {
+pub struct MovementIntent {
     /// Per-axis -1, 0, or +1. X is strafe (right/left), Y is fly up/down,
-    /// Z is forward/back. Server interprets these per `MovementMode`.
+    /// Z is forward/back. Controller interprets these per `MovementMode`.
     pub wishdir: [i8; 3],
     /// Held this tick — jump in walk mode, ascend in fly mode (redundant
     /// with `wishdir.y` but kept separate so the controller can tell
     /// "jump just-pressed" from "fly-up held").
     pub jump: bool,
-    /// Just-pressed this tick — server flips `MovementMode` on the avatar.
-    /// Later this gets gated on creative-mode permissions.
+    /// Just-pressed this tick — server flips `MovementMode` on the actor.
+    /// Player only (NPCs don't toggle fly). Later gated on creative-mode
+    /// permissions.
     pub toggle_mode: bool,
-    /// Camera yaw in radians (rotation around +Y). Sets the avatar's
-    /// body orientation; also drives the wishdir basis on the server's
-    /// controller side.
-    pub yaw: f32,
+    /// "Use the thing in front of me" this tick. Players will get this
+    /// from a key (E or similar); NPC brains set it when their goal
+    /// requires interacting with a block-entity (use bed, open door).
+    /// Currently inert — the controller doesn't act on it yet.
+    pub interact: bool,
+    /// Yaw delta in radians since the last tick (accumulated mouse motion
+    /// for players, brain steering delta for NPCs). The controller does
+    /// `pose.yaw += dyaw` — pose.yaw is the truth, and a default
+    /// intent naturally leaves the pose alone.
+    pub dyaw: f32,
 }
 
-impl MapEntities for PlayerInput {
+impl MapEntities for MovementIntent {
     fn map_entities<M: EntityMapper>(&mut self, _: &mut M) {}
 }
 

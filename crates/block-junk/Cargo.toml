@@ -17,9 +17,11 @@ ndshape = "0.3"
 #   client App talking via UDP-localhost (always-client architecture).
 lightyear = { version = "0.26", features = ["netcode", "udp", "input_native", "frame_interpolation"] }
 avian3d = "0.6"
+bevy_egui = "0.39"
 bevy-inspector-egui = "0.36"
 serde = { version = "1", features = ["derive"] }
-bincode = "2"
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
 thiserror = "2"
 
 block-junk-mod-api = { path = "../block-junk-mod-api" }

@@ -2,21 +2,30 @@ mod blocks;
 mod camera;
 mod client;
 mod collision;
+mod menu;
 mod network;
+mod npc;
 mod physics;
 mod preview;
 mod protocol;
 mod rooms;
+mod save;
 mod scripting;
 mod server;
 mod voxel;
 
+use core::sync::atomic::AtomicBool;
 use core::time::Duration;
+use std::sync::Arc;
 
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::log::{DEFAULT_FILTER, LogPlugin};
 use bevy::prelude::*;
 
+use crate::menu::{
+    AppState, JoinTarget, LaunchMode, MenuPlugin, ServerSaveConfig, ServerSaveRequestFlag,
+    ServerShutdownFlag,
+};
 use crate::network::{NetMode, NetworkPlugin};
 use crate::protocol::GameSet;
 
@@ -27,27 +36,77 @@ fn tick_duration() -> Duration {
     Duration::from_secs_f64(1.0 / TICK_HZ)
 }
 
-fn main() {
-    // Accept `server` / `--server` / `-s`, `client` / `--client` / `-c`,
-    // anything else (or no arg) → solo. trim handles the cargo-style
-    // `cargo run -- --client` where the binary sees `--client` verbatim.
-    let raw = std::env::args().nth(1).unwrap_or_default();
-    match raw.trim_start_matches('-') {
-        "server" | "s" => run_server(true),
-        "client" | "c" => run_client(),
-        _ => {
-            // Solo: server thread, client main thread. The thread is detached
-            // — when main exits, the process ends and the server dies with it.
-            // Tracing has a process-global subscriber, so only one side
-            // installs LogPlugin; client wins because it's the one with
-            // `DEFAULT_FILTER` tuned for ecosystem noise (gilrs etc.).
-            std::thread::spawn(|| run_server(false));
-            run_client();
+enum CliMode {
+    /// Dedicated headless server. No UI; lives until SIGINT.
+    DedicatedServer,
+    /// Pure client connecting to `addr`. Skips the main menu.
+    Client { addr: Option<core::net::SocketAddr> },
+    /// Default: client with the main menu.
+    Solo,
+}
+
+fn parse_cli() -> CliMode {
+    let mut args = std::env::args().skip(1);
+    let Some(first) = args.next() else {
+        return CliMode::Solo;
+    };
+    match first.trim_start_matches('-') {
+        "server" | "s" => CliMode::DedicatedServer,
+        "client" | "c" => {
+            let addr = args.next().and_then(|raw| match raw.parse() {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("invalid client addr {raw:?}: {e}; falling back to default");
+                    None
+                }
+            });
+            CliMode::Client { addr }
         }
+        _ => CliMode::Solo,
     }
 }
 
-fn run_server(install_log_plugin: bool) {
+fn main() {
+    match parse_cli() {
+        CliMode::DedicatedServer => run_server_inner(
+            None,
+            None,
+            ServerSaveConfig::dedicated(),
+            /*install_log_plugin*/ true,
+        ),
+        CliMode::Client { addr } => {
+            let target = addr.unwrap_or(crate::network::SERVER_ADDR);
+            run_client(Some(LaunchMode::JoinRemote { addr: target }));
+        }
+        CliMode::Solo => run_client(None),
+    }
+}
+
+/// Public entrypoint for the menu module to spawn a hosted server on a
+/// worker thread.
+///   - `shutdown` flag polled each tick; when set, server saves (per
+///     `config`) then emits `AppExit`.
+///   - `save_request` flag polled each tick; when set, server saves
+///     mid-session and clears the flag.
+pub fn run_server_with_shutdown(
+    shutdown: Arc<AtomicBool>,
+    save_request: Arc<AtomicBool>,
+    config: ServerSaveConfig,
+) {
+    run_server_inner(
+        Some(shutdown),
+        Some(save_request),
+        config,
+        /*install_log_plugin*/ false,
+    );
+}
+
+fn run_server_inner(
+    shutdown: Option<Arc<AtomicBool>>,
+    save_request: Option<Arc<AtomicBool>>,
+    save_config: ServerSaveConfig,
+    install_log_plugin: bool,
+) {
     let tick = tick_duration();
     let mut app = App::new();
 
@@ -73,10 +132,18 @@ fn run_server(install_log_plugin: bool) {
     });
     app.add_plugins(server::ServerPlugin);
 
+    if let Some(flag) = shutdown {
+        app.insert_resource(ServerShutdownFlag(flag));
+    }
+    if let Some(flag) = save_request {
+        app.insert_resource(ServerSaveRequestFlag(flag));
+    }
+    app.insert_resource(save_config);
+
     app.run();
 }
 
-fn run_client() {
+fn run_client(preset: Option<LaunchMode>) {
     let tick = tick_duration();
     let mut app = App::new();
 
@@ -100,13 +167,38 @@ fn run_client() {
     app.add_plugins(lightyear::prelude::client::ClientPlugins {
         tick_duration: tick,
     });
-    configure_shared_schedule(&mut app);
+    // Gameplay sets are chained AND gated on in_state(InGame) so nothing
+    // gameplay-y runs while the main menu is open.
+    app.configure_sets(
+        Update,
+        (
+            GameSet::Input,
+            GameSet::Simulation,
+            GameSet::PostSimulation,
+        )
+            .chain()
+            .run_if(in_state(AppState::InGame)),
+    );
+    app.add_plugins(MenuPlugin);
     app.add_plugins(NetworkPlugin {
         mode: NetMode::Client,
     });
     app.add_plugins(client::ClientPlugin);
 
+    // CLI shortcut: skip the menu and go straight to a session.
+    if let Some(mode) = preset {
+        if let LaunchMode::JoinRemote { addr } = &mode {
+            app.insert_resource(JoinTarget(*addr));
+        }
+        app.insert_resource(mode);
+        app.add_systems(Startup, kick_to_ingame);
+    }
+
     app.run();
+}
+
+fn kick_to_ingame(mut next: ResMut<NextState<AppState>>) {
+    next.set(AppState::InGame);
 }
 
 /// Schedule order shared by both Apps. Input → Simulation → PostSimulation

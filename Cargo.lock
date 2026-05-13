@@ -1076,12 +1076,14 @@ dependencies = [
  "bevy_log",
  "bevy_math",
  "bevy_mesh",
+ "bevy_picking",
  "bevy_platform",
  "bevy_reflect",
  "bevy_render",
  "bevy_shader",
  "bevy_time",
  "bevy_transform",
+ "bevy_ui_render",
  "bevy_utils",
  "bevy_window",
  "bevy_winit",
@@ -1097,6 +1099,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webbrowser",
  "wgpu-types",
  "winit",
 ]
@@ -2195,6 +2198,7 @@ dependencies = [
  "avian3d 0.6.1",
  "bevy",
  "bevy-inspector-egui",
+ "bevy_egui",
  "bincode",
  "block-junk-mod-api",
  "block-junk-scripting",
@@ -2202,6 +2206,7 @@ dependencies = [
  "lightyear",
  "ndshape",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -8466,6 +8471,22 @@ dependencies = [
  "pastey",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "webbrowser"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fc95580916af1e68ff6a7be07446fc5db73ebf71cf092de939bbf5f7e189f72"
+dependencies = [
+ "core-foundation 0.10.1",
+ "jni 0.22.4",
+ "log",
+ "ndk-context",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "url",
  "web-sys",
 ]
 

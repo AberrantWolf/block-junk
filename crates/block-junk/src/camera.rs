@@ -2,23 +2,29 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
-/// Per-camera mouse-look state. Translation is no longer FlyCam's job —
-/// it goes through the shared physics controller via PlayerInput. This
-/// component just holds yaw/pitch so the controller has a place to
-/// read facing from and `fly_cam_input` has a place to write.
+use crate::menu::AppState;
+use crate::protocol::AvatarPose;
+
+/// Per-camera mouse-look state. The avatar's `AvatarPose.yaw` is the
+/// authoritative running yaw; this component holds local-only pitch and
+/// `pending_dyaw` — mouse motion accumulated since the last input tick.
+/// `buffer_input` drains `pending_dyaw` into the next `MovementIntent`, the
+/// controller adds it to `pose.yaw`, and `fly_cam_input` shows the sum
+/// at render rate so the camera tracks the mouse without waiting for
+/// the next FixedUpdate.
 #[derive(Component)]
 pub struct FlyCam {
     pub sensitivity: f32,
-    pub yaw: f32,
     pub pitch: f32,
+    pub pending_dyaw: f32,
 }
 
 impl Default for FlyCam {
     fn default() -> Self {
         Self {
             sensitivity: 0.002,
-            yaw: 0.0,
             pitch: 0.0,
+            pending_dyaw: 0.0,
         }
     }
 }
@@ -27,9 +33,13 @@ pub struct FlyCamPlugin;
 
 impl Plugin for FlyCamPlugin {
     fn build(&self, app: &mut App) {
+        // Cursor capture is bound to the InGame state. Entering InGame
+        // locks the cursor; leaving it (to MainMenu or Paused) releases.
+        // The pause menu shortcut (Esc) lives in MenuPlugin, not here.
         app.init_resource::<DiscardNextMotion>()
-            .add_systems(Startup, lock_cursor)
-            .add_systems(Update, (toggle_cursor, fly_cam_input));
+            .add_systems(OnEnter(AppState::InGame), lock_cursor)
+            .add_systems(OnExit(AppState::InGame), release_cursor)
+            .add_systems(Update, fly_cam_input.run_if(in_state(AppState::InGame)));
     }
 }
 
@@ -53,20 +63,8 @@ fn lock_cursor(
     }
 }
 
-fn toggle_cursor(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
-    mut discard: ResMut<DiscardNextMotion>,
-) {
-    if !keys.just_pressed(KeyCode::Escape) {
-        return;
-    }
-    let Ok((mut window, mut cursor)) = windows.single_mut() else {
-        return;
-    };
-    if cursor.grab_mode == CursorGrabMode::None {
-        capture(&mut window, &mut cursor, &mut discard);
-    } else {
+fn release_cursor(mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>) {
+    if let Ok(mut cursor) = cursors.single_mut() {
         cursor.grab_mode = CursorGrabMode::None;
         cursor.visible = true;
     }
@@ -86,10 +84,10 @@ fn capture(window: &mut Window, cursor: &mut CursorOptions, discard: &mut Discar
 fn fly_cam_input(
     motion: Res<AccumulatedMouseMotion>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
-    mut cam: Query<(&mut FlyCam, &mut Transform)>,
+    mut cam: Query<(&mut FlyCam, &mut Transform, &AvatarPose)>,
     mut discard: ResMut<DiscardNextMotion>,
 ) {
-    let Ok((mut cam, mut transform)) = cam.single_mut() else {
+    let Ok((mut cam, mut transform, pose)) = cam.single_mut() else {
         return;
     };
     let locked = cursors
@@ -97,7 +95,7 @@ fn fly_cam_input(
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
 
-    // Mouse-look only — translation goes through PlayerInput → the shared
+    // Mouse-look only — translation goes through MovementIntent → the shared
     // controller now, so WASD / Space / Shift drive the avatar in both
     // walk and fly modes via the input pipeline.
     if locked && motion.delta != Vec2::ZERO {
@@ -106,11 +104,16 @@ fn fly_cam_input(
             // skip it once and resume normal processing.
             discard.0 = false;
         } else {
-            cam.yaw -= motion.delta.x * cam.sensitivity;
+            cam.pending_dyaw -= motion.delta.x * cam.sensitivity;
             cam.pitch = (cam.pitch - motion.delta.y * cam.sensitivity).clamp(-1.54, 1.54);
         }
     }
 
+    // Visible yaw = authoritative pose.yaw plus mouse motion accumulated
+    // since the last `buffer_input` drain. The next FixedUpdate will fold
+    // pending_dyaw into pose.yaw and reset it; the rendered camera stays
+    // continuous across that handoff because the sum is the same.
+    let visible_yaw = pose.yaw + cam.pending_dyaw;
     transform.rotation =
-        Quat::from_axis_angle(Vec3::Y, cam.yaw) * Quat::from_axis_angle(Vec3::X, cam.pitch);
+        Quat::from_axis_angle(Vec3::Y, visible_yaw) * Quat::from_axis_angle(Vec3::X, cam.pitch);
 }

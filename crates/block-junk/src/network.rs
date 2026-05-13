@@ -16,9 +16,11 @@ use bevy::prelude::*;
 use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
+use crate::menu::{AppState, JoinTarget};
+use crate::npc::Npc;
 use crate::protocol::{
-    Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkSnapshot,
-    ChunkUnload, MovementMode, PlayerInput, WorldChannel,
+    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
+    ChunkSnapshot, ChunkUnload, MovementIntent, MovementMode, WorldChannel,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,8 +40,16 @@ impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ProtocolPlugin);
         match self.mode {
-            NetMode::Server => app.add_systems(Startup, start_netcode_server),
-            NetMode::Client => app.add_systems(Startup, start_netcode_client),
+            // Server App is spawned per game session, so its Startup
+            // coincides with entering a game — bind the socket immediately.
+            NetMode::Server => {
+                app.add_systems(Startup, start_netcode_server);
+            }
+            // Client App outlives a session and shows a menu first. Defer
+            // the netcode connect until the user starts a game.
+            NetMode::Client => {
+                app.add_systems(OnEnter(AppState::InGame), start_netcode_client);
+            }
         };
     }
 }
@@ -70,7 +80,9 @@ impl Plugin for ProtocolPlugin {
         // per-tick state. We deliberately don't replicate `Transform` — the
         // 40-byte rotation+scale baggage isn't used.
         // See networking-design: state for entities, events for the grid.
+        app.register_component::<Actor>();
         app.register_component::<Avatar>();
+        app.register_component::<Npc>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between
         // server samples instead of snapping every 50 ms).
@@ -85,10 +97,10 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<AvatarOnGround>().add_prediction();
         app.register_component::<MovementMode>().add_prediction();
 
-        // Per-tick input replication. Adds `ActionState<PlayerInput>` and
+        // Per-tick input replication. Adds `ActionState<MovementIntent>` and
         // the buffering machinery on both sides. Phase 2.4 hangs the
         // avatar entity off this; this registration alone is inert.
-        app.add_plugins(input::native::InputPlugin::<PlayerInput>::default());
+        app.add_plugins(input::native::InputPlugin::<MovementIntent>::default());
     }
 }
 
@@ -106,11 +118,13 @@ fn start_netcode_server(mut commands: Commands) {
     info!("netcode server listening on {SERVER_ADDR}");
 }
 
-fn start_netcode_client(mut commands: Commands) {
+fn start_netcode_client(mut commands: Commands, target: Res<JoinTarget>) {
     use lightyear::netcode::Key;
     use lightyear::prelude::client::{NetcodeClient, NetcodeConfig};
     // Authentication and UdpIo come from the top-level prelude (already
     // imported via `lightyear::prelude::*`).
+
+    let server_addr = target.0;
 
     // Process-unique client ID. Hardcoding 0 means a second client trying
     // to connect to the same server gets `ClientIdInUse` — fine for unit
@@ -118,7 +132,7 @@ fn start_netcode_client(mut commands: Commands) {
     // when we add accounts; PID is enough until then.
     let client_id: u64 = std::process::id() as u64;
     let auth = Authentication::Manual {
-        server_addr: SERVER_ADDR,
+        server_addr,
         client_id,
         private_key: Key::default(),
         protocol_id: 0,
@@ -134,7 +148,7 @@ fn start_netcode_client(mut commands: Commands) {
         .spawn((
             Client::default(),
             LocalAddr(CLIENT_ADDR),
-            PeerAddr(SERVER_ADDR),
+            PeerAddr(server_addr),
             Link::new(None),
             ReplicationReceiver::default(),
             client,
@@ -142,5 +156,5 @@ fn start_netcode_client(mut commands: Commands) {
         ))
         .id();
     commands.trigger(Connect { entity });
-    info!("netcode client connecting to {SERVER_ADDR}");
+    info!("netcode client connecting to {server_addr}");
 }

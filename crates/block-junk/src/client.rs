@@ -13,11 +13,13 @@ use lightyear::input::native::prelude::*;
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
+use crate::menu::AppState;
+use crate::npc::Npc;
 use crate::physics::apply_walk_step;
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::protocol::{
     Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
-    ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementMode, PlayerInput, WorldChannel,
+    ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode, WorldChannel,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -48,7 +50,12 @@ impl Plugin for ClientPlugin {
             .init_resource::<BlockEntities>()
             .init_resource::<PreviewState>()
             .add_observer(swap_preview_scene_materials)
-            .add_systems(Startup, (setup_scene, setup_placement_preview))
+            // Scene setup runs when entering a game, not at process start.
+            // Before InGame the screen is the main menu only.
+            .add_systems(
+                OnEnter(AppState::InGame),
+                (setup_scene, setup_placement_preview),
+            )
             .add_systems(
                 Update,
                 (
@@ -58,19 +65,24 @@ impl Plugin for ClientPlugin {
                 )
                     .in_set(GameSet::Input),
             )
-            // Input replication: ActionState<PlayerInput> on the predicted
+            // Input replication: ActionState<MovementIntent> on the predicted
             // avatar gets written from the keyboard each fixed tick.
             // WriteClientInputs is the lightyear-defined set that ensures
             // the input is buffered before the simulation reads it.
             .add_systems(
                 FixedPreUpdate,
-                buffer_input.in_set(client::input::InputSystems::WriteClientInputs),
+                buffer_input
+                    .in_set(client::input::InputSystems::WriteClientInputs)
+                    .run_if(in_state(AppState::InGame)),
             )
             // Owner-side prediction: run the same controller the server
             // runs, against the same inputs, so we don't wait for the
             // server's reply to see ourselves move. Lightyear rolls back
             // and replays this when it receives a server correction.
-            .add_systems(FixedUpdate, client_player_step)
+            .add_systems(
+                FixedUpdate,
+                client_player_step.run_if(in_state(AppState::InGame)),
+            )
             // Chained: receive_snapshots inserts new chunks via Commands;
             // receive_block_edit_broadcasts queries those chunks. Without
             // a sync point between them an edit landing in the same tick
@@ -95,7 +107,9 @@ impl Plugin for ClientPlugin {
             // and current fixed tick by the render-frame overstep).
             .add_systems(
                 PostUpdate,
-                sync_avatar_transforms.after(FrameInterpolationSystems::Interpolate),
+                sync_avatar_transforms
+                    .after(FrameInterpolationSystems::Interpolate)
+                    .run_if(in_state(AppState::InGame)),
             )
             .add_systems(
                 Update,
@@ -105,6 +119,7 @@ impl Plugin for ClientPlugin {
                     update_hotbar_highlight,
                     update_placement_preview,
                     attach_avatar_visuals,
+                    attach_npc_visuals,
                 )
                     .in_set(GameSet::PostSimulation),
             )
@@ -115,13 +130,16 @@ impl Plugin for ClientPlugin {
     }
 }
 
-/// Pre-built mesh + material for remote-player avatars. Built once during
-/// `setup_scene` so every replicated avatar shares the same handles instead
-/// of allocating new GPU resources per spawn.
+/// Pre-built mesh + materials for replicated actors (remote players +
+/// NPCs). One shared mesh, one material per role so the renderer
+/// allocates GPU resources once per session, not per spawn. Distinct
+/// material per role gives the smoke-test NPC a visibly different
+/// colour from a player avatar.
 #[derive(Resource)]
 struct AvatarAssets {
     mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
+    avatar_material: Handle<StandardMaterial>,
+    npc_material: Handle<StandardMaterial>,
 }
 
 /// Tracks the ECS entity rendering each placed block-entity (a block
@@ -224,9 +242,14 @@ fn setup_scene(
     // the owner reports to the server.
     commands.insert_resource(AvatarAssets {
         mesh: meshes.add(Cuboid::new(0.6, 1.8, 0.6)),
-        material: materials.add(StandardMaterial {
+        avatar_material: materials.add(StandardMaterial {
             base_color: Color::srgb(0.95, 0.55, 0.25),
             perceptual_roughness: 0.6,
+            ..default()
+        }),
+        npc_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.4, 0.7, 0.35),
+            perceptual_roughness: 0.7,
             ..default()
         }),
     });
@@ -439,7 +462,7 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
 fn place_break_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
-    cam: Query<(&GlobalTransform, &FlyCam)>,
+    cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     selected: Res<SelectedBlock>,
@@ -461,7 +484,7 @@ fn place_break_input(
         return;
     }
 
-    let Ok((cam_t, fly)) = cam.single() else {
+    let Ok((cam_t, fly, pose)) = cam.single() else {
         return;
     };
     // MessageSender lives on the connection entity; exactly one in any
@@ -471,6 +494,7 @@ fn place_break_input(
     };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
+    let visible_yaw = pose.yaw + fly.pending_dyaw;
 
     let get_block = |world: IVec3| -> BlockSlot {
         let (coord, local) = crate::voxel::world_to_chunk(world);
@@ -504,7 +528,7 @@ fn place_break_input(
     } else {
         let anchor = hit.cell + hit.face_normal;
         let slot = selected.current(&palette);
-        let orientation = placement_orientation(fly.yaw, rotation.0);
+        let orientation = placement_orientation(visible_yaw, rotation.0);
         sender.send::<WorldChannel>(BlockEdit {
             anchor,
             slot,
@@ -750,7 +774,7 @@ fn setup_placement_preview(
 /// hierarchy.
 #[allow(clippy::too_many_arguments, reason = "preview spans many subsystems")]
 fn update_placement_preview(
-    cam: Query<(&GlobalTransform, &FlyCam)>,
+    cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
@@ -785,13 +809,14 @@ fn update_placement_preview(
         return;
     }
 
-    let Ok((cam_t, fly)) = cam.single() else {
+    let Ok((cam_t, fly, pose)) = cam.single() else {
         hide(state.cube_root, &mut roots);
         hide(state.scene_root, &mut roots);
         return;
     };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
+    let visible_yaw = pose.yaw + fly.pending_dyaw;
 
     let Some(hit) = entity_aware_raycast(
         cam_pos,
@@ -818,7 +843,7 @@ fn update_placement_preview(
 
     let slot = selected.current(&palette);
     let def = registry.def(slot);
-    let orientation = placement_orientation(fly.yaw, rotation.0);
+    let orientation = placement_orientation(visible_yaw, rotation.0);
     let cells = world_footprint(anchor, &def.footprint, orientation);
     if cells.is_empty() {
         hide(state.cube_root, &mut roots);
@@ -1001,7 +1026,7 @@ fn receive_snapshots(
     }
 }
 
-/// Read keyboard + camera yaw and write the next `PlayerInput` to the
+/// Read keyboard + camera yaw and write the next `MovementIntent` to the
 /// owner's predicted avatar. Runs in `FixedPreUpdate` (the
 /// WriteClientInputs set ensures the input is buffered before the
 /// simulation reads it). Lightyear takes care of replicating the buffer
@@ -1015,25 +1040,32 @@ fn receive_snapshots(
 fn buffer_input(
     keys: Res<ButtonInput<KeyCode>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
-    flycam: Query<&FlyCam>,
-    mut q: Query<&mut ActionState<PlayerInput>, With<InputMarker<PlayerInput>>>,
+    mut flycam: Query<&mut FlyCam>,
+    mut q: Query<&mut ActionState<MovementIntent>, With<InputMarker<MovementIntent>>>,
     mut prev_toggle: Local<bool>,
 ) {
     let Ok(mut state) = q.single_mut() else {
         return;
     };
 
-    // Skip input while the cursor is free (alt-tabbed, settings menu);
-    // keep yaw in sync via the FlyCam value. A zero-input ActionState
-    // is what the controller treats as "no keys held."
+    // Skip input while the cursor is free (alt-tabbed, settings menu).
+    // A default ActionState is what the controller treats as "no keys
+    // held, no rotation" — so we still tick through cleanly.
     let locked = cursors
         .single()
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
-    let yaw = flycam.single().map(|f| f.yaw).unwrap_or(0.0);
+    // Drain mouse-motion accumulator into this tick's dyaw. fly_cam_input
+    // refills it at render rate; the next FixedUpdate's controller folds
+    // the drained value into pose.yaw on both client (predicted) and
+    // server (authoritative).
+    let dyaw = flycam
+        .single_mut()
+        .map(|mut f| std::mem::take(&mut f.pending_dyaw))
+        .unwrap_or(0.0);
 
-    let mut input = PlayerInput {
-        yaw,
+    let mut input = MovementIntent {
+        dyaw,
         ..Default::default()
     };
     if locked {
@@ -1072,7 +1104,7 @@ fn client_player_step(
             &mut AvatarVelocity,
             &mut AvatarOnGround,
             &mut MovementMode,
-            &ActionState<PlayerInput>,
+            &ActionState<MovementIntent>,
         ),
         With<Predicted>,
     >,
@@ -1126,8 +1158,8 @@ fn handle_predicted_spawn(
         Camera3d::default(),
         Transform::default(),
         FlyCam::default(),
-        ActionState::<PlayerInput>::default(),
-        InputMarker::<PlayerInput>::default(),
+        ActionState::<MovementIntent>::default(),
+        InputMarker::<MovementIntent>::default(),
         // Smooth AvatarPose between FixedUpdate ticks at render-frame
         // resolution. Without this the camera position only changes 64×/s
         // even on a 144Hz display.
@@ -1311,7 +1343,24 @@ fn attach_avatar_visuals(
         info!("remote avatar entered view: {entity:?}");
         commands.entity(entity).insert((
             Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(assets.material.clone()),
+            MeshMaterial3d(assets.avatar_material.clone()),
+        ));
+    }
+}
+
+/// NPC version of `attach_avatar_visuals` — same shape, different
+/// material for visual disambiguation. NPCs never get the owner-skip
+/// treatment because no client owns them, so the query is simpler.
+fn attach_npc_visuals(
+    npcs: Query<Entity, (With<Npc>, Without<Mesh3d>)>,
+    assets: Res<AvatarAssets>,
+    mut commands: Commands,
+) {
+    for entity in npcs.iter() {
+        info!("npc entered view: {entity:?}");
+        commands.entity(entity).insert((
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(assets.npc_material.clone()),
         ));
     }
 }
