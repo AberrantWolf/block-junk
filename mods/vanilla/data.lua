@@ -166,3 +166,27 @@ engine.rooms.register {
         { kind = "floor_fraction", surface = "solid", min = 0.8 },
     },
 }
+
+-- Needs the engine itself doesn't know about — it just decays whatever
+-- needs are registered at the supplied rate. 1/300 ⇒ ~5 minutes from
+-- 0 to critical, slow enough that the current planner (which doesn't
+-- act on hunger yet) doesn't make NPCs look like they're in distress.
+
+engine.needs.register {
+    id = "hunger",
+    display_name = "Hunger",
+    decay_per_sec = 1.0 / 300.0,
+}
+
+-- The smoke-test NPC kind. The planner that drives it lives in
+-- events.lua; this block is just the declarative half (which side both
+-- the client and server need to agree on for any future networked kind
+-- table). default_needs is what each new NPC of this kind starts with.
+
+engine.npcs.register {
+    id = "vanilla:wanderer",
+    display_name = "Wanderer",
+    default_needs = {
+        hunger = 0.0,
+    },
+}

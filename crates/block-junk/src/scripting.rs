@@ -13,6 +13,7 @@ use block_junk_mod_api::shared::BlockPos;
 use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
 use crate::blocks::{BlockRegistry, WorldSlots};
+use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::protocol::{CellEdit, GameSet};
 use crate::rooms::{RoomEventMsg, RoomPatternRegistry};
 
@@ -36,11 +37,15 @@ impl Plugin for ServerScriptingPlugin {
             blocks,
             slots,
             rooms,
+            needs,
+            npc_kinds,
         } = load_side(Side::Server);
         app.insert_resource(ServerMods(mods));
         app.insert_resource(blocks);
         app.insert_resource(slots);
         app.insert_resource(rooms);
+        app.insert_resource(needs);
+        app.insert_resource(npc_kinds);
         app.add_systems(
             Update,
             (dispatch_block_placed, dispatch_room_events).in_set(GameSet::PostSimulation),
@@ -57,11 +62,15 @@ impl Plugin for ClientScriptingPlugin {
             blocks,
             slots,
             rooms,
+            needs,
+            npc_kinds,
         } = load_side(Side::Client);
         app.insert_resource(ClientMods(mods));
         app.insert_resource(blocks);
         app.insert_resource(slots);
         app.insert_resource(rooms);
+        app.insert_resource(needs);
+        app.insert_resource(npc_kinds);
         // No client-only hooks yet — the registry is in place so adding one
         // is a single-system addition rather than a wiring change.
     }
@@ -72,6 +81,8 @@ struct LoadResult {
     blocks: BlockRegistry,
     slots: WorldSlots,
     rooms: RoomPatternRegistry,
+    needs: NeedRegistry,
+    npc_kinds: NpcKindRegistry,
 }
 
 /// Run mod loading for one side, then build the resulting registries.
@@ -102,11 +113,29 @@ fn load_side(side: Side) -> LoadResult {
         side.as_str(),
         rooms.pattern_count()
     );
+    // Needs must be built before npc kinds so kind→need cross-validation
+    // can run inside `NpcKindRegistry::build`.
+    let needs = match NeedRegistry::build(ctx.take_needs()) {
+        Ok(r) => r,
+        Err(e) => panic!("{} need registry build failed: {e}", side.as_str()),
+    };
+    info!("[{}] need registry: {} need(s)", side.as_str(), needs.need_count());
+    let npc_kinds = match NpcKindRegistry::build(ctx.take_npc_kinds(), &needs) {
+        Ok(r) => r,
+        Err(e) => panic!("{} npc kind registry build failed: {e}", side.as_str()),
+    };
+    info!(
+        "[{}] npc kind registry: {} kind(s)",
+        side.as_str(),
+        npc_kinds.kind_count()
+    );
     LoadResult {
         mods,
         blocks,
         slots,
         rooms,
+        needs,
+        npc_kinds,
     }
 }
 

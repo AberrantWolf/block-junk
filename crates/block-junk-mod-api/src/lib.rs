@@ -24,9 +24,13 @@
 //! - [`client`] — types and hooks that would be exposed in client-side
 //!   contexts. None today; reserved.
 //! - [`blocks`] — block registry types (id, def, flags, tags). Side-agnostic.
+//! - [`npcs`] — NPC kind + need registry types and the planner goal
+//!   surface. Side-agnostic (the same kind registers on both sides);
+//!   planner callbacks live in server-only `events.lua`.
 //! - [`rooms`] — room pattern registry types. Side-agnostic.
 
 pub mod blocks;
+pub mod npcs;
 pub mod rooms;
 
 use serde::{Deserialize, Serialize};

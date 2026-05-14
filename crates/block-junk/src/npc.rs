@@ -1,27 +1,46 @@
-//! NPCs — server-authoritative actors driven by a needs-based brain.
+//! NPCs — server-authoritative actors driven by a two-layer brain.
 //!
-//! Starting slice (validates the puppeteer model before adding the Lua
-//! planner surface): one trivial NPC kind, one need (hunger), one goal
-//! (wander toward a random nearby target via A*). The brain writes a
-//! `MovementIntent` each tick and the same `apply_walk_step` players
-//! use consumes it — single physics path for any actor.
+//! **Layer 1 (this file, native Rust)** runs every fixed tick: decay
+//! needs, advance the current goal, write a [`MovementIntent`], step
+//! physics through the same `apply_walk_step` players use.
 //!
-//! Not yet present: the Lua planner (the planner here is hardcoded
-//! Rust), per-NPC error isolation, save/load, road-graph hierarchical
-//! pathfinding. See the design memo's future-work backlog.
+//! **Layer 2 (Lua planner)** runs only when the engine asks: when an
+//! NPC's goal completes (the brain enters [`Goal::Idle`]). The planner
+//! is a mod-registered callback keyed by [`NpcKind`]; the engine sends
+//! it an [`NpcSnapshot`] and the planner returns a [`PlannerGoal`] that
+//! the engine knows how to execute. Planners can choose between Wander,
+//! Rest, or Idle (defer to the next tick) but cannot invent new actions
+//! without engine support.
+//!
+//! **Per-NPC error isolation**: if the planner errors for one NPC, the
+//! engine attaches a [`BrainDisabled`] marker to that single entity and
+//! keeps running every other NPC + mod. This is stricter than the
+//! whole-mod disable used for declarative hooks — a buggy planner can
+//! reasonably be called many times before being trusted again, and we
+//! don't want one bad NPC kind to silence its entire mod.
+//!
+//! **Native fallback**: if no mod registered a planner for a kind, the
+//! engine drives it with the same Wander loop the project ran before
+//! the planner surface landed. Lets the engine boot + smoke-test even
+//! when no mods load.
 
 use bevy::prelude::*;
+use block_junk_mod_api::npcs::{NpcKindId, NpcSnapshot, PlannerGoal};
+use block_junk_mod_api::shared::BlockPos;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
+use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path};
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
 use crate::protocol::{
     Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementIntent, MovementMode,
 };
+use crate::scripting::ServerMods;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
 
 /// Replicated marker — "this entity is an NPC, not a player avatar."
@@ -44,47 +63,59 @@ pub struct NpcPath(pub Vec<IVec3>);
 
 /// Stable identifier for an NPC across save/load. Distinct from Bevy
 /// `Entity` because Entity values aren't preserved across reboots.
-/// Server-only today; allocated from a monotonic counter.
+/// Server-only today; allocated from a monotonic counter and exposed
+/// to mods in [`NpcSnapshot::id`].
 #[derive(Component, Clone, Copy, Debug)]
-#[allow(dead_code, reason = "consumed by save/load layer (future work)")]
 pub struct NpcId(pub u64);
 
-/// Mod-namespaced kind, e.g. `vanilla:wanderer`. Determines which need
-/// table and planner the brain runs. Currently inert (only one kind
-/// exists and the brain is hardcoded); becomes load-bearing when the
-/// Lua planner surface lands.
+/// Mod-namespaced kind, e.g. `vanilla:wanderer`. Selects which planner
+/// the engine calls on goal completion and which need table the spawn
+/// path initialises from the [`NpcKindRegistry`].
 #[derive(Component, Clone, Debug)]
-#[allow(dead_code, reason = "selects the brain/need table once Lua planners exist")]
 pub struct NpcKind(pub String);
 
 /// Floating-point need state. 0.0 = fully satisfied, 1.0 = critical.
-/// Goal selection (future) will score actions by deficit reduction.
-/// Starting slice has only hunger; this becomes a registry-backed map
-/// (per the design memo, "needs registered in `vanilla` mod, not engine")
-/// once the mod-API surface for needs lands.
+/// Keyed by need id (matches the [`NeedDef`] declared by mods); the
+/// engine never reads any individual need by name — it just decays every
+/// entry by the registry-supplied rate and hands the full table to the
+/// planner.
+///
+/// Per the design memo, needs are registered in the `vanilla` mod, not
+/// the engine, so the engine carries no knowledge of "hunger" vs
+/// "sleep." A kind that hasn't subscribed to any needs has an empty map
+/// and decays nothing — the native-fallback smoke-test NPC works fine
+/// in that state.
 #[derive(Component, Clone, Debug, Default)]
-pub struct Needs {
-    pub hunger: f32,
+pub struct Needs(pub HashMap<String, f32>);
+
+/// Per-NPC marker indicating its planner has errored and shouldn't run
+/// again this session. The brain tick filters this out via
+/// `Without<BrainDisabled>` so the entity still exists (renderable,
+/// physics still steps if we ever add it back), but no new goals are
+/// chosen and the existing intent is the empty default — the NPC stands
+/// still.
+///
+/// Distinct from the whole-mod disable applied to declarative hooks:
+/// one bad NPC kind shouldn't silence its entire mod, and a buggy
+/// planner that errors per-NPC will accumulate disabled NPCs visibly,
+/// each one logged on the way out.
+#[derive(Component, Clone, Debug)]
+#[allow(dead_code, reason = "field is read by debug HUD (future) and shows up in logs today")]
+pub struct BrainDisabled {
+    pub reason: String,
 }
 
-/// Per-second decay applied to each need. 1/300 ⇒ ~5 minutes of game
-/// time from 0 to critical. Slow on purpose: until food + sleep systems
-/// exist, an NPC visibly starving would just be confusing.
-const HUNGER_DECAY_PER_SEC: f32 = 1.0 / 300.0;
-
-/// Current goal the brain is executing.
-///
-/// MOD HOOK (future): the transition from `Idle` is the seam where
-/// a Lua planner will eventually decide what to do next based on
-/// `Needs`, opinions, and the world. Today the engine hardcodes
-/// "Wander → Resting → Wander → …" because there's only one need
-/// (hunger, decorative) and one action (wander). The shape of this
-/// enum is what mods will return from their planner callback.
+/// Current goal the brain is executing. Variants map 1:1 to the
+/// [`PlannerGoal`] surface mods see, plus engine-only bookkeeping
+/// fields needed to actually drive each one (current path + progress,
+/// remaining timer, stuck detector). The planner returns the abstract
+/// surface form; this enum is the live engine form.
 #[derive(Clone, Debug)]
 pub enum Goal {
-    /// No active goal — brain picks one next tick. Newly-spawned
-    /// NPCs start here, and any `Resting` that expired drops back
-    /// here so the planner picks a fresh action.
+    /// No active goal. Entering this state triggers a planner call on
+    /// the next brain tick; newly-spawned NPCs start here, and any
+    /// completed Wander/Resting drops back here so the planner picks
+    /// what's next.
     Idle,
     /// Walk a precomputed A* path of foot cells using pure-pursuit
     /// steering. `progress` is the NPC's monotonically-increasing
@@ -104,14 +135,10 @@ pub enum Goal {
         last_pos: Vec3,
         stuck_secs: f32,
     },
-    /// Stand still for a while. Inserted between Wanders so the NPC
-    /// reads as deliberate rather than frantic. Duration is sampled
-    /// per-rest from `[REST_MIN_SECS, REST_MAX_SECS]`.
-    ///
-    /// Once needs/opinions exist, mods will replace the random
-    /// duration with something derived from state ("rest until
-    /// fatigue < 0.4", "look at a thing for a beat after greeting
-    /// someone").
+    /// Stand still for a while. Duration is whatever the planner
+    /// returned in [`PlannerGoal::Rest`], clamped to
+    /// `[MIN_REST_SECS, MAX_REST_SECS]` so a misbehaving mod can't
+    /// freeze an NPC indefinitely or churn the planner at 60 Hz.
     Resting { remaining_secs: f32 },
 }
 
@@ -125,8 +152,19 @@ pub struct Brain {
     pub rng: u64,
 }
 
-const WANDER_RADIUS_CELLS: i32 = 12;
-const WANDER_TIMEOUT_SECS: f32 = 12.0;
+/// Default wander radius for the native fallback path (no planner
+/// registered for this NPC's kind). The Lua planner provides its own
+/// radius and may pick a larger one.
+const FALLBACK_WANDER_RADIUS_CELLS: i32 = 12;
+const FALLBACK_WANDER_TIMEOUT_SECS: f32 = 12.0;
+/// Bounds on planner-supplied goal parameters. A buggy planner that
+/// returns absurd numbers can't park an NPC for an hour or send the
+/// pathfinder on a multi-chunk search — values are clamped at the
+/// engine boundary before being committed to the live goal.
+const MAX_WANDER_RADIUS_CELLS: i32 = 64;
+const MAX_WANDER_TIMEOUT_SECS: f32 = 60.0;
+const MIN_REST_SECS: f32 = 0.5;
+const MAX_REST_SECS: f32 = 60.0;
 /// How far ahead of the closest-projection point on the path the NPC
 /// aims. Bigger ⇒ smoother turns, more corner-cutting; smaller ⇒
 /// hugs the path tighter, may oscillate. 0.5 m ≈ half a cell — the
@@ -140,11 +178,6 @@ const LOOKAHEAD_DIST: f32 = 0.5;
 /// to land inside the radius. 1.2 m gives some headroom over that
 /// while still feeling like "arrived at the spot."
 const PATH_ARRIVE_RADIUS: f32 = 1.2;
-/// Random rest duration between Wanders, in seconds. Keeps the NPC
-/// from looking frantic. Once mods can compute this from needs the
-/// range goes away; for now, a coarse uniform sample.
-const REST_MIN_SECS: f32 = 3.0;
-const REST_MAX_SECS: f32 = 8.0;
 /// How far ahead of `progress` we look for a step-up before holding
 /// the jump button. The walk-controller only converts `jump=true`
 /// into a jump impulse on the rising edge of `on_ground`, so holding
@@ -211,17 +244,39 @@ static SMOKE_TEST_SPAWNED: AtomicBool = AtomicBool::new(false);
 /// (player spawn = (0, 32, 60)). 4 m offset puts them in view but out
 /// of collision range. Replicated to all clients with interpolation
 /// (no client predicts NPCs — there's no per-client "owner" of one).
-fn spawn_initial_npc_on_first_connect(_: On<Add, Connected>, mut commands: Commands) {
+///
+/// Default needs come from the [`NpcKindRegistry`] entry for
+/// `vanilla:wanderer`; if no mod registered that kind we still spawn
+/// (with an empty need map) and let the native fallback drive the
+/// brain. That's what the design memo's "trivial native NPC for engine
+/// smoke tests" is — same entity, the brain just falls back to native
+/// logic when there's no Lua planner.
+fn spawn_initial_npc_on_first_connect(
+    _: On<Add, Connected>,
+    mut commands: Commands,
+    kinds: Res<NpcKindRegistry>,
+) {
     if SMOKE_TEST_SPAWNED.swap(true, Ordering::SeqCst) {
         return;
     }
     let id: u64 = 1;
+    let kind_id = "vanilla:wanderer";
+    let needs = match kinds.get(kind_id) {
+        Some(def) => Needs(def.default_needs.clone()),
+        None => {
+            warn!(
+                kind = kind_id,
+                "no NPC kind registered; spawning with empty needs (native fallback brain)"
+            );
+            Needs::default()
+        }
+    };
     commands.spawn((
         Actor,
         Npc,
         NpcId(id),
-        NpcKind("vanilla:wanderer".into()),
-        Needs::default(),
+        NpcKind(kind_id.into()),
+        needs,
         Brain {
             goal: Goal::Idle,
             rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
@@ -239,7 +294,7 @@ fn spawn_initial_npc_on_first_connect(_: On<Add, Connected>, mut commands: Comma
         InterpolationTarget::to_clients(NetworkTarget::All),
         Name::new(format!("npc:{id}")),
     ));
-    info!("spawned smoke-test NPC #{id}");
+    info!(kind = kind_id, "spawned smoke-test NPC #{id}");
 }
 
 /// Adapter that lets pathfinding query the live world. Treats unloaded
@@ -265,26 +320,34 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
     // changing the algorithm.
 }
 
-/// Per fixed-tick brain. Three phases per NPC:
-///   1. Decay needs.
-///   2. Tick the active goal (advance waypoint, check completion,
-///      detect stuck).
-///   3. If Idle (newly or post-completion), try to pick + path a new
-///      wander target. On A* failure stay Idle and retry next tick.
-///   4. Steer the `MovementIntent` toward the current waypoint.
+/// Per fixed-tick brain. Four phases per NPC:
+///   1. Decay every need by its registry-defined rate.
+///   2. Advance the active goal (timer countdown for Resting; pose-
+///      projection + stuck detection for Wander).
+///   3. If the goal completed, drop to Idle. If we're now Idle, ask
+///      the Lua planner (or native fallback) for a new goal. Planner
+///      errors disable just this one NPC's brain.
+///   4. Steer the [`MovementIntent`] toward the current waypoint
+///      (Wander only — Idle and Resting both clear intent).
 fn npc_brain_tick(
     time: Res<Time>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
+    mods: Res<ServerMods>,
+    need_registry: Res<NeedRegistry>,
+    mut commands: Commands,
     mut npcs: Query<
         (
+            Entity,
+            &NpcId,
             &AvatarPose,
             &mut Needs,
             &mut Brain,
             &mut MovementIntent,
             &mut NpcPath,
+            &NpcKind,
         ),
-        With<Npc>,
+        (With<Npc>, Without<BrainDisabled>),
     >,
 ) {
     let dt = time.delta_secs();
@@ -293,11 +356,20 @@ fn npc_brain_tick(
         chunk_map: &chunk_map,
     };
 
-    for (pose, mut needs, mut brain, mut intent, mut npc_path) in npcs.iter_mut() {
-        needs.hunger = (needs.hunger + HUNGER_DECAY_PER_SEC * dt).min(1.0);
+    for (entity, npc_id, pose, mut needs, mut brain, mut intent, mut npc_path, kind) in
+        npcs.iter_mut()
+    {
+        // Phase 1: decay every subscribed need by its registry-defined
+        // rate. Unknown ids decay at 0 (the rate-lookup returns 0) so
+        // an NPC carrying a stale need from before a mod reload won't
+        // crash — it just freezes that value.
+        for (id, value) in needs.0.iter_mut() {
+            let decay = need_registry.decay_per_sec(id);
+            *value = (*value + decay * dt).clamp(0.0, 1.0);
+        }
 
-        // Phase 1: advance the active goal. Each branch may flip a
-        // local flag asking Phase 2 to transition the goal.
+        // Phase 2: advance the active goal. Each branch may flip
+        // `wander_done` or `rest_done` asking phase 3 to transition.
         let mut wander_done = false;
         let mut rest_done = false;
         match &mut brain.goal {
@@ -324,19 +396,15 @@ fn npc_brain_tick(
                 }
                 *last_pos = pose.translation;
 
-                // Project the pose onto the path, monotonically.
                 let pose_xz = Vec2::new(pose.translation.x, pose.translation.z);
                 let new_progress = closest_progress_after(path, pose_xz, *progress);
                 if new_progress > *progress {
                     *progress = new_progress;
                 }
 
-                // Completion is "near the end" — the progress
-                // gate from the previous version turned the orbit
-                // problem into a livelock when the NPC's turn
-                // radius prevented it from tightening into a
-                // small arrive radius. PATH_ARRIVE_RADIUS is now
-                // wider than the turn radius so this fires.
+                // PATH_ARRIVE_RADIUS is wider than the NPC's turn
+                // radius so this fires reliably; otherwise an NPC
+                // could orbit its target forever.
                 let end_xz = waypoint_xz(*path.last().expect("path non-empty"));
                 let dist_to_end = (pose_xz - end_xz).length();
                 if dist_to_end < PATH_ARRIVE_RADIUS
@@ -348,51 +416,104 @@ fn npc_brain_tick(
             }
         }
 
-        // Phase 2: transition. Wander → Resting → Idle → Wander.
-        // MOD HOOK: this is the seam where a Lua planner will
-        // eventually decide what comes next based on Needs +
-        // opinions + world state. Today the engine rotates
-        // mechanically through the three states.
-        if wander_done {
-            let secs = REST_MIN_SECS
-                + rand_unit(&mut brain.rng) * (REST_MAX_SECS - REST_MIN_SECS);
-            brain.goal = Goal::Resting {
-                remaining_secs: secs,
-            };
-            // Hide the (now-stale) overlay during rest.
+        // Phase 3: transition. Completed Wander/Rest → Idle; Idle →
+        // ask the planner what's next. The planner result is
+        // converted to an engine Goal (Wander picks an A* path here;
+        // Rest commits a timer).
+        if wander_done || rest_done {
+            brain.goal = Goal::Idle;
             if !npc_path.0.is_empty() {
                 npc_path.0.clear();
             }
-        } else if rest_done {
-            brain.goal = Goal::Idle;
         }
         if matches!(brain.goal, Goal::Idle) {
-            let foot = pose_to_foot_cell(pose);
-            match pick_wander_path(foot, &mut brain.rng, &world) {
-                Some(path) => {
-                    // `set_if_neq` keeps the wire quiet on the
-                    // rare tick where the planner happens to pick
-                    // an identical path twice.
-                    npc_path.set_if_neq(NpcPath(path.clone()));
-                    brain.goal = Goal::Wander {
-                        path,
-                        progress: 0.0,
-                        deadline_secs: WANDER_TIMEOUT_SECS,
-                        last_pos: pose.translation,
-                        stuck_secs: 0.0,
-                    };
+            let kind_id = NpcKindId(kind.0.clone());
+            let snapshot = build_snapshot(*npc_id, &kind_id, pose, &needs);
+            let planner_goal = match mods.0.call_planner(&kind_id, &snapshot) {
+                Ok(Some(g)) => g,
+                Ok(None) => native_fallback_goal(),
+                Err(e) => {
+                    error!(
+                        entity = ?entity,
+                        kind = %kind.0,
+                        error = %e,
+                        "planner errored; disabling this NPC's brain"
+                    );
+                    commands.entity(entity).insert(BrainDisabled {
+                        reason: e.to_string(),
+                    });
+                    *intent = MovementIntent::default();
+                    continue;
                 }
-                None => {
+            };
+            // Convert the planner's surface form into a live engine
+            // Goal. Wander triggers an A* pick here; Rest/Idle just
+            // arm a timer. Clamps protect against a misbehaving
+            // planner returning absurd values.
+            match planner_goal {
+                PlannerGoal::Idle => {
+                    // "Ask me again soon", not "ask me every tick" —
+                    // arm a minimum rest so the planner-call cadence
+                    // stays in seconds, not frames.
+                    brain.goal = Goal::Resting {
+                        remaining_secs: MIN_REST_SECS,
+                    };
                     if !npc_path.0.is_empty() {
                         npc_path.0.clear();
                     }
-                    // Stay Idle; retry next tick.
+                    *intent = MovementIntent::default();
+                }
+                PlannerGoal::Rest { duration_secs } => {
+                    brain.goal = Goal::Resting {
+                        remaining_secs: duration_secs.clamp(MIN_REST_SECS, MAX_REST_SECS),
+                    };
+                    if !npc_path.0.is_empty() {
+                        npc_path.0.clear();
+                    }
+                    *intent = MovementIntent::default();
+                }
+                PlannerGoal::Wander {
+                    radius_cells,
+                    timeout_secs,
+                } => {
+                    let radius = radius_cells.clamp(1, MAX_WANDER_RADIUS_CELLS);
+                    let timeout = timeout_secs.clamp(1.0, MAX_WANDER_TIMEOUT_SECS);
+                    let foot = pose_to_foot_cell(pose);
+                    match pick_wander_path(foot, radius, &mut brain.rng, &world) {
+                        Some(path) => {
+                            // set_if_neq keeps the wire quiet on the
+                            // rare repeat path; planner-driven calls
+                            // are several seconds apart so it triggers
+                            // basically every time, but the guard is
+                            // free if it doesn't.
+                            npc_path.set_if_neq(NpcPath(path.clone()));
+                            brain.goal = Goal::Wander {
+                                path,
+                                progress: 0.0,
+                                deadline_secs: timeout,
+                                last_pos: pose.translation,
+                                stuck_secs: 0.0,
+                            };
+                        }
+                        None => {
+                            // No reachable target this slice — park
+                            // briefly so we don't churn the planner
+                            // every tick.
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            *intent = MovementIntent::default();
+                        }
+                    }
                 }
             }
         }
 
-        // Phase 3: steering. Only Wander drives intent; Idle and
-        // Resting both stay still.
+        // Phase 4: steering. Only Wander drives intent; Idle and
+        // Resting both clear it (default = no motion).
         let Goal::Wander {
             path, progress, ..
         } = &brain.goal
@@ -432,18 +553,20 @@ fn npc_brain_tick(
     }
 }
 
-/// Try a few random XZ targets within `WANDER_RADIUS_CELLS` of `foot`;
-/// project each onto the surface via `nearest_standable_below`; run A*.
-/// Return the first path that has at least one step. `None` if every
-/// attempt fails (caller stays Idle and retries next tick).
+/// Try a few random XZ targets within `radius_cells` of `foot`; project
+/// each onto the surface via `nearest_standable_below`; run A*. Return
+/// the first path that has at least one step. `None` if every attempt
+/// fails (caller stays Idle and retries next tick).
 fn pick_wander_path<W: Walkability>(
     foot: IVec3,
+    radius_cells: i32,
     rng: &mut u64,
     world: &W,
 ) -> Option<Vec<IVec3>> {
+    let radius = radius_cells.max(1) as f32;
     for _ in 0..MAX_WANDER_ATTEMPTS {
-        let dx = (rand_unit(rng) * 2.0 - 1.0) * WANDER_RADIUS_CELLS as f32;
-        let dz = (rand_unit(rng) * 2.0 - 1.0) * WANDER_RADIUS_CELLS as f32;
+        let dx = (rand_unit(rng) * 2.0 - 1.0) * radius;
+        let dz = (rand_unit(rng) * 2.0 - 1.0) * radius;
         // Probe from a few cells above the NPC's foot Y — if the
         // candidate is on a small hill we still see its top.
         let probe = foot + IVec3::new(dx as i32, 4, dz as i32);
@@ -467,6 +590,36 @@ fn pick_wander_path<W: Walkability>(
         }
     }
     None
+}
+
+/// Planner stand-in for kinds that have no Lua planner registered. The
+/// engine still has to drive the NPC, so it picks the simplest plausible
+/// behavior — a wander at the default radius. Pairs with
+/// [`apply_planner_goal`]'s "downgrade to a short rest on path failure"
+/// branch so a fallback NPC in a wall-locked spot doesn't spin.
+fn native_fallback_goal() -> PlannerGoal {
+    PlannerGoal::Wander {
+        radius_cells: FALLBACK_WANDER_RADIUS_CELLS,
+        timeout_secs: FALLBACK_WANDER_TIMEOUT_SECS,
+    }
+}
+
+/// Build the snapshot handed to a planner this tick. Clones the need
+/// map (the planner's Lua state needs an independent copy to walk into
+/// a Lua table) — that's the per-planner-call cost we accept to keep
+/// the brain tick cheap.
+fn build_snapshot(id: NpcId, kind: &NpcKindId, pose: &AvatarPose, needs: &Needs) -> NpcSnapshot {
+    let foot = pose_to_foot_cell(pose);
+    NpcSnapshot {
+        id: id.0,
+        kind: kind.clone(),
+        foot: BlockPos {
+            x: foot.x,
+            y: foot.y,
+            z: foot.z,
+        },
+        needs: needs.0.clone(),
+    }
 }
 
 /// The foot cell of an actor whose pose carries an eye-position

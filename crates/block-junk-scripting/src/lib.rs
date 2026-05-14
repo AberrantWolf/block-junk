@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use block_junk_mod_api::{
     API_VERSION, ApiVersion, ModManifest, Side,
     blocks::BlockDef,
+    npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal},
     rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
 };
@@ -54,6 +55,10 @@ pub enum LoadError {
 /// Slot in the per-mod `engine` table where a registered hook callback lives.
 const BLOCK_PLACED_SLOT: &str = "_block_placed_handler";
 const ROOM_EVENT_SLOT: &str = "_room_event_handler";
+/// Sub-table on `engine` holding per-kind NPC planner callbacks. Unlike
+/// the single-slot hooks above, planners are keyed by NPC kind id so one
+/// mod can plan for multiple kinds it has registered.
+const NPC_PLANNERS_TABLE: &str = "_npc_planners";
 
 /// Shared state passed to [`ModRegistry::load_dir`]. Each registration call
 /// from a mod's Lua state appends into one of these buffers; the engine
@@ -66,6 +71,8 @@ const ROOM_EVENT_SLOT: &str = "_room_event_handler";
 pub struct LoadContext {
     pub pending_blocks: Arc<Mutex<Vec<BlockDef>>>,
     pub pending_rooms: Arc<Mutex<Vec<RoomPattern>>>,
+    pub pending_npc_kinds: Arc<Mutex<Vec<NpcKindDef>>>,
+    pub pending_needs: Arc<Mutex<Vec<NeedDef>>>,
 }
 
 impl LoadContext {
@@ -82,6 +89,16 @@ impl LoadContext {
     /// Drain the accumulated room patterns.
     pub fn take_rooms(&self) -> Vec<RoomPattern> {
         std::mem::take(&mut *self.pending_rooms.lock().unwrap())
+    }
+
+    /// Drain the accumulated NPC kind defs.
+    pub fn take_npc_kinds(&self) -> Vec<NpcKindDef> {
+        std::mem::take(&mut *self.pending_npc_kinds.lock().unwrap())
+    }
+
+    /// Drain the accumulated need defs.
+    pub fn take_needs(&self) -> Vec<NeedDef> {
+        std::mem::take(&mut *self.pending_needs.lock().unwrap())
     }
 }
 
@@ -176,6 +193,58 @@ impl ModRegistry {
             }
         }
     }
+
+    /// Server-only: ask whichever active mod registered a planner for
+    /// `kind` what the NPC should do next. Walks the mods in load order
+    /// — the first one with a matching planner wins; duplicate
+    /// registrations from a later mod aren't visible from here.
+    ///
+    /// Returns:
+    /// - `Ok(Some(goal))` — planner returned a goal.
+    /// - `Ok(None)` — no active mod has a planner for this kind. The
+    ///   caller falls back to a native default (or stays Idle).
+    /// - `Err(_)` — the matching planner errored. Per the design memo
+    ///   this is a **per-NPC** problem: callers attach a "this NPC's
+    ///   brain is disabled" marker to that one entity rather than
+    ///   disabling the whole mod. A buggy planner that crashes for
+    ///   every NPC will silence its NPCs one-by-one and log loudly
+    ///   each time, but other mods + other kinds keep working.
+    pub fn call_planner(
+        &self,
+        kind: &NpcKindId,
+        snapshot: &NpcSnapshot,
+    ) -> Result<Option<PlannerGoal>, PlannerError> {
+        debug_assert_eq!(self.side, Side::Server);
+        for m in &self.mods {
+            if m.disabled {
+                continue;
+            }
+            match call_npc_planner(&m.lua, kind, snapshot) {
+                Ok(Some(goal)) => return Ok(Some(goal)),
+                Ok(None) => continue,
+                Err(source) => {
+                    return Err(PlannerError {
+                        mod_name: m.name.clone(),
+                        kind: kind.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Per-NPC planner failure. Carries enough context to log which mod +
+/// kind misbehaved; the engine's recovery is to mark the offending NPC
+/// brain-disabled and continue.
+#[derive(Debug, Error)]
+#[error("planner for {kind} in mod {mod_name} errored: {source}")]
+pub struct PlannerError {
+    pub mod_name: String,
+    pub kind: NpcKindId,
+    #[source]
+    pub source: mlua::Error,
 }
 
 pub fn warn_if_empty(registry: &ModRegistry) {
@@ -325,6 +394,63 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     rooms_table.set("register", register_room)?;
     engine.set("rooms", rooms_table)?;
 
+    // engine.needs.register(def) — both sides accumulate; only the server
+    // currently consults the need registry (needs decay during the brain
+    // tick), but registering on both sides keeps slot ordering identical
+    // so a future client-side debug HUD reads the same indices.
+    let needs_table = lua.create_table()?;
+    let pending_needs = ctx.pending_needs.clone();
+    let register_need = lua.create_function(move |lua, value: Value| {
+        let def: NeedDef = lua.from_value(value)?;
+        let mut buf = pending_needs.lock().unwrap();
+        if buf.iter().any(|n| n.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate need id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    needs_table.set("register", register_need)?;
+    engine.set("needs", needs_table)?;
+
+    // engine.npcs.register(def) — both sides accumulate. set_planner is
+    // server-only because planners run against authoritative state.
+    let npcs_table = lua.create_table()?;
+    let pending_npcs = ctx.pending_npc_kinds.clone();
+    let register_npc = lua.create_function(move |lua, value: Value| {
+        let def: NpcKindDef = lua.from_value(value)?;
+        let mut buf = pending_npcs.lock().unwrap();
+        if buf.iter().any(|n| n.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate npc kind id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    npcs_table.set("register", register_npc)?;
+
+    if side == Side::Server {
+        // Pre-create the planners table so set_planner's writes never
+        // hit a nil parent. Mods that don't call set_planner just leave
+        // it empty; dispatch checks before invoking.
+        let planners = lua.create_table()?;
+        engine.set(NPC_PLANNERS_TABLE, planners)?;
+
+        let set_planner = lua.create_function(|lua, (kind, callback): (String, Function)| {
+            let engine: Table = lua.globals().get("engine")?;
+            let planners: Table = engine.get(NPC_PLANNERS_TABLE)?;
+            planners.set(kind, callback)?;
+            Ok(())
+        })?;
+        npcs_table.set("set_planner", set_planner)?;
+    }
+
+    engine.set("npcs", npcs_table)?;
+
     if side == Side::Server {
         let register = lua.create_function(|lua, callback: Function| {
             let engine: Table = lua.globals().get("engine")?;
@@ -374,4 +500,30 @@ fn call_room_event(lua: &Lua, event: &RoomEvent) -> Result<(), mlua::Error> {
     };
     let event_value = lua.to_value_with(event, lua_event_options())?;
     handler.call::<()>(event_value)
+}
+
+/// Look up a planner for `kind` in this Lua state. Returns:
+/// - `Ok(Some(goal))` — planner present and returned a parseable goal.
+/// - `Ok(None)` — no planner registered for this kind in this state.
+/// - `Err(_)` — planner was present but errored (call failed, returned
+///   non-table, or returned something that doesn't parse as a
+///   [`PlannerGoal`]).
+fn call_npc_planner(
+    lua: &Lua,
+    kind: &NpcKindId,
+    snapshot: &NpcSnapshot,
+) -> Result<Option<PlannerGoal>, mlua::Error> {
+    let engine: Table = lua.globals().get("engine")?;
+    let planners: Value = engine.get(NPC_PLANNERS_TABLE)?;
+    let Value::Table(planners) = planners else {
+        return Ok(None);
+    };
+    let handler: Value = planners.get(kind.as_str())?;
+    let Value::Function(handler) = handler else {
+        return Ok(None);
+    };
+    let snapshot_value = lua.to_value_with(snapshot, lua_event_options())?;
+    let returned: Value = handler.call(snapshot_value)?;
+    let goal: PlannerGoal = lua.from_value(returned)?;
+    Ok(Some(goal))
 }
