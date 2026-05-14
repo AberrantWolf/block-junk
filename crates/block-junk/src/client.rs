@@ -1,3 +1,6 @@
+use core::time::Duration;
+
+use bevy::animation::{AnimatedBy, AnimationTargetId};
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
@@ -15,7 +18,7 @@ use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
 use crate::menu::AppState;
 use crate::npc::{Npc, NpcPath};
-use crate::physics::apply_walk_step;
+use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::protocol::{
     Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
@@ -50,6 +53,7 @@ impl Plugin for ClientPlugin {
             .init_resource::<BlockEntities>()
             .init_resource::<PreviewState>()
             .add_observer(swap_preview_scene_materials)
+            .add_observer(setup_npc_skeleton_anim)
             // Scene setup runs when entering a game, not at process start.
             // Before InGame the screen is the main menu only.
             .add_systems(
@@ -120,6 +124,8 @@ impl Plugin for ClientPlugin {
                     update_placement_preview,
                     attach_avatar_visuals,
                     attach_npc_visuals,
+                    start_npc_anim_idle,
+                    drive_npc_animation,
                     draw_npc_paths,
                 )
                     .in_set(GameSet::PostSimulation),
@@ -131,17 +137,45 @@ impl Plugin for ClientPlugin {
     }
 }
 
-/// Pre-built mesh + materials for replicated actors (remote players +
-/// NPCs). One shared mesh, one material per role so the renderer
-/// allocates GPU resources once per session, not per spawn. Distinct
-/// material per role gives the smoke-test NPC a visibly different
-/// colour from a player avatar.
+/// Pre-built mesh + material for replicated player avatars. NPCs use
+/// `CharacterAssets` (skinned glTF) instead. Shared so the renderer
+/// allocates GPU resources once per session, not per spawn.
 #[derive(Resource)]
 struct AvatarAssets {
     mesh: Handle<Mesh>,
     avatar_material: Handle<StandardMaterial>,
-    npc_material: Handle<StandardMaterial>,
 }
+
+/// Skinned character mesh + animation graph for NPCs. Built once when
+/// the first session enters InGame; survives pause/unpause via the same
+/// existence-check that gates `AvatarAssets`. The `idle` / `walk`
+/// indices point at clip nodes inside `anim_graph` — what we pass to
+/// `AnimationTransitions::play`.
+///
+/// Clips and the character mesh live in *separate* KayKit glbs that
+/// share the Rig_Medium skeleton. They retarget cleanly because Bevy
+/// keys animation targets by hashed bone path, not by the file they
+/// came from.
+#[derive(Resource)]
+struct CharacterAssets {
+    knight_scene: Handle<Scene>,
+    anim_graph: Handle<AnimationGraph>,
+    idle: AnimationNodeIndex,
+    walk: AnimationNodeIndex,
+}
+
+/// Clip indices inside the KayKit `Rig_Medium_*` glbs. Probed once with
+/// a Python parser; the vendor pack is frozen, so hardcoded indices
+/// stay valid. If the pack ever changes, re-probe with `python3 -c …`
+/// reading `animations[].name` and update both.
+///
+///   Rig_Medium_General.glb[6]       = "Idle_A"
+///   Rig_Medium_MovementBasic.glb[8] = "Walking_A"
+const KAYKIT_IDLE_A_INDEX: usize = 6;
+const KAYKIT_WALKING_A_INDEX: usize = 8;
+const KAYKIT_GENERAL_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_General.glb";
+const KAYKIT_MOVEMENT_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_MovementBasic.glb";
+const KAYKIT_KNIGHT_GLB: &str = "mods://vanilla/models/characters/Knight.glb";
 
 /// Tracks the ECS entity rendering each placed block-entity (a block
 /// whose `BlockDef.mesh` is set, e.g. furniture, doors). Indexed by world
@@ -230,6 +264,8 @@ fn setup_scene(
     mut ambient: ResMut<GlobalAmbientLight>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut anim_graphs: ResMut<Assets<AnimationGraph>>,
+    asset_server: Res<AssetServer>,
     palette: Res<PlaceablePalette>,
     registry: Res<BlockRegistry>,
     existing: Option<Res<AvatarAssets>>,
@@ -256,11 +292,24 @@ fn setup_scene(
             perceptual_roughness: 0.6,
             ..default()
         }),
-        npc_material: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.4, 0.7, 0.35),
-            perceptual_roughness: 0.7,
-            ..default()
-        }),
+    });
+
+    // KayKit Knight + Rig_Medium animation graph. The two anim glbs ship
+    // separate clips (Idle in General, Walk in MovementBasic) against the
+    // same skeleton the Knight mesh uses, so a single graph drives any
+    // Rig_Medium character. Switching to a different KayKit body (Mage,
+    // Rogue) is a one-line scene-handle swap; the graph stays.
+    let idle_clip = asset_server
+        .load(GltfAssetLabel::Animation(KAYKIT_IDLE_A_INDEX).from_asset(KAYKIT_GENERAL_GLB));
+    let walk_clip = asset_server
+        .load(GltfAssetLabel::Animation(KAYKIT_WALKING_A_INDEX).from_asset(KAYKIT_MOVEMENT_GLB));
+    let (anim_graph, clip_indices) = AnimationGraph::from_clips([idle_clip, walk_clip]);
+    commands.insert_resource(CharacterAssets {
+        knight_scene: asset_server
+            .load(GltfAssetLabel::Scene(0).from_asset(KAYKIT_KNIGHT_GLB)),
+        anim_graph: anim_graphs.add(anim_graph),
+        idle: clip_indices[0],
+        walk: clip_indices[1],
     });
 
 
@@ -1364,20 +1413,293 @@ fn attach_avatar_visuals(
     }
 }
 
-/// NPC version of `attach_avatar_visuals` — same shape, different
-/// material for visual disambiguation. NPCs never get the owner-skip
-/// treatment because no client owns them, so the query is simpler.
+/// Marker on the SceneRoot-bearing child entity that holds the NPC's
+/// glTF body. Lets `setup_npc_skeleton_anim` filter the global
+/// `SceneInstanceReady` stream to just our NPC scenes (the world also
+/// has block-entity scenes like the bed, and the placement preview).
+#[derive(Component)]
+struct NpcSceneRoot;
+
+/// Coarse animation state for an NPC. Only Idle/Walk this slice; Run
+/// + jump variants land when the threshold ladder is more interesting
+/// than "are we moving."
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum NpcAnimState {
+    #[default]
+    Idle,
+    Walk,
+}
+
+/// Marker on the NPC root entity once we've spawned its visual rig
+/// (SceneRoot child + future animation hookup). `attach_npc_visuals`
+/// adds this to gate the once-only attach; `setup_npc_anim_once_loaded`
+/// later fills `player` with the Entity carrying the auto-inserted
+/// `AnimationPlayer` so the per-frame state driver can find it without
+/// walking the hierarchy every tick.
+///
+/// Not a `Resource` because per-NPC: in the future, different NPC
+/// kinds will use different scenes (and thus different player entities)
+/// in the same world.
+#[derive(Component, Default)]
+struct NpcVisuals {
+    player: Option<Entity>,
+    state: NpcAnimState,
+}
+
+/// NPC visual attach: spawn the KayKit character as a child of the NPC
+/// root with a baked Y offset so the model's feet (at its glb origin)
+/// land at the avatar's foot Y. The root's Transform is the *eye*
+/// position (`sync_avatar_transforms`), so a fixed child offset of
+/// `-(EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y)` is the eye→foot
+/// translation.
+///
+/// Animations are NOT auto-wired: Knight.glb ships zero animation
+/// tracks (the clips live in separate Rig_Medium glbs), so Bevy's
+/// loader skips the AnimationPlayer + AnimationTargetId pass entirely.
+/// `setup_npc_skeleton_anim` replays that pass manually once the scene
+/// instance is ready.
 fn attach_npc_visuals(
-    npcs: Query<Entity, (With<Npc>, Without<Mesh3d>)>,
-    assets: Res<AvatarAssets>,
+    npcs: Query<Entity, (With<Npc>, Without<NpcVisuals>)>,
+    assets: Res<CharacterAssets>,
     mut commands: Commands,
 ) {
+    let foot_offset = -(EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y);
     for entity in npcs.iter() {
         info!("npc entered view: {entity:?}");
-        commands.entity(entity).insert((
-            Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(assets.npc_material.clone()),
-        ));
+        // Transform + Visibility on the NPC root: `sync_avatar_transforms`
+        // queries for `&mut Transform`, and without it (and the propagation
+        // siblings Visibility brings in) the child SceneRoot inherits from
+        // a missing parent transform and renders the entire skeleton at
+        // world origin. The old cuboid path got these for free via
+        // `Mesh3d`'s required components; the SceneRoot now lives on the
+        // child entity so the parent has to opt in explicitly.
+        //
+        // 180° Y rotation on the child: KayKit characters are authored
+        // facing +Z in bind pose, but the avatar's logical forward
+        // (the unit vector used by the brain's pure-pursuit aim) is -Z.
+        // Without this flip the knight walks backwards along his path.
+        commands
+            .entity(entity)
+            .insert((NpcVisuals::default(), Transform::default(), Visibility::default()))
+            .with_child((
+                NpcSceneRoot,
+                SceneRoot(assets.knight_scene.clone()),
+                Transform::from_xyz(0.0, foot_offset, 0.0)
+                    .with_rotation(Quat::from_rotation_y(core::f32::consts::PI)),
+            ));
+    }
+}
+
+/// Manually replay Bevy's animation-rigging pass when the Knight's
+/// scene instance is ready. Bevy's glTF loader normally inserts an
+/// `AnimationPlayer` on each "animation root" node and tags every
+/// descendant with `AnimationTargetId` + `AnimatedBy(player_entity)`
+/// — but only when the loaded glb contains animation tracks. Knight.glb
+/// has zero (clips live in `Rig_Medium_*.glb`), so we do it here.
+///
+/// Retargeting works because `AnimationTargetId` is hashed from the
+/// bone-name path, not the file the bone was loaded from. As long as
+/// the path from the scene-root node down (here `["Rig_Medium", "root",
+/// "hips", …]`) matches between the character and animation glbs, the
+/// IDs collide and the rig clip drives the Knight's bones.
+///
+/// We treat the entity that bears `SceneRoot` as a "virtual scene root"
+/// — its direct child is node[32] "Rig_Medium" in the glb, which gets
+/// the `AnimationPlayer`. The follow-up system `start_npc_anim_idle`
+/// watches `Added<AnimationPlayer>` to attach `AnimationTransitions`
+/// and start the idle clip.
+fn setup_npc_skeleton_anim(
+    trigger: On<SceneInstanceReady>,
+    npc_scene_roots: Query<(), With<NpcSceneRoot>>,
+    children_q: Query<&Children>,
+    names: Query<&Name>,
+    assets: Res<CharacterAssets>,
+    mut commands: Commands,
+) {
+    let scene_bearer = trigger.event_target();
+    if !npc_scene_roots.contains(scene_bearer) {
+        return;
+    }
+    // Bevy's glTF loader wraps the scene's top-level nodes in an
+    // unnamed entity that carries the coordinate-system conversion
+    // transform (see bevy_gltf loader.rs::world_root_id), so the named
+    // "Rig_Medium" node from the glb is a *grandchild* of the SceneRoot
+    // bearer, not a direct child. Search by name to be wrapper-agnostic.
+    let Some(rig_root) = find_named_descendant(scene_bearer, "Rig_Medium", &children_q, &names)
+    else {
+        warn!("npc scene ready but no 'Rig_Medium' descendant: {scene_bearer:?}");
+        return;
+    };
+    let rig_name = names.get(rig_root).map(|n| n.as_str()).unwrap_or("<unnamed>");
+    // Walk the rig hierarchy, tagging every named entity with the same
+    // (AnimationTargetId, AnimatedBy) pair the glTF loader would have
+    // assigned if Knight.glb had its own animations.
+    let mut path: Vec<Name> = Vec::new();
+    let mut tagged: usize = 0;
+    tag_animation_targets(
+        rig_root,
+        &mut path,
+        rig_root,
+        &children_q,
+        &names,
+        &mut commands,
+        &mut tagged,
+    );
+
+    // Insert AnimationPlayer + graph here; AnimationTransitions and the
+    // initial idle clip come next frame in `start_npc_anim_idle`. They
+    // can't go in this observer because AnimationTransitions::play
+    // needs `&mut AnimationPlayer`, which we can only borrow once the
+    // component is actually in the world.
+    commands.entity(rig_root).insert((
+        AnimationPlayer::default(),
+        AnimationGraphHandle(assets.anim_graph.clone()),
+    ));
+    info!(
+        "npc skeleton rigged: bearer {scene_bearer:?} rig_root {rig_root:?} \
+         rig_name={rig_name:?} tagged={tagged}"
+    );
+}
+
+fn find_named_descendant(
+    root: Entity,
+    target: &str,
+    children_q: &Query<&Children>,
+    names: &Query<&Name>,
+) -> Option<Entity> {
+    let mut stack: Vec<Entity> = vec![root];
+    while let Some(e) = stack.pop() {
+        if let Ok(name) = names.get(e)
+            && name.as_str() == target
+        {
+            return Some(e);
+        }
+        if let Ok(children) = children_q.get(e) {
+            for c in children.iter() {
+                stack.push(c);
+            }
+        }
+    }
+    None
+}
+
+fn tag_animation_targets(
+    entity: Entity,
+    path: &mut Vec<Name>,
+    rig_root: Entity,
+    children_q: &Query<&Children>,
+    names: &Query<&Name>,
+    commands: &mut Commands,
+    tagged: &mut usize,
+) {
+    let Ok(name) = names.get(entity) else {
+        // Skip unnamed entities (e.g. anonymous wrapper nodes); they
+        // can't be addressed by AnimationTargetId anyway.
+        return;
+    };
+    path.push(name.clone());
+    commands.entity(entity).insert((
+        AnimationTargetId::from_names(path.iter()),
+        AnimatedBy(rig_root),
+    ));
+    *tagged += 1;
+    if let Ok(children) = children_q.get(entity) {
+        for child in children.iter() {
+            tag_animation_targets(child, path, rig_root, children_q, names, commands, tagged);
+        }
+    }
+    path.pop();
+}
+
+/// Frame after `setup_npc_skeleton_anim` inserts an `AnimationPlayer`,
+/// attach `AnimationTransitions` and kick off the idle clip. Also
+/// back-fill `NpcVisuals.player` on the NPC root so the per-frame
+/// state driver finds the player in O(1).
+///
+/// Filter is `Without<AnimationTransitions>` rather than
+/// `Added<AnimationPlayer>` because observer-inserted components don't
+/// reliably trip the Added detection in the next Update — the
+/// commands-buffer apply point can land before or after the Added flag
+/// is cleared depending on schedule order. Querying for "lacks
+/// transitions" is idempotent: once we add them, the filter excludes
+/// the entity.
+///
+/// The hierarchy walk is bounded — KayKit scenes are a few levels deep
+/// but malformed glbs could in principle loop; 16 hops is conservative.
+fn start_npc_anim_idle(
+    mut commands: Commands,
+    assets: Res<CharacterAssets>,
+    mut new_players: Query<(Entity, &mut AnimationPlayer), Without<AnimationTransitions>>,
+    parents: Query<&ChildOf>,
+    mut npc_visuals_q: Query<&mut NpcVisuals>,
+) {
+    for (player_entity, mut player) in new_players.iter_mut() {
+        let Some(npc_root) = find_npc_ancestor(player_entity, &parents, &npc_visuals_q) else {
+            // AnimationPlayer on something that isn't an NPC scene —
+            // e.g. future player-character rigs. Leave it alone.
+            continue;
+        };
+        let mut transitions = AnimationTransitions::new();
+        transitions
+            .play(&mut player, assets.idle, Duration::ZERO)
+            .repeat();
+        commands.entity(player_entity).insert(transitions);
+        if let Ok(mut visuals) = npc_visuals_q.get_mut(npc_root) {
+            visuals.player = Some(player_entity);
+        }
+        info!("npc anim ready: root {npc_root:?} player {player_entity:?}");
+    }
+}
+
+fn find_npc_ancestor(
+    start: Entity,
+    parents: &Query<&ChildOf>,
+    npc_visuals_q: &Query<&mut NpcVisuals>,
+) -> Option<Entity> {
+    let mut cur = start;
+    for _ in 0..16 {
+        if npc_visuals_q.get(cur).is_ok() {
+            return Some(cur);
+        }
+        cur = parents.get(cur).ok()?.0;
+    }
+    None
+}
+
+/// Crossfade Idle ↔ Walk based on horizontal speed. Hysteresis (walk
+/// in at 0.5 m/s, fall back to idle at 0.2 m/s) stops the animation
+/// from strobing when the NPC's velocity hovers near a single
+/// threshold (e.g. at the end of a wander before Resting kicks in).
+/// 200 ms crossfade is short enough to feel responsive but long enough
+/// that the blend isn't a visible pop.
+fn drive_npc_animation(
+    mut npcs: Query<(&AvatarVelocity, &mut NpcVisuals), With<Npc>>,
+    mut players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    assets: Res<CharacterAssets>,
+) {
+    const WALK_ENTER: f32 = 0.5;
+    const WALK_EXIT: f32 = 0.2;
+    const CROSSFADE: Duration = Duration::from_millis(200);
+    for (velocity, mut visuals) in npcs.iter_mut() {
+        let Some(player_entity) = visuals.player else {
+            continue;
+        };
+        let speed_xz = Vec2::new(velocity.0.x, velocity.0.z).length();
+        let next = match visuals.state {
+            NpcAnimState::Idle if speed_xz > WALK_ENTER => Some(NpcAnimState::Walk),
+            NpcAnimState::Walk if speed_xz < WALK_EXIT => Some(NpcAnimState::Idle),
+            _ => None,
+        };
+        let Some(new_state) = next else { continue };
+        let Ok((mut player, mut transitions)) = players.get_mut(player_entity) else {
+            continue;
+        };
+        let node = match new_state {
+            NpcAnimState::Idle => assets.idle,
+            NpcAnimState::Walk => assets.walk,
+        };
+        transitions.play(&mut player, node, CROSSFADE).repeat();
+        visuals.state = new_state;
     }
 }
 
