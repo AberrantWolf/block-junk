@@ -119,11 +119,23 @@ fn start_netcode_server(mut commands: Commands) {
     info!("netcode server listening on {SERVER_ADDR}");
 }
 
-fn start_netcode_client(mut commands: Commands, target: Res<JoinTarget>) {
+fn start_netcode_client(
+    mut commands: Commands,
+    target: Res<JoinTarget>,
+    existing: Query<(), With<Client>>,
+) {
     use lightyear::netcode::Key;
     use lightyear::prelude::client::{NetcodeClient, NetcodeConfig};
     // Authentication and UdpIo come from the top-level prelude (already
     // imported via `lightyear::prelude::*`).
+
+    // `OnEnter(InGame)` fires every time the player un-pauses, but the
+    // session — and the netcode client entity — outlives pause. Spawning
+    // a second client with the same PID-derived id would race the first
+    // until it timed out, spamming `ClientIdInUse` warnings for seconds.
+    if !existing.is_empty() {
+        return;
+    }
 
     let server_addr = target.0;
 

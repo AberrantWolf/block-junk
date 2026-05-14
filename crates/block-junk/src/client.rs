@@ -232,7 +232,15 @@ fn setup_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     palette: Res<PlaceablePalette>,
     registry: Res<BlockRegistry>,
+    existing: Option<Res<AvatarAssets>>,
 ) {
+    // `OnEnter(InGame)` re-fires on every un-pause, but the scene
+    // (lights, crosshair, hotbar UI, avatar meshes) outlives pause.
+    // Re-running would spawn duplicate lights and a second hotbar UI.
+    if existing.is_some() {
+        return;
+    }
+
     // Default ambient (80) leaves shadowed faces near-black. Bumping it
     // floods all surfaces with enough light to read geometry.
     ambient.brightness = 250.0;
@@ -726,6 +734,13 @@ fn setup_placement_preview(
     mut back_mats: ResMut<Assets<PreviewBack>>,
     mut state: ResMut<PreviewState>,
 ) {
+    // `OnEnter(InGame)` re-fires on every un-pause. Without this guard
+    // we'd spawn a fresh `PreviewCubeRoot` and overwrite `state.cube_root`,
+    // orphaning the old cube as a permanent ghost in the world.
+    if state.cube_root.is_some() {
+        return;
+    }
+
     let cube_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let front = front_mats.add(PreviewFront {
         color: LinearRgba::new(1.0, 1.0, 1.0, 0.4),
