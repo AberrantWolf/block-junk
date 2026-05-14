@@ -341,6 +341,7 @@ fn spawn_initial_npc_on_first_connect(
 struct WorldWalk<'q, 'w, 's> {
     chunks: &'q Query<'w, 's, &'static Chunk>,
     chunk_map: &'q ChunkMap,
+    registry: &'q BlockRegistry,
 }
 
 impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
@@ -352,7 +353,16 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
         let Ok(chunk) = self.chunks.get(entity) else {
             return true;
         };
-        !chunk.get(local).is_empty()
+        let slot = chunk.get(local);
+        if slot.is_empty() {
+            return false;
+        }
+        // Doors / open gates: solid for room detection (the flood-fill
+        // wants them as walls so the room is bounded) but pathing
+        // treats them as passable so NPCs walk through rather than
+        // climb over. Matches the collision rule in `WorldCollision` —
+        // both controllers see the same passable cell.
+        !self.registry.def(slot).flags.walkable_boundary
     }
     // cost() default 1.0 — future road tags hook in here without
     // changing the algorithm.
@@ -371,6 +381,7 @@ fn npc_brain_tick(
     time: Res<Time>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
+    block_registry: Res<BlockRegistry>,
     mods: Res<ServerMods>,
     need_registry: Res<NeedRegistry>,
     room_map: Res<RoomMap>,
@@ -393,6 +404,7 @@ fn npc_brain_tick(
     let world = WorldWalk {
         chunks: &chunks,
         chunk_map: &chunk_map,
+        registry: &block_registry,
     };
 
     for (entity, npc_id, pose, mut needs, mut brain, mut intent, mut npc_path, kind) in
