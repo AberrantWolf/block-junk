@@ -271,8 +271,18 @@ fn spawn_initial_npc_on_first_connect(
     _: On<Add, Connected>,
     mut commands: Commands,
     kinds: Res<NpcKindRegistry>,
+    existing: Query<(), With<Npc>>,
 ) {
     if SMOKE_TEST_SPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // If a save was loaded at startup, NPCs already exist with their
+    // persisted ids — spawning the smoke-test cluster on top would
+    // duplicate ids (the cluster hardcodes 1..=4 and a freshly-saved
+    // world has those same ids). Skip silently; the atomic above still
+    // latches so subsequent reconnects don't re-attempt.
+    if !existing.is_empty() {
+        info!("NPCs already present (loaded from save); skipping smoke-test cluster spawn");
         return;
     }
     let kind_id = "vanilla:wanderer";

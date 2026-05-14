@@ -18,8 +18,9 @@ use crate::protocol::{
     ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode,
     WorldChannel,
 };
+use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::save::{SAVE_VERSION, SaveFile, SavedChunk, read_save, write_save};
+use crate::save::{SAVE_VERSION, SaveFile, SavedChunk, SavedNpc, read_save, write_save};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_world_transform, world_to_chunk};
 
 /// Marker on chunks whose state has diverged from the deterministic terrain
@@ -130,8 +131,9 @@ fn load_from_save(
         }
     };
     info!(
-        "loading {} edited chunks from save {name:?}",
-        save.edited_chunks.len()
+        "loading {} edited chunks + {} NPCs from save {name:?}",
+        save.edited_chunks.len(),
+        save.npcs.len()
     );
     pending_pose.0 = save.last_player_pose;
     for SavedChunk {
@@ -152,6 +154,37 @@ fn load_from_save(
             .id();
         chunk_map.0.insert(coord, entity);
     }
+    for npc in save.npcs {
+        spawn_loaded_npc(&mut commands, npc);
+    }
+}
+
+/// Spawn an NPC entity restored from a save. Mirrors the cluster-spawn
+/// observer in `npc.rs` except for the inputs: pose / mode / needs /
+/// rng come from the save, transient state (velocity, on-ground, goal,
+/// path overlay) defaults so the brain resumes from Idle and the
+/// planner picks a fresh action on the first post-load tick.
+fn spawn_loaded_npc(commands: &mut Commands, npc: SavedNpc) {
+    commands.spawn((
+        Actor,
+        Npc,
+        NpcId(npc.id),
+        NpcKind(npc.kind),
+        Needs(npc.needs),
+        Brain {
+            goal: Goal::Idle,
+            rng: npc.rng,
+        },
+        npc.pose,
+        AvatarVelocity::default(),
+        AvatarOnGround::default(),
+        npc.movement_mode,
+        MovementIntent::default(),
+        NpcPath::default(),
+        Replicate::to_clients(NetworkTarget::All),
+        InterpolationTarget::to_clients(NetworkTarget::All),
+        Name::new(format!("npc:{}", npc.id)),
+    ));
 }
 
 /// Polled each tick. When the client flips the save-request atomic, write
@@ -163,6 +196,7 @@ fn save_on_request(
     config: Option<Res<ServerSaveConfig>>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<&AvatarPose, With<Avatar>>,
+    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
 ) {
     let Some(flag) = flag else {
         return;
@@ -184,16 +218,39 @@ fn save_on_request(
             entities: ce.clone(),
         })
         .collect();
-    let count = edited.len();
+    let saved_npcs = collect_saved_npcs(&npcs);
+    let chunk_count = edited.len();
+    let npc_count = saved_npcs.len();
     let save = SaveFile {
         version: SAVE_VERSION,
         edited_chunks: edited,
         last_player_pose: avatars.iter().next().copied(),
+        npcs: saved_npcs,
     };
     match write_save(name, &save) {
-        Ok(()) => info!("save-on-request: wrote {count} chunks to {name:?}"),
+        Ok(()) => info!("save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs to {name:?}"),
         Err(e) => error!("save-on-request to {name:?} failed: {e}"),
     }
+}
+
+/// Snapshot every NPC's persistent state. `BrainDisabled` NPCs are
+/// included — the marker is treated as a runtime recovery state, not
+/// persisted, so reloading gives the planner a fresh chance. A
+/// consistently broken planner will re-disable each NPC on its first
+/// tick after load (and log loudly each time).
+fn collect_saved_npcs(
+    npcs: &Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
+) -> Vec<SavedNpc> {
+    npcs.iter()
+        .map(|(id, kind, pose, mode, needs, brain)| SavedNpc {
+            id: id.0,
+            kind: kind.0.clone(),
+            pose: *pose,
+            movement_mode: *mode,
+            needs: needs.0.clone(),
+            rng: brain.rng,
+        })
+        .collect()
 }
 
 /// Drives the server App's shutdown lifecycle. Each tick:
@@ -210,6 +267,7 @@ fn save_then_shutdown(
     config: Option<Res<ServerSaveConfig>>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<&AvatarPose, With<Avatar>>,
+    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
     mut exit: MessageWriter<AppExit>,
     mut handled: Local<bool>,
 ) {
@@ -235,14 +293,17 @@ fn save_then_shutdown(
                         entities: ce.clone(),
                     })
                     .collect();
-                let count = edited.len();
+                let saved_npcs = collect_saved_npcs(&npcs);
+                let chunk_count = edited.len();
+                let npc_count = saved_npcs.len();
                 let save = SaveFile {
                     version: SAVE_VERSION,
                     edited_chunks: edited,
                     last_player_pose: avatars.iter().next().copied(),
+                    npcs: saved_npcs,
                 };
                 match write_save(name, &save) {
-                    Ok(()) => info!("saved {count} edited chunks to {name:?}"),
+                    Ok(()) => info!("saved {chunk_count} chunks + {npc_count} NPCs to {name:?}"),
                     Err(e) => error!("save to {name:?} failed: {e}"),
                 }
             }

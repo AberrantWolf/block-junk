@@ -15,19 +15,21 @@
 //! incompatibly. Loaders refuse mismatched versions and surface a typed
 //! error rather than silently corrupting state.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::protocol::{AvatarPose, ChunkCoord};
+use crate::protocol::{AvatarPose, ChunkCoord, MovementMode};
 use crate::voxel::{Chunk, ChunkEntities};
 
 /// Bump on any breaking shape change. Loaders will refuse mismatched
 /// versions; a future migration layer can branch on this.
 /// v2 (2026-05-13): added `last_player_pose` to `SaveFile`.
-pub const SAVE_VERSION: u32 = 2;
+/// v3 (2026-05-15): added `npcs` to `SaveFile`.
+pub const SAVE_VERSION: u32 = 3;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -82,6 +84,12 @@ pub struct SaveFile {
     /// "the first player to reconnect lands here"; per-player persistence
     /// needs a stable client identity we don't have yet.
     pub last_player_pose: Option<AvatarPose>,
+    /// Every NPC alive at save time. Empty for a save made before NPCs
+    /// existed (those saves are v2 and won't load anyway, but the field
+    /// is `default` for forward compat — adding a new NPC system off
+    /// this field doesn't require another version bump).
+    #[serde(default)]
+    pub npcs: Vec<SavedNpc>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,6 +97,29 @@ pub struct SavedChunk {
     pub coord: ChunkCoord,
     pub chunk: Chunk,
     pub entities: ChunkEntities,
+}
+
+/// Persistent slice of an NPC. Captures the state the brain can't
+/// reconstruct from world/registry alone:
+/// - Identity (`id`, `kind`) so the same NPC reappears as itself.
+/// - Pose (translation + yaw) so they don't teleport on load.
+/// - Movement mode (typically `Walk`; saved for completeness so a future
+///   `Fly`-capable NPC doesn't lose state).
+/// - Need values; decay across save/load resumes from the saved float.
+/// - The brain's PRNG state, so wander-target selection isn't a fresh
+///   seed on every restart.
+///
+/// **Not** saved: `Brain::goal` (resets to `Idle`; the planner picks a
+/// fresh action on the first post-load tick), velocity, on-ground
+/// state, the live A* path overlay. All transient and cheap to rebuild.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedNpc {
+    pub id: u64,
+    pub kind: String,
+    pub pose: AvatarPose,
+    pub movement_mode: MovementMode,
+    pub needs: HashMap<String, f32>,
+    pub rng: u64,
 }
 
 pub fn save_root() -> PathBuf {
@@ -234,4 +265,57 @@ pub fn delete_save(name: &str) -> Result<(), SaveError> {
         path: dir,
         source: e,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::math::Vec3;
+
+    /// Round-trip a SaveFile through bincode to catch serde regressions
+    /// at the shape level — covers the v3 `npcs` field including its
+    /// HashMap, enum (MovementMode), and float fields. File-IO failures
+    /// are caught by the existing v1/v2 code paths; this only needs to
+    /// guard the new field.
+    #[test]
+    fn savefile_round_trips_with_npcs() {
+        let mut needs = HashMap::new();
+        needs.insert("hunger".to_owned(), 0.42);
+        let original = SaveFile {
+            version: SAVE_VERSION,
+            edited_chunks: vec![],
+            last_player_pose: Some(AvatarPose {
+                translation: Vec3::new(1.0, 2.0, 3.0),
+                yaw: 0.5,
+            }),
+            npcs: vec![SavedNpc {
+                id: 7,
+                kind: "vanilla:wanderer".to_owned(),
+                pose: AvatarPose {
+                    translation: Vec3::new(4.0, 5.0, 6.0),
+                    yaw: 1.0,
+                },
+                movement_mode: MovementMode::Walk,
+                needs: needs.clone(),
+                rng: 0xCAFE_BABE_DEAD_BEEF,
+            }],
+        };
+
+        let bytes =
+            bincode::serde::encode_to_vec(&original, bincode::config::standard()).unwrap();
+        let (decoded, _): (SaveFile, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+
+        assert_eq!(decoded.version, original.version);
+        assert_eq!(decoded.npcs.len(), 1);
+        let np = &decoded.npcs[0];
+        assert_eq!(np.id, 7);
+        assert_eq!(np.kind, "vanilla:wanderer");
+        assert_eq!(np.movement_mode, MovementMode::Walk);
+        assert_eq!(np.needs.get("hunger"), Some(&0.42));
+        assert_eq!(np.rng, 0xCAFE_BABE_DEAD_BEEF);
+        let pose = decoded.last_player_pose.unwrap();
+        assert_eq!(pose.translation, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(pose.yaw, 0.5);
+    }
 }
