@@ -5,6 +5,7 @@ mod collision;
 mod menu;
 mod network;
 mod npc;
+mod pathfinding;
 mod physics;
 mod preview;
 mod protocol;

@@ -17,7 +17,7 @@ use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
 use crate::menu::{AppState, JoinTarget};
-use crate::npc::Npc;
+use crate::npc::{Npc, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     ChunkSnapshot, ChunkUnload, MovementIntent, MovementMode, WorldChannel,
@@ -83,6 +83,7 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<Actor>();
         app.register_component::<Avatar>();
         app.register_component::<Npc>();
+        app.register_component::<NpcPath>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between
         // server samples instead of snapping every 50 ms).

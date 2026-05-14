@@ -14,7 +14,7 @@ use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
 use crate::menu::AppState;
-use crate::npc::Npc;
+use crate::npc::{Npc, NpcPath};
 use crate::physics::apply_walk_step;
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::protocol::{
@@ -120,6 +120,7 @@ impl Plugin for ClientPlugin {
                     update_placement_preview,
                     attach_avatar_visuals,
                     attach_npc_visuals,
+                    draw_npc_paths,
                 )
                     .in_set(GameSet::PostSimulation),
             )
@@ -1362,6 +1363,23 @@ fn attach_npc_visuals(
             Mesh3d(assets.mesh.clone()),
             MeshMaterial3d(assets.npc_material.clone()),
         ));
+    }
+}
+
+/// Debug overlay: draw each NPC's currently-planned A* path as cyan
+/// line segments between cell centres, raised slightly above the
+/// floor so they aren't z-fought into the surface. Empty paths
+/// (Idle NPCs) draw nothing. Cheap — `Gizmos` is immediate-mode and
+/// the path only changes on goal transitions.
+fn draw_npc_paths(mut gizmos: Gizmos, paths: Query<&NpcPath>) {
+    let raise = Vec3::new(0.5, 0.15, 0.5);
+    let color = Color::srgb(0.0, 1.0, 1.0);
+    for path in paths.iter() {
+        for window in path.0.windows(2) {
+            let a = window[0].as_vec3() + raise;
+            let b = window[1].as_vec3() + raise;
+            gizmos.line(a, b, color);
+        }
     }
 }
 
