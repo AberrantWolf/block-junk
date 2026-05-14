@@ -175,6 +175,48 @@ impl RoomMap {
         self.next_id += 1;
         id
     }
+
+    /// Iterate every detected region that currently has a matched
+    /// pattern. Yields `(room id, deepest pattern id, anchor cell)`,
+    /// where the anchor is whichever floor cell sits closest to the
+    /// region's geometric centroid — a sensible "go to this room"
+    /// target that's guaranteed to be walkable (it *is* a floor cell).
+    ///
+    /// Unmatched regions (detected but no pattern fits the signature)
+    /// are skipped — they're internal bookkeeping for invalidation and
+    /// of no use to a planner looking for a target.
+    pub fn iter_matched(&self) -> impl Iterator<Item = (RoomId, &RoomPatternId, IVec3)> + '_ {
+        self.rooms.iter().filter_map(|(&id, room)| {
+            let pattern = room.pattern.as_ref()?;
+            let anchor = floor_anchor(&room.floor_cells)?;
+            Some((id, pattern, anchor))
+        })
+    }
+}
+
+/// Floor cell nearest the geometric centroid of `cells`. Returns
+/// `None` only on empty input (cells are integer-cell positions and
+/// every region tracked by `RoomMap` has at least one floor cell). The
+/// centroid itself may not be a floor cell in L-shaped or U-shaped
+/// rooms — picking the nearest existing floor cell instead keeps the
+/// target walkable regardless of shape.
+fn floor_anchor(cells: &[IVec3]) -> Option<IVec3> {
+    if cells.is_empty() {
+        return None;
+    }
+    let mut sum = IVec3::ZERO;
+    for c in cells {
+        sum += *c;
+    }
+    let n = cells.len() as i32;
+    let centroid = sum / n;
+    cells
+        .iter()
+        .min_by_key(|c| {
+            let d = **c - centroid;
+            d.x.abs() + d.y.abs() + d.z.abs()
+        })
+        .copied()
 }
 
 #[derive(Resource, Default)]

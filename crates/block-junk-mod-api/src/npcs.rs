@@ -112,13 +112,13 @@ pub struct NpcKindDef {
 }
 
 /// Live state handed to the planner. Today carries id, kind, position,
-/// and current need values; future fields (nearby rooms, opinions,
-/// world clock) will be added behind serde defaults so old planners
-/// keep working as the surface grows.
+/// current need values, and a list of nearby matched rooms; future
+/// fields (opinions, world clock, nearby actors) will be added behind
+/// serde defaults so old planners keep working as the surface grows.
 ///
 /// Built on the engine side at planner-call time, serialised once into
 /// the target Lua state, and discarded. Planners read it as a Lua table
-/// (e.g. `snapshot.needs.hunger`, `snapshot.id`).
+/// (e.g. `snapshot.needs.hunger`, `snapshot.nearby_rooms[1]`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NpcSnapshot {
     /// Stable per-NPC handle — same value across every call for the
@@ -132,6 +132,40 @@ pub struct NpcSnapshot {
     /// once landmarks exist. For now the planner mostly ignores this.
     pub foot: BlockPos,
     pub needs: HashMap<String, f32>,
+    /// Up to K nearest detected rooms with a matched pattern, sorted by
+    /// distance from `foot` (closest first). Empty when no matched
+    /// rooms exist (early game, or the world detector hasn't run yet).
+    /// Planners filter by `pattern` to pick a target — e.g. "head for
+    /// the nearest `vanilla:small_house`."
+    #[serde(default)]
+    pub nearby_rooms: Vec<NearbyRoom>,
+}
+
+/// One entry in [`NpcSnapshot::nearby_rooms`]. Carries enough info to
+/// decide whether the room is interesting and where to walk to. The
+/// engine recomputes this fresh per planner call (the snapshot is
+/// transient), so planners shouldn't cache anchors across calls — the
+/// player may have demolished the floor in the meantime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NearbyRoom {
+    /// Engine-side stable id for the region. Plain u32, mirroring the
+    /// engine's `RoomId` so the planner can compare equality across
+    /// calls (same `id` ⇒ same room).
+    pub id: u32,
+    /// Deepest matching pattern id. A planner that wants "any enclosed
+    /// space" today has to check the full set (`enclosed_space`,
+    /// `walled_yard`, `small_house`); an `is_a` checker on the engine
+    /// surface comes later.
+    pub pattern: String,
+    /// Floor cell to use as the "go to this room" target — chosen by
+    /// the engine as whichever floor cell is closest to the room's
+    /// geometric centroid, so it's guaranteed walkable.
+    pub anchor: BlockPos,
+    /// Manhattan distance (cells) from the NPC's foot to the anchor.
+    /// Cheap to compute server-side and ranks correctly for "nearer is
+    /// better." Planners that need euclidean can compute it from
+    /// `foot` + `anchor` themselves.
+    pub distance: u32,
 }
 
 /// What a planner returns. Mirrors the goals the engine knows how to
@@ -166,6 +200,17 @@ pub enum PlannerGoal {
     /// sensible upper bound so a misbehaving planner can't park an NPC
     /// for an hour.
     Rest { duration_secs: f32 },
+    /// Walk to a specific target cell. The engine runs A* from the
+    /// NPC's current foot to `cell`; if no path exists within budget
+    /// the NPC parks briefly (the same fallback Wander uses). Use this
+    /// for "head to a room I saw in the snapshot" decisions; for
+    /// "explore my surroundings" use [`PlannerGoal::Wander`] which
+    /// picks a random reachable target itself.
+    Goto {
+        cell: BlockPos,
+        #[serde(default = "default_goto_timeout")]
+        timeout_secs: f32,
+    },
 }
 
 fn default_wander_radius() -> i32 {
@@ -174,4 +219,8 @@ fn default_wander_radius() -> i32 {
 
 fn default_wander_timeout() -> f32 {
     12.0
+}
+
+fn default_goto_timeout() -> f32 {
+    30.0
 }

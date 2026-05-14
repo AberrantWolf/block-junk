@@ -25,7 +25,7 @@
 //! when no mods load.
 
 use bevy::prelude::*;
-use block_junk_mod_api::npcs::{NpcKindId, NpcSnapshot, PlannerGoal};
+use block_junk_mod_api::npcs::{NearbyRoom, NpcKindId, NpcSnapshot, PlannerGoal};
 use block_junk_mod_api::shared::BlockPos;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path};
+use crate::rooms::RoomMap;
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
 use crate::protocol::{
     Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementIntent, MovementMode,
@@ -163,8 +164,15 @@ const FALLBACK_WANDER_TIMEOUT_SECS: f32 = 12.0;
 /// engine boundary before being committed to the live goal.
 const MAX_WANDER_RADIUS_CELLS: i32 = 64;
 const MAX_WANDER_TIMEOUT_SECS: f32 = 60.0;
+const MAX_GOTO_TIMEOUT_SECS: f32 = 120.0;
 const MIN_REST_SECS: f32 = 0.5;
 const MAX_REST_SECS: f32 = 60.0;
+/// How many nearby matched rooms to include in each planner snapshot.
+/// Cap exists so a world with hundreds of registered rooms doesn't
+/// blow up the per-call serialization cost; 8 is enough headroom for
+/// a planner to pick between "nearest of each kind" without flooding
+/// the table.
+const SNAPSHOT_ROOM_LIMIT: usize = 8;
 /// How far ahead of the closest-projection point on the path the NPC
 /// aims. Bigger ⇒ smoother turns, more corner-cutting; smaller ⇒
 /// hugs the path tighter, may oscillate. 0.5 m ≈ half a cell — the
@@ -236,14 +244,22 @@ impl Plugin for NpcServerPlugin {
 }
 
 /// Latches on the first `Connected` so subsequent reconnects don't
-/// re-spawn the smoke-test NPC. `AtomicBool` rather than `Local<bool>`
-/// because observers don't take `Local`.
+/// re-spawn the smoke-test cluster. `AtomicBool` rather than
+/// `Local<bool>` because observers don't take `Local`.
 static SMOKE_TEST_SPAWNED: AtomicBool = AtomicBool::new(false);
 
-/// Smoke-test spawn — one NPC near the player's default landing spot
-/// (player spawn = (0, 32, 60)). 4 m offset puts them in view but out
-/// of collision range. Replicated to all clients with interpolation
-/// (no client predicts NPCs — there's no per-client "owner" of one).
+/// Smoke-test cluster — a small ring of NPCs near the player's default
+/// landing spot (player spawn = (0, 32, 60)). Each is offset by a few
+/// metres so they don't all stack on one cell and so a player can
+/// visibly tell them apart at a glance.
+///
+/// The cluster is small on purpose: planner state per NPC is keyed by
+/// `NpcId` in Lua, so a multi-NPC smoke test is what validates that
+/// per-id state actually isolates. One NPC can't reveal the bug
+/// "everyone shares the same alternation state."
+///
+/// Replicated to all clients with interpolation (no client predicts
+/// NPCs — there's no per-client "owner" of one).
 ///
 /// Default needs come from the [`NpcKindRegistry`] entry for
 /// `vanilla:wanderer`; if no mod registered that kind we still spawn
@@ -259,42 +275,54 @@ fn spawn_initial_npc_on_first_connect(
     if SMOKE_TEST_SPAWNED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let id: u64 = 1;
     let kind_id = "vanilla:wanderer";
-    let needs = match kinds.get(kind_id) {
-        Some(def) => Needs(def.default_needs.clone()),
+    let default_needs = match kinds.get(kind_id) {
+        Some(def) => def.default_needs.clone(),
         None => {
             warn!(
                 kind = kind_id,
                 "no NPC kind registered; spawning with empty needs (native fallback brain)"
             );
-            Needs::default()
+            HashMap::new()
         }
     };
-    commands.spawn((
-        Actor,
-        Npc,
-        NpcId(id),
-        NpcKind(kind_id.into()),
-        needs,
-        Brain {
-            goal: Goal::Idle,
-            rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
-        },
-        AvatarPose {
-            translation: Vec3::new(4.0, 32.0, 60.0),
-            yaw: 0.0,
-        },
-        AvatarVelocity::default(),
-        AvatarOnGround::default(),
-        MovementMode::Walk,
-        MovementIntent::default(),
-        NpcPath::default(),
-        Replicate::to_clients(NetworkTarget::All),
-        InterpolationTarget::to_clients(NetworkTarget::All),
-        Name::new(format!("npc:{id}")),
-    ));
-    info!(kind = kind_id, "spawned smoke-test NPC #{id}");
+    // Offset positions east + south of the player spawn (0, 32, 60).
+    // Y picks one cell above so the controller settles them onto the
+    // floor on the first physics step. Small XZ spread keeps them all
+    // visible in the player's initial frame without overlapping.
+    let cluster = [
+        Vec3::new(4.0, 32.0, 60.0),
+        Vec3::new(6.0, 32.0, 62.0),
+        Vec3::new(2.0, 32.0, 62.0),
+        Vec3::new(4.0, 32.0, 64.0),
+    ];
+    for (i, translation) in cluster.into_iter().enumerate() {
+        let id: u64 = (i + 1) as u64;
+        commands.spawn((
+            Actor,
+            Npc,
+            NpcId(id),
+            NpcKind(kind_id.into()),
+            Needs(default_needs.clone()),
+            Brain {
+                goal: Goal::Idle,
+                rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
+            },
+            AvatarPose {
+                translation,
+                yaw: 0.0,
+            },
+            AvatarVelocity::default(),
+            AvatarOnGround::default(),
+            MovementMode::Walk,
+            MovementIntent::default(),
+            NpcPath::default(),
+            Replicate::to_clients(NetworkTarget::All),
+            InterpolationTarget::to_clients(NetworkTarget::All),
+            Name::new(format!("npc:{id}")),
+        ));
+    }
+    info!(kind = kind_id, count = cluster.len(), "spawned smoke-test NPC cluster");
 }
 
 /// Adapter that lets pathfinding query the live world. Treats unloaded
@@ -335,6 +363,7 @@ fn npc_brain_tick(
     chunk_map: Res<ChunkMap>,
     mods: Res<ServerMods>,
     need_registry: Res<NeedRegistry>,
+    room_map: Res<RoomMap>,
     mut commands: Commands,
     mut npcs: Query<
         (
@@ -428,7 +457,7 @@ fn npc_brain_tick(
         }
         if matches!(brain.goal, Goal::Idle) {
             let kind_id = NpcKindId(kind.0.clone());
-            let snapshot = build_snapshot(*npc_id, &kind_id, pose, &needs);
+            let snapshot = build_snapshot(*npc_id, &kind_id, pose, &needs, &room_map);
             let planner_goal = match mods.0.call_planner(&kind_id, &snapshot) {
                 Ok(Some(g)) => g,
                 Ok(None) => native_fallback_goal(),
@@ -499,6 +528,48 @@ fn npc_brain_tick(
                             // No reachable target this slice — park
                             // briefly so we don't churn the planner
                             // every tick.
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            *intent = MovementIntent::default();
+                        }
+                    }
+                }
+                PlannerGoal::Goto { cell, timeout_secs } => {
+                    // Same engine primitive as Wander once we have a
+                    // path — the only difference is target selection
+                    // (planner-supplied vs random within radius).
+                    let timeout = timeout_secs.clamp(1.0, MAX_GOTO_TIMEOUT_SECS);
+                    let foot = pose_to_foot_cell(pose);
+                    let target = IVec3::new(cell.x, cell.y, cell.z);
+                    let path = find_path(
+                        foot,
+                        target,
+                        &world,
+                        ASTAR_NODE_BUDGET,
+                        ASTAR_PATH_BUDGET,
+                    )
+                    .map(|raw| smooth_path(raw, &world))
+                    .filter(|p| p.len() >= 2);
+                    match path {
+                        Some(path) => {
+                            npc_path.set_if_neq(NpcPath(path.clone()));
+                            brain.goal = Goal::Wander {
+                                path,
+                                progress: 0.0,
+                                deadline_secs: timeout,
+                                last_pos: pose.translation,
+                                stuck_secs: 0.0,
+                            };
+                        }
+                        None => {
+                            // Target unreachable from here (no path or
+                            // path too short). Park briefly; the
+                            // planner can pick something else on the
+                            // next call.
                             if !npc_path.0.is_empty() {
                                 npc_path.0.clear();
                             }
@@ -606,10 +677,23 @@ fn native_fallback_goal() -> PlannerGoal {
 
 /// Build the snapshot handed to a planner this tick. Clones the need
 /// map (the planner's Lua state needs an independent copy to walk into
-/// a Lua table) — that's the per-planner-call cost we accept to keep
-/// the brain tick cheap.
-fn build_snapshot(id: NpcId, kind: &NpcKindId, pose: &AvatarPose, needs: &Needs) -> NpcSnapshot {
+/// a Lua table) and collects the K nearest matched rooms — that's the
+/// per-planner-call cost we accept to keep the brain tick cheap (only
+/// fires on goal transitions, not every fixed tick).
+///
+/// The room list is sorted by Manhattan distance from `foot`. Manhattan
+/// is cheap to compute server-side and ranks correctly for "nearer is
+/// better"; a planner that needs euclidean can derive it from `foot` +
+/// `anchor`.
+fn build_snapshot(
+    id: NpcId,
+    kind: &NpcKindId,
+    pose: &AvatarPose,
+    needs: &Needs,
+    rooms: &RoomMap,
+) -> NpcSnapshot {
     let foot = pose_to_foot_cell(pose);
+    let nearby_rooms = collect_nearby_rooms(rooms, foot, SNAPSHOT_ROOM_LIMIT);
     NpcSnapshot {
         id: id.0,
         kind: kind.clone(),
@@ -619,7 +703,35 @@ fn build_snapshot(id: NpcId, kind: &NpcKindId, pose: &AvatarPose, needs: &Needs)
             z: foot.z,
         },
         needs: needs.0.clone(),
+        nearby_rooms,
     }
+}
+
+/// K nearest matched rooms by Manhattan distance from `foot`. Returns a
+/// sorted Vec (closest first). Touches every matched room (typically a
+/// handful in a small world), so it's `O(rooms)` per call — fine at
+/// goal-transition cadence.
+fn collect_nearby_rooms(rooms: &RoomMap, foot: IVec3, limit: usize) -> Vec<NearbyRoom> {
+    let mut out: Vec<NearbyRoom> = rooms
+        .iter_matched()
+        .map(|(room_id, pattern, anchor)| {
+            let d = anchor - foot;
+            let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
+            NearbyRoom {
+                id: room_id.0,
+                pattern: pattern.0.clone(),
+                anchor: BlockPos {
+                    x: anchor.x,
+                    y: anchor.y,
+                    z: anchor.z,
+                },
+                distance,
+            }
+        })
+        .collect();
+    out.sort_by_key(|r| r.distance);
+    out.truncate(limit);
+    out
 }
 
 /// The foot cell of an actor whose pose carries an eye-position
