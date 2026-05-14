@@ -1,10 +1,3 @@
 name = "vanilla"
 version = "0.1.0"
 api_version = "0.1.0"
-
-# All blocks register from shared.lua so server and client end up with the
-# same slot assignments. The engine refuses to start unless `vanilla:empty`
-# lands at slot 0 — i.e. unless this mod loads (and registers it) first.
-
-[scripts]
-shared = "shared.lua"

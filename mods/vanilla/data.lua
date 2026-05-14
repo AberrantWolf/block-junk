@@ -1,4 +1,4 @@
--- Vanilla content registers from shared.lua so both the server and the
+-- Vanilla content registers from data.lua so both the server and the
 -- client end up with the same set of blocks (and the same slot order).
 --
 -- Order matters: vanilla:empty MUST be the first registration so it lands

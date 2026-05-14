@@ -40,7 +40,7 @@ pub enum LoadError {
         target: String,
         reason: String,
     },
-    #[error("mod {name} declares no scripts; need at least one of shared/client/server")]
+    #[error("mod {name} has no entry script; create data.lua or events.lua in its directory")]
     NoScripts { name: String },
     #[error("lua error in mod {name} ({side}): {source}")]
     Lua {
@@ -59,9 +59,9 @@ const ROOM_EVENT_SLOT: &str = "_room_event_handler";
 /// from a mod's Lua state appends into one of these buffers; the engine
 /// drains them after load to build its real registries (BlockRegistry, etc.).
 ///
-/// One context is built per side (server / client). Both sides run the
-/// `shared.lua` of every mod, so the same blocks register into both — the
-/// engine builds two parallel registries that agree slot-for-slot.
+/// One context is built per side (server / client). Both sides run each
+/// mod's `data.lua`, so the same blocks register into both — the engine
+/// builds two parallel registries that agree slot-for-slot.
 #[derive(Clone, Default)]
 pub struct LoadContext {
     pub pending_blocks: Arc<Mutex<Vec<BlockDef>>>,
@@ -187,6 +187,12 @@ pub fn warn_if_empty(registry: &ModRegistry) {
     }
 }
 
+/// Fixed entry-point filenames. Mods drop a `data.lua` (declarative
+/// registrations, runs on both sides) and/or an `events.lua` (runtime
+/// callback registrations, server only). At least one must be present.
+const DATA_SCRIPT: &str = "data.lua";
+const EVENTS_SCRIPT: &str = "events.lua";
+
 fn load_mod(side: Side, dir: &Path, ctx: &LoadContext) -> Result<LoadedMod, LoadError> {
     let manifest_path = dir.join("manifest.toml");
     let manifest_str = fs::read_to_string(&manifest_path).map_err(|e| LoadError::Io {
@@ -212,7 +218,13 @@ fn load_mod(side: Side, dir: &Path, ctx: &LoadContext) -> Result<LoadedMod, Load
             reason: format!("host API is {API_VERSION}"),
         });
     }
-    if manifest.scripts.is_empty() {
+
+    let has_data = dir.join(DATA_SCRIPT).exists();
+    // `events.lua` only runs on the server, but its presence still counts
+    // as a valid script for the no-scripts check on either side — an
+    // events-only mod (no declarative content) is legitimate.
+    let has_events = dir.join(EVENTS_SCRIPT).exists();
+    if !has_data && !has_events {
         return Err(LoadError::NoScripts {
             name: manifest.name.clone(),
         });
@@ -225,13 +237,14 @@ fn load_mod(side: Side, dir: &Path, ctx: &LoadContext) -> Result<LoadedMod, Load
         source,
     })?;
 
-    // Load shared first (so side scripts can use what shared defined),
-    // then the side-specific script.
-    if let Some(rel) = manifest.scripts.shared.as_deref() {
-        run_script(&lua, &manifest.name, side, dir, rel)?;
+    // data.lua runs first so events.lua can reference helpers/constants
+    // it defines. Server-only events.lua follows; on the client we stop
+    // after data.lua because no client-side hooks exist yet.
+    if has_data {
+        run_script(&lua, &manifest.name, side, dir, DATA_SCRIPT)?;
     }
-    if let Some(rel) = manifest.scripts.for_side(side) {
-        run_script(&lua, &manifest.name, side, dir, rel)?;
+    if has_events && side == Side::Server {
+        run_script(&lua, &manifest.name, side, dir, EVENTS_SCRIPT)?;
     }
 
     info!(name = %manifest.name, version = %manifest.version, side = side.as_str(), "loaded mod");

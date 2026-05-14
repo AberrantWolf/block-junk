@@ -1,5 +1,6 @@
--- Server-only script: registers a hook that fires after every successful
--- place-or-break edit applied to the authoritative world.
+-- events.lua: runtime hook registrations. Runs on the server only —
+-- authoritative events fire here. Helpers/constants from data.lua are
+-- already loaded into this Lua state.
 
 engine.on_block_placed(function(event)
     print(string.format(

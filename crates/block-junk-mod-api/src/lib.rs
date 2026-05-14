@@ -5,11 +5,24 @@
 //! recompile unless the surface here changes. Treat every public item like
 //! a public ABI.
 //!
-//! Items are organized by which side they belong to:
+//! Mods organize their scripts around two fixed entry points:
 //!
-//! - [`shared`] — types and hooks available to scripts on either side.
-//! - [`server`] — types and hooks only available to a mod's `server.lua`.
-//! - [`client`] — types and hooks only available to a mod's `client.lua`.
+//! - **`data.lua`** runs on both sides and is where mods register
+//!   declarative content (blocks, room patterns, future recipes / NPC
+//!   kinds). Both sides need the same registries so slot ordering and
+//!   pattern IDs agree across the wire.
+//! - **`events.lua`** runs on the server only. This is where mods
+//!   subscribe to runtime hooks (`engine.on_block_placed`,
+//!   `engine.on_room_event`, …) that fire against the authoritative
+//!   world. A mod that only adds content can omit it entirely.
+//!
+//! At least one of the two must exist. Items below are organized by
+//! the side they're relevant to:
+//!
+//! - [`shared`] — types and hooks available in either entry point.
+//! - [`server`] — types and hooks for `events.lua` on the server.
+//! - [`client`] — types and hooks that would be exposed in client-side
+//!   contexts. None today; reserved.
 //! - [`blocks`] — block registry types (id, def, flags, tags). Side-agnostic.
 //! - [`rooms`] — room pattern registry types. Side-agnostic.
 
@@ -79,42 +92,15 @@ impl core::fmt::Display for ApiVersion {
 
 /// On-disk mod metadata. Lives next to the entry scripts as `manifest.toml`.
 ///
-/// All script paths are relative to the mod's directory. Each is optional —
-/// a mod that only needs server behaviour can omit `client` and `shared`.
+/// Entry scripts live at fixed filenames inside the mod's directory —
+/// see the crate-level docs for the `data.lua` / `events.lua` split.
+/// The manifest is metadata only; no script paths.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModManifest {
     pub name: String,
     pub version: String,
     /// Target API version, e.g. "0.1.0".
     pub api_version: String,
-    #[serde(default)]
-    pub scripts: ScriptPaths,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct ScriptPaths {
-    /// Loaded into both client and server Lua states (separately — there is
-    /// no shared runtime state). Use for constants and pure helpers.
-    pub shared: Option<String>,
-    pub client: Option<String>,
-    pub server: Option<String>,
-}
-
-impl ScriptPaths {
-    /// At least one of `shared`, `client`, or `server` must be set; a mod
-    /// with no scripts has nothing to do.
-    pub fn is_empty(&self) -> bool {
-        self.shared.is_none() && self.client.is_none() && self.server.is_none()
-    }
-
-    /// Path the loader should run on `side`, given its scripts. `shared` runs
-    /// in addition to (and before) the side-specific script.
-    pub fn for_side(&self, side: Side) -> Option<&str> {
-        match side {
-            Side::Client => self.client.as_deref(),
-            Side::Server => self.server.as_deref(),
-        }
-    }
 }
 
 /// Which side of the engine a mod registry runs on. Determines which scripts

@@ -151,7 +151,7 @@ Save to `mods/<your-mod>/models/<name>.glb`.
 
 ## Declaring the block
 
-In your mod's `shared.lua`:
+In your mod's `data.lua`:
 
 ```lua
 register {
