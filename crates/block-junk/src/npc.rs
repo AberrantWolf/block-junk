@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
-use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path};
+use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
 use crate::protocol::{
@@ -529,7 +529,8 @@ fn npc_brain_tick(
                 } => {
                     let radius = radius_cells.clamp(1, MAX_WANDER_RADIUS_CELLS);
                     let timeout = timeout_secs.clamp(1.0, MAX_WANDER_TIMEOUT_SECS);
-                    let foot = pose_to_foot_cell(pose);
+                    let foot = pose_to_standable_foot(pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(pose));
                     match pick_wander_path(foot, radius, &mut brain.rng, &world) {
                         Some(path) => {
                             // set_if_neq keeps the wire quiet on the
@@ -547,6 +548,12 @@ fn npc_brain_tick(
                             };
                         }
                         None => {
+                            warn!(
+                                npc = npc_id.0,
+                                foot = ?foot.to_array(),
+                                standable = standable(&world, foot),
+                                "wander failed: every attempt unreachable, parking briefly"
+                            );
                             // No reachable target this slice — park
                             // briefly so we don't churn the planner
                             // every tick.
@@ -565,7 +572,8 @@ fn npc_brain_tick(
                     // path — the only difference is target selection
                     // (planner-supplied vs random within radius).
                     let timeout = timeout_secs.clamp(1.0, MAX_GOTO_TIMEOUT_SECS);
-                    let foot = pose_to_foot_cell(pose);
+                    let foot = pose_to_standable_foot(pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(pose));
                     let target = IVec3::new(cell.x, cell.y, cell.z);
                     let path = find_path(
                         foot,
@@ -588,6 +596,14 @@ fn npc_brain_tick(
                             };
                         }
                         None => {
+                            warn!(
+                                npc = npc_id.0,
+                                foot = ?foot.to_array(),
+                                target = ?target.to_array(),
+                                standable_start = standable(&world, foot),
+                                standable_target = standable(&world, target),
+                                "goto failed: no A* path, parking briefly"
+                            );
                             // Target unreachable from here (no path or
                             // path too short). Park briefly; the
                             // planner can pick something else on the
@@ -760,6 +776,11 @@ fn collect_nearby_rooms(rooms: &RoomMap, foot: IVec3, limit: usize) -> Vec<Nearb
 /// `translation`. Mirrors the player AABB derivation in
 /// `apply_walk_step`: feet are `EYE_OFFSET_FROM_CENTRE + half-y`
 /// below the eye.
+///
+/// This is the *literal* pose-floor cell. For pathfinding, prefer
+/// [`pose_to_standable_foot`] — the AABB can straddle a cell boundary,
+/// in which case the literal floor lands on an unsupported cell while
+/// the actor is physically resting on an adjacent one.
 fn pose_to_foot_cell(pose: &AvatarPose) -> IVec3 {
     let feet_y = pose.translation.y - EYE_OFFSET_FROM_CENTRE - PLAYER_HALF_EXTENTS.y;
     IVec3::new(
@@ -767,6 +788,52 @@ fn pose_to_foot_cell(pose: &AvatarPose) -> IVec3 {
         feet_y.floor() as i32,
         pose.translation.z.floor() as i32,
     )
+}
+
+/// Pick a standable foot cell beneath the NPC's body AABB. Returns
+/// [`pose_to_foot_cell`] directly when that's already standable;
+/// otherwise scans the (up to 4) cells the AABB's XZ extent actually
+/// straddles for one that supports the actor.
+///
+/// **Why this exists.** Body half-extents are (0.3, _, 0.3), so the
+/// AABB spans 0.6 m in XZ. When pose.x or pose.z lands near a cell
+/// boundary the AABB overlaps two cells; the sweep can support the
+/// actor from a block in the *adjacent* cell while their pose-floor
+/// lands on a cell over a drop. The actor is physically fine — they're
+/// edge-balanced — but pathfinding sees a non-standable start and
+/// every plan fails, so the NPC freezes in place.
+///
+/// Returns `None` when none of the overlapped cells is standable (the
+/// rare case of being truly mid-fall, embedded in a wall, or hovering
+/// over genuinely-empty space). Callers treat that as a normal
+/// "no path" outcome.
+fn pose_to_standable_foot<W: Walkability>(pose: &AvatarPose, world: &W) -> Option<IVec3> {
+    let nominal = pose_to_foot_cell(pose);
+    if standable(world, nominal) {
+        return Some(nominal);
+    }
+    let aabb_min_x = pose.translation.x - PLAYER_HALF_EXTENTS.x;
+    let aabb_max_x = pose.translation.x + PLAYER_HALF_EXTENTS.x;
+    let aabb_min_z = pose.translation.z - PLAYER_HALF_EXTENTS.z;
+    let aabb_max_z = pose.translation.z + PLAYER_HALF_EXTENTS.z;
+    let cx_lo = aabb_min_x.floor() as i32;
+    // -ε so an AABB whose max sits exactly on an integer boundary doesn't
+    // claim it overlaps the next cell (boundary-touching != overlap).
+    let cx_hi = (aabb_max_x - 1e-4).floor() as i32;
+    let cz_lo = aabb_min_z.floor() as i32;
+    let cz_hi = (aabb_max_z - 1e-4).floor() as i32;
+    for cx in cx_lo..=cx_hi {
+        for cz in cz_lo..=cz_hi {
+            if cx == nominal.x && cz == nominal.z {
+                continue; // already checked above
+            }
+            let candidate = IVec3::new(cx, nominal.y, cz);
+            if standable(world, candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Horizontal centre of a foot cell — the 2D aim target for steering.
