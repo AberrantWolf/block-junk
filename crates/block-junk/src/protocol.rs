@@ -255,12 +255,13 @@ pub const DAY_LENGTH_SECS: f32 = 600.0;
 
 /// Server-authoritative day clock. `time_of_day` is the fraction of the
 /// current day elapsed: 0.0 = midnight, 0.25 = sunrise, 0.5 = noon,
-/// 0.75 = sunset. `day` counts completed days since session start;
-/// future save persistence will land it here. Lives as a `Resource` on
-/// both sides — server ticks it forward, client snaps it from
-/// `WorldClockSync` messages and locally extrapolates between syncs so
-/// the sun doesn't visibly tick once a second.
-#[derive(Resource, Clone, Copy, Debug, Default)]
+/// 0.75 = sunset. `day` counts completed days since session start.
+/// Lives as a `Resource` on both sides — server ticks it forward,
+/// client snaps it from `WorldClockSync` messages and locally
+/// extrapolates between syncs so the sun doesn't visibly tick once
+/// a second. Persisted in the save file (`SaveFile::world_clock`)
+/// so a reload picks up where the world left off.
+#[derive(Resource, Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct WorldClock {
     pub day: u32,
     pub time_of_day: f32,

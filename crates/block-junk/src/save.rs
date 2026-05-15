@@ -22,14 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::protocol::{AvatarPose, ChunkCoord, MovementMode};
+use crate::protocol::{AvatarPose, ChunkCoord, MovementMode, WorldClock};
 use crate::voxel::{Chunk, ChunkEntities};
 
 /// Bump on any breaking shape change. Loaders will refuse mismatched
 /// versions; a future migration layer can branch on this.
 /// v2 (2026-05-13): added `last_player_pose` to `SaveFile`.
 /// v3 (2026-05-15): added `npcs` to `SaveFile`.
-pub const SAVE_VERSION: u32 = 3;
+/// v4 (2026-05-15): added `world_clock` to `SaveFile`.
+pub const SAVE_VERSION: u32 = 4;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -90,6 +91,12 @@ pub struct SaveFile {
     /// this field doesn't require another version bump).
     #[serde(default)]
     pub npcs: Vec<SavedNpc>,
+    /// Day + time-of-day at save time. `Option` so a future
+    /// non-WorldClock build (or a save manually constructed without
+    /// it) deserializes cleanly; the load path falls back to the
+    /// default sunrise position when this is missing.
+    #[serde(default)]
+    pub world_clock: Option<WorldClock>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -273,12 +280,12 @@ mod tests {
     use bevy::math::Vec3;
 
     /// Round-trip a SaveFile through bincode to catch serde regressions
-    /// at the shape level — covers the v3 `npcs` field including its
-    /// HashMap, enum (MovementMode), and float fields. File-IO failures
-    /// are caught by the existing v1/v2 code paths; this only needs to
-    /// guard the new field.
+    /// at the shape level — covers the v3 `npcs` field and the v4
+    /// `world_clock` field including its enum (MovementMode), HashMap,
+    /// and float fields. File-IO failures are caught by the existing
+    /// v1/v2 code paths; this only needs to guard the new fields.
     #[test]
-    fn savefile_round_trips_with_npcs() {
+    fn savefile_round_trips_with_npcs_and_clock() {
         let mut needs = HashMap::new();
         needs.insert("hunger".to_owned(), 0.42);
         let original = SaveFile {
@@ -299,6 +306,10 @@ mod tests {
                 needs: needs.clone(),
                 rng: 0xCAFE_BABE_DEAD_BEEF,
             }],
+            world_clock: Some(WorldClock {
+                day: 3,
+                time_of_day: 0.625,
+            }),
         };
 
         let bytes =
@@ -317,5 +328,8 @@ mod tests {
         let pose = decoded.last_player_pose.unwrap();
         assert_eq!(pose.translation, Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(pose.yaw, 0.5);
+        let clock = decoded.world_clock.unwrap();
+        assert_eq!(clock.day, 3);
+        assert_eq!(clock.time_of_day, 0.625);
     }
 }

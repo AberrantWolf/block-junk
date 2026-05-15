@@ -131,6 +131,7 @@ fn load_from_save(
     mut chunk_map: ResMut<ChunkMap>,
     mut pending_pose: ResMut<PendingSpawnPose>,
     mut dirty: ResMut<DetectionDirty>,
+    mut clock: ResMut<WorldClock>,
     config: Option<Res<ServerSaveConfig>>,
     block_registry: Res<BlockRegistry>,
     kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
@@ -157,6 +158,17 @@ fn load_from_save(
         save.npcs.len()
     );
     pending_pose.0 = save.last_player_pose;
+    // Restore the world clock if the save carries one. Saves predating
+    // v4 don't (Option::None); fall back to the resource's default
+    // sunrise position rather than zeroing it to midnight.
+    if let Some(saved_clock) = save.world_clock {
+        *clock = saved_clock;
+        info!(
+            day = clock.day,
+            time_of_day = clock.time_of_day,
+            "restored world clock from save",
+        );
+    }
     // Mark every room-bounding cell in loaded chunks dirty for room
     // detection. RoomMap is runtime-only state (not persisted — RoomIds
     // aren't stable across restarts per the design memo), so without
@@ -263,6 +275,7 @@ fn spawn_loaded_npc(
 fn save_on_request(
     flag: Option<Res<ServerSaveRequestFlag>>,
     config: Option<Res<ServerSaveConfig>>,
+    clock: Res<WorldClock>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<&AvatarPose, With<Avatar>>,
     npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
@@ -295,6 +308,7 @@ fn save_on_request(
         edited_chunks: edited,
         last_player_pose: avatars.iter().next().copied(),
         npcs: saved_npcs,
+        world_clock: Some(*clock),
     };
     match write_save(name, &save) {
         Ok(()) => info!("save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs to {name:?}"),
@@ -334,6 +348,7 @@ fn collect_saved_npcs(
 fn save_then_shutdown(
     flag: Option<Res<ServerShutdownFlag>>,
     config: Option<Res<ServerSaveConfig>>,
+    clock: Res<WorldClock>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<&AvatarPose, With<Avatar>>,
     npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
@@ -370,6 +385,7 @@ fn save_then_shutdown(
                     edited_chunks: edited,
                     last_player_pose: avatars.iter().next().copied(),
                     npcs: saved_npcs,
+                    world_clock: Some(*clock),
                 };
                 match write_save(name, &save) {
                     Ok(()) => info!("saved {chunk_count} chunks + {npc_count} NPCs to {name:?}"),
