@@ -56,6 +56,16 @@ pub enum BootstrapError {
         "block {block} consumable.duration_secs = {value}; must be ≥ 0.1 (very short eats look glitchy)"
     )]
     ConsumableDurationOutOfRange { block: BlockId, value: f32 },
+    #[error("block {block} sleeper references unregistered need {need}")]
+    SleeperNeedUnknown { block: BlockId, need: String },
+    #[error(
+        "block {block} sleeper.restores = {value}; must be > 0 and ≤ 1 (need values are deficits in [0, 1])"
+    )]
+    SleeperRestoresOutOfRange { block: BlockId, value: f32 },
+    #[error(
+        "block {block} sleeper.duration_secs = {value}; must be ≥ 1.0 (sleep should feel like seconds, not a teleport)"
+    )]
+    SleeperDurationOutOfRange { block: BlockId, value: f32 },
 }
 
 /// The live, finalised registry. Held as a Bevy `Resource` on each side.
@@ -173,6 +183,37 @@ impl BlockRegistry {
                 return Err(BootstrapError::ConsumableDurationOutOfRange {
                     block: def.id.clone(),
                     value: c.duration_secs,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Cross-validate sleeper-bearing blocks against the [`NeedRegistry`].
+    /// Same shape as `validate_consumables` but with a stricter lower
+    /// bound on `duration_secs` — a sleep that completes inside one tick
+    /// is almost certainly an authoring mistake.
+    pub fn validate_sleepers(&self, needs: &NeedRegistry) -> Result<(), BootstrapError> {
+        for def in &self.defs_by_slot {
+            let Some(s) = &def.sleeper else { continue };
+            if !needs.contains(&s.need) {
+                return Err(BootstrapError::SleeperNeedUnknown {
+                    block: def.id.clone(),
+                    need: s.need.clone(),
+                });
+            }
+            if !(s.restores > 0.0 && s.restores <= 1.0) {
+                return Err(BootstrapError::SleeperRestoresOutOfRange {
+                    block: def.id.clone(),
+                    value: s.restores,
+                });
+            }
+            // 1.0 s lower bound: sleep should feel substantive. The
+            // brain's per-action upper clamp catches the other end.
+            if s.duration_secs < 1.0 {
+                return Err(BootstrapError::SleeperDurationOutOfRange {
+                    block: def.id.clone(),
+                    value: s.duration_secs,
                 });
             }
         }

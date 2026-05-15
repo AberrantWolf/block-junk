@@ -255,6 +255,21 @@ Fix: replay the loader's rigging pass yourself in a `SceneInstanceReady` observe
 
 One more wrapper trap when reaching into a scene: Bevy's glTF loader spawns an unnamed coordinate-system-conversion entity (`world_root_id`) above the glTF's named top-level nodes. So `SceneRoot bearer → first child` is the unnamed wrapper, *not* the named glTF root. Search descendants by `Name` (`name.as_str() == "Rig_Medium"`) rather than positional `children.iter().next()` — the wrapper count can change with Bevy versions or `convert_coordinates` settings.
 
+### bevy_egui: interactive UI must run in `EguiPrimaryContextPass`
+
+bevy_egui's pointer/click event collection only happens inside the `EguiPrimaryContextPass` schedule. A `Window::show(...)` call placed in regular `Update` (or `FixedUpdate`, or one of the project's `GameSet::*` sets) **will render the window and its buttons, but every `button(...).clicked()` returns false** — the input never reaches egui. Symptom: panel visible, cursor releases as expected, clicks land silently with no log spam to suggest a wiring problem.
+
+Read-only egui systems (like `debug_overlay_ui`) get away with it because they don't read input. Anything with buttons, sliders, or text fields must live in `EguiPrimaryContextPass`:
+
+```rust
+app.add_systems(
+    bevy_egui::EguiPrimaryContextPass,
+    my_panel_ui.run_if(in_state(AppState::InGame)),
+);
+```
+
+In-repo: `menu.rs::pause_menu_ui` and `debug.rs::debug_panel_ui` both use this schedule. Other system ordering (`GameSet::Input` etc.) still applies to the input *handlers* (keyboard toggles, etc.) — only the egui UI itself needs the special schedule.
+
 ## When a check fails
 
 The cached crate source at `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/<crate>-<version>/` is the source of truth. Before guessing at an API:

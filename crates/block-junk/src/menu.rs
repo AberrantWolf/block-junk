@@ -51,12 +51,14 @@ use crate::voxel::world_to_chunk;
 /// Top-level lifecycle states for the client App. The server App, when
 /// hosting, runs in its own thread and has no `AppState` — it just runs
 /// until its shutdown flag is set.
+///
+/// There is no `Paused` variant: the in-game pause/options overlay is
+/// just a UI flag ([`PauseMenuOpen`]) that doesn't halt simulation.
 #[derive(States, Default, Debug, Clone, Eq, PartialEq, Hash)]
 pub enum AppState {
     #[default]
     MainMenu,
     InGame,
-    Paused,
 }
 
 /// What kind of session the user is starting / has started. Set by the menu
@@ -178,6 +180,13 @@ impl Default for DebugNoSaveOnExit {
 #[derive(Component)]
 pub struct GameRoot;
 
+/// True while the in-game pause/options overlay is visible. The world
+/// keeps simulating regardless — the "Paused" overlay is just a menu
+/// that happens to release the cursor so its buttons are clickable.
+/// Toggled by `toggle_pause`.
+#[derive(Resource, Default)]
+pub struct PauseMenuOpen(pub bool);
+
 pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
@@ -191,6 +200,7 @@ impl Plugin for MenuPlugin {
         app.init_resource::<NewWorldName>();
         app.init_resource::<SaveListing>();
         app.init_resource::<SaveStatus>();
+        app.init_resource::<PauseMenuOpen>();
         app.add_systems(OnEnter(AppState::MainMenu), refresh_save_listing);
 
         // bevy_egui attaches its primary context to the FIRST camera that
@@ -205,15 +215,18 @@ impl Plugin for MenuPlugin {
             bevy_egui::EguiPrimaryContextPass,
             (
                 main_menu_ui.run_if(in_state(AppState::MainMenu)),
-                pause_menu_ui.run_if(in_state(AppState::Paused)),
+                // Pause menu rides on top of InGame — the world keeps
+                // simulating beneath it, the menu just releases the
+                // cursor so its buttons are clickable. The `if open`
+                // gate is inside the system rather than `run_if` so
+                // egui's window can claim the click in the same frame
+                // it's opened (no one-frame gap before it renders).
+                pause_menu_ui.run_if(in_state(AppState::InGame)),
                 debug_overlay_ui.run_if(in_state(AppState::InGame)),
             ),
         );
 
-        app.add_systems(
-            Update,
-            toggle_pause.run_if(in_state(AppState::InGame).or(in_state(AppState::Paused))),
-        );
+        app.add_systems(Update, toggle_pause.run_if(in_state(AppState::InGame)));
 
         // Server thread lifecycle is tied to *session* boundaries, not to
         // InGame ↔ Paused. Pausing must not tear down the server; only
@@ -457,26 +470,36 @@ fn relative_time(unix_seconds: u64) -> String {
 
 fn pause_menu_ui(
     mut contexts: EguiContexts,
-    mut next_state: ResMut<NextState<AppState>>,
+    mut open: ResMut<PauseMenuOpen>,
     mut session: ResMut<ServerSession>,
     mut exit: MessageWriter<AppExit>,
+    mut windows: Query<
+        (&mut bevy::window::Window, &mut bevy::window::CursorOptions),
+        With<bevy::window::PrimaryWindow>,
+    >,
 ) {
+    if !open.0 {
+        return;
+    }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
     let hosting = session.is_hosting();
+    let mut close_request = false;
     egui::Window::new("Paused")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
+            ui.label("The world is still running.");
+            ui.add_space(4.0);
             ui.vertical_centered(|ui| {
                 if ui.button("Resume").clicked() {
-                    next_state.set(AppState::InGame);
+                    close_request = true;
                 }
                 // Save Now bypasses DebugNoSaveOnExit so you can verify a
-                // save without quitting. Hidden on JoinRemote (the local
-                // App isn't authoritative over the world).
+                // save without quitting. Disabled on JoinRemote (the
+                // local App isn't authoritative over the world).
                 ui.add_enabled_ui(hosting, |ui| {
                     if ui.button("Save Now").clicked() {
                         session.request_save();
@@ -501,6 +524,16 @@ fn pause_menu_ui(
                 }
             });
         });
+    if close_request {
+        open.0 = false;
+        if let Ok((mut window, mut cursor)) = windows.single_mut() {
+            let centre =
+                Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
+            window.set_cursor_position(Some(centre));
+            cursor.grab_mode = bevy::window::CursorGrabMode::Locked;
+            cursor.visible = false;
+        }
+    }
 }
 
 /// Small in-game overlay in the top-left corner showing the local player's
@@ -540,18 +573,35 @@ fn debug_overlay_ui(
         });
 }
 
+/// Esc toggles the in-game pause overlay. Doesn't change `AppState`
+/// — the world keeps simulating while the menu is up — and instead
+/// just flips `PauseMenuOpen` and (un)locks the cursor inline. The
+/// cursor handling mirrors `camera::capture`/`release_cursor`; going
+/// through those would require introducing a state-transition the
+/// rest of the codebase doesn't want.
 fn toggle_pause(
     keys: Res<ButtonInput<KeyCode>>,
-    state: Res<State<AppState>>,
-    mut next_state: ResMut<NextState<AppState>>,
+    mut open: ResMut<PauseMenuOpen>,
+    mut windows: Query<
+        (&mut bevy::window::Window, &mut bevy::window::CursorOptions),
+        With<bevy::window::PrimaryWindow>,
+    >,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
         return;
     }
-    match state.get() {
-        AppState::InGame => next_state.set(AppState::Paused),
-        AppState::Paused => next_state.set(AppState::InGame),
-        AppState::MainMenu => {}
+    open.0 = !open.0;
+    let Ok((mut window, mut cursor)) = windows.single_mut() else {
+        return;
+    };
+    if open.0 {
+        cursor.grab_mode = bevy::window::CursorGrabMode::None;
+        cursor.visible = true;
+    } else {
+        let centre = Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
+        window.set_cursor_position(Some(centre));
+        cursor.grab_mode = bevy::window::CursorGrabMode::Locked;
+        cursor.visible = false;
     }
 }
 

@@ -35,6 +35,15 @@ local last_action = {}
 -- everything else on tick zero.
 local HUNGER_THRESHOLD = 0.3
 
+-- Sleep threshold above which a tired NPC will *consider* heading for
+-- a bed — actual sleep only fires when it's also night out (gated by
+-- snapshot.is_night below). With `restores = 0.7` per bed and threshold
+-- 0.25, an NPC that's slept will go well below the trigger, but an NPC
+-- that hasn't slept in a day will be visibly tired by the time night
+-- rolls around. The spawn default is 0.15, so a fresh NPC won't head
+-- straight for a bed on session start.
+local SLEEP_THRESHOLD = 0.25
+
 -- Probability of "go visit a room" after a rest, when at least one
 -- matched room is reachable in the snapshot. 0.5 makes the room
 -- behavior frequent enough to demo, but still leaves wander time so
@@ -55,6 +64,19 @@ local function nearest_consumable_for(snapshot, need_id)
     return nil
 end
 
+-- Mirror of `nearest_consumable_for` for sleepers. The engine already
+-- excludes beds claimed by other NPCs, so the first match is one this
+-- NPC could actually claim (modulo the rare same-tick race the engine
+-- catches at try_claim time).
+local function nearest_sleeper_for(snapshot, need_id)
+    for _, s in ipairs(snapshot.nearby_sleepers) do
+        if s.need == need_id then
+            return s.cell
+        end
+    end
+    return nil
+end
+
 engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- snapshot.id                — stable u64 id of this NPC (table key)
     -- snapshot.kind              — NpcKindId we registered
@@ -63,9 +85,32 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- snapshot.nearby_rooms      — sorted nearest-first list
     -- snapshot.nearby_consumables — sorted nearest-first list
 
-    -- Highest priority: hunger that's reached the eat threshold AND a
-    -- reachable food source. Returns immediately so this short-circuits
-    -- the rest/wander rhythm whenever the NPC has both a deficit and a
+    -- Highest priority: tired-at-night with a free bed reachable.
+    -- The night gate is what stops NPCs from collapsing into a bed at
+    -- noon the moment they reach the tired threshold — sleep is a
+    -- nocturnal action even if they're exhausted earlier in the day.
+    -- Ordered above hunger so a tired hungry NPC sleeps now and eats
+    -- in the morning (a tired NPC mid-meal at sunrise would be
+    -- disorienting to watch; the simple rule reads cleaner).
+    local sleep_need = snapshot.needs.sleep or 0.0
+    if snapshot.is_night and sleep_need >= SLEEP_THRESHOLD then
+        local bed_cell = nearest_sleeper_for(snapshot, "sleep")
+        if bed_cell ~= nil then
+            last_action[snapshot.id] = "sleep"
+            return {
+                kind = "sleep",
+                cell = bed_cell,
+                timeout_secs = 60.0,
+            }
+        end
+        -- Tired at night with no bed: fall through to wander/eat so
+        -- the NPC isn't frozen pacing in place. If a player places a
+        -- bed nearby, the next planner call will catch it.
+    end
+
+    -- Next: hunger that's reached the eat threshold AND a reachable
+    -- food source. Returns immediately so this short-circuits the
+    -- rest/wander rhythm whenever the NPC has both a deficit and a
     -- way to fix it.
     local hunger = snapshot.needs.hunger or 0.0
     if hunger >= HUNGER_THRESHOLD then
@@ -85,10 +130,11 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
 
     local prev = last_action[snapshot.id]
 
-    -- Always rest after motion (wander, visit, or consume). Keeps the
-    -- NPC from looking frantic and stops "complete goal, immediately
-    -- repeat" loops.
-    if prev == "wander" or prev == "visit" or prev == "consume" then
+    -- Always rest after motion (wander, visit, consume, or sleep).
+    -- Keeps the NPC from looking frantic and stops "complete goal,
+    -- immediately repeat" loops. Sleep included so an NPC that just
+    -- woke takes a breath before deciding the next thing.
+    if prev == "wander" or prev == "visit" or prev == "consume" or prev == "sleep" then
         last_action[snapshot.id] = "rest"
         return { kind = "rest", duration_secs = 3.0 + math.random() * 5.0 }
     end

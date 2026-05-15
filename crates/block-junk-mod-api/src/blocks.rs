@@ -148,6 +148,17 @@ pub struct BlockDef {
     /// default) ⇒ NPCs never consider this block for a Consume goal.
     #[serde(default)]
     pub consumable: Option<Consumable>,
+    /// Marks this block as a sleeper (a bed, a bedroll, a sarcophagus —
+    /// anything one NPC can use to satisfy a need over a long stretch
+    /// of time). Mechanically similar to `consumable` but with two
+    /// extra rules: (a) only one NPC can claim a given sleeper at a
+    /// time (the engine maintains a per-anchor claim table) and
+    /// (b) duration is allowed to be much longer (sleep is intended
+    /// to feel like minutes, not seconds). The engine validates at
+    /// boot that `need` refers to a registered need id, same as
+    /// `consumable`. `None` ⇒ NPCs never consider this block for sleep.
+    #[serde(default)]
+    pub sleeper: Option<Sleeper>,
 }
 
 /// Block-level "interacting with this satisfies a need" declaration.
@@ -178,6 +189,31 @@ pub struct Consumable {
     /// amount is applied. Gives the action visible weight (NPC clearly
     /// *interacted*, didn't just touch and turn). Engine clamps to a
     /// sane bound so a misbehaving mod can't park an NPC indefinitely.
+    pub duration_secs: f32,
+}
+
+/// Block-level "an NPC can sleep here to satisfy a need" declaration.
+/// Same shape as [`Consumable`] but a single sleeper accommodates one
+/// NPC at a time — the engine reserves the anchor cell for whichever
+/// NPC committed first and rejects competing claims until release.
+/// Beds today, larger fixtures (a campfire ring, a guest hall pad)
+/// later; the engine doesn't care what the asset is.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sleeper {
+    /// Id of the need this sleep reduces. Cross-validated against the
+    /// [`NeedDef`](crate::npcs::NeedDef) registry at boot — a sleeper
+    /// referencing an unregistered need is a load error.
+    pub need: String,
+    /// How much deficit is subtracted from the named need on completion.
+    /// Need values run 0.0 (fully satisfied) → 1.0 (critical), so a
+    /// larger `restores` is more refreshing. Clamped at 0.0 after the
+    /// subtraction. A whole night might restore 0.8–1.0; a nap less.
+    pub restores: f32,
+    /// How long the NPC stands at the sleeper before the `restores`
+    /// amount is applied. Engine clamps to a sane upper bound so a
+    /// misbehaving mod can't park an NPC for an hour, but the bound
+    /// is much larger than the consumable bound — sleep is allowed to
+    /// feel like minutes.
     pub duration_secs: f32,
 }
 

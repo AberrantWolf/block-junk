@@ -20,7 +20,8 @@ use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    ChunkSnapshot, ChunkUnload, MovementIntent, MovementMode, WorldChannel,
+    ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, MovementIntent, MovementMode,
+    WorldChannel, WorldClockSync,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +75,14 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<BlockManifest>()
             .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<WorldClockSync>()
+            .add_direction(NetworkDirection::ServerToClient);
+        // Debug-only client→server requests. No auth gate yet — see the
+        // doc comments on `DebugSetClock` / `DebugBumpNeed`.
+        app.register_message::<DebugAdvanceTime>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<DebugBumpNeed>()
+            .add_direction(NetworkDirection::ClientToServer);
 
         // Player-avatar replication. Server owns the avatar entities; the
         // marker tells receivers "attach a mesh," and `AvatarPose` is the

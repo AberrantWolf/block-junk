@@ -127,6 +127,9 @@ fn load_side(side: Side) -> LoadResult {
     if let Err(e) = blocks.validate_consumables(&needs) {
         panic!("{} consumable validation failed: {e}", side.as_str());
     }
+    if let Err(e) = blocks.validate_sleepers(&needs) {
+        panic!("{} sleeper validation failed: {e}", side.as_str());
+    }
     let npc_kinds = match NpcKindRegistry::build(ctx.take_npc_kinds(), &needs) {
         Ok(r) => r,
         Err(e) => panic!("{} npc kind registry build failed: {e}", side.as_str()),

@@ -155,6 +155,48 @@ pub struct NpcSnapshot {
     /// "what's nearby right now" decision, not a global search.
     #[serde(default)]
     pub nearby_consumables: Vec<NearbyConsumable>,
+    /// Up to K nearest unclaimed sleeper blocks, sorted by distance
+    /// (closest first). Beds today, but anything a mod has tagged
+    /// with [`Sleeper`](crate::blocks::Sleeper) shows up here.
+    /// **Already filtered**: a sleeper currently claimed by a
+    /// different NPC is excluded from this list — the planner sees
+    /// only what *it* could plausibly use this tick. Race-on-claim
+    /// is still possible (two planners tick the same instant and
+    /// both see the same free bed), but the brain's `try_claim`
+    /// step resolves that atomically by failing the second arrival.
+    #[serde(default)]
+    pub nearby_sleepers: Vec<NearbySleeper>,
+    /// True when the world clock currently reads as night. Mirrors
+    /// the engine's `WorldClock::is_night`. Lets a planner gate
+    /// nocturnal-only actions (sleep, hunt) without having to read
+    /// raw `time_of_day` and re-derive the threshold.
+    #[serde(default)]
+    pub is_night: bool,
+}
+
+/// One entry in [`NpcSnapshot::nearby_sleepers`]. Same shape as
+/// [`NearbyConsumable`] but for sleepers; the engine pre-computes
+/// `need` and `restores` from the block's
+/// [`Sleeper`](crate::blocks::Sleeper) def so the planner doesn't
+/// need to know which block-id is a bed today. The engine
+/// re-resolves the block + claim state on arrival so a snapshot
+/// that's gone stale (bed broken, bed claimed first by another NPC)
+/// degrades to "completes silently" rather than producing wrong
+/// behaviour.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NearbySleeper {
+    /// World cell of the sleeper block. May be the foot or the head
+    /// of a multi-cell bed; the engine resolves the anchor at goal
+    /// commit time.
+    pub cell: BlockPos,
+    /// Need this sleep reduces. Mirrored from
+    /// [`Sleeper::need`](crate::blocks::Sleeper).
+    pub need: String,
+    /// Pre-clamp magnitude of the deficit reduction.
+    pub restores: f32,
+    /// Manhattan distance from the NPC's foot, same metric used by
+    /// `nearby_consumables.distance`.
+    pub distance: u32,
 }
 
 /// One entry in [`NpcSnapshot::nearby_consumables`]. Pre-computed
@@ -269,6 +311,29 @@ pub enum PlannerGoal {
         #[serde(default = "default_consume_timeout")]
         timeout_secs: f32,
     },
+    /// Walk to a sleeper block (a bed today), claim it for the
+    /// duration of the sleep, stand still for its declared
+    /// `duration_secs`, then subtract its `restores` from the
+    /// matching need and release the claim. Differs from `Consume`
+    /// in two ways: the engine maintains a per-bed claim table so
+    /// only one NPC sleeps in a given bed at a time, and the brain
+    /// allows much longer durations (sleep is intended to feel like
+    /// real seconds, not a brief pause).
+    ///
+    /// `cell` may be any cell of a multi-cell sleeper (foot or head
+    /// of a bed); the engine resolves the anchor via the chunk
+    /// sidecar so two planners that picked different ends of the
+    /// same bed contend for the same claim.
+    ///
+    /// If the bed is gone, replaced, or claimed by someone else by
+    /// the time the NPC arrives, the goal completes silently. The
+    /// planner is expected to read `snapshot.nearby_sleepers` to
+    /// see what's available.
+    Sleep {
+        cell: BlockPos,
+        #[serde(default = "default_sleep_timeout")]
+        timeout_secs: f32,
+    },
 }
 
 fn default_wander_radius() -> i32 {
@@ -285,4 +350,8 @@ fn default_goto_timeout() -> f32 {
 
 fn default_consume_timeout() -> f32 {
     30.0
+}
+
+fn default_sleep_timeout() -> f32 {
+    60.0
 }

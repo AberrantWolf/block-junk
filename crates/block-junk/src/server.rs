@@ -17,7 +17,7 @@ use crate::physics::apply_walk_step;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
-    MovementIntent, MovementMode, WorldChannel,
+    MovementIntent, MovementMode, WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
@@ -39,6 +39,8 @@ impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::scripting::ServerScriptingPlugin);
         app.add_plugins(crate::consumables::ConsumableIndexPlugin);
+        app.add_plugins(crate::sleepers::SleeperIndexPlugin);
+        app.add_plugins(crate::debug::DebugServerPlugin);
         app.add_plugins(crate::npc::NpcServerPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
@@ -51,6 +53,15 @@ impl Plugin for ServerPlugin {
         app.init_resource::<PendingSpawnPose>();
         app.init_resource::<RoomMap>();
         app.init_resource::<DetectionDirty>();
+        // World clock. Start at 0.25 (sunrise) so a fresh session begins
+        // with the world lit and gives players a few minutes before the
+        // first sleep-driven NPC behaviour kicks in. Save persistence is
+        // future work; today every load lands here.
+        app.insert_resource(WorldClock {
+            day: 0,
+            time_of_day: 0.25,
+        });
+        app.init_resource::<ClockSyncCooldown>();
         // Local Bevy bus for server-internal observers (scripting, building
         // detection, etc.). Not what crosses the wire — that's lightyear's
         // MessageSender/Receiver. Server-only.
@@ -84,6 +95,8 @@ impl Plugin for ServerPlugin {
         // compares this against the client's predicted state and replays
         // unacked inputs on disagreement.
         app.add_systems(FixedUpdate, server_player_step);
+        app.add_systems(FixedUpdate, tick_world_clock);
+        app.add_systems(Update, broadcast_world_clock);
         // Save/load wiring. `load_from_save` runs before any other Startup
         // system that touches ChunkMap so loaded chunks beat AoI's
         // procedural fallback. `save_then_shutdown` polls the shutdown flag
@@ -120,6 +133,7 @@ fn load_from_save(
     mut dirty: ResMut<DetectionDirty>,
     config: Option<Res<ServerSaveConfig>>,
     block_registry: Res<BlockRegistry>,
+    kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
 ) {
     let Some(config) = config else {
         return;
@@ -193,7 +207,7 @@ fn load_from_save(
         info!("primed {dirty_marked} room-bounding cells for re-detection after load");
     }
     for npc in save.npcs {
-        spawn_loaded_npc(&mut commands, npc);
+        spawn_loaded_npc(&mut commands, npc, &kind_registry);
     }
 }
 
@@ -202,13 +216,30 @@ fn load_from_save(
 /// rng come from the save, transient state (velocity, on-ground, goal,
 /// path overlay) defaults so the brain resumes from Idle and the
 /// planner picks a fresh action on the first post-load tick.
-fn spawn_loaded_npc(commands: &mut Commands, npc: SavedNpc) {
+///
+/// Backfills any needs the kind registry declares but the save doesn't
+/// carry — saves from before a mod added a new need would otherwise
+/// leave that NPC permanently missing the entry, and the planner would
+/// read it as `nil` forever. The save's value wins on collision (the
+/// saved decay is the authoritative state for needs that already
+/// existed), only-in-registry needs get the registry's default.
+fn spawn_loaded_npc(
+    commands: &mut Commands,
+    npc: SavedNpc,
+    kind_registry: &crate::npc_registry::NpcKindRegistry,
+) {
+    let mut needs = npc.needs;
+    if let Some(def) = kind_registry.get(&npc.kind) {
+        for (need_id, default_value) in &def.default_needs {
+            needs.entry(need_id.clone()).or_insert(*default_value);
+        }
+    }
     commands.spawn((
         Actor,
         Npc,
         NpcId(npc.id),
         NpcKind(npc.kind),
-        Needs(npc.needs),
+        Needs(needs),
         Brain {
             goal: Goal::Idle,
             rng: npc.rng,
@@ -469,6 +500,51 @@ fn register_new_client(
 /// and runs the same controller the predicted client runs. The resulting
 /// AvatarPose is what gets replicated back; the predicted client compares
 /// against it and rolls back on disagreement.
+/// Real seconds between `WorldClockSync` broadcasts. The client
+/// extrapolates locally between syncs (via `WorldClock::advance` in its
+/// own `Update`), so 1 Hz is plenty to keep drift bounded — at
+/// `DAY_LENGTH_SECS = 600` a one-second drift is one part in 600 of the
+/// day cycle, well below visible.
+const CLOCK_SYNC_INTERVAL_SECS: f32 = 1.0;
+
+/// Countdown until the next clock sync. Wraps `f32` rather than a Bevy
+/// `Timer` because the only use is "decrement, fire-when-zero, reset" —
+/// the timer API's repeating/just-finished bookkeeping is overkill.
+#[derive(Resource, Default)]
+pub struct ClockSyncCooldown(pub f32);
+
+/// Advance the world clock one fixed tick. Single-source-of-truth for
+/// time-of-day; the snapshot builder and the replication broadcaster
+/// both read this resource.
+fn tick_world_clock(time: Res<Time>, mut clock: ResMut<WorldClock>) {
+    clock.advance(time.delta_secs());
+}
+
+/// Periodic clock broadcast. Sends `WorldClockSync` to every connected
+/// client once every `CLOCK_SYNC_INTERVAL_SECS` real seconds. Also fires
+/// the first sync on the cooldown's initial tick after spawn, so a
+/// freshly-connected client snaps within ~1 s of join rather than
+/// waiting for the cooldown to first roll over.
+fn broadcast_world_clock(
+    time: Res<Time>,
+    clock: Res<WorldClock>,
+    mut cooldown: ResMut<ClockSyncCooldown>,
+    mut senders: Query<&mut MessageSender<WorldClockSync>>,
+) {
+    cooldown.0 -= time.delta_secs();
+    if cooldown.0 > 0.0 {
+        return;
+    }
+    cooldown.0 = CLOCK_SYNC_INTERVAL_SECS;
+    let msg = WorldClockSync {
+        day: clock.day,
+        time_of_day: clock.time_of_day,
+    };
+    for mut sender in senders.iter_mut() {
+        sender.send::<WorldChannel>(msg);
+    }
+}
+
 fn server_player_step(
     time: Res<Time>,
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,

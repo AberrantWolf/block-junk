@@ -3,6 +3,7 @@ mod camera;
 mod client;
 mod collision;
 mod consumables;
+mod debug;
 mod menu;
 mod network;
 mod npc;
@@ -15,6 +16,7 @@ mod rooms;
 mod save;
 mod scripting;
 mod server;
+mod sleepers;
 mod voxel;
 
 use core::sync::atomic::AtomicBool;

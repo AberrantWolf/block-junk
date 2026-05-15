@@ -247,3 +247,84 @@ pub enum GameSet {
     Simulation,
     PostSimulation,
 }
+
+/// One in-game day in real seconds. Picked short enough that a session
+/// always sees several day/night transitions, long enough that the
+/// transition itself doesn't feel like a flicker. Tune to taste.
+pub const DAY_LENGTH_SECS: f32 = 600.0;
+
+/// Server-authoritative day clock. `time_of_day` is the fraction of the
+/// current day elapsed: 0.0 = midnight, 0.25 = sunrise, 0.5 = noon,
+/// 0.75 = sunset. `day` counts completed days since session start;
+/// future save persistence will land it here. Lives as a `Resource` on
+/// both sides — server ticks it forward, client snaps it from
+/// `WorldClockSync` messages and locally extrapolates between syncs so
+/// the sun doesn't visibly tick once a second.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct WorldClock {
+    pub day: u32,
+    pub time_of_day: f32,
+}
+
+impl WorldClock {
+    /// True during the half of the day when the sun is below the horizon.
+    /// Mirrors the sun-rotation math in the client lighting system.
+    pub fn is_night(self) -> bool {
+        // Sun-up window is sunrise (0.25) → sunset (0.75). Anything else
+        // is night. Phrasing in terms of "below 0.25 or above 0.75" keeps
+        // the planner snapshot and the visuals reading the same truth.
+        self.time_of_day < 0.25 || self.time_of_day >= 0.75
+    }
+
+    /// Advance the clock by `dt` real-time seconds, scaled by
+    /// `DAY_LENGTH_SECS`. Server uses this every fixed tick; client uses
+    /// it during render frames to extrapolate between sync messages.
+    pub fn advance(&mut self, dt: f32) {
+        self.time_of_day += dt / DAY_LENGTH_SECS;
+        while self.time_of_day >= 1.0 {
+            self.time_of_day -= 1.0;
+            self.day = self.day.wrapping_add(1);
+        }
+    }
+}
+
+/// Server → client periodic sync of the world clock. Tiny (5 bytes)
+/// and sent at low cadence — the client extrapolates locally between
+/// messages. Lives on `WorldChannel` so it benefits from ordered-
+/// reliable delivery (we don't want clocks to skip backwards from
+/// out-of-order delivery; ordering pins each sync as monotonically
+/// progressing).
+#[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct WorldClockSync {
+    pub day: u32,
+    pub time_of_day: f32,
+}
+
+/// Client → server: debug request to fast-forward the world by
+/// `secs` real-time seconds. Intended for the dev debug panel only;
+/// no permission check today (see the wider note on debug messages).
+///
+/// "Fast-forward" means two things atomically: the [`WorldClock`]
+/// rolls forward by `secs / DAY_LENGTH_SECS` (wrapping into the
+/// next day), and every NPC's needs decay by `decay_per_sec * secs`
+/// — i.e. the world experiences `secs` of time without the player
+/// having to wait. Negative values are clamped to 0 (going backward
+/// is weird — the existing-deficits don't ungrow; if you want to
+/// rewind the clock, just keep advancing through the next cycle).
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DebugAdvanceTime {
+    pub secs: f32,
+}
+
+/// Client → server: debug request to bump every NPC's value for the
+/// named need by `delta` (typically positive — "make everyone more
+/// tired" or "more hungry" to trigger behaviour without waiting
+/// minutes for natural decay). Server clamps the resulting per-NPC
+/// value to [0, 1] so a runaway delta can't break the math, and
+/// silently ignores `need` ids the registry doesn't know about
+/// (e.g. a typo from the UI).
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct DebugBumpNeed {
+    pub need: String,
+    pub delta: f32,
+}

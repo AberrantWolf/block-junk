@@ -23,6 +23,7 @@ use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::protocol::{
     Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
     ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode, WorldChannel,
+    WorldClock, WorldClockSync,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -37,7 +38,8 @@ impl Plugin for ClientPlugin {
             // display you see 64 Hz physics steps with the renderer drawing
             // the same position for multiple frames between ticks.
             .add_plugins(FrameInterpolationPlugin::<AvatarPose>::default())
-            .add_plugins(crate::scripting::ClientScriptingPlugin);
+            .add_plugins(crate::scripting::ClientScriptingPlugin)
+            .add_plugins(crate::debug::DebugClientPlugin);
         // ClientScriptingPlugin inserts BlockRegistry. Derive client-side
         // resources from it.
         let palette = {
@@ -52,6 +54,14 @@ impl Plugin for ClientPlugin {
             .init_resource::<PlacementRotation>()
             .init_resource::<BlockEntities>()
             .init_resource::<PreviewState>()
+            // Client mirror of the server's day/night clock. Starts at
+            // 0.25 (sunrise) so the first frame after entering a session
+            // — before any WorldClockSync arrives — has the world lit
+            // rather than at midnight black.
+            .insert_resource(WorldClock {
+                day: 0,
+                time_of_day: 0.25,
+            })
             .add_observer(swap_preview_scene_materials)
             .add_observer(setup_npc_skeleton_anim)
             // Scene setup runs when entering a game, not at process start.
@@ -101,9 +111,17 @@ impl Plugin for ClientPlugin {
                     receive_snapshots,
                     receive_block_edit_broadcasts,
                     receive_chunk_unloads,
+                    receive_world_clock,
                 )
                     .chain()
                     .in_set(GameSet::Simulation),
+            )
+            .add_systems(
+                Update,
+                (advance_local_clock, update_day_night_lighting)
+                    .chain()
+                    .in_set(GameSet::PostSimulation)
+                    .run_if(in_state(AppState::InGame)),
             )
             // Avatar transform sync runs in PostUpdate after frame
             // interpolation, so the camera Transform we hand to the
@@ -321,35 +339,38 @@ fn setup_scene(
     // the server replicates it. Until then (a few ms in solo mode, up
     // to ~200 ms over the network) the screen has no active 3D camera.
 
-    // Two directional lights from opposite angles. The key light casts
-    // shadows; the back light only fills (no shadow map) so it doesn't
-    // create competing shadows that fight the key light's. The back light
-    // is tinted slightly cool so the two sides of geometry read differently
-    // even where they're both lit.
-    for (rot, illuminance, shadows, color) in [
-        (
-            Quat::from_euler(EulerRot::XYZ, -0.8, 0.4, 0.0),
-            10_000.0,
-            true,
-            Color::WHITE,
-        ),
-        (
-            Quat::from_euler(EulerRot::XYZ, 0.5, 2.6, 0.0),
-            3_000.0,
-            false,
-            Color::srgb(0.75, 0.85, 1.0),
-        ),
-    ] {
-        commands.spawn((
-            DirectionalLight {
-                color,
-                illuminance,
-                shadows_enabled: shadows,
-                ..default()
-            },
-            Transform::from_rotation(rot),
-        ));
-    }
+    // Sun light. `update_day_night_lighting` rotates it around X every
+    // frame from the world clock; initial transform is "noon" so the
+    // first frame before the first tick of the lighting system isn't
+    // visibly off. Tagged with `SunLight` so the lighting system can
+    // find it without relying on entity ordering.
+    commands.spawn((
+        DirectionalLight {
+            color: Color::WHITE,
+            illuminance: 10_000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(
+            EulerRot::XYZ,
+            -std::f32::consts::FRAC_PI_2,
+            0.0,
+            0.0,
+        )),
+        SunLight,
+    ));
+    // Back light. Static cool fill that softens the side of geometry the
+    // sun isn't on. Doesn't track the sun — it would just fight the key
+    // light if it did. Lower illuminance so it never out-shines daylight.
+    commands.spawn((
+        DirectionalLight {
+            color: Color::srgb(0.75, 0.85, 1.0),
+            illuminance: 3_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, 0.5, 2.6, 0.0)),
+    ));
 
     // Screen-centred crosshair.
     commands
@@ -495,6 +516,93 @@ fn update_hotbar_highlight(
             BorderColor::all(Color::BLACK)
         };
     }
+}
+
+/// Marker on the directional light that follows the world clock —
+/// rotates around the world's east/west axis with `time_of_day` and is
+/// dimmed/brightened to match the sun height. Letting the light find
+/// itself by component query rather than `Resource<Entity>` keeps the
+/// startup ordering loose (the lighting tick is a no-op until the
+/// light spawns; we don't have to insert it before the first tick).
+#[derive(Component)]
+struct SunLight;
+
+/// Receive replicated clock samples from the server. Snaps the local
+/// `WorldClock` to the latest sample so any drift accumulated in
+/// `advance_local_clock` is corrected each second. Out-of-order
+/// delivery would cause the clock to step backwards, but the message
+/// rides `WorldChannel` (ordered-reliable), so we only ever see
+/// monotonically newer samples.
+fn receive_world_clock(
+    mut receivers: Query<&mut MessageReceiver<WorldClockSync>>,
+    mut clock: ResMut<WorldClock>,
+) {
+    for mut receiver in receivers.iter_mut() {
+        for sync in receiver.receive() {
+            clock.day = sync.day;
+            clock.time_of_day = sync.time_of_day;
+        }
+    }
+}
+
+/// Locally extrapolate the clock between server syncs so the sun's
+/// rotation isn't visibly stepped at the 1 Hz sync cadence. Each
+/// incoming `WorldClockSync` corrects whatever this drifted to.
+fn advance_local_clock(time: Res<Time>, mut clock: ResMut<WorldClock>) {
+    clock.advance(time.delta_secs());
+}
+
+/// Drive the sun light's rotation, the directional intensity, the
+/// ambient brightness, and the sky colour from `WorldClock`. All four
+/// are derived from one shared "sun angle" so the visual stays
+/// coherent: sun overhead at noon, on the horizon at sunrise/sunset,
+/// below ground at night with the lights dimmed to moonlight.
+fn update_day_night_lighting(
+    clock: Res<WorldClock>,
+    mut ambient: ResMut<GlobalAmbientLight>,
+    mut clear: ResMut<ClearColor>,
+    mut sun: Query<(&mut Transform, &mut DirectionalLight), With<SunLight>>,
+) {
+    // Sun angle parameterised so `time_of_day` 0.25 → angle 0 (sunrise),
+    // 0.5 → PI/2 (noon), 0.75 → PI (sunset), 0.0 → -PI/2 (midnight).
+    let angle = (clock.time_of_day - 0.25) * core::f32::consts::TAU;
+    // Height curve: -1 = directly below, 0 = horizon, +1 = overhead.
+    // Matches `WorldClock::is_night` (height < 0 ⇔ night).
+    let daylight = angle.sin().max(0.0);
+
+    if let Ok((mut tf, mut light)) = sun.single_mut() {
+        // Light direction: when the sun is overhead it points straight
+        // down (rotation around X = -PI/2 puts the default -Z forward
+        // pointing at -Y). At sunrise the light points horizontally
+        // (rotation 0). The constant Y rotation (0.4 rad) gives the
+        // shadow side a slight south/east bias so flat geometry still
+        // reads as 3D rather than washing out at noon.
+        let rot_x = -angle;
+        tf.rotation = Quat::from_euler(EulerRot::XYZ, rot_x, 0.4, 0.0);
+        // Direct sunlight scales with sun height. Night drops to 0 —
+        // ambient + the static back light keep things readable.
+        light.illuminance = 10_000.0 * daylight;
+        // Disable shadow casting at low sun angles. The cascade-shadow
+        // projection becomes extremely stretched when the sun is near
+        // horizontal — small bias errors turn into visible stripes
+        // across flat geometry. Below ~10° elevation the visual
+        // benefit of shadows is small anyway (everything's dim),
+        // so just drop them until the sun is well clear of the
+        // horizon. Threshold 0.18 ≈ sin(10°).
+        light.shadows_enabled = daylight > 0.18;
+    }
+
+    // Ambient floor at moonlight (30 lx) — pitch black is unplayable.
+    // Ramps to the original flat-read value (250 lx) at noon.
+    ambient.brightness = 30.0 + 220.0 * daylight;
+
+    // Sky/clear colour: lerp between night blue and day blue. Sunset
+    // warm tones would need a separate "twilight" channel; skip for
+    // now since we don't have a skybox to layer it onto anyway.
+    let day_sky = Vec3::new(0.55, 0.75, 1.0);
+    let night_sky = Vec3::new(0.02, 0.03, 0.08);
+    let mix = day_sky * daylight + night_sky * (1.0 - daylight);
+    clear.0 = Color::srgb(mix.x, mix.y, mix.z);
 }
 
 /// Reach in world cells. Generous because the camera is a flying free-cam;

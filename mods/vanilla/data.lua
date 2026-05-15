@@ -90,20 +90,26 @@ register {
     color = { 0.40, 0.18, 0.05 },
 }
 
--- First block-entity test: a placeholder bed mesh. The .glb is a small
--- generated cuboid (1×0.5×2 ish, dark brown) — replace with proper art
--- when ready. The voxel mesher skips this slot's cube faces because
--- mesh is set; the client spawns an ECS entity with a SceneRoot loaded
--- from the path.
+-- KayKit "bed_single_A" mesh. The asset's local frame is the KayKit
+-- convention (extends ±Z, centred at origin, ~1.6×1×3 m, pillow at
+-- -Z), which doesn't match block-junk's "default-orientation extends
+-- +X." The gltf carries a node-level transform that bakes in the
+-- correction: a -90° Y rotation (KayKit -Z pillow → engine +X head),
+-- an X-axis scale of 0.625 (so the 1.6 m width fits in a 1 m cell),
+-- a Z-axis scale of 2/3 (so the 3 m length fits in 2 cells = 2 m),
+-- and a +0.5 m X translation (centres the 2 m bed across the
+-- anchor + head cells, pillow at the head cell's far edge). The engine's existing spawn path
+-- (`SceneRoot` + `Transform::from_rotation_y(orientation.yaw())`)
+-- handles place-time rotation against this baked-in default.
 --
--- footprint = two cells extending east of the anchor: anchor (foot) at
--- {0,0,0}, head at {1,0,0}. The engine rotates this when the player
--- places at non-default orientations.
+-- footprint = two cells east of the anchor (foot, head). The engine
+-- rotates this together with the mesh at non-default orientations.
 --
--- entity_aabb tracks the visible mesh's actual extent so ray tests that
--- pass above the low bed (it's roughly half-cell tall) don't break it.
--- Tune this when the real bed mesh lands. Coordinates are model-space:
--- anchor's bottom-centre at (0,0,0), +X = head, +Y = up.
+-- entity_aabb is in default-orientation model space (origin at the
+-- anchor's bottom-centre, +X = extends direction, +Y = up) and tracks
+-- the visible mesh after the gltf-level scale + translation. A tight
+-- box matters for the place/break raycast: a click *above* the bed
+-- shouldn't break it.
 register {
     id = "vanilla:bed",
     display_name = "Bed",
@@ -112,11 +118,24 @@ register {
         support_below = true,
     },
     color = { 0.40, 0.18, 0.05 },
-    mesh = "mods://vanilla/models/bed.glb",
+    mesh = "mods://vanilla/models/bed_single_A.gltf",
     footprint = { {0, 0, 0}, {1, 0, 0} },
     entity_aabb = {
         min = { -0.5, 0.0, -0.5 },
-        max = {  1.5, 0.5,  0.5 },
+        max = {  1.5, 1.0,  0.5 },
+    },
+    -- The first sleeper. `restores = 0.7` means a full sleep brings a
+    -- tiredness deficit down by 70% — a bedtime mostly resets the need
+    -- but doesn't completely max it, so a long day still ends with the
+    -- NPC visibly tired before bed. `duration_secs = 25` is long enough
+    -- to read as "they're asleep" but short enough that a player
+    -- watching the world doesn't lose interest before the cycle
+    -- completes. Only one NPC may claim a given bed at a time; the
+    -- engine maintains the claim table.
+    sleeper = {
+        need = "sleep",
+        restores = 0.7,
+        duration_secs = 25.0,
     },
 }
 
@@ -211,6 +230,20 @@ engine.needs.register {
     decay_per_sec = 1.0 / 300.0,
 }
 
+-- Sleep / tiredness. Decays slower than hunger because a day/night
+-- cycle is the natural beat for it: at DAY_LENGTH_SECS = 600 (10 real
+-- minutes) and decay 1/450, an NPC starting at 0 tiredness reaches the
+-- typical eat threshold (~0.3, picked low so behaviour fires often)
+-- well before the second night, leaving room for them to also do other
+-- things during the day. The planner gates the actual sleep action on
+-- it being night, so a tired NPC at noon still wanders rather than
+-- collapsing into the nearest bed.
+engine.needs.register {
+    id = "sleep",
+    display_name = "Tiredness",
+    decay_per_sec = 1.0 / 450.0,
+}
+
 -- The smoke-test NPC kind. The planner that drives it lives in
 -- events.lua; this block is just the declarative half (which side both
 -- the client and server need to agree on for any future networked kind
@@ -223,5 +256,11 @@ engine.npcs.register {
     display_name = "Wanderer",
     default_needs = {
         hunger = 0.2,
+        -- Spawn slightly tired so the first night triggers visible bed
+        -- behaviour without waiting a full decay runway. Threshold +
+        -- this baseline mean an NPC spawned at sunrise won't sleep
+        -- until evening, but one spawned just before night may head
+        -- straight for a bed.
+        sleep = 0.15,
     },
 }
