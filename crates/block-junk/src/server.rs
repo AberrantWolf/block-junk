@@ -1,4 +1,5 @@
 use core::time::Duration;
+use std::time::Instant;
 
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
@@ -14,14 +15,17 @@ use crate::collision::WorldCollision;
 use crate::menu::{ServerSaveConfig, ServerSaveRequestFlag, ServerShutdownFlag};
 use crate::physics::apply_walk_step;
 use crate::protocol::{
-    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, CellEdit,
-    ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode,
-    WorldChannel,
+    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
+    CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
+    MovementIntent, MovementMode, WorldChannel,
 };
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{SAVE_VERSION, SaveFile, SavedChunk, SavedNpc, read_save, write_save};
-use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_world_transform, world_to_chunk};
+use crate::voxel::{
+    Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
+    world_to_chunk,
+};
 
 /// Marker on chunks whose state has diverged from the deterministic terrain
 /// function. Server uses it to decide whether to ship the bytes or just
@@ -112,7 +116,9 @@ fn load_from_save(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut pending_pose: ResMut<PendingSpawnPose>,
+    mut dirty: ResMut<DetectionDirty>,
     config: Option<Res<ServerSaveConfig>>,
+    block_registry: Res<BlockRegistry>,
 ) {
     let Some(config) = config else {
         return;
@@ -136,12 +142,40 @@ fn load_from_save(
         save.npcs.len()
     );
     pending_pose.0 = save.last_player_pose;
+    // Mark every room-bounding cell in loaded chunks dirty for room
+    // detection. RoomMap is runtime-only state (not persisted — RoomIds
+    // aren't stable across restarts per the design memo), so without
+    // priming the dirty queue here, registered rooms from before the
+    // save would only re-detect after the player edited a block. Use
+    // the moment-of-load timestamp so the existing DEBOUNCE window
+    // applies and the first `process_dirty` tick after Startup runs
+    // the detection.
+    let now = Instant::now();
+    let mut dirty_marked = 0usize;
     for SavedChunk {
         coord,
         chunk,
         entities,
     } in save.edited_chunks
     {
+        // Interior cells run [1, CHUNK_PADDED - 1) in chunk-local space.
+        // `chunk_local_to_world` converts to the unpadded world cell.
+        for x in 1..(CHUNK_PADDED as i32 - 1) {
+            for y in 1..(CHUNK_PADDED as i32 - 1) {
+                for z in 1..(CHUNK_PADDED as i32 - 1) {
+                    let local = IVec3::new(x, y, z);
+                    let slot = chunk.get(local);
+                    if slot.is_empty() {
+                        continue;
+                    }
+                    if !block_registry.def(slot).flags.room_boundary {
+                        continue;
+                    }
+                    dirty.push(chunk_local_to_world(coord, local), now);
+                    dirty_marked += 1;
+                }
+            }
+        }
         let entity = commands
             .spawn((
                 chunk,
@@ -153,6 +187,9 @@ fn load_from_save(
             ))
             .id();
         chunk_map.0.insert(coord, entity);
+    }
+    if dirty_marked > 0 {
+        info!("primed {dirty_marked} room-bounding cells for re-detection after load");
     }
     for npc in save.npcs {
         spawn_loaded_npc(&mut commands, npc);

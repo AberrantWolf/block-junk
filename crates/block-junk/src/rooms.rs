@@ -224,6 +224,16 @@ pub struct DetectionDirty {
     cells: Vec<(IVec3, Instant)>,
 }
 
+impl DetectionDirty {
+    /// Mark a world cell dirty for re-detection. Honours the same
+    /// [`DEBOUNCE`] window as edit-driven marking — used by the save
+    /// loader to prime re-detection of rooms that existed at save time
+    /// (RoomMap itself is runtime-only).
+    pub fn push(&mut self, cell: IVec3, at: Instant) {
+        self.cells.push((cell, at));
+    }
+}
+
 // ---------- systems ----------
 
 /// Reads applied per-cell edits from the local server bus and pushes the
