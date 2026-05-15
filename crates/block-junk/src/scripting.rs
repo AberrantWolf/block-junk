@@ -120,6 +120,13 @@ fn load_side(side: Side) -> LoadResult {
         Err(e) => panic!("{} need registry build failed: {e}", side.as_str()),
     };
     info!("[{}] need registry: {} need(s)", side.as_str(), needs.need_count());
+    // Consumable blocks reference need ids; the need registry has to
+    // exist before we can validate them. Failing here at boot beats
+    // discovering "this food doesn't satisfy anything" the first time
+    // an NPC tries to eat it.
+    if let Err(e) = blocks.validate_consumables(&needs) {
+        panic!("{} consumable validation failed: {e}", side.as_str());
+    }
     let npc_kinds = match NpcKindRegistry::build(ctx.take_npc_kinds(), &needs) {
         Ok(r) => r,
         Err(e) => panic!("{} npc kind registry build failed: {e}", side.as_str()),

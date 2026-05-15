@@ -25,7 +25,10 @@
 //! when no mods load.
 
 use bevy::prelude::*;
-use block_junk_mod_api::npcs::{NearbyRoom, NpcKindId, NpcSnapshot, PlannerGoal};
+use block_junk_mod_api::blocks::Consumable;
+use block_junk_mod_api::npcs::{
+    NearbyConsumable, NearbyRoom, NpcKindId, NpcSnapshot, PlannerGoal,
+};
 use block_junk_mod_api::shared::BlockPos;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -34,6 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
+use crate::consumables::ConsumableIndex;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
@@ -106,41 +110,93 @@ pub struct BrainDisabled {
     pub reason: String,
 }
 
-/// Current goal the brain is executing. Variants map 1:1 to the
-/// [`PlannerGoal`] surface mods see, plus engine-only bookkeeping
-/// fields needed to actually drive each one (current path + progress,
-/// remaining timer, stuck detector). The planner returns the abstract
-/// surface form; this enum is the live engine form.
+/// Current goal the brain is executing. Variants combine the abstract
+/// planner-supplied action with the engine-only bookkeeping needed to
+/// drive it (current path + progress, remaining timer, stuck detector).
+///
+/// `MoveTo` is the single path-following primitive — Wander, Goto, and
+/// Consume from [`PlannerGoal`] all reduce to "walk along this path,
+/// then optionally do something on arrival." Multiple path-driven
+/// planner actions share one variant rather than each adding a parallel
+/// pile of (path, progress, deadline, stuck) fields.
 #[derive(Clone, Debug)]
 pub enum Goal {
     /// No active goal. Entering this state triggers a planner call on
     /// the next brain tick; newly-spawned NPCs start here, and any
-    /// completed Wander/Resting drops back here so the planner picks
-    /// what's next.
+    /// completed action drops back here so the planner picks what's
+    /// next.
     Idle,
     /// Walk a precomputed A* path of foot cells using pure-pursuit
-    /// steering. `progress` is the NPC's monotonically-increasing
-    /// arc length along the path — recomputed each tick by
-    /// projecting the pose onto the path (never backwards), then
-    /// offset by `LOOKAHEAD_DIST` to produce the actual aim point.
-    /// Steering toward an always-ahead carrot (vs. the current
-    /// waypoint) stops the NPC from circling a point it's trying
-    /// to reach faster than its turn rate allows. `last_pos` +
-    /// `stuck_secs` detect a path that's become impossible (player
-    /// dug in front of us, NPC wedged on a corner) and force a
-    /// replan via completion.
-    Wander {
+    /// steering, then on successful arrival run `on_arrive`. `progress`
+    /// is the NPC's monotonically-increasing arc length along the path
+    /// — recomputed each tick by projecting the pose onto the path
+    /// (never backwards), then offset by `LOOKAHEAD_DIST` to produce
+    /// the actual aim point. Steering toward an always-ahead carrot
+    /// (vs. the current waypoint) stops the NPC from circling a point
+    /// it's trying to reach faster than its turn rate allows. `last_pos`
+    /// + `stuck_secs` detect a path that's become impossible (player
+    /// dug in front of us, NPC wedged on a corner) and force a replan
+    /// via abandonment. Abandonment skips `on_arrive` — only a clean
+    /// arrival fires it.
+    MoveTo {
         path: Vec<IVec3>,
         progress: f32,
         deadline_secs: f32,
         last_pos: Vec3,
         stuck_secs: f32,
+        on_arrive: ArrivalAction,
     },
     /// Stand still for a while. Duration is whatever the planner
     /// returned in [`PlannerGoal::Rest`], clamped to
     /// `[MIN_REST_SECS, MAX_REST_SECS]` so a misbehaving mod can't
     /// freeze an NPC indefinitely or churn the planner at 60 Hz.
     Resting { remaining_secs: f32 },
+    /// Standing at a consumable cell, counting down to the moment the
+    /// `restores` deficit is subtracted from the named need. Entered
+    /// only via a successful arrival on a `MoveTo` with
+    /// `ArrivalAction::Consume`. Need + magnitude are captured at goal
+    /// creation so a planner that, mid-action, decides "actually you
+    /// should be eating *that* food" can't retroactively change what
+    /// the NPC is doing now. `target_cell` is the consumable block
+    /// itself — the brain uses it to rotate the body toward whatever
+    /// the NPC is interacting with, without forward motion (forward
+    /// motion would orbit, since the NPC's already adjacent).
+    Consuming {
+        remaining_secs: f32,
+        need: String,
+        restores: f32,
+        target_cell: IVec3,
+    },
+}
+
+/// What the engine does after the NPC arrives at the end of a
+/// [`Goal::MoveTo`] path. `None` means "just stop, drop to Idle, let
+/// the planner pick the next thing." `Consume` triggers a transition
+/// into [`Goal::Consuming`] which applies the need restoration on
+/// completion.
+///
+/// Extending this enum is how we add new arrival-side primitives
+/// (sleep on a bed, work at a workbench, etc.) — each gets its own
+/// follow-on `Goal` variant the same way Consume does.
+#[derive(Clone, Debug)]
+pub enum ArrivalAction {
+    /// Just stop on arrival. Used by `PlannerGoal::Wander` and
+    /// `PlannerGoal::Goto`, which describe motion without a follow-on.
+    None,
+    /// Begin a stand-still consume action at the target cell. The
+    /// captured `need` / `restores` / `duration_secs` are the values
+    /// the snapshot saw — taken from the block's
+    /// [`Consumable`](Consumable) metadata at planner-call time. If the
+    /// block has changed by arrival, the brain re-validates against the
+    /// current cell before applying the restoration. `target_cell` is
+    /// the consumable block itself (not the stand cell); the body is
+    /// rotated toward this cell during [`Goal::Consuming`].
+    Consume {
+        need: String,
+        restores: f32,
+        duration_secs: f32,
+        target_cell: IVec3,
+    },
 }
 
 /// Native-side brain state. Holds the current goal + a tiny PRNG seed
@@ -165,14 +221,32 @@ const FALLBACK_WANDER_TIMEOUT_SECS: f32 = 12.0;
 const MAX_WANDER_RADIUS_CELLS: i32 = 64;
 const MAX_WANDER_TIMEOUT_SECS: f32 = 60.0;
 const MAX_GOTO_TIMEOUT_SECS: f32 = 120.0;
+const MAX_CONSUME_TIMEOUT_SECS: f32 = 120.0;
 const MIN_REST_SECS: f32 = 0.5;
 const MAX_REST_SECS: f32 = 60.0;
+/// Per the consumable-duration validation in `BlockRegistry`, mods
+/// can't register a duration shorter than 0.1 s; the brain enforces a
+/// matching upper bound so a 5-minute ritual eat is the worst-case
+/// frozen NPC. Both bounds are applied as a clamp at goal creation
+/// so the running goal always carries a sane remaining_secs.
+const MIN_CONSUME_DURATION_SECS: f32 = 0.1;
+const MAX_CONSUME_DURATION_SECS: f32 = 30.0;
 /// How many nearby matched rooms to include in each planner snapshot.
 /// Cap exists so a world with hundreds of registered rooms doesn't
 /// blow up the per-call serialization cost; 8 is enough headroom for
 /// a planner to pick between "nearest of each kind" without flooding
 /// the table.
 const SNAPSHOT_ROOM_LIMIT: usize = 8;
+/// Same idea as `SNAPSHOT_ROOM_LIMIT` for the consumables array. 8 is
+/// plenty for "nearest of each need" picks in early-game; the planner
+/// only sees the closest entries so a player who places hundreds of
+/// food blocks doesn't blow up the per-call cost.
+const SNAPSHOT_CONSUMABLE_LIMIT: usize = 8;
+/// Chebyshev radius the snapshot builder scans for consumables. Past
+/// this the NPC won't see a food block at all — it'll wander toward
+/// rooms or random targets until it bumps into one. 48 cells ≈ 3
+/// chunks at CHUNK_SIZE = 16, big enough to cover a small settlement.
+const SNAPSHOT_CONSUMABLE_RADIUS_CELLS: i32 = 48;
 /// How far ahead of the closest-projection point on the path the NPC
 /// aims. Bigger ⇒ smoother turns, more corner-cutting; smaller ⇒
 /// hugs the path tighter, may oscillate. 0.5 m ≈ half a cell — the
@@ -385,6 +459,7 @@ fn npc_brain_tick(
     mods: Res<ServerMods>,
     need_registry: Res<NeedRegistry>,
     room_map: Res<RoomMap>,
+    consumable_index: Res<ConsumableIndex>,
     mut commands: Commands,
     mut npcs: Query<
         (
@@ -419,10 +494,15 @@ fn npc_brain_tick(
             *value = (*value + decay * dt).clamp(0.0, 1.0);
         }
 
-        // Phase 2: advance the active goal. Each branch may flip
-        // `wander_done` or `rest_done` asking phase 3 to transition.
-        let mut wander_done = false;
+        // Phase 2: advance the active goal. MoveTo can finish in one
+        // of two ways — `arrived` (reached the path's final waypoint;
+        // run `on_arrive`) or `abandoned` (timed out or stuck; drop
+        // straight to Idle with no follow-on). Consuming and Resting
+        // both complete by timer expiry.
+        let mut move_arrived: Option<ArrivalAction> = None;
+        let mut move_abandoned = false;
         let mut rest_done = false;
+        let mut consume_done = false;
         match &mut brain.goal {
             Goal::Idle => {}
             Goal::Resting { remaining_secs } => {
@@ -431,12 +511,19 @@ fn npc_brain_tick(
                     rest_done = true;
                 }
             }
-            Goal::Wander {
+            Goal::Consuming { remaining_secs, .. } => {
+                *remaining_secs -= dt;
+                if *remaining_secs <= 0.0 {
+                    consume_done = true;
+                }
+            }
+            Goal::MoveTo {
                 path,
                 progress,
                 deadline_secs,
                 last_pos,
                 stuck_secs,
+                on_arrive,
             } => {
                 *deadline_secs -= dt;
                 let moved = (pose.translation - *last_pos).length();
@@ -458,28 +545,91 @@ fn npc_brain_tick(
                 // could orbit its target forever.
                 let end_xz = waypoint_xz(*path.last().expect("path non-empty"));
                 let dist_to_end = (pose_xz - end_xz).length();
-                if dist_to_end < PATH_ARRIVE_RADIUS
-                    || *deadline_secs <= 0.0
-                    || *stuck_secs > STUCK_REPLAN_SECS
-                {
-                    wander_done = true;
+                if dist_to_end < PATH_ARRIVE_RADIUS {
+                    move_arrived = Some(on_arrive.clone());
+                } else if *deadline_secs <= 0.0 || *stuck_secs > STUCK_REPLAN_SECS {
+                    move_abandoned = true;
                 }
             }
         }
 
-        // Phase 3: transition. Completed Wander/Rest → Idle; Idle →
-        // ask the planner what's next. The planner result is
-        // converted to an engine Goal (Wander picks an A* path here;
-        // Rest commits a timer).
-        if wander_done || rest_done {
+        // Phase 3: transition. A successful arrival branches on
+        // `on_arrive` — None drops to Idle, Consume kicks off the
+        // stand-still consumption timer. Abandonment and Rest go
+        // straight to Idle. Consuming's expiry applies the
+        // restoration after re-validating the block (mods may have
+        // changed it mid-action).
+        if let Some(action) = move_arrived {
+            if !npc_path.0.is_empty() {
+                npc_path.0.clear();
+            }
+            *intent = MovementIntent::default();
+            match action {
+                ArrivalAction::None => {
+                    brain.goal = Goal::Idle;
+                }
+                ArrivalAction::Consume {
+                    need,
+                    restores,
+                    duration_secs,
+                    target_cell,
+                } => {
+                    brain.goal = Goal::Consuming {
+                        remaining_secs: duration_secs,
+                        need,
+                        restores,
+                        target_cell,
+                    };
+                }
+            }
+        }
+        if move_abandoned || rest_done {
             brain.goal = Goal::Idle;
             if !npc_path.0.is_empty() {
                 npc_path.0.clear();
             }
         }
+        if consume_done {
+            // Re-resolve the consumable at the current goal's stored
+            // need/restores: capture happened at planner-call time,
+            // but the block may have been broken or replaced since.
+            // We trust the captured values (the NPC saw them when
+            // committing) and just decrement — if the block was
+            // removed, the NPC still "ate the air" once, which is
+            // the same as accepting the stale snapshot at all
+            // upstream layers. Player can't exploit it because the
+            // duration_secs hold them in place for the full action.
+            if let Goal::Consuming { need, restores, .. } = &brain.goal {
+                if let Some(value) = needs.0.get_mut(need) {
+                    *value = (*value - *restores).max(0.0);
+                    info!(
+                        npc = npc_id.0,
+                        need = %need,
+                        restored = restores,
+                        remaining_deficit = *value,
+                        "consumption complete",
+                    );
+                } else {
+                    warn!(
+                        npc = npc_id.0,
+                        need = %need,
+                        "consumption complete but NPC has no entry for need; ignoring",
+                    );
+                }
+            }
+            brain.goal = Goal::Idle;
+        }
         if matches!(brain.goal, Goal::Idle) {
             let kind_id = NpcKindId(kind.0.clone());
-            let snapshot = build_snapshot(*npc_id, &kind_id, pose, &needs, &room_map);
+            let snapshot = build_snapshot(
+                *npc_id,
+                &kind_id,
+                pose,
+                &needs,
+                &room_map,
+                &consumable_index,
+                &block_registry,
+            );
             let planner_goal = match mods.0.call_planner(&kind_id, &snapshot) {
                 Ok(Some(g)) => g,
                 Ok(None) => native_fallback_goal(),
@@ -539,12 +689,13 @@ fn npc_brain_tick(
                             // basically every time, but the guard is
                             // free if it doesn't.
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal = Goal::Wander {
+                            brain.goal = Goal::MoveTo {
                                 path,
                                 progress: 0.0,
                                 deadline_secs: timeout,
                                 last_pos: pose.translation,
                                 stuck_secs: 0.0,
+                                on_arrive: ArrivalAction::None,
                             };
                         }
                         None => {
@@ -575,6 +726,21 @@ fn npc_brain_tick(
                     let foot = pose_to_standable_foot(pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(pose));
                     let target = IVec3::new(cell.x, cell.y, cell.z);
+                    // Already at the target: the planner picked a cell
+                    // the NPC's already standing on (typically the
+                    // anchor of the room they're currently in). Drop
+                    // to Idle so the planner re-picks next tick — it
+                    // already set `last_action = "visit"` before
+                    // returning this Goto, so the next call cycles to
+                    // rest naturally.
+                    if target == foot {
+                        if !npc_path.0.is_empty() {
+                            npc_path.0.clear();
+                        }
+                        brain.goal = Goal::Idle;
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
                     let path = find_path(
                         foot,
                         target,
@@ -587,12 +753,13 @@ fn npc_brain_tick(
                     match path {
                         Some(path) => {
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal = Goal::Wander {
+                            brain.goal = Goal::MoveTo {
                                 path,
                                 progress: 0.0,
                                 deadline_secs: timeout,
                                 last_pos: pose.translation,
                                 stuck_secs: 0.0,
+                                on_arrive: ArrivalAction::None,
                             };
                         }
                         None => {
@@ -618,48 +785,194 @@ fn npc_brain_tick(
                         }
                     }
                 }
+                PlannerGoal::Consume { cell, timeout_secs } => {
+                    let timeout = timeout_secs.clamp(1.0, MAX_CONSUME_TIMEOUT_SECS);
+                    let target_cell = IVec3::new(cell.x, cell.y, cell.z);
+                    // Re-resolve the consumable on the current world
+                    // state (not the snapshot). Mods can in principle
+                    // hand back any cell — we only path to it if it
+                    // still has consumable metadata. Stale references
+                    // become a no-op + brief rest, identical to a
+                    // failed path.
+                    let consumable = match consumable_at_cell(
+                        target_cell,
+                        &chunks,
+                        &chunk_map,
+                        &block_registry,
+                    ) {
+                        Some(c) => c,
+                        None => {
+                            info!(
+                                npc = npc_id.0,
+                                target = ?target_cell.to_array(),
+                                "consume target no longer consumable; parking briefly",
+                            );
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            *intent = MovementIntent::default();
+                            continue;
+                        }
+                    };
+                    let foot = pose_to_standable_foot(pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(pose));
+                    // Consumables are typically solid blocks, so the
+                    // NPC's actual stand cell is one of their
+                    // neighbours. Pick the standable neighbour
+                    // closest to the NPC's current foot so the path
+                    // bends toward the side the NPC's already
+                    // approaching from.
+                    let Some(stand_cell) = nearest_standable_neighbor(target_cell, foot, &world)
+                    else {
+                        info!(
+                            npc = npc_id.0,
+                            target = ?target_cell.to_array(),
+                            "no standable neighbour of consumable; parking briefly",
+                        );
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    };
+                    let duration = consumable
+                        .duration_secs
+                        .clamp(MIN_CONSUME_DURATION_SECS, MAX_CONSUME_DURATION_SECS);
+                    // Already standing where we'd path to: no MoveTo
+                    // needed, fire the consumption timer immediately.
+                    // Common when the planner re-targets the same
+                    // basket on a subsequent tick and the NPC hasn't
+                    // moved, or when the NPC happens to wander into the
+                    // standable cell before the planner runs.
+                    if stand_cell == foot {
+                        if !npc_path.0.is_empty() {
+                            npc_path.0.clear();
+                        }
+                        brain.goal = Goal::Consuming {
+                            remaining_secs: duration,
+                            need: consumable.need.clone(),
+                            restores: consumable.restores,
+                            target_cell,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                    let path = find_path(
+                        foot,
+                        stand_cell,
+                        &world,
+                        ASTAR_NODE_BUDGET,
+                        ASTAR_PATH_BUDGET,
+                    )
+                    .map(|raw| smooth_path(raw, &world))
+                    .filter(|p| p.len() >= 2);
+                    match path {
+                        Some(path) => {
+                            npc_path.set_if_neq(NpcPath(path.clone()));
+                            brain.goal = Goal::MoveTo {
+                                path,
+                                progress: 0.0,
+                                deadline_secs: timeout,
+                                last_pos: pose.translation,
+                                stuck_secs: 0.0,
+                                on_arrive: ArrivalAction::Consume {
+                                    need: consumable.need.clone(),
+                                    restores: consumable.restores,
+                                    duration_secs: duration,
+                                    target_cell,
+                                },
+                            };
+                        }
+                        None => {
+                            warn!(
+                                npc = npc_id.0,
+                                foot = ?foot.to_array(),
+                                target = ?target_cell.to_array(),
+                                stand = ?stand_cell.to_array(),
+                                "consume failed: no A* path to standable neighbour, parking briefly"
+                            );
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            *intent = MovementIntent::default();
+                        }
+                    }
+                }
             }
         }
 
-        // Phase 4: steering. Only Wander drives intent; Idle and
-        // Resting both clear it (default = no motion).
-        let Goal::Wander {
-            path, progress, ..
-        } = &brain.goal
-        else {
-            *intent = MovementIntent::default();
-            continue;
-        };
-        // Pure-pursuit aim: LOOKAHEAD_DIST ahead of the closest
-        // projection along the path. The `forward` in
-        // `apply_walk_step` is `(-sin(yaw), 0, -cos(yaw))`, so the
-        // yaw pointing toward `(dx, 0, dz)` is `atan2(-dx, -dz)`.
+        // Phase 4: steering. MoveTo drives forward motion + turning
+        // (pure-pursuit along the path). Consuming rotates the body
+        // toward the target cell without forward motion — full speed
+        // would orbit a target the NPC is already adjacent to.
+        // Idle and Resting clear intent (default = no motion).
         let pose_xz = Vec2::new(pose.translation.x, pose.translation.z);
-        let aim = lookahead_point(path, *progress, LOOKAHEAD_DIST);
-        let dx = aim.x - pose_xz.x;
-        let dz = aim.y - pose_xz.y;
-        if dx * dx + dz * dz < f32::EPSILON {
-            *intent = MovementIntent::default();
-            continue;
+        match &brain.goal {
+            Goal::MoveTo {
+                path, progress, ..
+            } => {
+                // Pure-pursuit aim: LOOKAHEAD_DIST ahead of the closest
+                // projection along the path. The `forward` in
+                // `apply_walk_step` is `(-sin(yaw), 0, -cos(yaw))`, so
+                // the yaw pointing toward `(dx, 0, dz)` is
+                // `atan2(-dx, -dz)`.
+                let aim = lookahead_point(path, *progress, LOOKAHEAD_DIST);
+                let Some(dyaw) = aim_yaw_step(pose_xz, pose.yaw, aim, dt) else {
+                    *intent = MovementIntent::default();
+                    continue;
+                };
+                let foot_y = pose_to_foot_cell(pose).y;
+                let jump = step_up_imminent(path, *progress, foot_y);
+                *intent = MovementIntent {
+                    wishdir: [0, 0, -1],
+                    jump,
+                    toggle_mode: false,
+                    interact: false,
+                    dyaw,
+                };
+            }
+            Goal::Consuming { target_cell, .. } => {
+                let aim = waypoint_xz(*target_cell);
+                let Some(dyaw) = aim_yaw_step(pose_xz, pose.yaw, aim, dt) else {
+                    *intent = MovementIntent::default();
+                    continue;
+                };
+                *intent = MovementIntent {
+                    wishdir: [0, 0, 0],
+                    jump: false,
+                    toggle_mode: false,
+                    interact: false,
+                    dyaw,
+                };
+            }
+            Goal::Idle | Goal::Resting { .. } => {
+                *intent = MovementIntent::default();
+            }
         }
-        let desired_yaw = (-dx).atan2(-dz);
-        let mut delta = (desired_yaw - pose.yaw) % core::f32::consts::TAU;
-        if delta > core::f32::consts::PI {
-            delta -= core::f32::consts::TAU;
-        } else if delta < -core::f32::consts::PI {
-            delta += core::f32::consts::TAU;
-        }
-        let dyaw = delta.clamp(-NPC_TURN_RATE * dt, NPC_TURN_RATE * dt);
-        let foot_y = pose_to_foot_cell(pose).y;
-        let jump = step_up_imminent(path, *progress, foot_y);
-        *intent = MovementIntent {
-            wishdir: [0, 0, -1],
-            jump,
-            toggle_mode: false,
-            interact: false,
-            dyaw,
-        };
     }
+}
+
+/// Compute the per-tick yaw step that rotates `current_yaw` toward
+/// whichever yaw points from `pose_xz` to `aim`. Clamped to
+/// `NPC_TURN_RATE * dt` so a 180° flip doesn't snap. Returns `None`
+/// when `aim` is on top of `pose_xz` (no direction to face).
+fn aim_yaw_step(pose_xz: Vec2, current_yaw: f32, aim: Vec2, dt: f32) -> Option<f32> {
+    let dx = aim.x - pose_xz.x;
+    let dz = aim.y - pose_xz.y;
+    if dx * dx + dz * dz < f32::EPSILON {
+        return None;
+    }
+    let desired_yaw = (-dx).atan2(-dz);
+    let mut delta = (desired_yaw - current_yaw) % core::f32::consts::TAU;
+    if delta > core::f32::consts::PI {
+        delta -= core::f32::consts::TAU;
+    } else if delta < -core::f32::consts::PI {
+        delta += core::f32::consts::TAU;
+    }
+    Some(delta.clamp(-NPC_TURN_RATE * dt, NPC_TURN_RATE * dt))
 }
 
 /// Try a few random XZ targets within `radius_cells` of `foot`; project
@@ -729,9 +1042,18 @@ fn build_snapshot(
     pose: &AvatarPose,
     needs: &Needs,
     rooms: &RoomMap,
+    consumables: &ConsumableIndex,
+    block_registry: &BlockRegistry,
 ) -> NpcSnapshot {
     let foot = pose_to_foot_cell(pose);
     let nearby_rooms = collect_nearby_rooms(rooms, foot, SNAPSHOT_ROOM_LIMIT);
+    let nearby_consumables = collect_nearby_consumables(
+        consumables,
+        block_registry,
+        foot,
+        SNAPSHOT_CONSUMABLE_RADIUS_CELLS,
+        SNAPSHOT_CONSUMABLE_LIMIT,
+    );
     NpcSnapshot {
         id: id.0,
         kind: kind.clone(),
@@ -742,7 +1064,118 @@ fn build_snapshot(
         },
         needs: needs.0.clone(),
         nearby_rooms,
+        nearby_consumables,
     }
+}
+
+/// K nearest consumable cells within `radius_cells` (Chebyshev) of
+/// `foot`. Each entry pulls its `need` + `restores` from the block's
+/// [`Consumable`](Consumable) def via the registry — the index only
+/// stores `(cell, BlockSlot)` to avoid duplicating data that ultimately
+/// lives in the def.
+///
+/// Distance is Manhattan (consistent with `nearby_rooms.distance`); the
+/// radius filter uses Chebyshev because that matches how the index's
+/// internal `iter_within` is bounded. The two metrics agree on "closer
+/// is closer" for ranking purposes.
+fn collect_nearby_consumables(
+    index: &ConsumableIndex,
+    block_registry: &BlockRegistry,
+    foot: IVec3,
+    radius_cells: i32,
+    limit: usize,
+) -> Vec<NearbyConsumable> {
+    let mut out: Vec<NearbyConsumable> = index
+        .iter_within(foot, radius_cells)
+        .filter_map(|(cell, slot)| {
+            // Defensive: the index *should* never carry a slot whose def
+            // lacks `consumable`, but the path from CellEdit insert →
+            // def lookup goes through the registry once and the data
+            // here a second time; if a future mod-reload path changes a
+            // block to no longer be consumable while a stale index
+            // entry remains, we just skip rather than panic.
+            let c = block_registry.def(slot).consumable.as_ref()?;
+            let d = cell - foot;
+            let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
+            Some(NearbyConsumable {
+                cell: BlockPos {
+                    x: cell.x,
+                    y: cell.y,
+                    z: cell.z,
+                },
+                need: c.need.clone(),
+                restores: c.restores,
+                distance,
+            })
+        })
+        .collect();
+    out.sort_by_key(|c| c.distance);
+    out.truncate(limit);
+    out
+}
+
+/// Resolve the [`Consumable`] at a world cell, if any. Returns `None`
+/// when the cell is empty, the chunk isn't loaded, or the block's def
+/// has no `consumable` metadata. Used by the Consume goal handler to
+/// re-validate the planner's choice against current world state.
+fn consumable_at_cell(
+    cell: IVec3,
+    chunks: &Query<&Chunk>,
+    chunk_map: &ChunkMap,
+    registry: &BlockRegistry,
+) -> Option<Consumable> {
+    let (coord, local) = world_to_chunk(cell);
+    let entity = *chunk_map.0.get(&coord)?;
+    let chunk = chunks.get(entity).ok()?;
+    let slot = chunk.get(local);
+    if slot.is_empty() {
+        return None;
+    }
+    registry.def(slot).consumable.clone()
+}
+
+/// Find a standable cell adjacent to `target` that an NPC can stand on
+/// while interacting with `target`. Consumables are typically solid
+/// blocks the NPC can't stand *on*, so the brain pathfinds to one of
+/// their neighbours instead.
+///
+/// Search order: same-Y cardinals first (the common case — basket on a
+/// floor), then one cell up (basket on a low step), then one cell down
+/// (basket on a raised platform the NPC approaches from below). Within
+/// each Y, ties broken by Manhattan distance from `from` so the
+/// resulting path bends toward whichever side the NPC's already
+/// approaching from rather than picking an arbitrary cardinal.
+fn nearest_standable_neighbor<W: Walkability>(
+    target: IVec3,
+    from: IVec3,
+    world: &W,
+) -> Option<IVec3> {
+    let offsets = [
+        IVec3::new(1, 0, 0),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(0, 0, 1),
+        IVec3::new(0, 0, -1),
+    ];
+    for dy in [0, 1, -1] {
+        let mut best: Option<(IVec3, i32)> = None;
+        for off in offsets {
+            let cand = target + off + IVec3::new(0, dy, 0);
+            if !standable(world, cand) {
+                continue;
+            }
+            let d = cand - from;
+            let dist = d.x.abs() + d.y.abs() + d.z.abs();
+            match best {
+                None => best = Some((cand, dist)),
+                Some((_, prev)) if dist < prev => best = Some((cand, dist)),
+                _ => {}
+            }
+        }
+        if let Some((cell, _)) = best {
+            return Some(cell);
+        }
+    }
+    None
 }
 
 /// K nearest matched rooms by Manhattan distance from `foot`. Returns a

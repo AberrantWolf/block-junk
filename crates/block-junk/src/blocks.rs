@@ -15,6 +15,8 @@ use block_mesh::{MergeVoxel, Voxel, VoxelVisibility};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::npc_registry::NeedRegistry;
+
 /// Compact numeric handle for a registered block. Two bytes per cell in
 /// chunk storage, stable for a session (and across sessions once
 /// [`WorldSlots`] hits disk). Mods never see this — they use [`BlockId`].
@@ -44,6 +46,16 @@ pub enum BootstrapError {
     DuplicateBlockId(BlockId),
     #[error("registry exceeds u16 slot space ({slots} blocks registered)")]
     SlotOverflow { slots: usize },
+    #[error("block {block} consumable references unregistered need {need}")]
+    ConsumableNeedUnknown { block: BlockId, need: String },
+    #[error(
+        "block {block} consumable.restores = {value}; must be > 0 and ≤ 1 (need values are deficits in [0, 1])"
+    )]
+    ConsumableRestoresOutOfRange { block: BlockId, value: f32 },
+    #[error(
+        "block {block} consumable.duration_secs = {value}; must be ≥ 0.1 (very short eats look glitchy)"
+    )]
+    ConsumableDurationOutOfRange { block: BlockId, value: f32 },
 }
 
 /// The live, finalised registry. Held as a Bevy `Resource` on each side.
@@ -129,6 +141,44 @@ impl BlockRegistry {
             .enumerate()
             .map(|(i, d)| (BlockSlot(i as u16), d))
     }
+
+    /// Cross-validate consumable-bearing blocks against the [`NeedRegistry`].
+    /// Run from `scripting.rs::load_side` after both registries exist; can't
+    /// fold into `build` because that runs before needs are known.
+    pub fn validate_consumables(&self, needs: &NeedRegistry) -> Result<(), BootstrapError> {
+        for def in &self.defs_by_slot {
+            let Some(c) = &def.consumable else { continue };
+            if !needs.contains(&c.need) {
+                return Err(BootstrapError::ConsumableNeedUnknown {
+                    block: def.id.clone(),
+                    need: c.need.clone(),
+                });
+            }
+            // Restores is the deficit subtracted on completion. Zero or
+            // negative would either no-op (bug) or make the need worse
+            // (almost certainly a bug); >1 is meaningless because the
+            // post-eat clamp is at 0.0 anyway. We require a real value.
+            if !(c.restores > 0.0 && c.restores <= 1.0) {
+                return Err(BootstrapError::ConsumableRestoresOutOfRange {
+                    block: def.id.clone(),
+                    value: c.restores,
+                });
+            }
+            // 0.1 s lower bound: anything shorter completes inside one
+            // fixed tick (≈16 ms at 60 Hz) and the NPC visibly teleports
+            // through the action. Upper bound is enforced by the brain
+            // clamp at execution time, not here — a mod author who wants
+            // a 5-minute "ritual" eat shouldn't be blocked at boot.
+            if c.duration_secs < 0.1 {
+                return Err(BootstrapError::ConsumableDurationOutOfRange {
+                    block: def.id.clone(),
+                    value: c.duration_secs,
+                });
+            }
+        }
+        Ok(())
+    }
+
 }
 
 /// Slots the engine's terrain generator resolves once at startup so it

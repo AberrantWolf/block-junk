@@ -139,6 +139,49 @@ pub struct NpcSnapshot {
     /// the nearest `vanilla:small_house`."
     #[serde(default)]
     pub nearby_rooms: Vec<NearbyRoom>,
+    /// Up to K nearest consumable cells reachable from `foot`, sorted
+    /// by distance (closest first). Each entry says *which* need the
+    /// block restores and by how much, so a planner that's hungry
+    /// (or thirsty, or low on mana) can pick the nearest entry that
+    /// addresses *its* deficit rather than walking to a fountain when
+    /// what it needs is bread. "Consumable" is deliberately broad —
+    /// food, drink, potions, scrolls, anything a mod declared with
+    /// [`block_junk_mod_api::blocks::Consumable`] metadata.
+    ///
+    /// Empty when no consumable blocks exist in the NPC's neighbourhood
+    /// (early game, or the player hasn't placed any yet). The engine
+    /// snapshot builder bounds the scan radius, so a basket on the
+    /// other side of the map won't show up; the planner is making a
+    /// "what's nearby right now" decision, not a global search.
+    #[serde(default)]
+    pub nearby_consumables: Vec<NearbyConsumable>,
+}
+
+/// One entry in [`NpcSnapshot::nearby_consumables`]. Pre-computed
+/// `need` + `restores` mirror the originating block's
+/// [`Consumable`](crate::blocks::Consumable) so the planner doesn't
+/// need a parallel block-def lookup table on the Lua side. The engine
+/// re-resolves the block on actual consumption, so if the block was
+/// changed or removed between snapshot and arrival, the NPC just
+/// completes the goal with no effect.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NearbyConsumable {
+    /// World-cell of the consumable block. Planners hand this back as
+    /// `PlannerGoal::Consume::cell`. Adjacency to a standable cell is
+    /// the engine's problem — the planner just names the target.
+    pub cell: BlockPos,
+    /// Need id this consumption reduces (e.g. `"hunger"`). Mirrored
+    /// from the block's [`Consumable::need`](crate::blocks::Consumable).
+    pub need: String,
+    /// Pre-clamp magnitude of the deficit reduction. A planner can
+    /// compare against `snapshot.needs[need]` to score "this restores
+    /// enough to be worth walking to."
+    pub restores: f32,
+    /// Manhattan distance from the NPC's foot, same metric used by
+    /// `nearby_rooms.distance`. Cheap, ranks correctly for "nearer is
+    /// better." Planners that need euclidean derive it from `foot` +
+    /// `cell` themselves.
+    pub distance: u32,
 }
 
 /// One entry in [`NpcSnapshot::nearby_rooms`]. Carries enough info to
@@ -211,6 +254,21 @@ pub enum PlannerGoal {
         #[serde(default = "default_goto_timeout")]
         timeout_secs: f32,
     },
+    /// Walk to a consumable block, stand still for its declared
+    /// duration, then subtract its `restores` from the matching need.
+    /// `cell` is the consumable block itself — the engine paths to a
+    /// standable neighbour, since the block itself is solid. If by
+    /// the time the NPC arrives the block has been broken or replaced
+    /// with something non-consumable, the goal completes silently
+    /// (no effect, no error).
+    ///
+    /// This is the *only* primitive that mutates need state; pairs
+    /// with planner picks that read `snapshot.nearby_consumables`.
+    Consume {
+        cell: BlockPos,
+        #[serde(default = "default_consume_timeout")]
+        timeout_secs: f32,
+    },
 }
 
 fn default_wander_radius() -> i32 {
@@ -222,5 +280,9 @@ fn default_wander_timeout() -> f32 {
 }
 
 fn default_goto_timeout() -> f32 {
+    30.0
+}
+
+fn default_consume_timeout() -> f32 {
     30.0
 }

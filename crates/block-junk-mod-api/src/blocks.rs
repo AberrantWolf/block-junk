@@ -139,6 +139,46 @@ pub struct BlockDef {
     /// safe fallback for cube-shaped blocks.
     #[serde(default)]
     pub entity_aabb: Option<EntityAabb>,
+    /// Marks this block as something NPCs can consume to satisfy a
+    /// need. Present ⇒ an NPC whose planner picks a Consume goal on
+    /// this cell pathfinds to a standable neighbour, stands still for
+    /// `duration_secs`, and on completion subtracts `restores` from
+    /// the named need (clamped at 0). The engine validates at boot
+    /// that `need` refers to a registered need id. `None` (the
+    /// default) ⇒ NPCs never consider this block for a Consume goal.
+    #[serde(default)]
+    pub consumable: Option<Consumable>,
+}
+
+/// Block-level "interacting with this satisfies a need" declaration.
+/// Deliberately kept generic — a food basket, a healing fountain, a
+/// spell scroll, a workbench, and an altar are all the same shape from
+/// the engine's perspective: walk there, stand still for some time,
+/// decrement a named need. The mod owns what the action *means*; the
+/// engine just executes the path-arrive-pause-restore loop.
+///
+/// Consumption is **non-destructive** in this slice — the block stays
+/// after an NPC consumes from it. Depletion / regrowth (a basket
+/// emptying, a scroll being used up) is a future concern; today every
+/// consumable block is a permanent attraction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Consumable {
+    /// Id of the need this consumption reduces. Cross-validated against
+    /// the [`NeedDef`](crate::npcs::NeedDef) registry at boot — a
+    /// consumable referencing an unregistered need is a load error.
+    /// Plain `String` (not `NeedId`) matches the existing
+    /// `default_needs` convention on `NpcKindDef`.
+    pub need: String,
+    /// How much deficit is subtracted from the named need on completion.
+    /// Need values run 0.0 (fully satisfied) → 1.0 (critical), so a
+    /// larger `restores` is a more potent consumption. Clamped at 0.0
+    /// after the subtraction. Sensible range is roughly `[0.1, 1.0]`.
+    pub restores: f32,
+    /// How long the NPC stands still at the cell before the `restores`
+    /// amount is applied. Gives the action visible weight (NPC clearly
+    /// *interacted*, didn't just touch and turn). Engine clamps to a
+    /// sane bound so a misbehaving mod can't park an NPC indefinitely.
+    pub duration_secs: f32,
 }
 
 /// Default footprint helper for serde. A single cell at the anchor.

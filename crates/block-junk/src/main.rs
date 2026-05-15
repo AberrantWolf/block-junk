@@ -2,6 +2,7 @@ mod blocks;
 mod camera;
 mod client;
 mod collision;
+mod consumables;
 mod menu;
 mod network;
 mod npc;

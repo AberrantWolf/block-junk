@@ -167,10 +167,43 @@ engine.rooms.register {
     },
 }
 
+-- A berry basket — the first consumable. Block-entity like the bed
+-- (1-cell footprint, but with a custom mesh), and tagged with
+-- `consumable` metadata so the engine indexes it for NPC snapshots.
+-- The mesh's local frame puts the basket centred at the anchor's
+-- bottom (Y in [0, 0.67], X/Z in ±0.43), so the default bottom-centre
+-- modelling rule fits without translation.
+--
+-- `restores = 0.4` ⇒ one consumption brings a hunger deficit down by
+-- 0.4 (40% of the 0..1 scale). With decay 1/300 ⇒ ~2 minutes of decay
+-- before the same need climbs back. `duration_secs = 2.0` is enough
+-- visible standstill for a player to see "the NPC stopped to eat";
+-- shorter looks like a teleport, longer feels ritualistic.
+register {
+    id = "vanilla:berry_basket",
+    display_name = "Berry basket",
+    flags = {
+        solid = true,
+        support_below = true,
+    },
+    color = { 0.6, 0.25, 0.35 },
+    mesh = "mods://vanilla/models/berry_basket.gltf",
+    entity_aabb = {
+        min = { -0.43, 0.0, -0.43 },
+        max = {  0.43, 0.67, 0.43 },
+    },
+    consumable = {
+        need = "hunger",
+        restores = 0.4,
+        duration_secs = 2.0,
+    },
+}
+
 -- Needs the engine itself doesn't know about — it just decays whatever
 -- needs are registered at the supplied rate. 1/300 ⇒ ~5 minutes from
--- 0 to critical, slow enough that the current planner (which doesn't
--- act on hunger yet) doesn't make NPCs look like they're in distress.
+-- 0 to critical. The planner consumes this need via berry baskets;
+-- decay was tuned slow enough that NPCs don't look frantic, fast
+-- enough that a typical play session sees a few hunger cycles.
 
 engine.needs.register {
     id = "hunger",
@@ -181,12 +214,14 @@ engine.needs.register {
 -- The smoke-test NPC kind. The planner that drives it lives in
 -- events.lua; this block is just the declarative half (which side both
 -- the client and server need to agree on for any future networked kind
--- table). default_needs is what each new NPC of this kind starts with.
-
+-- table). default_needs is what each new NPC of this kind starts with;
+-- spawning a partial deficit means the eat behaviour is observable
+-- within ~30 s of session start rather than after the full decay
+-- runway.
 engine.npcs.register {
     id = "vanilla:wanderer",
     display_name = "Wanderer",
     default_needs = {
-        hunger = 0.0,
+        hunger = 0.2,
     },
 }
