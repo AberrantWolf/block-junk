@@ -32,6 +32,7 @@
 pub mod blocks;
 pub mod npcs;
 pub mod rooms;
+pub mod textures;
 
 use serde::{Deserialize, Serialize};
 

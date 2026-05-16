@@ -12,6 +12,7 @@ use block_junk_mod_api::server::BlockPlacedEvent;
 use block_junk_mod_api::shared::BlockPos;
 use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
+use crate::block_textures::{MaskRegistry, RampRegistry};
 use crate::blocks::{BlockRegistry, WorldSlots};
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::protocol::{CellEdit, GameSet};
@@ -39,6 +40,8 @@ impl Plugin for ServerScriptingPlugin {
             rooms,
             needs,
             npc_kinds,
+            masks,
+            ramps,
         } = load_side(Side::Server);
         app.insert_resource(ServerMods(mods));
         app.insert_resource(blocks);
@@ -46,6 +49,8 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
+        app.insert_resource(masks);
+        app.insert_resource(ramps);
         app.add_systems(
             Update,
             (dispatch_block_placed, dispatch_room_events).in_set(GameSet::PostSimulation),
@@ -64,6 +69,8 @@ impl Plugin for ClientScriptingPlugin {
             rooms,
             needs,
             npc_kinds,
+            masks,
+            ramps,
         } = load_side(Side::Client);
         app.insert_resource(ClientMods(mods));
         app.insert_resource(blocks);
@@ -71,6 +78,8 @@ impl Plugin for ClientScriptingPlugin {
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
+        app.insert_resource(masks);
+        app.insert_resource(ramps);
         // No client-only hooks yet — the registry is in place so adding one
         // is a single-system addition rather than a wiring change.
     }
@@ -83,6 +92,8 @@ struct LoadResult {
     rooms: RoomPatternRegistry,
     needs: NeedRegistry,
     npc_kinds: NpcKindRegistry,
+    masks: MaskRegistry,
+    ramps: RampRegistry,
 }
 
 /// Run mod loading for one side, then build the resulting registries.
@@ -139,6 +150,26 @@ fn load_side(side: Side) -> LoadResult {
         side.as_str(),
         npc_kinds.kind_count()
     );
+    // Mask + ramp registries feed the chunk material's mask/ramp
+    // atlases. Build them before validating block layers — the
+    // validator needs both to resolve every layer ref.
+    let masks = match MaskRegistry::build(ctx.take_masks()) {
+        Ok(r) => r,
+        Err(e) => panic!("{} mask registry build failed: {e}", side.as_str()),
+    };
+    let ramps = match RampRegistry::build(ctx.take_ramps()) {
+        Ok(r) => r,
+        Err(e) => panic!("{} ramp registry build failed: {e}", side.as_str()),
+    };
+    info!(
+        "[{}] texture registries: {} mask(s), {} ramp(s)",
+        side.as_str(),
+        masks.slot_count(),
+        ramps.slot_count(),
+    );
+    if let Err(e) = blocks.validate_layers(&masks, &ramps) {
+        panic!("{} block layer validation failed: {e}", side.as_str());
+    }
     LoadResult {
         mods,
         blocks,
@@ -146,6 +177,8 @@ fn load_side(side: Side) -> LoadResult {
         rooms,
         needs,
         npc_kinds,
+        masks,
+        ramps,
     }
 }
 

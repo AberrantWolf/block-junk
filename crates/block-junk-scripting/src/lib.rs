@@ -16,6 +16,7 @@ use block_junk_mod_api::{
     npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal},
     rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
+    textures::{MaskDef, RampDef},
 };
 use mlua::{Function, Lua, LuaSerdeExt, SerializeOptions, Table, Value};
 use thiserror::Error;
@@ -73,6 +74,8 @@ pub struct LoadContext {
     pub pending_rooms: Arc<Mutex<Vec<RoomPattern>>>,
     pub pending_npc_kinds: Arc<Mutex<Vec<NpcKindDef>>>,
     pub pending_needs: Arc<Mutex<Vec<NeedDef>>>,
+    pub pending_masks: Arc<Mutex<Vec<MaskDef>>>,
+    pub pending_ramps: Arc<Mutex<Vec<RampDef>>>,
 }
 
 impl LoadContext {
@@ -99,6 +102,16 @@ impl LoadContext {
     /// Drain the accumulated need defs.
     pub fn take_needs(&self) -> Vec<NeedDef> {
         std::mem::take(&mut *self.pending_needs.lock().unwrap())
+    }
+
+    /// Drain the accumulated mask defs.
+    pub fn take_masks(&self) -> Vec<MaskDef> {
+        std::mem::take(&mut *self.pending_masks.lock().unwrap())
+    }
+
+    /// Drain the accumulated ramp defs.
+    pub fn take_ramps(&self) -> Vec<RampDef> {
+        std::mem::take(&mut *self.pending_ramps.lock().unwrap())
     }
 }
 
@@ -450,6 +463,45 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     }
 
     engine.set("npcs", npcs_table)?;
+
+    // engine.masks.register(def) — both sides accumulate identical mask
+    // sets so slot ordering matches across the wire. The engine bakes
+    // them into a texture-array atlas at boot; block defs reference them
+    // by id inside `BlockDef.layers`.
+    let masks_table = lua.create_table()?;
+    let pending_masks = ctx.pending_masks.clone();
+    let register_mask = lua.create_function(move |lua, value: Value| {
+        let def: MaskDef = lua.from_value(value)?;
+        let mut buf = pending_masks.lock().unwrap();
+        if buf.iter().any(|m| m.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate mask id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    masks_table.set("register", register_mask)?;
+    engine.set("masks", masks_table)?;
+
+    // engine.ramps.register(def) — symmetric with masks.register.
+    let ramps_table = lua.create_table()?;
+    let pending_ramps = ctx.pending_ramps.clone();
+    let register_ramp = lua.create_function(move |lua, value: Value| {
+        let def: RampDef = lua.from_value(value)?;
+        let mut buf = pending_ramps.lock().unwrap();
+        if buf.iter().any(|r| r.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate ramp id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    ramps_table.set("register", register_ramp)?;
+    engine.set("ramps", ramps_table)?;
 
     if side == Side::Server {
         let register = lua.create_function(|lua, callback: Function| {

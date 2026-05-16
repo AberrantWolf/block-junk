@@ -4,26 +4,33 @@
 //! generated procedurally from the block's `color` and `pattern` fields.
 //! That image is the *base* color — the chunk fragment shader samples it,
 //! then composites a per-block stack of mask+ramp **layers** on top before
-//! handing the result to PBR lighting. Layers are described by
-//! [`LayerStack`] entries (one per block slot) and uploaded as a storage
-//! buffer; a stack with `num_layers = 0` reproduces the pre-layer look
-//! exactly, so blocks without a configured stack are unaffected.
+//! handing the result to PBR lighting.
+//!
+//! Layers, masks, and ramps are all **mod-defined**. Mods register named
+//! [`MaskDef`]s and [`RampDef`]s via `engine.masks.register` /
+//! `engine.ramps.register`, and reference them by id in each
+//! [`BlockDef.layers`] entry. The engine bakes those defs into texture-
+//! array atlases at boot and resolves the ids to slot indices that the
+//! shader can use directly. A stack with `num_layers = 0` reproduces the
+//! pre-layer look exactly, so blocks without configured layers are
+//! unaffected.
 //!
 //! Resources bound by [`BlockTextureExt`]:
 //!
-//! - The base block atlas (`texture_2d_array`, one layer per slot, Nearest
-//!   + Repeat) — same as before.
+//! - The base block atlas (`texture_2d_array`, one layer per slot,
+//!   Nearest + Repeat).
 //! - A *mask atlas* (`texture_2d_array`, R8 grayscale, Linear + Repeat) —
-//!   tile-able patterns (bubbles, etc.) referenced by `Layer.mask_slot`.
+//!   tile-able patterns baked from each registered mask's [`MaskSource`].
 //! - A *ramp atlas* (`texture_2d_array`, RGBA8, Linear + Clamp) — 1-pixel-
-//!   tall color gradients referenced by `Layer.ramp_slot`. The shader
-//!   samples a ramp at U = mask value so the gradient gives painterly
-//!   shading *within* a masked region.
+//!   tall color gradients interpolated from each registered ramp's stops.
 //! - A storage buffer of `LayerStack` (one entry per block slot).
 //!
-//! v1 hardcodes a couple of stacks (grass with grey rock blobs, stone with
-//! green moss spots) directly in [`BlockTexturesPlugin::build`]. v2 will
-//! plumb the stack definitions through to the mod-side block defs.
+//! If a mod registers zero masks or zero ramps, the atlases are built with
+//! a single placeholder layer so the wgpu bindings remain valid; in that
+//! state no block can have layers (validation rejects refs to non-existent
+//! ids), so the placeholder is never sampled.
+
+use std::collections::HashMap;
 
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -35,9 +42,9 @@ use bevy::render::render_resource::{
 };
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::shader::ShaderRef;
-use block_junk_mod_api::blocks::BlockId;
+use block_junk_mod_api::textures::{MaskDef, MaskId, MaskSource, RampDef, RampId};
 
-use crate::blocks::{BlockRegistry, BlockSlot};
+use crate::blocks::{BlockRegistry, BlockSlot, BootstrapError};
 
 /// 16×16 is enough resolution for distinct pixel-art patterns while
 /// keeping the per-block memory tiny (~1 KB per layer). The chunk
@@ -56,16 +63,10 @@ pub const RAMP_SIZE: u32 = 64;
 
 /// How many layers a single block's stack can carry. Cap is shared with
 /// the WGSL `array<Layer, MAX_LAYERS_PER_BLOCK>` declaration in
-/// `block_textures.wgsl` — keep them in sync.
+/// `block_textures.wgsl` — keep them in sync. Mod-side `BlockDef.layers`
+/// entries beyond this cap are silently truncated; we log a warning so
+/// authors notice rather than discover it visually.
 pub const MAX_LAYERS_PER_BLOCK: usize = 4;
-
-// --- Mask slot constants. Indices into the mask atlas. ---
-pub const MASK_SMALL_BUBBLES: u32 = 0;
-pub const MASK_LARGE_BUBBLES: u32 = 1;
-
-// --- Ramp slot constants. Indices into the ramp atlas. ---
-pub const RAMP_GRASS_GREEN: u32 = 0;
-pub const RAMP_STONE_GREY: u32 = 1;
 
 /// Embedded shader path. Lives next to this file so the binary is
 /// self-contained — same pattern as `preview.wgsl`.
@@ -102,6 +103,130 @@ impl Pattern {
     }
 }
 
+/// Compact numeric handle for a registered mask, assigned in registration
+/// order. Mods never see this — they reference masks by [`MaskId`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MaskSlot(pub u16);
+
+/// Compact numeric handle for a registered ramp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RampSlot(pub u16);
+
+/// Engine-side registry of mod-registered masks. Same shape as
+/// [`BlockRegistry`]: slot order = registration order, ids interned to
+/// compact slot indices that the shader can sample directly.
+#[derive(Resource)]
+pub struct MaskRegistry {
+    defs_by_slot: Vec<MaskDef>,
+    slot_by_id: HashMap<MaskId, MaskSlot>,
+}
+
+impl MaskRegistry {
+    pub fn build(pending: Vec<MaskDef>) -> Result<Self, BootstrapError> {
+        if pending.len() > u16::MAX as usize {
+            return Err(BootstrapError::MaskSlotOverflow {
+                slots: pending.len(),
+            });
+        }
+        let mut slot_by_id = HashMap::with_capacity(pending.len());
+        for (i, def) in pending.iter().enumerate() {
+            // Validate source parameters now so a misconfigured mask is
+            // a load error, not a confusing "all black" texture later.
+            match &def.source {
+                MaskSource::Worley { cells } => {
+                    if *cells == 0 {
+                        return Err(BootstrapError::MaskWorleyCellsInvalid {
+                            mask: def.id.clone(),
+                            cells: *cells,
+                        });
+                    }
+                }
+                // `MaskSource` is `#[non_exhaustive]`: future variants
+                // skip per-variant validation here. Boot-time API-version
+                // compat check should keep mods + engine in sync on the
+                // set of variants in practice.
+                _ => {}
+            }
+            if slot_by_id
+                .insert(def.id.clone(), MaskSlot(i as u16))
+                .is_some()
+            {
+                return Err(BootstrapError::DuplicateMaskId(def.id.clone()));
+            }
+        }
+        Ok(Self {
+            defs_by_slot: pending,
+            slot_by_id,
+        })
+    }
+
+    pub fn slot_of(&self, id: &MaskId) -> Option<MaskSlot> {
+        self.slot_by_id.get(id).copied()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.defs_by_slot.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (MaskSlot, &MaskDef)> + '_ {
+        self.defs_by_slot
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (MaskSlot(i as u16), d))
+    }
+}
+
+/// Engine-side registry of mod-registered color ramps.
+#[derive(Resource)]
+pub struct RampRegistry {
+    defs_by_slot: Vec<RampDef>,
+    slot_by_id: HashMap<RampId, RampSlot>,
+}
+
+impl RampRegistry {
+    pub fn build(pending: Vec<RampDef>) -> Result<Self, BootstrapError> {
+        if pending.len() > u16::MAX as usize {
+            return Err(BootstrapError::RampSlotOverflow {
+                slots: pending.len(),
+            });
+        }
+        let mut slot_by_id = HashMap::with_capacity(pending.len());
+        for (i, def) in pending.iter().enumerate() {
+            if def.stops.len() < 2 {
+                return Err(BootstrapError::RampTooFewStops {
+                    ramp: def.id.clone(),
+                    stops: def.stops.len(),
+                });
+            }
+            if slot_by_id
+                .insert(def.id.clone(), RampSlot(i as u16))
+                .is_some()
+            {
+                return Err(BootstrapError::DuplicateRampId(def.id.clone()));
+            }
+        }
+        Ok(Self {
+            defs_by_slot: pending,
+            slot_by_id,
+        })
+    }
+
+    pub fn slot_of(&self, id: &RampId) -> Option<RampSlot> {
+        self.slot_by_id.get(id).copied()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.defs_by_slot.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (RampSlot, &RampDef)> + '_ {
+        self.defs_by_slot
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (RampSlot(i as u16), d))
+    }
+}
+
 /// One mask+ramp layer composited over the base block color in the
 /// chunk fragment shader. Layout matches the WGSL `Layer` struct in
 /// `block_textures.wgsl` exactly — encase scalar layout, no padding
@@ -117,8 +242,7 @@ pub struct Layer {
     /// computes `mask_uv = face_uv / scale`.
     pub scale: f32,
     /// Smoothstep midpoint applied to the raw mask value to derive the
-    /// blend coverage. 0.5 keeps the mask's natural shapes; raising it
-    /// shrinks the masked region, lowering it grows it.
+    /// blend coverage.
     pub threshold: f32,
     /// Smoothstep half-width. 0 = hard edge (cartoon); 0.2 = soft.
     pub softness: f32,
@@ -144,10 +268,9 @@ pub struct BlockTextures {
     /// Stand-alone 2D handles per slot, indexed by `BlockSlot.0 as usize`.
     /// Used by the hotbar `ImageNode`s.
     pub icons: Vec<Handle<Image>>,
-    /// Grayscale mask atlas. R8, one layer per mask. See `MASK_*` constants.
+    /// Grayscale mask atlas. R8, one layer per registered mask.
     pub mask_atlas: Handle<Image>,
-    /// Color-ramp atlas. RGBA8, one `RAMP_SIZE × 1` layer per ramp. See
-    /// `RAMP_*` constants.
+    /// Color-ramp atlas. RGBA8, one `RAMP_SIZE × 1` layer per ramp.
     pub ramp_atlas: Handle<Image>,
     /// Per-slot layer stacks, indexed by `BlockSlot.0`. Empty default for
     /// slots that don't configure layers.
@@ -198,58 +321,61 @@ impl Plugin for BlockTexturesPlugin {
         embedded_asset!(app, "block_textures.wgsl");
         app.add_plugins(MaterialPlugin::<ChunkMaterial>::default());
 
-        // Phase 1: read the registry, generate per-slot base images and
-        // build the layer-stack vector. CPU-only — no asset borrow yet.
+        // Phase 1: pull from the three registries and generate everything
+        // CPU-side. Borrows are confined to this block so the asset
+        // registries can be mutably borrowed in Phase 2.
         let mut per_slot: Vec<Image> = Vec::new();
-        let mut stacks_data: Vec<LayerStack>;
+        let mut stacks_data: Vec<LayerStack> = Vec::new();
         let slot_count;
+        let mask_image;
+        let ramp_image;
         {
-            let registry = app.world().resource::<BlockRegistry>();
-            slot_count = registry.slot_count();
+            let block_reg = app.world().resource::<BlockRegistry>();
+            let mask_reg = app.world().resource::<MaskRegistry>();
+            let ramp_reg = app.world().resource::<RampRegistry>();
+
+            slot_count = block_reg.slot_count();
+            stacks_data.reserve(slot_count);
             for slot_idx in 0..slot_count {
-                let def = registry.def(BlockSlot(slot_idx as u16));
+                let def = block_reg.def(BlockSlot(slot_idx as u16));
                 let pattern = Pattern::parse(def.pattern.as_deref());
                 per_slot.push(generate_texture(def.color, pattern));
+
+                // Resolve this block's layer ids to slot indices. The
+                // BlockRegistry::validate_layers call run earlier
+                // guarantees every id resolves, so `expect` here is a
+                // contract assertion, not a real fallible path.
+                let mut stack = LayerStack::default();
+                if def.layers.len() > MAX_LAYERS_PER_BLOCK {
+                    warn!(
+                        block = %def.id,
+                        configured = def.layers.len(),
+                        cap = MAX_LAYERS_PER_BLOCK,
+                        "block has more layers than the shader cap; extras truncated",
+                    );
+                }
+                let take = def.layers.len().min(MAX_LAYERS_PER_BLOCK);
+                stack.num_layers = take as u32;
+                for (i, layer_def) in def.layers.iter().take(take).enumerate() {
+                    let mask_slot = mask_reg
+                        .slot_of(&layer_def.mask)
+                        .expect("validated by BlockRegistry::validate_layers");
+                    let ramp_slot = ramp_reg
+                        .slot_of(&layer_def.ramp)
+                        .expect("validated by BlockRegistry::validate_layers");
+                    stack.layers[i] = Layer {
+                        mask_slot: u32::from(mask_slot.0),
+                        ramp_slot: u32::from(ramp_slot.0),
+                        scale: layer_def.scale,
+                        threshold: layer_def.threshold,
+                        softness: layer_def.softness,
+                    };
+                }
+                stacks_data.push(stack);
             }
-            stacks_data = vec![LayerStack::default(); slot_count];
-            // v1 demo stacks. Hardcoded so we can see the system work
-            // end-to-end before we plumb the layer config through to
-            // mod-side block defs (v2). Other slots get the default
-            // empty stack and look identical to the pre-layer behavior.
-            if let Some(grass) = registry.slot_of(&BlockId::new("vanilla:grass")) {
-                stacks_data[grass.0 as usize] = LayerStack {
-                    num_layers: 1,
-                    layers: [
-                        Layer {
-                            mask_slot: MASK_LARGE_BUBBLES,
-                            ramp_slot: RAMP_STONE_GREY,
-                            scale: 2.0,
-                            threshold: 0.62,
-                            softness: 0.05,
-                        },
-                        Layer::default(),
-                        Layer::default(),
-                        Layer::default(),
-                    ],
-                };
-            }
-            if let Some(stone) = registry.slot_of(&BlockId::new("vanilla:stone")) {
-                stacks_data[stone.0 as usize] = LayerStack {
-                    num_layers: 1,
-                    layers: [
-                        Layer {
-                            mask_slot: MASK_SMALL_BUBBLES,
-                            ramp_slot: RAMP_GRASS_GREEN,
-                            scale: 1.0,
-                            threshold: 0.70,
-                            softness: 0.10,
-                        },
-                        Layer::default(),
-                        Layer::default(),
-                        Layer::default(),
-                    ],
-                };
-            }
+
+            mask_image = generate_mask_atlas(mask_reg);
+            ramp_image = generate_ramp_atlas(ramp_reg);
         }
 
         // Build the array Image by concatenating each layer's bytes.
@@ -297,11 +423,6 @@ impl Plugin for BlockTexturesPlugin {
             ..TextureViewDescriptor::default()
         });
 
-        // Mask + ramp atlases are independent of the per-slot data above
-        // — they're a small library shared across all blocks.
-        let mask_image = generate_mask_atlas();
-        let ramp_image = generate_ramp_atlas();
-
         // Phase 2: register Image assets. Borrow Assets<Image> mutably,
         // collect handles, drop the borrow before grabbing the storage-
         // buffer asset registry.
@@ -323,9 +444,6 @@ impl Plugin for BlockTexturesPlugin {
             (array_handle, mask_atlas_handle, ramp_atlas_handle, icons)
         };
         // Phase 3: encase the layer stacks into a storage buffer asset.
-        // `From<T: ShaderType + WriteInto>` writes the encase scalar
-        // layout directly — so as long as the WGSL `LayerStack` mirrors
-        // the Rust struct field-for-field, we're aligned.
         let stacks_handle = world
             .resource_mut::<Assets<ShaderStorageBuffer>>()
             .add(ShaderStorageBuffer::from(stacks_data));
@@ -466,20 +584,42 @@ fn scale(color: [f32; 3], k: f32) -> [f32; 3] {
     [color[0] * k, color[1] * k, color[2] * k]
 }
 
-/// Build the grayscale mask atlas. One layer per mask, R8Unorm, sized
-/// `MASK_SIZE × MASK_SIZE`. v1 ships two tileable Worley-style "bubble"
-/// masks at different cell counts — the same algorithm with different
-/// `cells` gives the same shape character at different scales.
-fn generate_mask_atlas() -> Image {
-    const MASK_LAYERS: u32 = 2;
-    let mut data = Vec::with_capacity((MASK_SIZE * MASK_SIZE * MASK_LAYERS) as usize);
-    for layer in 0..MASK_LAYERS {
-        // Higher cell count = more, smaller bubbles per tile.
-        let cells = if layer == MASK_SMALL_BUBBLES { 8 } else { 4 };
-        for y in 0..MASK_SIZE {
-            for x in 0..MASK_SIZE {
-                let v = worley_tileable(x, y, MASK_SIZE, cells, layer);
-                data.push((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+/// Build the grayscale mask atlas from the [`MaskRegistry`]. One layer
+/// per registered mask, R8Unorm, `MASK_SIZE × MASK_SIZE`. When no masks
+/// are registered, ship a single all-zero placeholder layer so the
+/// wgpu binding remains valid (no block can reference a non-existent
+/// mask, so the placeholder is never sampled).
+fn generate_mask_atlas(reg: &MaskRegistry) -> Image {
+    let count = reg.slot_count();
+    let layer_count = count.max(1) as u32;
+    let pixels_per_layer = (MASK_SIZE * MASK_SIZE) as usize;
+    let mut data = Vec::with_capacity(pixels_per_layer * layer_count as usize);
+    if count == 0 {
+        data.resize(pixels_per_layer, 0u8);
+    } else {
+        for (slot, def) in reg.iter() {
+            match &def.source {
+                MaskSource::Worley { cells } => {
+                    for y in 0..MASK_SIZE {
+                        for x in 0..MASK_SIZE {
+                            let v =
+                                worley_tileable(x, y, MASK_SIZE, *cells, u32::from(slot.0));
+                            data.push((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+                        }
+                    }
+                }
+                // Future variants: emit a black layer so the atlas
+                // stays valid. `MaskSource` is `#[non_exhaustive]`; in
+                // practice the API-version check rejects mismatched
+                // mods at load time.
+                _ => {
+                    warn!(
+                        mask = %def.id,
+                        "unknown mask source kind; baking as black placeholder",
+                    );
+                    let pixels = (MASK_SIZE * MASK_SIZE) as usize;
+                    data.extend(std::iter::repeat_n(0u8, pixels));
+                }
             }
         }
     }
@@ -487,7 +627,7 @@ fn generate_mask_atlas() -> Image {
         Extent3d {
             width: MASK_SIZE,
             height: MASK_SIZE,
-            depth_or_array_layers: MASK_LAYERS,
+            depth_or_array_layers: layer_count,
         },
         TextureDimension::D2,
         data,
@@ -563,36 +703,37 @@ fn hash2d_seed(x: u32, y: u32, seed: u32) -> f32 {
     (h & 0xFFFFFF) as f32 / 16_777_216.0
 }
 
-/// Build the color-ramp atlas. Each layer is a `RAMP_SIZE × 1` RGBA8
-/// gradient strip; the shader samples it with U = mask value (clamped),
-/// V = 0.5. Linear filtering smooths the gradient between the chosen
-/// stops — no mip levels needed at this resolution.
-fn generate_ramp_atlas() -> Image {
-    const RAMP_LAYERS: u32 = 2;
-    let mut data = Vec::with_capacity((RAMP_SIZE * 4 * RAMP_LAYERS) as usize);
-    for layer in 0..RAMP_LAYERS {
-        let (lo, hi) = if layer == RAMP_GRASS_GREEN {
-            // Mossy green: dark olive at low mask values → brighter
-            // grass green at high. The "moss on stone" demo uses this.
-            ([0.18, 0.32, 0.10], [0.45, 0.65, 0.20])
-        } else {
-            // Stone grey: mid-grey → slightly lighter cool grey. Reads
-            // as the rock-blob highlights when used over green grass.
-            ([0.32, 0.32, 0.34], [0.58, 0.58, 0.60])
-        };
-        for x in 0..RAMP_SIZE {
-            let t = x as f32 / (RAMP_SIZE - 1) as f32;
-            data.push(to_u8(lo[0] + (hi[0] - lo[0]) * t));
-            data.push(to_u8(lo[1] + (hi[1] - lo[1]) * t));
-            data.push(to_u8(lo[2] + (hi[2] - lo[2]) * t));
-            data.push(255);
+/// Build the color-ramp atlas from the [`RampRegistry`]. Each layer is a
+/// `RAMP_SIZE × 1` RGBA8 strip; the shader samples it with U = mask
+/// value, V = 0.5. Linear filtering on the sampler smooths between
+/// adjacent stops. As with masks, a registry with zero ramps ships a
+/// single white placeholder layer so the binding remains valid.
+fn generate_ramp_atlas(reg: &RampRegistry) -> Image {
+    let count = reg.slot_count();
+    let layer_count = count.max(1) as u32;
+    let bytes_per_layer = (RAMP_SIZE * 4) as usize;
+    let mut data = Vec::with_capacity(bytes_per_layer * layer_count as usize);
+    if count == 0 {
+        for _ in 0..RAMP_SIZE {
+            data.extend_from_slice(&[255, 255, 255, 255]);
+        }
+    } else {
+        for (_slot, def) in reg.iter() {
+            for x in 0..RAMP_SIZE {
+                let t = x as f32 / (RAMP_SIZE - 1) as f32;
+                let [r, g, b] = sample_ramp(&def.stops, t);
+                data.push(to_u8(r));
+                data.push(to_u8(g));
+                data.push(to_u8(b));
+                data.push(255);
+            }
         }
     }
     let mut img = Image::new(
         Extent3d {
             width: RAMP_SIZE,
             height: 1,
-            depth_or_array_layers: RAMP_LAYERS,
+            depth_or_array_layers: layer_count,
         },
         TextureDimension::D2,
         data,
@@ -613,4 +754,22 @@ fn generate_ramp_atlas() -> Image {
         ..TextureViewDescriptor::default()
     });
     img
+}
+
+/// Sample a piecewise-linear ramp at `t ∈ [0, 1]`. Stops are evenly
+/// distributed; `RampRegistry::build` enforces `stops.len() >= 2`.
+fn sample_ramp(stops: &[[f32; 3]], t: f32) -> [f32; 3] {
+    debug_assert!(stops.len() >= 2);
+    let n = stops.len();
+    let scaled = t.clamp(0.0, 1.0) * (n - 1) as f32;
+    let lo = (scaled.floor() as usize).min(n - 2);
+    let hi = lo + 1;
+    let f = scaled - lo as f32;
+    let a = stops[lo];
+    let b = stops[hi];
+    [
+        a[0] + (b[0] - a[0]) * f,
+        a[1] + (b[1] - a[1]) * f,
+        a[2] + (b[2] - a[2]) * f,
+    ]
 }

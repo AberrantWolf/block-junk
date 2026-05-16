@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::textures::LayerDef;
+
 /// Stable string identifier for a block kind, "namespace:name" by convention.
 /// The namespace matches the mod that registered the block ("vanilla",
 /// "mymod"). Equality is byte-exact on the full string.
@@ -125,6 +127,13 @@ pub struct BlockDef {
     /// flat, which is the look this whole field exists to fix.
     #[serde(default)]
     pub pattern: Option<String>,
+    /// Optional mask+ramp layer stack composited over the base texture
+    /// in the chunk fragment shader. Each entry references a previously
+    /// registered mask and ramp by id; the engine resolves them to slot
+    /// indices at boot. See [`LayerDef`] for the per-layer parameters
+    /// and the `textures` module docs for the authoring model.
+    #[serde(default)]
+    pub layers: Vec<LayerDef>,
     /// Optional asset path for a non-cube visual. When set, the client
     /// renders this block as a separate ECS entity loaded from the given
     /// glTF (or scene) path, instead of baking cube faces into the chunk

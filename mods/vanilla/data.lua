@@ -19,6 +19,46 @@ register {
     color = { 0.0, 0.0, 0.0 },
 }
 
+-- Masks + ramps composited per-block by the chunk fragment shader.
+-- Slot order is registration order; refs from `layers` below resolve
+-- against these by id at boot. Mods can register their own with
+-- `engine.masks.register` / `engine.ramps.register` and reference them
+-- from their own blocks; the atlas grows accordingly.
+
+engine.masks.register {
+    id = "vanilla:bubbles_large",
+    -- Worley with 4 cells per tile = a handful of fat blobs. Good for
+    -- grass-rocks scale at scale = 2.0 in world space.
+    source = { kind = "worley", cells = 4 },
+}
+
+engine.masks.register {
+    id = "vanilla:bubbles_small",
+    -- Same algorithm at 2x cell count: many smaller blobs. Good for
+    -- moss-on-stone speckle at scale = 1.0.
+    source = { kind = "worley", cells = 8 },
+}
+
+engine.ramps.register {
+    id = "vanilla:stone_grey",
+    -- Mid-grey → slightly lighter cool grey. Reads as rock-blob
+    -- highlights when used over green grass.
+    stops = {
+        { 0.32, 0.32, 0.34 },
+        { 0.58, 0.58, 0.60 },
+    },
+}
+
+engine.ramps.register {
+    id = "vanilla:grass_green",
+    -- Dark olive → brighter grass green. Drives the moss-on-stone
+    -- effect when stone uses it under bubbles_small.
+    stops = {
+        { 0.18, 0.32, 0.10 },
+        { 0.45, 0.65, 0.20 },
+    },
+}
+
 register {
     id = "vanilla:stone",
     display_name = "Stone",
@@ -29,6 +69,17 @@ register {
     },
     color = { 0.55, 0.55, 0.58 },
     pattern = "speckle",
+    -- Green moss patches scattered across stone. High threshold so most
+    -- pixels stay grey; soft edge to read as moss spreading.
+    layers = {
+        {
+            mask = "vanilla:bubbles_small",
+            ramp = "vanilla:grass_green",
+            scale = 1.0,
+            threshold = 0.70,
+            softness = 0.10,
+        },
+    },
 }
 
 register {
@@ -53,6 +104,17 @@ register {
     },
     color = { 0.36, 0.62, 0.30 },
     pattern = "noise",
+    -- Grey rock blobs embedded in the grass. Low softness for crisp
+    -- cartoon edges; scale = 2.0 so the blobs span ~2 world cells.
+    layers = {
+        {
+            mask = "vanilla:bubbles_large",
+            ramp = "vanilla:stone_grey",
+            scale = 2.0,
+            threshold = 0.62,
+            softness = 0.05,
+        },
+    },
 }
 
 register {
