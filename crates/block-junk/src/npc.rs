@@ -25,7 +25,7 @@
 //! when no mods load.
 
 use bevy::prelude::*;
-use block_junk_mod_api::blocks::{Consumable, Sleeper};
+use block_junk_mod_api::blocks::{Cardinal, Consumable, Sleeper};
 use block_junk_mod_api::npcs::{
     NearbyConsumable, NearbyPlan, NearbyRoom, NearbySleeper, NpcKindId, NpcSnapshot,
     PlanKindHint, PlannerGoal,
@@ -249,6 +249,11 @@ pub enum ArrivalAction {
         duration_secs: f32,
         target_cell: IVec3,
         anchor_cell: IVec3,
+        /// Bed's stored placement orientation. Snapped onto the NPC's
+        /// pose yaw at arrival so they end up aligned with the bed's
+        /// long axis instead of facing whatever direction their last
+        /// walk segment happened to leave them in.
+        orientation: Cardinal,
     },
     /// Begin a work action at the plan target cell. Carries the snapshot
     /// of the `PlanKind` at the moment the goal was committed so a
@@ -613,7 +618,7 @@ fn npc_brain_tick(
         (
             Entity,
             &NpcId,
-            &AvatarPose,
+            &mut AvatarPose,
             &mut Needs,
             &mut Brain,
             &mut MovementIntent,
@@ -630,7 +635,7 @@ fn npc_brain_tick(
         registry: &block_registry,
     };
 
-    for (entity, npc_id, pose, mut needs, mut brain, mut intent, mut npc_path, kind) in
+    for (entity, npc_id, mut pose, mut needs, mut brain, mut intent, mut npc_path, kind) in
         npcs.iter_mut()
     {
         // Phase 1: decay every subscribed need by its registry-defined
@@ -749,7 +754,9 @@ fn npc_brain_tick(
                     duration_secs,
                     target_cell,
                     anchor_cell,
+                    orientation,
                 } => {
+                    pose.yaw = sleep_yaw_for(orientation);
                     brain.goal = Goal::Sleeping {
                         remaining_secs: duration_secs,
                         need,
@@ -898,7 +905,7 @@ fn npc_brain_tick(
             let snapshot = build_snapshot(
                 *npc_id,
                 &kind_id,
-                pose,
+                &pose,
                 &needs,
                 &room_map,
                 &consumable_index,
@@ -980,8 +987,8 @@ fn npc_brain_tick(
                 } => {
                     let radius = radius_cells.clamp(1, MAX_WANDER_RADIUS_CELLS);
                     let timeout = timeout_secs.clamp(1.0, MAX_WANDER_TIMEOUT_SECS);
-                    let foot = pose_to_standable_foot(pose, &world)
-                        .unwrap_or_else(|| pose_to_foot_cell(pose));
+                    let foot = pose_to_standable_foot(&pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     match pick_wander_path(foot, radius, &mut brain.rng, &world) {
                         Some(path) => {
                             // set_if_neq keeps the wire quiet on the
@@ -1024,8 +1031,8 @@ fn npc_brain_tick(
                     // path — the only difference is target selection
                     // (planner-supplied vs random within radius).
                     let timeout = timeout_secs.clamp(1.0, MAX_GOTO_TIMEOUT_SECS);
-                    let foot = pose_to_standable_foot(pose, &world)
-                        .unwrap_or_else(|| pose_to_foot_cell(pose));
+                    let foot = pose_to_standable_foot(&pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     let target = IVec3::new(cell.x, cell.y, cell.z);
                     // Already at the target: the planner picked a cell
                     // the NPC's already standing on (typically the
@@ -1112,11 +1119,18 @@ fn npc_brain_tick(
                             continue;
                         }
                     };
-                    // Resolve the bed's anchor — the planner may have
-                    // picked the foot or the head of a multi-cell bed.
-                    // Both should contend for the same claim slot.
-                    let anchor_cell =
-                        resolve_anchor_cell(target_cell, &chunk_entities_q, &chunk_map);
+                    // Resolve the bed's anchor + its stored orientation.
+                    // Anchor doubles as the claim key (foot and head of a
+                    // multi-cell bed contend for the same slot); the
+                    // orientation feeds the yaw snap on arrival so the
+                    // sleeping NPC ends up aligned with the bed's long
+                    // axis instead of pointing wherever the last walk
+                    // segment left them.
+                    let (anchor_cell, bed_orientation) = resolve_anchor_with_orientation(
+                        target_cell,
+                        &chunk_entities_q,
+                        &chunk_map,
+                    );
                     // Atomic claim. Failure means another NPC took the
                     // bed between snapshot construction and now — fall
                     // through to a brief rest, the planner will re-pick.
@@ -1133,14 +1147,27 @@ fn npc_brain_tick(
                         *intent = MovementIntent::default();
                         continue;
                     }
-                    let foot = pose_to_standable_foot(pose, &world)
-                        .unwrap_or_else(|| pose_to_foot_cell(pose));
-                    let Some(stand_cell) = nearest_standable_neighbor(target_cell, foot, &world)
-                    else {
+                    let foot = pose_to_standable_foot(&pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
+                    // Sleep stands the NPC *on* the bed (cell directly
+                    // above the anchor), not next to it like a consumable.
+                    // `support_below = true` on the bed makes the cell
+                    // above standable for free; if it isn't (overhang /
+                    // low ceiling), fall back to the cardinal-neighbour
+                    // search so a placed-in-a-tight-spot bed still gives
+                    // *some* sleep target rather than refusing to sleep.
+                    let atop_anchor = anchor_cell + IVec3::Y;
+                    let stand_cell = if standable(&world, atop_anchor) {
+                        atop_anchor
+                    } else if let Some(c) =
+                        nearest_standable_neighbor(target_cell, foot, &world)
+                    {
+                        c
+                    } else {
                         info!(
                             npc = npc_id.0,
                             target = ?target_cell.to_array(),
-                            "no standable neighbour of sleeper; releasing claim and parking briefly",
+                            "no standable cell atop sleeper or in its cardinal neighbours; releasing claim and parking briefly",
                         );
                         bed_claims.release(anchor_cell, *npc_id);
                         brain.goal = Goal::Resting {
@@ -1156,6 +1183,7 @@ fn npc_brain_tick(
                         if !npc_path.0.is_empty() {
                             npc_path.0.clear();
                         }
+                        pose.yaw = sleep_yaw_for(bed_orientation);
                         brain.goal = Goal::Sleeping {
                             remaining_secs: duration,
                             need: sleeper.need.clone(),
@@ -1190,6 +1218,7 @@ fn npc_brain_tick(
                                     duration_secs: duration,
                                     target_cell,
                                     anchor_cell,
+                                    orientation: bed_orientation,
                                 },
                             };
                         }
@@ -1241,8 +1270,8 @@ fn npc_brain_tick(
                             continue;
                         }
                     };
-                    let foot = pose_to_standable_foot(pose, &world)
-                        .unwrap_or_else(|| pose_to_foot_cell(pose));
+                    let foot = pose_to_standable_foot(&pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     // Consumables are typically solid blocks, so the
                     // NPC's actual stand cell is one of their
                     // neighbours. Pick the standable neighbour
@@ -1359,8 +1388,8 @@ fn npc_brain_tick(
                         *intent = MovementIntent::default();
                         continue;
                     }
-                    let foot = pose_to_standable_foot(pose, &world)
-                        .unwrap_or_else(|| pose_to_foot_cell(pose));
+                    let foot = pose_to_standable_foot(&pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     let Some(stand_cell) =
                         nearest_standable_neighbor(target_cell, foot, &world)
                     else {
@@ -1455,7 +1484,7 @@ fn npc_brain_tick(
                     *intent = MovementIntent::default();
                     continue;
                 };
-                let foot_y = pose_to_foot_cell(pose).y;
+                let foot_y = pose_to_foot_cell(&pose).y;
                 let jump = step_up_imminent(path, *progress, foot_y);
                 *intent = MovementIntent {
                     wishdir: [0, 0, -1],
@@ -1756,6 +1785,55 @@ fn resolve_anchor_cell(
         Some(EntryKind::Anchor { .. }) | None => cell,
         Some(EntryKind::Ghost { anchor }) => anchor,
     }
+}
+
+/// Like [`resolve_anchor_cell`] but also pulls the bed's stored
+/// orientation. Falls back to `Cardinal::East` (the default placement)
+/// when the cell has no entity entry — e.g. a 1-cell sleeper without a
+/// sidecar entry, or a chunk that isn't loaded yet.
+fn resolve_anchor_with_orientation(
+    cell: IVec3,
+    chunk_entities: &Query<&'static ChunkEntities>,
+    chunk_map: &ChunkMap,
+) -> (IVec3, Cardinal) {
+    let (coord, _) = world_to_chunk(cell);
+    let Some(&entity) = chunk_map.0.get(&coord) else {
+        return (cell, Cardinal::default());
+    };
+    let Ok(entries) = chunk_entities.get(entity) else {
+        return (cell, Cardinal::default());
+    };
+    match entries.get(cell) {
+        Some(EntryKind::Anchor { orientation }) => (cell, orientation),
+        Some(EntryKind::Ghost { anchor }) => {
+            // Look up the anchor's own entry to read its orientation;
+            // ghost entries don't carry one.
+            let (a_coord, _) = world_to_chunk(anchor);
+            let Some(&a_entity) = chunk_map.0.get(&a_coord) else {
+                return (anchor, Cardinal::default());
+            };
+            let Ok(a_entries) = chunk_entities.get(a_entity) else {
+                return (anchor, Cardinal::default());
+            };
+            let orientation = match a_entries.get(anchor) {
+                Some(EntryKind::Anchor { orientation }) => orientation,
+                _ => Cardinal::default(),
+            };
+            (anchor, orientation)
+        }
+        None => (cell, Cardinal::default()),
+    }
+}
+
+/// NPC pose yaw that aligns the body with a bed of the given placement
+/// orientation — forward points from the bed's foot toward its head.
+///
+/// `Cardinal::yaw()` is the *mesh* rotation (model-space +X → cardinal
+/// direction). The NPC mesh's model-space forward is -Z (Bevy
+/// convention), so we shift by -π/2 to convert mesh-yaw into NPC-yaw
+/// for the same direction.
+fn sleep_yaw_for(orientation: Cardinal) -> f32 {
+    orientation.yaw() - core::f32::consts::FRAC_PI_2
 }
 
 /// Resolve the [`Sleeper`] at a world cell, if any. Returns `None`
