@@ -21,7 +21,7 @@ use crate::npc::{Npc, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, MovementIntent, MovementMode,
-    WorldChannel, WorldClockSync,
+    PlanEdit, PlanFullSync, WorldChannel, WorldClockSync,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +69,10 @@ impl Plugin for ProtocolPlugin {
 
         app.register_message::<BlockEdit>()
             .add_direction(NetworkDirection::Bidirectional);
+        app.register_message::<PlanEdit>()
+            .add_direction(NetworkDirection::Bidirectional);
+        app.register_message::<PlanFullSync>()
+            .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ChunkSnapshot>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ChunkUnload>()

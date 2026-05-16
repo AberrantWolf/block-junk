@@ -42,6 +42,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::sleepers::SleeperIndexPlugin);
         app.add_plugins(crate::debug::DebugServerPlugin);
         app.add_plugins(crate::npc::NpcServerPlugin);
+        app.add_plugins(crate::plans::PlansServerPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());

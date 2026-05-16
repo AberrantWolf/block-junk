@@ -10,6 +10,8 @@ mod npc;
 mod npc_registry;
 mod pathfinding;
 mod physics;
+mod plans;
+mod player_mode;
 mod preview;
 mod protocol;
 mod rooms;
@@ -17,6 +19,7 @@ mod save;
 mod scripting;
 mod server;
 mod sleepers;
+mod target_outline;
 mod voxel;
 
 use core::sync::atomic::AtomicBool;

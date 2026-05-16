@@ -181,6 +181,49 @@ pub struct ChunkUnload {
     pub coord: ChunkCoord,
 }
 
+/// What a player has tagged a cell to become. Lives in the shared [`Plans`]
+/// resource (server-authoritative, mirrored on each client). Tagged cells
+/// aren't world state — they're work orders for NPCs to consume in a
+/// future phase. The world block at the cell is untouched until the work
+/// completes (Phase 6).
+///
+/// `Remove` means "I want whatever is here to be gone." `Build` carries
+/// the slot + orientation so an NPC working the plan knows what to
+/// construct and how to rotate it. Multi-cell footprints are recorded
+/// at the anchor cell only — the NPC expands the footprint at work time
+/// against the live registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PlanKind {
+    Remove,
+    Build {
+        slot: BlockSlot,
+        orientation: Cardinal,
+    },
+}
+
+/// Client → server: tag (`kind = Some`) or untag (`kind = None`) a cell.
+/// Server → client: the canonical applied edit, broadcast to everyone in
+/// the world. Same bidirectional shape as [`BlockEdit`] for symmetry.
+///
+/// Server validation:
+///   - `Some(Remove)` rejected if the cell is currently empty.
+///   - `Some(Build {..})` rejected if the cell is currently solid.
+///   - `None` succeeds even if no tag exists (idempotent untag).
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PlanEdit {
+    pub cell: IVec3,
+    pub kind: Option<PlanKind>,
+}
+
+/// Server → client on connect: the current state of the [`Plans`] map.
+/// Sparse — only tagged cells. Tagged-add cells with stale orientations
+/// from an older save are not migrated; the snapshot is whatever the
+/// server resource currently holds.
+#[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PlanFullSync {
+    pub entries: Vec<(IVec3, PlanKind)>,
+}
+
 /// Channel marker. One ordered-reliable channel for all world events
 /// (BlockEdit, ChunkSnapshot, building events…). Future work may split
 /// priorities; for now KISS.

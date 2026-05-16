@@ -146,6 +146,52 @@ Bevy's preprocessor replaces `#{MATERIAL_BIND_GROUP}` at compile time. This is t
 
 Also note: Bevy uses **reversed-Z depth**. Default `depth_compare` is `CompareFunction::GreaterEqual` — closer to camera = larger depth value. To pick out fragments BEHIND existing geometry (X-ray / blueprint effects), flip to `Less`, not `Greater`.
 
+## bevy_ui: BorderRadius is a `Node` field, not a Component
+
+The standalone `BorderRadius` component is gone in 0.18 — `BorderRadius` is now a `pub` field on `Node`. Spawning `(Node { .. }, BorderRadius::all(Val::Px(6.0)))` fails the `Bundle` check (`BorderRadius` no longer derives `Component`):
+
+```rust
+// 0.16:
+commands.spawn((Node { .. }, BorderRadius::all(Val::Px(6.0))));
+
+// 0.18:
+commands.spawn(Node {
+    border_radius: BorderRadius::all(Val::Px(6.0)),
+    ..default()
+});
+```
+
+`BackgroundColor` and `BorderColor` are still standalone components — only `BorderRadius` was folded into `Node`. The asymmetry is jarring but real.
+
+## `SystemParam` and tuple caps in Bevy 0.18
+
+Two distinct ceilings will bite you when systems grow:
+
+1. **A single system can take at most 16 system params.** Adding a 17th gives a cryptic `no method named "in_set" found for fn item …` error at the call site — the compiler is really saying "`IntoSystem`/`SystemParam` doesn't reach 17," but it surfaces on `.in_set` / `.run_if` / `.chain` rather than on the system definition. Fix: combine related params under a `#[derive(SystemParam)]` struct, or — usually simpler — extract gating logic into a `run_if` so the gated param isn't needed inside the system at all.
+
+2. **`add_systems(Update, (a, b, c, …))` tuples cap at ~5–8 systems** before the trait-resolution chain explodes. The threshold isn't fixed — it depends on each system's signature complexity (more params per system = lower system count). If one of your systems has many params, the whole tuple's trait resolution gets monstrous and fails. Fix: split into multiple `.add_systems(Update, …)` calls. The server's `Simulation` set in `server.rs` uses this workaround on purpose.
+
+Both caps surface as the same E0599 "no method named in_set found" pattern, with the long type name written to `target/debug/deps/…long-type-….txt`. When you see that error, count params (cap 1) and tuple size (cap 2) before chasing other leads.
+
+## bevy_ui: `Text` and `ImageNode` constructors
+
+Both are real components in 0.18, with `Text::new(impl Into<String>)` and `ImageNode::new(Handle<Image>)`. Each auto-inserts a `Node` via required-components, but if you want sizing/layout you spawn an explicit `Node` *alongside* them:
+
+```rust
+commands.spawn((
+    ImageNode::new(asset_server.load("ui/icon.png")),
+    Node { width: Val::Px(28.0), height: Val::Px(28.0), ..default() },
+));
+
+commands.spawn((
+    Text::new("Select"),
+    TextFont { font_size: 18.0, ..default() },
+    TextColor(Color::WHITE),
+));
+```
+
+`TextFont` and `TextColor` are separate sibling components on the text entity — they're required-components of `Text`, so you only need to spawn the ones you want to override.
+
 ## DirectionalLight as component
 
 ```rust

@@ -19,7 +19,10 @@ use crate::collision::WorldCollision;
 use crate::menu::AppState;
 use crate::npc::{Npc, NpcPath};
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
+use crate::plans::PlansClientPlugin;
+use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
+use crate::target_outline::TargetOutlinePlugin;
 use crate::protocol::{
     Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
     ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode, WorldChannel,
@@ -33,6 +36,9 @@ impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FlyCamPlugin)
             .add_plugins(PreviewPlugin)
+            .add_plugins(PlayerModePlugin)
+            .add_plugins(TargetOutlinePlugin)
+            .add_plugins(PlansClientPlugin)
             // Frame interpolation smooths AvatarPose between FixedUpdate
             // ticks during PostUpdate render. Without it, on a high-refresh
             // display you see 64 Hz physics steps with the renderer drawing
@@ -133,18 +139,38 @@ impl Plugin for ClientPlugin {
                     .after(FrameInterpolationSystems::Interpolate)
                     .run_if(in_state(AppState::InGame)),
             )
+            // Split into multiple add_systems calls — Bevy 0.18 hits a
+            // trait-resolution cap when the tuple's combined system
+            // signatures grow large. `update_placement_preview` carries
+            // ~17 params; lumping it with anything else here pushes us
+            // over. Same workaround as the server's Simulation set.
+            .add_systems(
+                Update,
+                update_placement_preview
+                    .run_if(in_build_mode)
+                    .in_set(GameSet::PostSimulation),
+            )
+            .add_systems(
+                Update,
+                hide_preview_on_mode_change.in_set(GameSet::PostSimulation),
+            )
             .add_systems(
                 Update,
                 (
                     mesh_chunks,
                     refresh_block_entities,
                     update_hotbar_highlight,
-                    update_placement_preview,
+                    draw_npc_paths,
+                )
+                    .in_set(GameSet::PostSimulation),
+            )
+            .add_systems(
+                Update,
+                (
                     attach_avatar_visuals,
                     attach_npc_visuals,
                     start_npc_anim_idle,
                     drive_npc_animation,
-                    draw_npc_paths,
                 )
                     .in_set(GameSet::PostSimulation),
             )
@@ -451,6 +477,7 @@ fn cycle_selected_or_rotation(
     scroll: Res<AccumulatedMouseScroll>,
     keys: Res<ButtonInput<KeyCode>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    mode: Res<PlayerMode>,
     mut selected: ResMut<SelectedBlock>,
     mut rotation: ResMut<PlacementRotation>,
     palette: Res<PlaceablePalette>,
@@ -461,6 +488,12 @@ fn cycle_selected_or_rotation(
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
     if !locked {
+        return;
+    }
+    // Wheel only cycles blocks while the wheel-action has a use: Build
+    // (the block being placed) and Plan (the block being planned for
+    // build via Shift+L-click).
+    if !matches!(*mode, PlayerMode::Build | PlayerMode::Plan) {
         return;
     }
     let dy = scroll.delta.y;
@@ -607,11 +640,11 @@ fn update_day_night_lighting(
 
 /// Reach in world cells. Generous because the camera is a flying free-cam;
 /// real survival reach (Minecraft-y ~5 blocks) lands when there's an avatar.
-const RAYCAST_REACH: f32 = 256.0;
+pub(crate) const RAYCAST_REACH: f32 = 256.0;
 
 /// Convenience: compose the player's facing-derived orientation with the
 /// manual rotation offset to get the orientation a place action would use.
-fn placement_orientation(player_yaw: f32, manual: Cardinal) -> Cardinal {
+pub(crate) fn placement_orientation(player_yaw: f32, manual: Cardinal) -> Cardinal {
     Cardinal::from_yaw_facing(player_yaw).rotated(manual as i32)
 }
 
@@ -628,6 +661,7 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
 fn place_break_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    mode: Res<PlayerMode>,
     cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
@@ -637,8 +671,17 @@ fn place_break_input(
     registry: Res<BlockRegistry>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
-    let break_click = mouse.just_pressed(MouseButton::Left);
-    let place_click = mouse.just_pressed(MouseButton::Right);
+    // L-click is the primary verb across modes: it removes in Destroy,
+    // places in Build. Select and Plan eat clicks here — they'll grow
+    // their own L-click verbs in later phases (Select: inspect; Plan:
+    // tag-for-remove + Shift+L for tag-for-build). R-click is reserved
+    // for per-mode secondary actions and is a no-op in Build/Destroy
+    // until something claims it. Mouse buttons are still consumed by
+    // Bevy's `just_pressed` latch either way, so a discarded click
+    // doesn't ghost-fire on the next mode switch.
+    let left = mouse.just_pressed(MouseButton::Left);
+    let break_click = left && *mode == PlayerMode::Destroy;
+    let place_click = left && *mode == PlayerMode::Build;
     if !break_click && !place_click {
         return;
     }
@@ -706,9 +749,9 @@ fn place_break_input(
 /// Raycast hit for the place/break path. `cell` is the world cell that
 /// would receive the action: for break, the cell whose block should be
 /// affected; for place, the cell adjacent to the hit face.
-struct EntityAwareHit {
-    cell: IVec3,
-    face_normal: IVec3,
+pub(crate) struct EntityAwareHit {
+    pub(crate) cell: IVec3,
+    pub(crate) face_normal: IVec3,
 }
 
 /// Walks world cells like the plain voxel raycast, but treats block-entity
@@ -718,7 +761,7 @@ struct EntityAwareHit {
 /// land on whatever is behind it. On hit, return the entity cell.
 ///
 /// For non-entity cells the behaviour is identical to `world_raycast`.
-fn entity_aware_raycast(
+pub(crate) fn entity_aware_raycast(
     origin: Vec3,
     dir: Vec3,
     max_distance: f32,
@@ -934,6 +977,31 @@ fn setup_placement_preview(
     commands.insert_resource(PreviewMaterials { front, back });
 }
 
+/// Run-condition: only show the placement preview ghost in Build mode.
+/// Spelled as a free fn so multiple systems can share it if needed.
+fn in_build_mode(mode: Res<PlayerMode>) -> bool {
+    *mode == PlayerMode::Build
+}
+
+/// Hide the placement preview ghost when the player just left Build mode.
+/// Without this the last-frame ghost would linger on screen — the main
+/// preview system stops running thanks to the `run_if` gate, so something
+/// has to actively flip Visibility on the transition.
+fn hide_preview_on_mode_change(
+    mode: Res<PlayerMode>,
+    state: Res<PreviewState>,
+    mut vis: Query<&mut Visibility>,
+) {
+    if !mode.is_changed() || *mode == PlayerMode::Build {
+        return;
+    }
+    for entity in [state.cube_root, state.scene_root].into_iter().flatten() {
+        if let Ok(mut v) = vis.get_mut(entity) {
+            *v = Visibility::Hidden;
+        }
+    }
+}
+
 /// Repaint the placement preview each frame. Routes between two render
 /// paths based on the selected block:
 ///   - Voxel block (no `def.mesh`) → the pre-built cube preview, scaled
@@ -964,6 +1032,10 @@ fn update_placement_preview(
     mut roots: Query<(&mut Visibility, &mut Transform)>,
     scene_ready: Query<(), With<PreviewSceneReady>>,
 ) {
+    // `Res<PlayerMode>` would push this past the 16-param `SystemParam`
+    // cap in Bevy 0.18. Mode gating lives in a `run_if` on the system
+    // registration plus `hide_preview_on_mode_change` for the leave-Build
+    // transition. Cursor-lock gating still happens here.
     let hide = |entity: Option<Entity>, q: &mut Query<(&mut Visibility, &mut Transform)>| {
         if let Some(e) = entity {
             if let Ok((mut v, _)) = q.get_mut(e) {

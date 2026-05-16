@@ -37,6 +37,7 @@ pub struct DebugClientPlugin;
 impl Plugin for DebugClientPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DebugPanelOpen>();
+        app.init_resource::<InstantPlayerBuilds>();
         app.add_systems(
             Update,
             toggle_debug_panel
@@ -73,6 +74,20 @@ impl Plugin for DebugServerPlugin {
 /// come back from the menu would be tedious during a debug session).
 #[derive(Resource, Default)]
 pub struct DebugPanelOpen(pub bool);
+
+/// When true, the player's Build/Destroy verbs skip the action timer
+/// and resolve immediately — the way clicks worked before mode-gated
+/// input landed. Defaults to `true` so the dev workflow today matches
+/// pre-Phase-1 behaviour; flip to false (or change the default) once
+/// the Phase 5 timer is in and we want timed actions as the baseline.
+#[derive(Resource)]
+pub struct InstantPlayerBuilds(pub bool);
+
+impl Default for InstantPlayerBuilds {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 /// Toggle the debug panel on F3 and also un/relock the cursor so the
 /// panel's buttons are actually clickable. The cursor-lock toggle
@@ -117,6 +132,7 @@ const BUMPABLE_NEEDS: &[(&str, &str)] = &[
 fn debug_panel_ui(
     mut contexts: EguiContexts,
     mut open: ResMut<DebugPanelOpen>,
+    mut instant_builds: ResMut<InstantPlayerBuilds>,
     clock: Option<Res<WorldClock>>,
     mut advance_sender: Query<&mut MessageSender<DebugAdvanceTime>>,
     mut need_sender: Query<&mut MessageSender<DebugBumpNeed>>,
@@ -164,6 +180,12 @@ fn debug_panel_ui(
         .default_width(280.0)
         .show(ctx, |ui| {
             ui.label("F3 toggles this panel.");
+            ui.separator();
+            ui.label(egui::RichText::new("Player").strong());
+            ui.checkbox(
+                &mut instant_builds.0,
+                "Instant player builds (skip action timer)",
+            );
             ui.separator();
             ui.label(egui::RichText::new("Advance time").strong());
             ui.label(time_label);
