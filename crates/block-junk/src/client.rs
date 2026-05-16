@@ -58,6 +58,7 @@ impl Plugin for ClientPlugin {
         app.init_resource::<ChunkMap>()
             .init_resource::<SelectedBlock>()
             .init_resource::<PlacementRotation>()
+            .init_resource::<PlayerActionState>()
             .init_resource::<BlockEntities>()
             .init_resource::<PreviewState>()
             // Client mirror of the server's day/night clock. Starts at
@@ -160,6 +161,7 @@ impl Plugin for ClientPlugin {
                     mesh_chunks,
                     refresh_block_entities,
                     update_hotbar_highlight,
+                    update_action_progress_ui,
                     draw_npc_paths,
                 )
                     .in_set(GameSet::PostSimulation),
@@ -256,8 +258,43 @@ impl SelectedBlock {
 #[derive(Resource, Default)]
 pub struct PlacementRotation(pub Cardinal);
 
+/// In-flight player action in Build/Destroy mode. The timer ticks up
+/// while L is held against a stable target; when it reaches 1.0 the
+/// underlying `BlockEdit` is sent. Releasing L or aiming at a different
+/// cell drops the state and the next frame starts fresh from 0.
+#[derive(Resource, Default)]
+pub struct PlayerActionState {
+    pub active: Option<ActiveAction>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ActiveAction {
+    pub target_cell: IVec3,
+    pub kind: ActionKind,
+    /// Normalised 0.0 → 1.0; reaches 1.0 in [`PLAYER_ACTION_DURATION_SECS`]
+    /// of held time on the same target.
+    pub progress: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+    Place,
+    Break,
+}
+
+/// Real seconds to complete one Build or Destroy action with the timer
+/// path. Picked so a sweep across a 3-block-wide wall feels deliberate
+/// without being tedious — tune as the feature settles.
+pub const PLAYER_ACTION_DURATION_SECS: f32 = 0.6;
+
 #[derive(Component)]
 struct HotbarSlot(usize);
+
+#[derive(Component)]
+struct ActionProgressBar;
+
+#[derive(Component)]
+struct ActionProgressFill;
 
 /// Root of the cube-style preview (used when the selected block is a
 /// plain voxel block — no glTF mesh). Holds the world Transform and
@@ -419,6 +456,43 @@ fn setup_scene(
             ));
         });
 
+    // Action-progress bar: shown while an L-hold Build/Destroy action
+    // is in flight. Absolute-anchored at screen centre + a 14 px gap
+    // below the crosshair; negative left margin = half the bar width
+    // so the centre lines up with the crosshair.
+    commands
+        .spawn((
+            ActionProgressBar,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Percent(50.0),
+                left: Val::Percent(50.0),
+                margin: UiRect {
+                    top: Val::Px(14.0),
+                    left: Val::Px(-40.0),
+                    ..default()
+                },
+                width: Val::Px(80.0),
+                height: Val::Px(6.0),
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.4)),
+            Visibility::Hidden,
+        ))
+        .with_children(|bar| {
+            bar.spawn((
+                ActionProgressFill,
+                Node {
+                    width: Val::Percent(0.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.95, 0.95, 0.95)),
+            ));
+        });
+
     // Hotbar on the right edge: vertical column of slots. Selected slot
     // gets a white border via update_hotbar_highlight.
     commands
@@ -532,6 +606,30 @@ fn reset_rotation_on_selection_change(
 ) {
     if selected.is_changed() {
         rotation.0 = Cardinal::default();
+    }
+}
+
+/// Show/hide the action progress bar and resize the fill child to
+/// match `PlayerActionState.progress`. Visibility flips on the frame
+/// the action starts or ends; the fill width updates every frame an
+/// action is in flight.
+fn update_action_progress_ui(
+    action: Res<PlayerActionState>,
+    mut bars: Query<&mut Visibility, With<ActionProgressBar>>,
+    mut fills: Query<&mut Node, With<ActionProgressFill>>,
+) {
+    if !action.is_changed() {
+        return;
+    }
+    let (vis, progress) = match action.active {
+        Some(a) => (Visibility::Inherited, a.progress),
+        None => (Visibility::Hidden, 0.0),
+    };
+    for mut v in bars.iter_mut() {
+        *v = vis;
+    }
+    for mut node in fills.iter_mut() {
+        node.width = Val::Percent(progress.clamp(0.0, 1.0) * 100.0);
     }
 }
 
@@ -658,10 +756,26 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
         .collect()
 }
 
+/// Held-button action timer in Build/Destroy mode. L-click is the
+/// primary verb (places in Build, removes in Destroy). Holding L
+/// against a stable target advances the timer; reaching 1.0 sends
+/// the underlying `BlockEdit`. Releasing L or aiming at a different
+/// cell drops the in-flight action.
+///
+/// The F3 [`crate::debug::InstantPlayerBuilds`] toggle short-circuits
+/// the timer: on `just_pressed`, send the edit immediately and bypass
+/// the state machine — same dev-loop ergonomics as before Phase 5.
+///
+/// Select and Plan modes don't run this system (mode gate); R-click is
+/// the per-mode secondary slot and remains a no-op in Build/Destroy
+/// until something claims it.
+#[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
 fn place_break_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
     mode: Res<PlayerMode>,
+    time: Res<Time>,
+    instant_builds: Res<crate::debug::InstantPlayerBuilds>,
     cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
@@ -669,20 +783,14 @@ fn place_break_input(
     palette: Res<PlaceablePalette>,
     rotation: Res<PlacementRotation>,
     registry: Res<BlockRegistry>,
+    mut action: ResMut<PlayerActionState>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
-    // L-click is the primary verb across modes: it removes in Destroy,
-    // places in Build. Select and Plan eat clicks here — they'll grow
-    // their own L-click verbs in later phases (Select: inspect; Plan:
-    // tag-for-remove + Shift+L for tag-for-build). R-click is reserved
-    // for per-mode secondary actions and is a no-op in Build/Destroy
-    // until something claims it. Mouse buttons are still consumed by
-    // Bevy's `just_pressed` latch either way, so a discarded click
-    // doesn't ghost-fire on the next mode switch.
-    let left = mouse.just_pressed(MouseButton::Left);
-    let break_click = left && *mode == PlayerMode::Destroy;
-    let place_click = left && *mode == PlayerMode::Build;
-    if !break_click && !place_click {
+    // Only Build and Destroy use the action timer. Switching modes or
+    // losing cursor lock mid-action cancels the in-flight progress so
+    // re-entering doesn't pick up a stale timer state.
+    if !matches!(*mode, PlayerMode::Build | PlayerMode::Destroy) {
+        action.active = None;
         return;
     }
     let locked = cursors
@@ -690,30 +798,23 @@ fn place_break_input(
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
     if !locked {
+        action.active = None;
+        return;
+    }
+    if !mouse.pressed(MouseButton::Left) {
+        action.active = None;
         return;
     }
 
     let Ok((cam_t, fly, pose)) = cam.single() else {
         return;
     };
-    // MessageSender lives on the connection entity; exactly one in any
-    // non-server-only mode.
     let Ok(mut sender) = sender.single_mut() else {
         return;
     };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
     let visible_yaw = pose.yaw + fly.pending_dyaw;
-
-    let get_block = |world: IVec3| -> BlockSlot {
-        let (coord, local) = crate::voxel::world_to_chunk(world);
-        chunk_map
-            .0
-            .get(&coord)
-            .and_then(|&entity| chunks.get(entity).ok())
-            .map(|(chunk, _)| chunk.get(local))
-            .unwrap_or(BlockSlot::EMPTY)
-    };
     let Some(hit) = entity_aware_raycast(
         cam_pos,
         cam_dir,
@@ -722,26 +823,70 @@ fn place_break_input(
         &chunk_map,
         &registry,
     ) else {
+        action.active = None;
         return;
     };
 
-    if break_click {
-        // Server resolves anchor + footprint via the chunk sidecar.
-        // Orientation is irrelevant on a break request; default is fine.
-        let _ = get_block; // consumed via the raycast
-        sender.send::<WorldChannel>(BlockEdit {
-            anchor: hit.cell,
-            slot: BlockSlot::EMPTY,
-            orientation: Cardinal::default(),
-        });
+    // Resolve this frame's action target + the BlockEdit it would send.
+    let (target_cell, kind, edit) = match *mode {
+        PlayerMode::Build => {
+            let anchor = hit.cell + hit.face_normal;
+            let slot = selected.current(&palette);
+            let orientation = placement_orientation(visible_yaw, rotation.0);
+            (
+                anchor,
+                ActionKind::Place,
+                BlockEdit {
+                    anchor,
+                    slot,
+                    orientation,
+                },
+            )
+        }
+        PlayerMode::Destroy => (
+            hit.cell,
+            ActionKind::Break,
+            BlockEdit {
+                anchor: hit.cell,
+                slot: BlockSlot::EMPTY,
+                orientation: Cardinal::default(),
+            },
+        ),
+        _ => unreachable!("mode gated above"),
+    };
+
+    // Instant path: F3 toggle skips the timer. Single send on the
+    // first frame of L-pressed; no state machine, no progress bar.
+    if instant_builds.0 {
+        if mouse.just_pressed(MouseButton::Left) {
+            sender.send::<WorldChannel>(edit);
+            action.active = None;
+        }
+        return;
+    }
+
+    // Timed path: accumulate progress against the same target across
+    // frames, restart from zero if the target changed (player swept
+    // the cursor to a different cell).
+    let step = time.delta_secs() / PLAYER_ACTION_DURATION_SECS;
+    let progress = match action.active {
+        Some(a) if a.target_cell == target_cell && a.kind == kind => a.progress + step,
+        _ => step,
+    };
+
+    if progress >= 1.0 {
+        sender.send::<WorldChannel>(edit);
+        // Drop state. If L is still held the next frame's raycast
+        // will see the updated world (or, for ~1 tick before the
+        // broadcast lands, the stale cell — server rejects the
+        // duplicate). Held-sweep mining/placing falls out naturally
+        // once the world updates and the target cell changes.
+        action.active = None;
     } else {
-        let anchor = hit.cell + hit.face_normal;
-        let slot = selected.current(&palette);
-        let orientation = placement_orientation(visible_yaw, rotation.0);
-        sender.send::<WorldChannel>(BlockEdit {
-            anchor,
-            slot,
-            orientation,
+        action.active = Some(ActiveAction {
+            target_cell,
+            kind,
+            progress,
         });
     }
 }

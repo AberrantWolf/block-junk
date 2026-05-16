@@ -77,15 +77,15 @@ pub struct DebugPanelOpen(pub bool);
 
 /// When true, the player's Build/Destroy verbs skip the action timer
 /// and resolve immediately — the way clicks worked before mode-gated
-/// input landed. Defaults to `true` so the dev workflow today matches
-/// pre-Phase-1 behaviour; flip to false (or change the default) once
-/// the Phase 5 timer is in and we want timed actions as the baseline.
+/// input landed. Defaults to `false`: timed actions are the gameplay
+/// baseline as of Phase 5. Toggle on for fast iteration when shaping
+/// terrain by hand.
 #[derive(Resource)]
 pub struct InstantPlayerBuilds(pub bool);
 
 impl Default for InstantPlayerBuilds {
     fn default() -> Self {
-        Self(true)
+        Self(false)
     }
 }
 
