@@ -37,6 +37,10 @@ pub struct Plans {
 }
 
 impl Plans {
+    pub fn get(&self, cell: IVec3) -> Option<PlanKind> {
+        self.map.get(&cell).copied()
+    }
+
     pub fn set(&mut self, cell: IVec3, kind: PlanKind) {
         self.map.insert(cell, kind);
     }

@@ -10,6 +10,7 @@ mod npc;
 mod npc_registry;
 mod pathfinding;
 mod physics;
+mod plan_claims;
 mod plans;
 mod player_mode;
 mod preview;

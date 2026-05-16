@@ -244,6 +244,19 @@ engine.needs.register {
     decay_per_sec = 1.0 / 450.0,
 }
 
+-- Work / purpose. Drives NPCs to pick up player-tagged plans (build,
+-- demolish). Rises faster than sleep but slower than hunger — an NPC
+-- with no plans available will see the deficit max out, but as long as
+-- the player has work for them they'll churn through it. 1/240 ⇒ ~4
+-- minutes from 0 to 1; threshold 0.3 means an NPC picks up the first
+-- plan after ~70 seconds of idle, and a busy session keeps them at
+-- moderate baseline as they work tags down.
+engine.needs.register {
+    id = "work",
+    display_name = "Purpose",
+    decay_per_sec = 1.0 / 240.0,
+}
+
 -- The smoke-test NPC kind. The planner that drives it lives in
 -- events.lua; this block is just the declarative half (which side both
 -- the client and server need to agree on for any future networked kind
@@ -262,5 +275,9 @@ engine.npcs.register {
         -- until evening, but one spawned just before night may head
         -- straight for a bed.
         sleep = 0.15,
+        -- Spawn with some pent-up purpose so a freshly-loaded session
+        -- with a pre-tagged plan gets observable NPC activity within
+        -- ~30 s rather than after the full 4-minute decay runway.
+        work = 0.2,
     },
 }

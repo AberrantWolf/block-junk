@@ -166,12 +166,48 @@ pub struct NpcSnapshot {
     /// step resolves that atomically by failing the second arrival.
     #[serde(default)]
     pub nearby_sleepers: Vec<NearbySleeper>,
+    /// Up to K nearest unclaimed player-tagged plan cells, sorted by
+    /// distance (closest first). Each carries the verb (remove vs.
+    /// build) so a planner can pick "the closest plan I'm willing to
+    /// work on" — e.g. a villager kind that only builds, not demolishes,
+    /// can filter by kind. **Already filtered**: claims held by a
+    /// different NPC are excluded; race-on-claim still possible but
+    /// resolved by the brain's atomic try_claim on goal commit.
+    #[serde(default)]
+    pub nearby_plans: Vec<NearbyPlan>,
     /// True when the world clock currently reads as night. Mirrors
     /// the engine's `WorldClock::is_night`. Lets a planner gate
     /// nocturnal-only actions (sleep, hunt) without having to read
     /// raw `time_of_day` and re-derive the threshold.
     #[serde(default)]
     pub is_night: bool,
+}
+
+/// One entry in [`NpcSnapshot::nearby_plans`]. Carries the cell and a
+/// kind *hint* — not the full engine-side `PlanKind` (which would couple
+/// the mod API to block-slot internals). Planners only need the verb to
+/// decide whether to take the plan; the engine looks up the full
+/// PlanKind from its server-side `Plans` resource at goal commit time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NearbyPlan {
+    /// World cell of the plan. For Remove plans the cell is currently
+    /// solid (the block to break); for Build plans the cell is empty
+    /// (where the new block should land).
+    pub cell: BlockPos,
+    pub kind: PlanKindHint,
+    /// Manhattan distance from the NPC's foot, same metric as
+    /// `nearby_sleepers.distance` / `nearby_consumables.distance`.
+    pub distance: u32,
+}
+
+/// Verb of a [`NearbyPlan`]. Cut down from the engine's full PlanKind:
+/// the planner doesn't need the BlockSlot + orientation that a Build
+/// plan carries — those are engine concerns resolved at completion.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanKindHint {
+    Remove,
+    Build,
 }
 
 /// One entry in [`NpcSnapshot::nearby_sleepers`]. Same shape as
@@ -334,6 +370,23 @@ pub enum PlannerGoal {
         #[serde(default = "default_sleep_timeout")]
         timeout_secs: f32,
     },
+    /// Walk to a player-tagged plan cell, claim it, work for a fixed
+    /// duration, then apply the underlying world mutation (break the
+    /// block for a Remove tag, place the recorded block for a Build
+    /// tag), clear the tag, release the claim, and subtract from the
+    /// NPC's `work` need.
+    ///
+    /// `cell` is the plan target as it appears in `nearby_plans`.
+    /// If by arrival the plan has been cancelled or the world state
+    /// no longer matches the plan's intent (the block has been broken
+    /// by something else for a Remove plan, or filled for a Build
+    /// plan), the goal completes silently — same degradation pattern
+    /// as `Consume` and `Sleep`.
+    WorkPlan {
+        cell: BlockPos,
+        #[serde(default = "default_work_timeout")]
+        timeout_secs: f32,
+    },
 }
 
 fn default_wander_radius() -> i32 {
@@ -353,5 +406,9 @@ fn default_consume_timeout() -> f32 {
 }
 
 fn default_sleep_timeout() -> f32 {
+    60.0
+}
+
+fn default_work_timeout() -> f32 {
     60.0
 }

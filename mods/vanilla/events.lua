@@ -44,6 +44,15 @@ local HUNGER_THRESHOLD = 0.3
 -- straight for a bed on session start.
 local SLEEP_THRESHOLD = 0.25
 
+-- Work threshold above which an NPC will pick up the nearest player-
+-- tagged plan. With `restores = 0.35` per completed action and threshold
+-- 0.3, a villager who's just finished a tag won't immediately re-trigger
+-- (post-completion deficit ~= 0), but a few minutes later they're back
+-- in the queue. Ordered below sleep (rest is mandatory) and below
+-- hunger (eating is more urgent), but above the idle wander/visit
+-- rhythm — work is what a villager *chooses* to do over wandering.
+local WORK_THRESHOLD = 0.3
+
 -- Probability of "go visit a room" after a rest, when at least one
 -- matched room is reachable in the snapshot. 0.5 makes the room
 -- behavior frequent enough to demo, but still leaves wander time so
@@ -73,6 +82,17 @@ local function nearest_sleeper_for(snapshot, need_id)
         if s.need == need_id then
             return s.cell
         end
+    end
+    return nil
+end
+
+-- Closest plan cell, ignoring verb (build vs remove). nearby_plans is
+-- already engine-sorted nearest-first and filtered against other NPCs'
+-- claims. Returns the cell table the engine will path to, or nil if
+-- nothing's available.
+local function nearest_plan(snapshot)
+    if snapshot.nearby_plans and #snapshot.nearby_plans > 0 then
+        return snapshot.nearby_plans[1].cell
     end
     return nil
 end
@@ -128,13 +148,35 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
         -- range as it moves.
     end
 
+    -- Then: pick up player-tagged work if the deficit is high enough
+    -- and there's something to do. Sits below sleep / hunger (those are
+    -- survival-flavoured) and above the idle wander rhythm. A villager
+    -- with a queue of tags will work through them rather than wander.
+    local work = snapshot.needs.work or 0.0
+    if work >= WORK_THRESHOLD then
+        local plan_cell = nearest_plan(snapshot)
+        if plan_cell ~= nil then
+            last_action[snapshot.id] = "work"
+            return {
+                kind = "work_plan",
+                cell = plan_cell,
+                timeout_secs = 60.0,
+            }
+        end
+    end
+
     local prev = last_action[snapshot.id]
 
-    -- Always rest after motion (wander, visit, consume, or sleep).
+    -- Always rest after motion (wander, visit, consume, sleep, or work).
     -- Keeps the NPC from looking frantic and stops "complete goal,
-    -- immediately repeat" loops. Sleep included so an NPC that just
-    -- woke takes a breath before deciding the next thing.
-    if prev == "wander" or prev == "visit" or prev == "consume" or prev == "sleep" then
+    -- immediately repeat" loops. Sleep + work included so an NPC that
+    -- just finished one takes a breath before deciding the next thing.
+    if prev == "wander"
+        or prev == "visit"
+        or prev == "consume"
+        or prev == "sleep"
+        or prev == "work"
+    then
         last_action[snapshot.id] = "rest"
         return { kind = "rest", duration_secs = 3.0 + math.random() * 5.0 }
     end

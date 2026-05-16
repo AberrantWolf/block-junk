@@ -27,7 +27,8 @@
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::{Consumable, Sleeper};
 use block_junk_mod_api::npcs::{
-    NearbyConsumable, NearbyRoom, NearbySleeper, NpcKindId, NpcSnapshot, PlannerGoal,
+    NearbyConsumable, NearbyPlan, NearbyRoom, NearbySleeper, NpcKindId, NpcSnapshot,
+    PlanKindHint, PlannerGoal,
 };
 use block_junk_mod_api::shared::BlockPos;
 use lightyear::prelude::*;
@@ -42,8 +43,11 @@ use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
+use crate::plan_claims::PlanClaims;
+use crate::plans::Plans;
 use crate::protocol::{
-    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementIntent, MovementMode, WorldClock,
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementIntent, MovementMode, PlanKind,
+    WorldClock,
 };
 use crate::scripting::ServerMods;
 use crate::sleepers::{BedClaims, SleeperIndex};
@@ -185,6 +189,20 @@ pub enum Goal {
         target_cell: IVec3,
         anchor_cell: IVec3,
     },
+    /// Working a player-tagged plan at `target_cell` until the timer
+    /// expires, at which point the engine applies the world mutation
+    /// captured in `plan_kind`, clears the tag, releases the claim,
+    /// and the brain reduces the `work` need. Entered only via a
+    /// successful arrival on a [`ArrivalAction::Work`].
+    ///
+    /// `plan_kind` is snapshot-at-goal-commit-time so a player who
+    /// re-tags the cell mid-traversal can't redirect what the NPC
+    /// builds — they get to cancel the plan, but not silently swap it.
+    Working {
+        remaining_secs: f32,
+        target_cell: IVec3,
+        plan_kind: PlanKind,
+    },
 }
 
 /// What the engine does after the NPC arrives at the end of a
@@ -228,6 +246,16 @@ pub enum ArrivalAction {
         duration_secs: f32,
         target_cell: IVec3,
         anchor_cell: IVec3,
+    },
+    /// Begin a work action at the plan target cell. Carries the snapshot
+    /// of the `PlanKind` at the moment the goal was committed so a
+    /// mid-traversal tag swap (player edits the tag while NPC is en
+    /// route) doesn't redirect the work — the player gets to cancel
+    /// but not silently re-aim.
+    Work {
+        duration_secs: f32,
+        target_cell: IVec3,
+        plan_kind: PlanKind,
     },
 }
 
@@ -277,6 +305,23 @@ const MAX_SLEEP_TIMEOUT_SECS: f32 = 120.0;
 /// shouldn't influence a planner's pick.
 const SNAPSHOT_SLEEPER_RADIUS_CELLS: i32 = 48;
 const SNAPSHOT_SLEEPER_LIMIT: usize = 8;
+/// Plan-pickup scan radius (Manhattan via the Chebyshev pre-filter).
+/// Same magnitude as sleepers/consumables — plans on the far side of
+/// the map shouldn't keep luring a villager from local tasks.
+const SNAPSHOT_PLAN_RADIUS_CELLS: i32 = 48;
+const SNAPSHOT_PLAN_LIMIT: usize = 8;
+/// How long a single-cell work action takes the NPC. Picked so a
+/// villager visibly stands at the target for a few seconds (matches
+/// the player's own [`crate::client::PLAYER_ACTION_DURATION_SECS`] in
+/// feel without being identical — NPCs are slower at hand-crafting).
+/// Tune as work animations land.
+const WORK_DURATION_SECS: f32 = 4.0;
+const MAX_WORK_TIMEOUT_SECS: f32 = 120.0;
+/// How much of the `work` need a completed action satisfies. Same
+/// magnitude as a sleeper's `restores` floor — one job moves the
+/// villager from "looking for purpose" back toward content.
+const WORK_RESTORES: f32 = 0.35;
+const WORK_NEED_ID: &str = "work";
 /// How many nearby matched rooms to include in each planner snapshot.
 /// Cap exists so a world with hundreds of registered rooms doesn't
 /// blow up the per-call serialization cost; 8 is enough headroom for
@@ -356,11 +401,28 @@ impl Plugin for NpcServerPlugin {
         // an NPC spawned into an empty world falls past unloaded chunks
         // forever (no candidates to collide against).
         app.add_observer(spawn_initial_npc_on_first_connect);
+        // Local-bus message: brain emits on Working timer completion;
+        // server-side consumer (in server.rs) applies the underlying
+        // BlockEdit + clears the plan tag. Splits these concerns so the
+        // brain tick stays under the SystemParam cap.
+        app.add_message::<NpcWorkCompleted>();
         // Brain → physics order matters: physics consumes the intent
         // the brain writes this tick. Both run in FixedUpdate alongside
         // the player physics so all actors advance together.
         app.add_systems(FixedUpdate, (npc_brain_tick, npc_physics_step).chain());
     }
+}
+
+/// Brain → server-bus message. Emitted in `npc_brain_tick` when a
+/// `Goal::Working` timer expires; consumed in `server::apply_npc_work`
+/// which translates `plan_kind` into the matching `BlockEdit` and
+/// runs it through `apply_block_edit` so the world mutation, the
+/// broadcast, and the plan-tag auto-clear all happen through the
+/// same code path that handles player edits.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct NpcWorkCompleted {
+    pub cell: IVec3,
+    pub plan_kind: PlanKind,
 }
 
 /// Latches on the first `Connected` so subsequent reconnects don't
@@ -497,6 +559,7 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
 ///      errors disable just this one NPC's brain.
 ///   4. Steer the [`MovementIntent`] toward the current waypoint
 ///      (Wander only — Idle and Resting both clear intent).
+#[allow(clippy::too_many_arguments, reason = "brain tick spans many subsystems")]
 fn npc_brain_tick(
     time: Res<Time>,
     chunks: Query<&'static Chunk>,
@@ -509,6 +572,8 @@ fn npc_brain_tick(
     consumable_index: Res<ConsumableIndex>,
     sleeper_index: Res<SleeperIndex>,
     mut bed_claims: ResMut<BedClaims>,
+    plans: Res<Plans>,
+    mut plan_claims: ResMut<PlanClaims>,
     world_clock: Res<WorldClock>,
     mut commands: Commands,
     mut npcs: Query<
@@ -554,6 +619,7 @@ fn npc_brain_tick(
         let mut rest_done = false;
         let mut consume_done = false;
         let mut sleep_done = false;
+        let mut work_done = false;
         match &mut brain.goal {
             Goal::Idle => {}
             Goal::Resting { remaining_secs } => {
@@ -572,6 +638,12 @@ fn npc_brain_tick(
                 *remaining_secs -= dt;
                 if *remaining_secs <= 0.0 {
                     sleep_done = true;
+                }
+            }
+            Goal::Working { remaining_secs, .. } => {
+                *remaining_secs -= dt;
+                if *remaining_secs <= 0.0 {
+                    work_done = true;
                 }
             }
             Goal::MoveTo {
@@ -653,15 +725,33 @@ fn npc_brain_tick(
                         anchor_cell,
                     };
                 }
+                ArrivalAction::Work {
+                    duration_secs,
+                    target_cell,
+                    plan_kind,
+                } => {
+                    brain.goal = Goal::Working {
+                        remaining_secs: duration_secs,
+                        target_cell,
+                        plan_kind,
+                    };
+                }
             }
         }
-        // Abandonment of a MoveTo whose ArrivalAction is Sleep needs to
-        // release the claim too — the brain reserved it at goal commit
-        // time and a stuck/timeout abandon never reaches arrival.
+        // Abandonment of a MoveTo whose ArrivalAction is Sleep or Work
+        // needs to release the claim too — the brain reserved it at
+        // goal commit time and a stuck/timeout abandon never reaches
+        // arrival.
         if move_abandoned {
             if let Goal::MoveTo { on_arrive, .. } = &brain.goal {
-                if let ArrivalAction::Sleep { anchor_cell, .. } = on_arrive {
-                    bed_claims.release(*anchor_cell, *npc_id);
+                match on_arrive {
+                    ArrivalAction::Sleep { anchor_cell, .. } => {
+                        bed_claims.release(*anchor_cell, *npc_id);
+                    }
+                    ArrivalAction::Work { target_cell, .. } => {
+                        plan_claims.release(*target_cell, *npc_id);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -733,6 +823,43 @@ fn npc_brain_tick(
             }
             brain.goal = Goal::Idle;
         }
+        if work_done {
+            // Reduce `work` need, release the claim, and emit a local
+            // message for the server-side consumer to apply the world
+            // mutation (place or break) + clear the plan tag. Splitting
+            // it across systems keeps the brain tick under the
+            // SystemParam cap — the consumer needs the broadcast
+            // sender + chunk-write params the brain doesn't carry.
+            if let Goal::Working {
+                target_cell,
+                plan_kind,
+                ..
+            } = &brain.goal
+            {
+                if let Some(value) = needs.0.get_mut(WORK_NEED_ID) {
+                    *value = (*value - WORK_RESTORES).max(0.0);
+                    info!(
+                        npc = npc_id.0,
+                        cell = ?target_cell.to_array(),
+                        kind = ?plan_kind,
+                        restored = WORK_RESTORES,
+                        remaining_deficit = *value,
+                        "work complete",
+                    );
+                } else {
+                    warn!(
+                        npc = npc_id.0,
+                        "work complete but NPC has no `work` need entry; ignoring",
+                    );
+                }
+                commands.write_message(NpcWorkCompleted {
+                    cell: *target_cell,
+                    plan_kind: *plan_kind,
+                });
+                plan_claims.release(*target_cell, *npc_id);
+            }
+            brain.goal = Goal::Idle;
+        }
         if matches!(brain.goal, Goal::Idle) {
             let kind_id = NpcKindId(kind.0.clone());
             let snapshot = build_snapshot(
@@ -744,6 +871,8 @@ fn npc_brain_tick(
                 &consumable_index,
                 &sleeper_index,
                 &bed_claims,
+                &plans,
+                &plan_claims,
                 &chunk_entities_q,
                 &chunk_map,
                 &block_registry,
@@ -775,8 +904,10 @@ fn npc_brain_tick(
                         "planner errored; disabling this NPC's brain"
                     );
                     // Release any held claims — a disabled brain
-                    // shouldn't lock a bed for the rest of the session.
+                    // shouldn't lock a bed or plan for the rest of
+                    // the session.
                     bed_claims.release_all_for(*npc_id);
+                    plan_claims.release_all_for(*npc_id);
                     commands.entity(entity).insert(BrainDisabled {
                         reason: e.to_string(),
                     });
@@ -1164,6 +1295,110 @@ fn npc_brain_tick(
                         }
                     }
                 }
+                PlannerGoal::WorkPlan { cell, timeout_secs } => {
+                    let timeout = timeout_secs.clamp(1.0, MAX_WORK_TIMEOUT_SECS);
+                    let target_cell = IVec3::new(cell.x, cell.y, cell.z);
+                    // Re-resolve against the authoritative `Plans`. The
+                    // planner saw a snapshot — the tag may have been
+                    // cancelled or auto-cleared by the time we commit.
+                    let Some(plan_kind) = plans.get(target_cell) else {
+                        info!(
+                            npc = npc_id.0,
+                            target = ?target_cell.to_array(),
+                            "work target no longer tagged; parking briefly",
+                        );
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    };
+                    // Atomic claim. Lost-race → brief rest; planner re-picks.
+                    if !plan_claims.try_claim(target_cell, *npc_id) {
+                        info!(
+                            npc = npc_id.0,
+                            target = ?target_cell.to_array(),
+                            "work target claimed by another NPC; parking briefly",
+                        );
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                    let foot = pose_to_standable_foot(pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(pose));
+                    let Some(stand_cell) =
+                        nearest_standable_neighbor(target_cell, foot, &world)
+                    else {
+                        info!(
+                            npc = npc_id.0,
+                            target = ?target_cell.to_array(),
+                            "no standable neighbour of plan target; releasing claim and parking briefly",
+                        );
+                        plan_claims.release(target_cell, *npc_id);
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    };
+                    if stand_cell == foot {
+                        if !npc_path.0.is_empty() {
+                            npc_path.0.clear();
+                        }
+                        brain.goal = Goal::Working {
+                            remaining_secs: WORK_DURATION_SECS,
+                            target_cell,
+                            plan_kind,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                    let path = find_path(
+                        foot,
+                        stand_cell,
+                        &world,
+                        ASTAR_NODE_BUDGET,
+                        ASTAR_PATH_BUDGET,
+                    )
+                    .map(|raw| smooth_path(raw, &world))
+                    .filter(|p| p.len() >= 2);
+                    match path {
+                        Some(path) => {
+                            npc_path.set_if_neq(NpcPath(path.clone()));
+                            brain.goal = Goal::MoveTo {
+                                path,
+                                progress: 0.0,
+                                deadline_secs: timeout,
+                                last_pos: pose.translation,
+                                stuck_secs: 0.0,
+                                on_arrive: ArrivalAction::Work {
+                                    duration_secs: WORK_DURATION_SECS,
+                                    target_cell,
+                                    plan_kind,
+                                },
+                            };
+                        }
+                        None => {
+                            warn!(
+                                npc = npc_id.0,
+                                foot = ?foot.to_array(),
+                                target = ?target_cell.to_array(),
+                                stand = ?stand_cell.to_array(),
+                                "work failed: no A* path to standable neighbour, releasing claim and parking briefly"
+                            );
+                            plan_claims.release(target_cell, *npc_id);
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            *intent = MovementIntent::default();
+                        }
+                    }
+                }
             }
         }
 
@@ -1197,7 +1432,9 @@ fn npc_brain_tick(
                     dyaw,
                 };
             }
-            Goal::Consuming { target_cell, .. } | Goal::Sleeping { target_cell, .. } => {
+            Goal::Consuming { target_cell, .. }
+            | Goal::Sleeping { target_cell, .. }
+            | Goal::Working { target_cell, .. } => {
                 let aim = waypoint_xz(*target_cell);
                 let Some(dyaw) = aim_yaw_step(pose_xz, pose.yaw, aim, dt) else {
                     *intent = MovementIntent::default();
@@ -1299,6 +1536,7 @@ fn native_fallback_goal() -> PlannerGoal {
 /// is cheap to compute server-side and ranks correctly for "nearer is
 /// better"; a planner that needs euclidean can derive it from `foot` +
 /// `anchor`.
+#[allow(clippy::too_many_arguments, reason = "snapshot builder collates many subsystems")]
 fn build_snapshot(
     id: NpcId,
     kind: &NpcKindId,
@@ -1308,6 +1546,8 @@ fn build_snapshot(
     consumables: &ConsumableIndex,
     sleepers: &SleeperIndex,
     bed_claims: &BedClaims,
+    plans: &Plans,
+    plan_claims: &PlanClaims,
     chunk_entities: &Query<&'static ChunkEntities>,
     chunk_map: &ChunkMap,
     block_registry: &BlockRegistry,
@@ -1333,6 +1573,14 @@ fn build_snapshot(
         SNAPSHOT_SLEEPER_RADIUS_CELLS,
         SNAPSHOT_SLEEPER_LIMIT,
     );
+    let nearby_plans = collect_nearby_plans(
+        plans,
+        plan_claims,
+        id,
+        foot,
+        SNAPSHOT_PLAN_RADIUS_CELLS,
+        SNAPSHOT_PLAN_LIMIT,
+    );
     NpcSnapshot {
         id: id.0,
         kind: kind.clone(),
@@ -1345,8 +1593,51 @@ fn build_snapshot(
         nearby_rooms,
         nearby_consumables,
         nearby_sleepers,
+        nearby_plans,
         is_night: world_clock.is_night(),
     }
+}
+
+/// K nearest *unclaimed* plan cells within `radius_cells` (Manhattan)
+/// of `foot`. Same shape as `collect_nearby_sleepers` — filter taken,
+/// sort by distance, truncate to limit. The `kind` is mapped from the
+/// full engine-side `PlanKind` to the simpler `PlanKindHint` exposed
+/// to mods (which don't need slot + orientation to make the decision).
+fn collect_nearby_plans(
+    plans: &Plans,
+    plan_claims: &PlanClaims,
+    self_id: NpcId,
+    foot: IVec3,
+    radius_cells: i32,
+    limit: usize,
+) -> Vec<NearbyPlan> {
+    let mut out: Vec<NearbyPlan> = Vec::new();
+    for (cell, kind) in plans.iter() {
+        let d = *cell - foot;
+        if d.x.abs() > radius_cells || d.y.abs() > radius_cells || d.z.abs() > radius_cells {
+            continue;
+        }
+        if plan_claims.is_taken_by_other(*cell, self_id) {
+            continue;
+        }
+        let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
+        let hint = match kind {
+            PlanKind::Remove => PlanKindHint::Remove,
+            PlanKind::Build { .. } => PlanKindHint::Build,
+        };
+        out.push(NearbyPlan {
+            cell: BlockPos {
+                x: cell.x,
+                y: cell.y,
+                z: cell.z,
+            },
+            kind: hint,
+            distance,
+        });
+    }
+    out.sort_by_key(|p| p.distance);
+    out.truncate(limit);
+    out
 }
 
 /// K nearest *unclaimed* beds within `radius_cells` (Chebyshev) of

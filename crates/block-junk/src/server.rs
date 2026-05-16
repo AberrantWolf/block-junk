@@ -14,12 +14,13 @@ use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::collision::WorldCollision;
 use crate::menu::{ServerSaveConfig, ServerSaveRequestFlag, ServerShutdownFlag};
 use crate::physics::apply_walk_step;
+use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
-    MovementIntent, MovementMode, WorldChannel, WorldClock, WorldClockSync,
+    MovementIntent, MovementMode, PlanEdit, PlanKind, WorldChannel, WorldClock, WorldClockSync,
 };
-use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath};
+use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{SAVE_VERSION, SaveFile, SavedChunk, SavedNpc, read_save, write_save};
 use crate::voxel::{
@@ -43,6 +44,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::debug::DebugServerPlugin);
         app.add_plugins(crate::npc::NpcServerPlugin);
         app.add_plugins(crate::plans::PlansServerPlugin);
+        app.add_plugins(crate::plan_claims::PlanClaimsPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
@@ -82,6 +84,23 @@ impl Plugin for ServerPlugin {
             Update,
             (receive_block_edits, mark_dirty_from_edits, process_dirty)
                 .chain()
+                .in_set(GameSet::Simulation),
+        );
+        // NPC work-completion adapter: translates the brain's local-bus
+        // `NpcWorkCompleted` events into the same `apply_block_edit`
+        // path that handles client `BlockEdit` messages — so the world
+        // mutation, the broadcast, and the plan auto-clear all run
+        // through one code path.
+        //
+        // `auto_clear_stale_plans` listens to the `CellEdit` bus that
+        // `apply_block_edit` writes per cell change and clears any
+        // matching plan tag, then broadcasts a `PlanEdit{None}` so
+        // client mirrors drop the now-stale outline.
+        app.add_systems(
+            Update,
+            (apply_npc_work, auto_clear_stale_plans)
+                .chain()
+                .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
         );
         app.add_systems(
@@ -1015,4 +1034,90 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
         .iter()
         .map(|&offset| anchor + IVec3::from_array(orientation.rotate_offset(offset)))
         .collect()
+}
+
+/// NPC work consumer. Translates the brain's `NpcWorkCompleted` events
+/// into `BlockEdit`s and feeds them through the same `apply_block_edit`
+/// path that handles client requests — so the world mutation, the
+/// broadcast, and the plan auto-clear all funnel through one code path.
+#[allow(clippy::too_many_arguments, reason = "block-edit application spans many subsystems")]
+fn apply_npc_work(
+    mut reader: MessageReader<NpcWorkCompleted>,
+    mut commands: Commands,
+    mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    servers: Query<&Server>,
+    mut broadcast: ServerMultiMessageSender,
+    mut bus: MessageWriter<CellEdit>,
+) {
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for completion in reader.read() {
+        let edit = match completion.plan_kind {
+            PlanKind::Remove => BlockEdit {
+                anchor: completion.cell,
+                slot: BlockSlot::EMPTY,
+                orientation: Cardinal::default(),
+            },
+            PlanKind::Build { slot, orientation } => BlockEdit {
+                anchor: completion.cell,
+                slot,
+                orientation,
+            },
+        };
+        apply_block_edit(
+            edit,
+            &mut commands,
+            &mut chunks,
+            &map,
+            &registry,
+            server,
+            &mut broadcast,
+            &mut bus,
+        );
+    }
+}
+
+/// Auto-clear plan tags whose underlying world state no longer matches
+/// the plan's intent. A Remove tag whose cell becomes empty (because
+/// the player destroyed it themselves, or an NPC finished the job) is
+/// stale; same for a Build tag whose cell becomes solid. Listens to
+/// the per-cell `CellEdit` bus that `apply_block_edit` writes so both
+/// player-driven and NPC-driven mutations trigger the cleanup.
+///
+/// Broadcasts a `PlanEdit { kind: None }` per cleared tag so client
+/// mirrors drop their outline at the same moment the cell changes.
+fn auto_clear_stale_plans(
+    mut reader: MessageReader<CellEdit>,
+    mut plans: ResMut<Plans>,
+    mut broadcast: ServerMultiMessageSender,
+    servers: Query<&Server>,
+) {
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for edit in reader.read() {
+        let stale = match plans.get(edit.world) {
+            Some(PlanKind::Remove) => edit.slot.is_empty(),
+            Some(PlanKind::Build { .. }) => !edit.slot.is_empty(),
+            None => false,
+        };
+        if !stale {
+            continue;
+        }
+        plans.clear(edit.world);
+        let msg = PlanEdit {
+            cell: edit.world,
+            kind: None,
+        };
+        if let Err(err) = broadcast.send::<PlanEdit, WorldChannel>(
+            &msg,
+            server,
+            &NetworkTarget::All,
+        ) {
+            warn!("auto-clear PlanEdit broadcast failed: {err}");
+        }
+    }
 }
