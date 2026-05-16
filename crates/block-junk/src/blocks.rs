@@ -49,26 +49,16 @@ pub enum BootstrapError {
     DuplicateBlockId(BlockId),
     #[error("registry exceeds u16 slot space ({slots} blocks registered)")]
     SlotOverflow { slots: usize },
-    #[error("block {block} consumable references unregistered need {need}")]
-    ConsumableNeedUnknown { block: BlockId, need: String },
+    #[error("block {block} interactable.need_restore references unregistered need {need}")]
+    InteractableNeedUnknown { block: BlockId, need: String },
     #[error(
-        "block {block} consumable.restores = {value}; must be > 0 and ≤ 1 (need values are deficits in [0, 1])"
+        "block {block} interactable.need_restore.restores = {value}; must be > 0 and ≤ 1 (need values are deficits in [0, 1])"
     )]
-    ConsumableRestoresOutOfRange { block: BlockId, value: f32 },
+    InteractableRestoresOutOfRange { block: BlockId, value: f32 },
     #[error(
-        "block {block} consumable.duration_secs = {value}; must be ≥ 0.1 (very short eats look glitchy)"
+        "block {block} interactable.duration_secs = {value}; must be ≥ {min} (exclusive interactions should feel substantive; non-exclusive ones still need long enough to register visually)"
     )]
-    ConsumableDurationOutOfRange { block: BlockId, value: f32 },
-    #[error("block {block} sleeper references unregistered need {need}")]
-    SleeperNeedUnknown { block: BlockId, need: String },
-    #[error(
-        "block {block} sleeper.restores = {value}; must be > 0 and ≤ 1 (need values are deficits in [0, 1])"
-    )]
-    SleeperRestoresOutOfRange { block: BlockId, value: f32 },
-    #[error(
-        "block {block} sleeper.duration_secs = {value}; must be ≥ 1.0 (sleep should feel like seconds, not a teleport)"
-    )]
-    SleeperDurationOutOfRange { block: BlockId, value: f32 },
+    InteractableDurationOutOfRange { block: BlockId, value: f32, min: f32 },
     #[error("duplicate mask id {0}")]
     DuplicateMaskId(MaskId),
     #[error("duplicate ramp id {0}")]
@@ -179,37 +169,46 @@ impl BlockRegistry {
             .map(|(i, d)| (BlockSlot(i as u16), d))
     }
 
-    /// Cross-validate consumable-bearing blocks against the [`NeedRegistry`].
-    /// Run from `scripting.rs::load_side` after both registries exist; can't
-    /// fold into `build` because that runs before needs are known.
-    pub fn validate_consumables(&self, needs: &NeedRegistry) -> Result<(), BootstrapError> {
+    /// Cross-validate interactable-bearing blocks against the
+    /// [`NeedRegistry`]. Runs from `scripting.rs::load_side` after
+    /// both registries exist (the build step here happens before
+    /// needs are known, so we can't fold it in).
+    ///
+    /// Rules:
+    /// - `need_restore.need` (if present) is a registered need id.
+    /// - `need_restore.restores` is in (0, 1] — zero or negative is
+    ///   either a no-op (bug) or makes the need worse (almost
+    ///   certainly a bug); >1 is meaningless because the post-action
+    ///   clamp is at 0.0 anyway.
+    /// - `duration_secs` ≥ 1.0 for exclusive blocks (sleep should
+    ///   feel substantive) and ≥ 0.1 otherwise (shorter eats look
+    ///   glitchy — they complete inside one fixed tick at 60 Hz).
+    ///   Upper bound is enforced by the brain at execution time,
+    ///   not here — a mod author who wants a 5-minute "ritual"
+    ///   interaction shouldn't be blocked at boot.
+    pub fn validate_interactables(&self, needs: &NeedRegistry) -> Result<(), BootstrapError> {
         for def in &self.defs_by_slot {
-            let Some(c) = &def.consumable else { continue };
-            if !needs.contains(&c.need) {
-                return Err(BootstrapError::ConsumableNeedUnknown {
-                    block: def.id.clone(),
-                    need: c.need.clone(),
-                });
+            let Some(i) = &def.interactable else { continue };
+            if let Some(nr) = &i.need_restore {
+                if !needs.contains(&nr.need) {
+                    return Err(BootstrapError::InteractableNeedUnknown {
+                        block: def.id.clone(),
+                        need: nr.need.clone(),
+                    });
+                }
+                if !(nr.restores > 0.0 && nr.restores <= 1.0) {
+                    return Err(BootstrapError::InteractableRestoresOutOfRange {
+                        block: def.id.clone(),
+                        value: nr.restores,
+                    });
+                }
             }
-            // Restores is the deficit subtracted on completion. Zero or
-            // negative would either no-op (bug) or make the need worse
-            // (almost certainly a bug); >1 is meaningless because the
-            // post-eat clamp is at 0.0 anyway. We require a real value.
-            if !(c.restores > 0.0 && c.restores <= 1.0) {
-                return Err(BootstrapError::ConsumableRestoresOutOfRange {
+            let min_duration = if i.exclusive { 1.0 } else { 0.1 };
+            if i.duration_secs < min_duration {
+                return Err(BootstrapError::InteractableDurationOutOfRange {
                     block: def.id.clone(),
-                    value: c.restores,
-                });
-            }
-            // 0.1 s lower bound: anything shorter completes inside one
-            // fixed tick (≈16 ms at 60 Hz) and the NPC visibly teleports
-            // through the action. Upper bound is enforced by the brain
-            // clamp at execution time, not here — a mod author who wants
-            // a 5-minute "ritual" eat shouldn't be blocked at boot.
-            if c.duration_secs < 0.1 {
-                return Err(BootstrapError::ConsumableDurationOutOfRange {
-                    block: def.id.clone(),
-                    value: c.duration_secs,
+                    value: i.duration_secs,
+                    min: min_duration,
                 });
             }
         }
@@ -269,37 +268,6 @@ impl BlockRegistry {
                         cell: *cell,
                     });
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// Cross-validate sleeper-bearing blocks against the [`NeedRegistry`].
-    /// Same shape as `validate_consumables` but with a stricter lower
-    /// bound on `duration_secs` — a sleep that completes inside one tick
-    /// is almost certainly an authoring mistake.
-    pub fn validate_sleepers(&self, needs: &NeedRegistry) -> Result<(), BootstrapError> {
-        for def in &self.defs_by_slot {
-            let Some(s) = &def.sleeper else { continue };
-            if !needs.contains(&s.need) {
-                return Err(BootstrapError::SleeperNeedUnknown {
-                    block: def.id.clone(),
-                    need: s.need.clone(),
-                });
-            }
-            if !(s.restores > 0.0 && s.restores <= 1.0) {
-                return Err(BootstrapError::SleeperRestoresOutOfRange {
-                    block: def.id.clone(),
-                    value: s.restores,
-                });
-            }
-            // 1.0 s lower bound: sleep should feel substantive. The
-            // brain's per-action upper clamp catches the other end.
-            if s.duration_secs < 1.0 {
-                return Err(BootstrapError::SleeperDurationOutOfRange {
-                    block: def.id.clone(),
-                    value: s.duration_secs,
-                });
             }
         }
         Ok(())

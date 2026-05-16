@@ -192,18 +192,20 @@ register {
         min = { -0.5, 0.0, -0.5 },
         max = {  1.5, 1.0,  0.5 },
     },
-    -- The first sleeper. `restores = 0.7` means a full sleep brings a
-    -- tiredness deficit down by 70% — a bedtime mostly resets the need
-    -- but doesn't completely max it, so a long day still ends with the
-    -- NPC visibly tired before bed. `duration_secs = 25` is long enough
-    -- to read as "they're asleep" but short enough that a player
-    -- watching the world doesn't lose interest before the cycle
-    -- completes. Only one NPC may claim a given bed at a time; the
+    -- The first exclusive interactable. `restores = 0.7` means a
+    -- full sleep brings a tiredness deficit down by 70% — bedtime
+    -- mostly resets the need but doesn't completely max it, so a
+    -- long day still ends with the NPC visibly tired before bed.
+    -- `duration_secs = 25` is long enough to read as "they're
+    -- asleep" but short enough that a player watching the world
+    -- doesn't lose interest before the cycle completes.
+    -- `exclusive = true` is what makes a bed a bed rather than a
+    -- berry basket: only one NPC claims it at a time, and the
     -- engine maintains the claim table.
-    sleeper = {
-        need = "sleep",
-        restores = 0.7,
+    interactable = {
+        need_restore = { need = "sleep", restores = 0.7 },
         duration_secs = 25.0,
+        exclusive = true,
     },
     -- Snap-to-slot positioning for the sleep action. Without this the
     -- brain would try to derive "stand atop the foot cell + face the
@@ -299,18 +301,23 @@ engine.rooms.register {
     },
 }
 
--- A berry basket — the first consumable. Block-entity like the bed
--- (1-cell footprint, but with a custom mesh), and tagged with
--- `consumable` metadata so the engine indexes it for NPC snapshots.
--- The mesh's local frame puts the basket centred at the anchor's
--- bottom (Y in [0, 0.67], X/Z in ±0.43), so the default bottom-centre
--- modelling rule fits without translation.
+-- A berry basket — the first non-exclusive interactable. Block-
+-- entity like the bed (1-cell footprint, custom mesh), and tagged
+-- with `interactable` metadata so the engine indexes it for NPC
+-- snapshots. The mesh's local frame puts the basket centred at the
+-- anchor's bottom (Y in [0, 0.67], X/Z in ±0.43), so the default
+-- bottom-centre modelling rule fits without translation.
 --
--- `restores = 0.4` ⇒ one consumption brings a hunger deficit down by
+-- `restores = 0.4` ⇒ one interaction brings a hunger deficit down by
 -- 0.4 (40% of the 0..1 scale). With decay 1/300 ⇒ ~2 minutes of decay
 -- before the same need climbs back. `duration_secs = 2.0` is enough
 -- visible standstill for a player to see "the NPC stopped to eat";
 -- shorter looks like a teleport, longer feels ritualistic.
+--
+-- No `use_slot` ⇒ NPCs walk to any standable neighbour and eat
+-- from there, supporting use-from-any-angle. `exclusive = false`
+-- ⇒ a queue of hungry villagers can pull from the same basket
+-- from different sides at the same time.
 register {
     id = "vanilla:berry_basket",
     display_name = "Berry basket",
@@ -324,10 +331,10 @@ register {
         min = { -0.43, 0.0, -0.43 },
         max = {  0.43, 0.67, 0.43 },
     },
-    consumable = {
-        need = "hunger",
-        restores = 0.4,
+    interactable = {
+        need_restore = { need = "hunger", restores = 0.4 },
         duration_secs = 2.0,
+        exclusive = false,
     },
 }
 

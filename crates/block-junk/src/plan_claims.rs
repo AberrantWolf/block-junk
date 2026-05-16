@@ -1,6 +1,6 @@
 //! Per-cell reservation table for player-tagged plans (server-only).
 //!
-//! Mirrors [`crate::sleepers::BedClaims`] for the work axis: when an NPC
+//! Mirrors [`crate::interactables::InteractionClaims`] for the work axis: when an NPC
 //! commits to a [`crate::protocol::PlanKind`] tag, it claims that cell
 //! so two NPCs don't path to the same plan and collide on arrival.
 //! Claims are released on every transition out of `Goal::Working`

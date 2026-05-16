@@ -139,33 +139,29 @@ pub struct NpcSnapshot {
     /// the nearest `vanilla:small_house`."
     #[serde(default)]
     pub nearby_rooms: Vec<NearbyRoom>,
-    /// Up to K nearest consumable cells reachable from `foot`, sorted
-    /// by distance (closest first). Each entry says *which* need the
-    /// block restores and by how much, so a planner that's hungry
-    /// (or thirsty, or low on mana) can pick the nearest entry that
-    /// addresses *its* deficit rather than walking to a fountain when
-    /// what it needs is bread. "Consumable" is deliberately broad —
-    /// food, drink, potions, scrolls, anything a mod declared with
-    /// [`block_junk_mod_api::blocks::Consumable`] metadata.
+    /// Up to K nearest reachable interactable blocks, sorted by
+    /// distance (closest first). One entry per
+    /// [`Interactable`](crate::blocks::Interactable)-bearing cell in
+    /// the NPC's neighbourhood, regardless of *which* action the
+    /// interactable represents (eat, sleep, enchant, sit). Each
+    /// entry exposes the optional `need` + `restores` the engine
+    /// pre-computed from the block def + the `exclusive` flag, so
+    /// planners pick targets by matching the need they want to
+    /// reduce — "this NPC's `hunger` is high, pick the nearest
+    /// entry whose `need == hunger` and whose `restores` covers
+    /// it" — without needing parallel block-def lookups on the
+    /// Lua side. **Already filtered**: exclusive entries currently
+    /// claimed by a different NPC are excluded. Race-on-claim is
+    /// still possible if two planners tick the same instant; the
+    /// brain's atomic `try_claim` resolves that at goal commit.
     ///
-    /// Empty when no consumable blocks exist in the NPC's neighbourhood
-    /// (early game, or the player hasn't placed any yet). The engine
-    /// snapshot builder bounds the scan radius, so a basket on the
-    /// other side of the map won't show up; the planner is making a
-    /// "what's nearby right now" decision, not a global search.
+    /// Empty when no interactables exist in range (early game, or
+    /// the player hasn't placed any yet). The engine snapshot
+    /// builder bounds the scan radius, so a basket on the other
+    /// side of the map won't show up; the planner makes a "what's
+    /// nearby right now" decision, not a global search.
     #[serde(default)]
-    pub nearby_consumables: Vec<NearbyConsumable>,
-    /// Up to K nearest unclaimed sleeper blocks, sorted by distance
-    /// (closest first). Beds today, but anything a mod has tagged
-    /// with [`Sleeper`](crate::blocks::Sleeper) shows up here.
-    /// **Already filtered**: a sleeper currently claimed by a
-    /// different NPC is excluded from this list — the planner sees
-    /// only what *it* could plausibly use this tick. Race-on-claim
-    /// is still possible (two planners tick the same instant and
-    /// both see the same free bed), but the brain's `try_claim`
-    /// step resolves that atomically by failing the second arrival.
-    #[serde(default)]
-    pub nearby_sleepers: Vec<NearbySleeper>,
+    pub nearby_interactions: Vec<NearbyInteraction>,
     /// Up to K nearest unclaimed player-tagged plan cells, sorted by
     /// distance (closest first). Each carries the verb (remove vs.
     /// build) so a planner can pick "the closest plan I'm willing to
@@ -196,7 +192,7 @@ pub struct NearbyPlan {
     pub cell: BlockPos,
     pub kind: PlanKindHint,
     /// Manhattan distance from the NPC's foot, same metric as
-    /// `nearby_sleepers.distance` / `nearby_consumables.distance`.
+    /// `nearby_interactions.distance`.
     pub distance: u32,
 }
 
@@ -210,51 +206,36 @@ pub enum PlanKindHint {
     Build,
 }
 
-/// One entry in [`NpcSnapshot::nearby_sleepers`]. Same shape as
-/// [`NearbyConsumable`] but for sleepers; the engine pre-computes
-/// `need` and `restores` from the block's
-/// [`Sleeper`](crate::blocks::Sleeper) def so the planner doesn't
-/// need to know which block-id is a bed today. The engine
-/// re-resolves the block + claim state on arrival so a snapshot
-/// that's gone stale (bed broken, bed claimed first by another NPC)
-/// degrades to "completes silently" rather than producing wrong
-/// behaviour.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NearbySleeper {
-    /// World cell of the sleeper block. May be the foot or the head
-    /// of a multi-cell bed; the engine resolves the anchor at goal
-    /// commit time.
-    pub cell: BlockPos,
-    /// Need this sleep reduces. Mirrored from
-    /// [`Sleeper::need`](crate::blocks::Sleeper).
-    pub need: String,
-    /// Pre-clamp magnitude of the deficit reduction.
-    pub restores: f32,
-    /// Manhattan distance from the NPC's foot, same metric used by
-    /// `nearby_consumables.distance`.
-    pub distance: u32,
-}
-
-/// One entry in [`NpcSnapshot::nearby_consumables`]. Pre-computed
+/// One entry in [`NpcSnapshot::nearby_interactions`]. Pre-computed
 /// `need` + `restores` mirror the originating block's
-/// [`Consumable`](crate::blocks::Consumable) so the planner doesn't
-/// need a parallel block-def lookup table on the Lua side. The engine
-/// re-resolves the block on actual consumption, so if the block was
-/// changed or removed between snapshot and arrival, the NPC just
-/// completes the goal with no effect.
+/// [`Interactable::need_restore`](crate::blocks::Interactable::need_restore)
+/// so the planner doesn't need a parallel block-def lookup table on
+/// the Lua side. The engine re-resolves the block on arrival, so if
+/// the block was changed or removed between snapshot and arrival,
+/// the NPC just completes the goal with no effect (and no need
+/// change).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NearbyConsumable {
-    /// World-cell of the consumable block. Planners hand this back as
-    /// `PlannerGoal::Consume::cell`. Adjacency to a standable cell is
-    /// the engine's problem — the planner just names the target.
+pub struct NearbyInteraction {
+    /// World cell of the interactable block. May be any cell of a
+    /// multi-cell block; the engine resolves the anchor at goal
+    /// commit time. Planners hand this back as
+    /// [`PlannerGoal::Interact::cell`](crate::npcs::PlannerGoal::Interact).
     pub cell: BlockPos,
-    /// Need id this consumption reduces (e.g. `"hunger"`). Mirrored
-    /// from the block's [`Consumable::need`](crate::blocks::Consumable).
-    pub need: String,
-    /// Pre-clamp magnitude of the deficit reduction. A planner can
-    /// compare against `snapshot.needs[need]` to score "this restores
-    /// enough to be worth walking to."
+    /// Need id this interaction reduces (e.g. `"hunger"`, `"sleep"`).
+    /// `None` ⇒ purely positional interaction (sit in a chair, no
+    /// need change). When present, mirrors `need_restore.need` from
+    /// the block's [`Interactable`](crate::blocks::Interactable) def.
+    pub need: Option<String>,
+    /// Pre-clamp magnitude of the deficit reduction. Meaningful
+    /// only when `need.is_some()`; `0.0` when the interaction is
+    /// purely positional.
     pub restores: f32,
+    /// `true` ⇒ the block enforces single-user exclusivity (bed,
+    /// altar). Planners use this to score "is anyone else going
+    /// to take it before I get there"; non-exclusive entries
+    /// (water well, food shelf) can be ignored when the planner
+    /// just wants any-anyone-eat-here.
+    pub exclusive: bool,
     /// Manhattan distance from the NPC's foot, same metric used by
     /// `nearby_rooms.distance`. Cheap, ranks correctly for "nearer is
     /// better." Planners that need euclidean derive it from `foot` +
@@ -332,42 +313,33 @@ pub enum PlannerGoal {
         #[serde(default = "default_goto_timeout")]
         timeout_secs: f32,
     },
-    /// Walk to a consumable block, stand still for its declared
-    /// duration, then subtract its `restores` from the matching need.
-    /// `cell` is the consumable block itself — the engine paths to a
-    /// standable neighbour, since the block itself is solid. If by
-    /// the time the NPC arrives the block has been broken or replaced
-    /// with something non-consumable, the goal completes silently
-    /// (no effect, no error).
+    /// Walk to an interactable block, optionally claim it (if its
+    /// def declares `exclusive`), snap onto its [`UseSlot`] (if it
+    /// declares one), wait the block's `duration_secs`, then apply
+    /// the optional `need_restore` and release any held claim. One
+    /// primitive covers every action variant the engine knows how
+    /// to drive: eat at a basket, sleep in a bed, enchant at an
+    /// altar, sit in a chair. The block def — not this enum — is
+    /// what makes the action distinct.
     ///
-    /// This is the *only* primitive that mutates need state; pairs
-    /// with planner picks that read `snapshot.nearby_consumables`.
-    Consume {
-        cell: BlockPos,
-        #[serde(default = "default_consume_timeout")]
-        timeout_secs: f32,
-    },
-    /// Walk to a sleeper block (a bed today), claim it for the
-    /// duration of the sleep, stand still for its declared
-    /// `duration_secs`, then subtract its `restores` from the
-    /// matching need and release the claim. Differs from `Consume`
-    /// in two ways: the engine maintains a per-bed claim table so
-    /// only one NPC sleeps in a given bed at a time, and the brain
-    /// allows much longer durations (sleep is intended to feel like
-    /// real seconds, not a brief pause).
-    ///
-    /// `cell` may be any cell of a multi-cell sleeper (foot or head
-    /// of a bed); the engine resolves the anchor via the chunk
+    /// `cell` may be any cell of a multi-cell interactable (foot or
+    /// head of a bed); the engine resolves the anchor via the chunk
     /// sidecar so two planners that picked different ends of the
-    /// same bed contend for the same claim.
+    /// same block contend for the same claim.
     ///
-    /// If the bed is gone, replaced, or claimed by someone else by
-    /// the time the NPC arrives, the goal completes silently. The
-    /// planner is expected to read `snapshot.nearby_sleepers` to
-    /// see what's available.
-    Sleep {
+    /// If by the time the NPC arrives the block has been broken,
+    /// replaced with a non-interactable, or claimed by someone
+    /// else (for an exclusive interactable), the goal completes
+    /// silently — no effect, no error. The planner is expected to
+    /// read [`NpcSnapshot::nearby_interactions`] to discover
+    /// available targets.
+    ///
+    /// Replaces the previous `Consume` + `Sleep` variants — the
+    /// distinction now lives entirely in the block def's
+    /// `Interactable::exclusive` flag and `duration_secs` value.
+    Interact {
         cell: BlockPos,
-        #[serde(default = "default_sleep_timeout")]
+        #[serde(default = "default_interact_timeout")]
         timeout_secs: f32,
     },
     /// Walk to a player-tagged plan cell, claim it, work for a fixed
@@ -401,11 +373,11 @@ fn default_goto_timeout() -> f32 {
     30.0
 }
 
-fn default_consume_timeout() -> f32 {
-    30.0
-}
-
-fn default_sleep_timeout() -> f32 {
+fn default_interact_timeout() -> f32 {
+    // Covers both quick eats and full sleeps. Upper end is generous
+    // because exclusive interactables (beds, altars) can run for
+    // tens of seconds before completing; the brain's per-action
+    // clamp catches misbehaving mods.
     60.0
 }
 

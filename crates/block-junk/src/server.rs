@@ -42,8 +42,7 @@ pub struct ServerPlugin;
 impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::scripting::ServerScriptingPlugin);
-        app.add_plugins(crate::consumables::ConsumableIndexPlugin);
-        app.add_plugins(crate::sleepers::SleeperIndexPlugin);
+        app.add_plugins(crate::interactables::InteractableIndexPlugin);
         app.add_plugins(crate::debug::DebugServerPlugin);
         app.add_plugins(crate::npc::NpcServerPlugin);
         app.add_plugins(crate::plans::PlansServerPlugin);
@@ -1188,23 +1187,18 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
             let target = path.last().copied();
             (format!("moving ({} cells)", path.len()), target)
         }
-        Goal::Consuming {
+        Goal::Interacting {
             remaining_secs,
-            need,
+            need_restore,
             target_cell,
             ..
-        } => (
-            format!("consuming {need} ({remaining_secs:.1}s)"),
-            Some(*target_cell),
-        ),
-        Goal::Sleeping {
-            remaining_secs,
-            target_cell,
-            ..
-        } => (
-            format!("sleeping ({remaining_secs:.1}s)"),
-            Some(*target_cell),
-        ),
+        } => {
+            let label = match need_restore {
+                Some(nr) => format!("interacting ({}, {:.1}s)", nr.need, remaining_secs),
+                None => format!("interacting ({remaining_secs:.1}s)"),
+            };
+            (label, Some(*target_cell))
+        }
         Goal::Working {
             remaining_secs,
             target_cell,

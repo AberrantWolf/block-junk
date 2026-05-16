@@ -135,11 +135,8 @@ fn load_side(side: Side) -> LoadResult {
     // exist before we can validate them. Failing here at boot beats
     // discovering "this food doesn't satisfy anything" the first time
     // an NPC tries to eat it.
-    if let Err(e) = blocks.validate_consumables(&needs) {
-        panic!("{} consumable validation failed: {e}", side.as_str());
-    }
-    if let Err(e) = blocks.validate_sleepers(&needs) {
-        panic!("{} sleeper validation failed: {e}", side.as_str());
+    if let Err(e) = blocks.validate_interactables(&needs) {
+        panic!("{} interactable validation failed: {e}", side.as_str());
     }
     if let Err(e) = blocks.validate_use_slots() {
         panic!("{} use_slot validation failed: {e}", side.as_str());

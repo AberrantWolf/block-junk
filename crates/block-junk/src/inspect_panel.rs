@@ -6,7 +6,7 @@
 //!   panel renders name/kind/needs/goal.
 //! - **Block**: R-click a block → client resolves the block-def from
 //!   its local `BlockRegistry` and renders id/display name/tags +
-//!   any consumable/sleeper metadata. No round-trip needed.
+//!   any interactable metadata. No round-trip needed.
 //!
 //! The panel is intentionally `bevy_ui`, not `egui`: egui is reserved
 //! for debug (F3) so in-game UI reads as a distinct visual layer.
@@ -293,17 +293,13 @@ fn format_block(cell: IVec3, slot: BlockSlot, registry: &BlockRegistry) -> Strin
     out.push_str(&format!("{}\n", def.display_name));
     out.push_str(&format!("id: {}\n", def.id));
     out.push_str(&format!("cell ({}, {}, {})\n", cell.x, cell.y, cell.z));
-    if let Some(c) = def.consumable.as_ref() {
-        out.push_str(&format!(
-            "\nconsumable\n  need: {}\n  restores: {:.2}\n  duration: {:.1}s\n",
-            c.need, c.restores, c.duration_secs
-        ));
-    }
-    if let Some(s) = def.sleeper.as_ref() {
-        out.push_str(&format!(
-            "\nsleeper\n  need: {}\n  restores: {:.2}\n  duration: {:.1}s\n",
-            s.need, s.restores, s.duration_secs
-        ));
+    if let Some(i) = def.interactable.as_ref() {
+        out.push_str("\ninteractable\n");
+        if let Some(nr) = &i.need_restore {
+            out.push_str(&format!("  need: {}\n  restores: {:.2}\n", nr.need, nr.restores));
+        }
+        out.push_str(&format!("  duration: {:.1}s\n", i.duration_secs));
+        out.push_str(&format!("  exclusive: {}\n", i.exclusive));
     }
     out
 }

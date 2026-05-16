@@ -156,15 +156,19 @@ pub struct BlockDef {
     /// safe fallback for cube-shaped blocks.
     #[serde(default)]
     pub entity_aabb: Option<EntityAabb>,
-    /// Marks this block as something NPCs can consume to satisfy a
-    /// need. Present ⇒ an NPC whose planner picks a Consume goal on
-    /// this cell pathfinds to a standable neighbour, stands still for
-    /// `duration_secs`, and on completion subtracts `restores` from
-    /// the named need (clamped at 0). The engine validates at boot
-    /// that `need` refers to a registered need id. `None` (the
-    /// default) ⇒ NPCs never consider this block for a Consume goal.
+    /// Marks this block as an NPC-interactable: present ⇒ planners
+    /// can target this block with [`PlannerGoal::Interact`], the
+    /// engine paths to it (snapping to [`use_slot`] if one is
+    /// declared, otherwise any standable neighbour), holds the NPC
+    /// at the target for `duration_secs`, and on completion applies
+    /// the optional `need_restore`. `exclusive` controls whether
+    /// one NPC at a time holds a claim (beds: yes; berry baskets:
+    /// no). Mods add new actions — sleep, eat, enchant, smelt — by
+    /// authoring this metadata on a block; the engine doesn't carry
+    /// any per-action code paths. `None` ⇒ NPCs ignore the block
+    /// for planner purposes.
     #[serde(default)]
-    pub consumable: Option<Consumable>,
+    pub interactable: Option<Interactable>,
     /// Optional dedicated "use slot" — anchor-relative pose and yaw an
     /// NPC snaps to when actively using this block, plus the set of
     /// standable cells from which the action may begin. Present ⇒ the
@@ -180,73 +184,69 @@ pub struct BlockDef {
     /// that read naturally from any side leave it as `None`.
     #[serde(default)]
     pub use_slot: Option<UseSlot>,
-    /// Marks this block as a sleeper (a bed, a bedroll, a sarcophagus —
-    /// anything one NPC can use to satisfy a need over a long stretch
-    /// of time). Mechanically similar to `consumable` but with two
-    /// extra rules: (a) only one NPC can claim a given sleeper at a
-    /// time (the engine maintains a per-anchor claim table) and
-    /// (b) duration is allowed to be much longer (sleep is intended
-    /// to feel like minutes, not seconds). The engine validates at
-    /// boot that `need` refers to a registered need id, same as
-    /// `consumable`. `None` ⇒ NPCs never consider this block for sleep.
-    #[serde(default)]
-    pub sleeper: Option<Sleeper>,
 }
 
-/// Block-level "interacting with this satisfies a need" declaration.
-/// Deliberately kept generic — a food basket, a healing fountain, a
-/// spell scroll, a workbench, and an altar are all the same shape from
-/// the engine's perspective: walk there, stand still for some time,
-/// decrement a named need. The mod owns what the action *means*; the
-/// engine just executes the path-arrive-pause-restore loop.
+/// Block-level "this is something NPCs can use" declaration. One
+/// schema for every action the engine knows how to drive: eat, sleep,
+/// enchant, smelt, sit. The engine never branches on the *kind* of
+/// interaction — it just runs the same path-arrive-pause-restore
+/// pipeline, reads this metadata to decide duration / need delta /
+/// claim semantics, and trusts the mod to provide visually distinct
+/// blocks + assets. Adding a new action ("read tome") is purely a
+/// data change.
 ///
-/// Consumption is **non-destructive** in this slice — the block stays
-/// after an NPC consumes from it. Depletion / regrowth (a basket
-/// emptying, a scroll being used up) is a future concern; today every
-/// consumable block is a permanent attraction.
+/// **Non-destructive** for now — the block stays after use. Depletion
+/// / regrowth (basket emptying, scroll consumed) is a follow-up.
+///
+/// Pairs with [`UseSlot`] for body positioning. The two are
+/// independent: an `Interactable` without a slot reads as "stand at
+/// any standable neighbour and wait" (berry basket); an
+/// `Interactable` with a slot reads as "snap the body onto the
+/// authored pose for the duration" (bed). A pure-positional
+/// interaction (sit in a chair, no need restore) sets `need_restore
+/// = None` and still gets the snap + lock + duration behaviour.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Consumable {
-    /// Id of the need this consumption reduces. Cross-validated against
-    /// the [`NeedDef`](crate::npcs::NeedDef) registry at boot — a
-    /// consumable referencing an unregistered need is a load error.
-    /// Plain `String` (not `NeedId`) matches the existing
-    /// `default_needs` convention on `NpcKindDef`.
-    pub need: String,
-    /// How much deficit is subtracted from the named need on completion.
-    /// Need values run 0.0 (fully satisfied) → 1.0 (critical), so a
-    /// larger `restores` is a more potent consumption. Clamped at 0.0
-    /// after the subtraction. Sensible range is roughly `[0.1, 1.0]`.
-    pub restores: f32,
-    /// How long the NPC stands still at the cell before the `restores`
-    /// amount is applied. Gives the action visible weight (NPC clearly
-    /// *interacted*, didn't just touch and turn). Engine clamps to a
-    /// sane bound so a misbehaving mod can't park an NPC indefinitely.
+pub struct Interactable {
+    /// Optional need change applied when the interaction completes.
+    /// `None` ⇒ purely positional (the NPC stood / sat for
+    /// `duration_secs` and nothing else happened, which is the
+    /// "sit in chair" case). `Some` ⇒ the named need is reduced by
+    /// `restores`, clamped at 0. The engine validates at boot that
+    /// `need_restore.need` is a registered [`NeedDef`](crate::npcs::NeedDef).
+    #[serde(default)]
+    pub need_restore: Option<NeedRestore>,
+    /// How long the NPC stays at the block before completion fires.
+    /// Engine clamps to a sane upper bound so a misbehaving mod
+    /// can't park an NPC for an hour. The lower bound is 0.1 s for
+    /// non-exclusive blocks (short eats look glitchy below that)
+    /// and 1.0 s for exclusive blocks (sleep is intended to feel
+    /// like seconds, not a teleport).
     pub duration_secs: f32,
+    /// Whether the engine enforces single-user exclusivity through
+    /// a per-anchor claim. `true` ⇒ a bed-style claim: one NPC at
+    /// a time, contention rejected at the brain's commit step.
+    /// `false` ⇒ unbounded concurrent use (food on a shelf, water
+    /// at a well, a public altar). Defaults to `false` since the
+    /// majority of interactables are non-exclusive.
+    #[serde(default)]
+    pub exclusive: bool,
 }
 
-/// Block-level "an NPC can sleep here to satisfy a need" declaration.
-/// Same shape as [`Consumable`] but a single sleeper accommodates one
-/// NPC at a time — the engine reserves the anchor cell for whichever
-/// NPC committed first and rejects competing claims until release.
-/// Beds today, larger fixtures (a campfire ring, a guest hall pad)
-/// later; the engine doesn't care what the asset is.
+/// Need + magnitude pair for [`Interactable::need_restore`]. Split
+/// from the parent so a pure-positional interaction (no need change)
+/// is just `None` instead of having to encode "ignore these values."
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Sleeper {
-    /// Id of the need this sleep reduces. Cross-validated against the
-    /// [`NeedDef`](crate::npcs::NeedDef) registry at boot — a sleeper
-    /// referencing an unregistered need is a load error.
+pub struct NeedRestore {
+    /// Id of the need this interaction reduces. Cross-validated
+    /// against the registered [`NeedDef`](crate::npcs::NeedDef)s at
+    /// boot. Plain `String` matches the existing `default_needs`
+    /// convention on `NpcKindDef`.
     pub need: String,
-    /// How much deficit is subtracted from the named need on completion.
-    /// Need values run 0.0 (fully satisfied) → 1.0 (critical), so a
-    /// larger `restores` is more refreshing. Clamped at 0.0 after the
-    /// subtraction. A whole night might restore 0.8–1.0; a nap less.
+    /// How much deficit is subtracted from the named need on
+    /// completion. Need values run 0.0 (fully satisfied) → 1.0
+    /// (critical), so a larger `restores` is a more potent
+    /// interaction. Clamped at 0 after the subtraction.
     pub restores: f32,
-    /// How long the NPC stands at the sleeper before the `restores`
-    /// amount is applied. Engine clamps to a sane upper bound so a
-    /// misbehaving mod can't park an NPC for an hour, but the bound
-    /// is much larger than the consumable bound — sleep is allowed to
-    /// feel like minutes.
-    pub duration_secs: f32,
 }
 
 /// Dedicated "use slot" for an interactable block — bed, chair, forge,

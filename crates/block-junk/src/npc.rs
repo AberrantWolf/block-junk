@@ -25,10 +25,9 @@
 //! when no mods load.
 
 use bevy::prelude::*;
-use block_junk_mod_api::blocks::{Cardinal, Consumable, Sleeper, UseSlot};
+use block_junk_mod_api::blocks::{Cardinal, Interactable, NeedRestore, UseSlot};
 use block_junk_mod_api::npcs::{
-    NearbyConsumable, NearbyPlan, NearbyRoom, NearbySleeper, NpcKindId, NpcSnapshot,
-    PlanKindHint, PlannerGoal,
+    NearbyInteraction, NearbyPlan, NearbyRoom, NpcKindId, NpcSnapshot, PlanKindHint, PlannerGoal,
 };
 use block_junk_mod_api::shared::BlockPos;
 use lightyear::prelude::*;
@@ -38,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
-use crate::consumables::ConsumableIndex;
+use crate::interactables::{InteractableIndex, InteractionClaims};
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
@@ -50,7 +49,6 @@ use crate::protocol::{
     NpcActivity, PlanKind, WorldClock,
 };
 use crate::scripting::ServerMods;
-use crate::sleepers::{BedClaims, SleeperIndex};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, world_to_chunk};
 
 /// Replicated marker — "this entity is an NPC, not a player avatar."
@@ -173,38 +171,31 @@ pub enum Goal {
     /// `[MIN_REST_SECS, MAX_REST_SECS]` so a misbehaving mod can't
     /// freeze an NPC indefinitely or churn the planner at 60 Hz.
     Resting { remaining_secs: f32 },
-    /// Standing at a consumable cell, counting down to the moment the
-    /// `restores` deficit is subtracted from the named need. Entered
-    /// only via a successful arrival on a `MoveTo` with
-    /// `ArrivalAction::Consume`. Need + magnitude are captured at goal
-    /// creation so a planner that, mid-action, decides "actually you
+    /// Standing at an interactable cell, counting down to completion.
+    /// One state covers every variant the engine used to have a
+    /// separate Goal for (Consuming, Sleeping, and the future
+    /// Enchanting / Smelting / etc.) — the block def's
+    /// [`Interactable`](block_junk_mod_api::blocks::Interactable)
+    /// supplies the action-specific tuning (need to decrement,
+    /// duration, exclusivity).
+    ///
+    /// Entered only via a successful arrival on a `MoveTo` with
+    /// `ArrivalAction::Interact`. `need_restore` is captured at goal
+    /// creation so a planner that mid-action decides "actually you
     /// should be eating *that* food" can't retroactively change what
-    /// the NPC is doing now. `target_cell` is the consumable block
-    /// itself — the brain uses it to rotate the body toward whatever
-    /// the NPC is interacting with, without forward motion (forward
-    /// motion would orbit, since the NPC's already adjacent).
-    Consuming {
+    /// the NPC is doing now — the captured snapshot wins. `target_cell`
+    /// is the interactable block itself (not the stand cell); the
+    /// brain uses it to rotate the body toward whatever the NPC is
+    /// interacting with for non-snap interactions. `anchor_cell` is
+    /// the claim key for `exclusive` interactables — released on any
+    /// path out of [`Goal::Interacting`] including stuck-abandon or
+    /// planner override; ignored when the block is non-exclusive.
+    Interacting {
         remaining_secs: f32,
-        need: String,
-        restores: f32,
-        target_cell: IVec3,
-    },
-    /// Standing at a sleeper cell with a held claim, counting down to
-    /// the moment `restores` is subtracted from the named need. Entered
-    /// only via a successful arrival on a `MoveTo` with
-    /// `ArrivalAction::Sleep`. `anchor_cell` carries the claim key so
-    /// the brain releases the right slot on transition out (including
-    /// when the sleep is abandoned by stuck-detection or by a planner
-    /// override). `target_cell` is whichever sleeper cell the planner
-    /// originally picked (foot or head); it's what the brain rotates
-    /// the body toward during the sleep so the visible action lines up
-    /// with the bed orientation.
-    Sleeping {
-        remaining_secs: f32,
-        need: String,
-        restores: f32,
+        need_restore: Option<NeedRestore>,
         target_cell: IVec3,
         anchor_cell: IVec3,
+        exclusive: bool,
     },
     /// Working a player-tagged plan at `target_cell` until the timer
     /// expires, at which point the engine applies the world mutation
@@ -256,33 +247,21 @@ pub enum ArrivalAction {
     /// Just stop on arrival. Used by `PlannerGoal::Wander` and
     /// `PlannerGoal::Goto`, which describe motion without a follow-on.
     None,
-    /// Begin a stand-still consume action at the target cell. The
-    /// captured `need` / `restores` / `duration_secs` are the values
-    /// the snapshot saw — taken from the block's
-    /// [`Consumable`](Consumable) metadata at planner-call time. If the
-    /// block has changed by arrival, the brain re-validates against the
-    /// current cell before applying the restoration. `target_cell` is
-    /// the consumable block itself (not the stand cell); the body is
-    /// rotated toward this cell during [`Goal::Consuming`].
-    Consume {
-        need: String,
-        restores: f32,
-        duration_secs: f32,
-        target_cell: IVec3,
-    },
-    /// Begin a sleep action at the target sleeper cell. Captured
-    /// values mirror `Consume`; `anchor_cell` is the claim key the
-    /// brain reserved at goal commit time and must release on any
-    /// path out of [`Goal::Sleeping`]. If the brain reaches the
-    /// arrival check and the bed has been broken or the claim was
-    /// somehow lost mid-traversal, the action degrades silently to
-    /// "stand briefly, then idle."
-    Sleep {
-        need: String,
-        restores: f32,
+    /// Begin a stand-still interaction at the target block. Captured
+    /// values mirror the block's
+    /// [`Interactable`](block_junk_mod_api::blocks::Interactable)
+    /// metadata at goal-commit time. `anchor_cell` is the claim key
+    /// the brain reserved for `exclusive` blocks (ignored when not
+    /// exclusive); the brain must release the claim on any path out
+    /// of the resulting [`Goal::Interacting`]. If the block has been
+    /// broken, replaced, or claim-stolen by arrival, the action
+    /// degrades silently to "stand briefly, then idle."
+    Interact {
+        need_restore: Option<NeedRestore>,
         duration_secs: f32,
         target_cell: IVec3,
         anchor_cell: IVec3,
+        exclusive: bool,
     },
     /// Begin a work action at the plan target cell. Carries the snapshot
     /// of the `PlanKind` at the moment the goal was committed so a
@@ -318,30 +297,21 @@ const FALLBACK_WANDER_TIMEOUT_SECS: f32 = 12.0;
 const MAX_WANDER_RADIUS_CELLS: i32 = 64;
 const MAX_WANDER_TIMEOUT_SECS: f32 = 60.0;
 const MAX_GOTO_TIMEOUT_SECS: f32 = 120.0;
-const MAX_CONSUME_TIMEOUT_SECS: f32 = 120.0;
+/// Max walk-timeout the brain accepts for an Interact goal. Same
+/// magnitude as the goto/work timeouts — past two minutes, an NPC
+/// trying to reach an interactable should abandon and let the
+/// planner pick again rather than chase it forever.
+const MAX_INTERACT_TIMEOUT_SECS: f32 = 120.0;
 const MIN_REST_SECS: f32 = 0.5;
 const MAX_REST_SECS: f32 = 60.0;
-/// Per the consumable-duration validation in `BlockRegistry`, mods
-/// can't register a duration shorter than 0.1 s; the brain enforces a
-/// matching upper bound so a 5-minute ritual eat is the worst-case
-/// frozen NPC. Both bounds are applied as a clamp at goal creation
-/// so the running goal always carries a sane remaining_secs.
-const MIN_CONSUME_DURATION_SECS: f32 = 0.1;
-const MAX_CONSUME_DURATION_SECS: f32 = 30.0;
-/// Sleep is allowed to last longer than a consumable action by
-/// design — it's intended to feel like minutes, not seconds. Lower
-/// bound mirrors the registry's `validate_sleepers` lower bound
-/// (>= 1.0); upper bound caps the worst-case "NPC is parked here"
-/// at a couple of game minutes so a misbehaving mod or a typo in a
-/// duration field doesn't permanently freeze an NPC.
-const MIN_SLEEP_DURATION_SECS: f32 = 1.0;
-const MAX_SLEEP_DURATION_SECS: f32 = 120.0;
-const MAX_SLEEP_TIMEOUT_SECS: f32 = 120.0;
-/// How far the snapshot builder scans for sleepers. Same magnitude
-/// as `SNAPSHOT_CONSUMABLE_RADIUS_CELLS` — a bed across the world
-/// shouldn't influence a planner's pick.
-const SNAPSHOT_SLEEPER_RADIUS_CELLS: i32 = 48;
-const SNAPSHOT_SLEEPER_LIMIT: usize = 8;
+/// Interaction duration is read from the block's
+/// [`Interactable::duration_secs`](block_junk_mod_api::blocks::Interactable::duration_secs).
+/// The brain clamps to `[0.1, 120.0]` so a typo or a misbehaving mod
+/// can't park an NPC for an hour or strobe through the action in
+/// one tick. The registry validator enforces the lower bound at
+/// boot too (≥ 1.0 for exclusive blocks, ≥ 0.1 otherwise).
+const MIN_INTERACT_DURATION_SECS: f32 = 0.1;
+const MAX_INTERACT_DURATION_SECS: f32 = 120.0;
 /// Plan-pickup scan radius (Manhattan via the Chebyshev pre-filter).
 /// Same magnitude as sleepers/consumables — plans on the far side of
 /// the map shouldn't keep luring a villager from local tasks.
@@ -365,16 +335,17 @@ const WORK_NEED_ID: &str = "work";
 /// a planner to pick between "nearest of each kind" without flooding
 /// the table.
 const SNAPSHOT_ROOM_LIMIT: usize = 8;
-/// Same idea as `SNAPSHOT_ROOM_LIMIT` for the consumables array. 8 is
-/// plenty for "nearest of each need" picks in early-game; the planner
-/// only sees the closest entries so a player who places hundreds of
-/// food blocks doesn't blow up the per-call cost.
-const SNAPSHOT_CONSUMABLE_LIMIT: usize = 8;
-/// Chebyshev radius the snapshot builder scans for consumables. Past
-/// this the NPC won't see a food block at all — it'll wander toward
-/// rooms or random targets until it bumps into one. 48 cells ≈ 3
-/// chunks at CHUNK_SIZE = 16, big enough to cover a small settlement.
-const SNAPSHOT_CONSUMABLE_RADIUS_CELLS: i32 = 48;
+/// Same idea as `SNAPSHOT_ROOM_LIMIT` for the unified interactions
+/// array. 8 is plenty for "nearest of each need" picks in early-game;
+/// the planner only sees the closest entries so a player who places
+/// hundreds of food blocks or beds doesn't blow up the per-call cost.
+const SNAPSHOT_INTERACTION_LIMIT: usize = 8;
+/// Chebyshev radius the snapshot builder scans for interactables.
+/// Past this the NPC won't see a food block or a bed at all — it'll
+/// wander toward rooms or random targets until it bumps into one.
+/// 48 cells ≈ 3 chunks at CHUNK_SIZE = 16, big enough to cover a
+/// small settlement.
+const SNAPSHOT_INTERACTION_RADIUS_CELLS: i32 = 48;
 /// How far ahead of the closest-projection point on the path the NPC
 /// aims. Bigger ⇒ smoother turns, more corner-cutting; smaller ⇒
 /// hugs the path tighter, may oscillate. 0.5 m ≈ half a cell — the
@@ -460,10 +431,18 @@ impl Plugin for NpcServerPlugin {
 /// maps to `Idle` — the client takes over once velocity rises.
 /// Resting and Consuming also map to `Idle` until we have dedicated
 /// clips for them.
-fn refresh_npc_activity(mut npcs: Query<(&Brain, &mut NpcActivity), With<Npc>>) {
-    for (brain, mut activity) in npcs.iter_mut() {
+fn refresh_npc_activity(
+    mut npcs: Query<(&Brain, &mut NpcActivity, Has<KinematicLock>), With<Npc>>,
+) {
+    for (brain, mut activity, is_locked) in npcs.iter_mut() {
+        // Goal::Interacting covers everything from "stand at a basket
+        // and eat" to "lie in a bed and sleep" — the engine doesn't
+        // know which animation suits the action. Use the kinematic
+        // lock as the proxy: snapped-and-locked ⇒ Sleeping (Lie_Idle
+        // clip), unlocked ⇒ Idle. Once per-interactable animation
+        // clip data lands, this mapping moves into the def too.
         let next = match &brain.goal {
-            Goal::Sleeping { .. } => NpcActivity::Sleeping,
+            Goal::Interacting { .. } if is_locked => NpcActivity::Sleeping,
             Goal::Working { .. } => NpcActivity::Working,
             _ => NpcActivity::Idle,
         };
@@ -636,9 +615,8 @@ fn npc_brain_tick(
     mods: Res<ServerMods>,
     need_registry: Res<NeedRegistry>,
     room_map: Res<RoomMap>,
-    consumable_index: Res<ConsumableIndex>,
-    sleeper_index: Res<SleeperIndex>,
-    mut bed_claims: ResMut<BedClaims>,
+    interactable_index: Res<InteractableIndex>,
+    mut interaction_claims: ResMut<InteractionClaims>,
     plans: Res<Plans>,
     mut plan_claims: ResMut<PlanClaims>,
     world_clock: Res<WorldClock>,
@@ -698,8 +676,7 @@ fn npc_brain_tick(
         let mut move_arrived: Option<(ArrivalAction, Option<UseSlotSnap>)> = None;
         let mut move_abandoned = false;
         let mut rest_done = false;
-        let mut consume_done = false;
-        let mut sleep_done = false;
+        let mut interact_completed = false;
         let mut work_done = false;
         match &mut brain.goal {
             Goal::Idle => {}
@@ -709,16 +686,10 @@ fn npc_brain_tick(
                     rest_done = true;
                 }
             }
-            Goal::Consuming { remaining_secs, .. } => {
+            Goal::Interacting { remaining_secs, .. } => {
                 *remaining_secs -= dt;
                 if *remaining_secs <= 0.0 {
-                    consume_done = true;
-                }
-            }
-            Goal::Sleeping { remaining_secs, .. } => {
-                *remaining_secs -= dt;
-                if *remaining_secs <= 0.0 {
-                    sleep_done = true;
+                    interact_completed = true;
                 }
             }
             Goal::Working { remaining_secs, .. } => {
@@ -800,32 +771,19 @@ fn npc_brain_tick(
                 ArrivalAction::None => {
                     brain.goal = Goal::Idle;
                 }
-                ArrivalAction::Consume {
-                    need,
-                    restores,
-                    duration_secs,
-                    target_cell,
-                } => {
-                    brain.goal = Goal::Consuming {
-                        remaining_secs: duration_secs,
-                        need,
-                        restores,
-                        target_cell,
-                    };
-                }
-                ArrivalAction::Sleep {
-                    need,
-                    restores,
+                ArrivalAction::Interact {
+                    need_restore,
                     duration_secs,
                     target_cell,
                     anchor_cell,
+                    exclusive,
                 } => {
-                    brain.goal = Goal::Sleeping {
+                    brain.goal = Goal::Interacting {
                         remaining_secs: duration_secs,
-                        need,
-                        restores,
+                        need_restore,
                         target_cell,
                         anchor_cell,
+                        exclusive,
                     };
                 }
                 ArrivalAction::Work {
@@ -841,15 +799,19 @@ fn npc_brain_tick(
                 }
             }
         }
-        // Abandonment of a MoveTo whose ArrivalAction is Sleep or Work
-        // needs to release the claim too — the brain reserved it at
-        // goal commit time and a stuck/timeout abandon never reaches
-        // arrival.
+        // Abandonment of a MoveTo with an action that reserved a
+        // claim needs to release it — the brain took the claim at
+        // goal commit and a stuck/timeout abandon never reaches
+        // the arrival branch that would otherwise own the release.
         if move_abandoned {
             if let Goal::MoveTo { on_arrive, .. } = &brain.goal {
                 match on_arrive {
-                    ArrivalAction::Sleep { anchor_cell, .. } => {
-                        bed_claims.release(*anchor_cell, *npc_id);
+                    ArrivalAction::Interact {
+                        anchor_cell,
+                        exclusive: true,
+                        ..
+                    } => {
+                        interaction_claims.release(*anchor_cell, *npc_id);
                     }
                     ArrivalAction::Work { target_cell, .. } => {
                         plan_claims.release(*target_cell, *npc_id);
@@ -864,75 +826,54 @@ fn npc_brain_tick(
                 npc_path.0.clear();
             }
         }
-        // Target cell of whichever interaction just finished
-        // (consume / sleep / work). Set by the matching per-action
-        // branch; consumed once by the generic post-interaction
-        // block to drive eject + kinematic unlock + Idle transition.
+        // Target cell of whichever interaction just finished. Set by
+        // the matching per-action branch; consumed by the generic
+        // post-interaction block (eject + kinematic unlock + Idle).
         let mut interact_done: Option<IVec3> = None;
-        if consume_done {
-            // Action-specific completion: re-resolve the need and
-            // apply the captured restore. We trust the captured
-            // values (the NPC committed to them at planner-call
-            // time) — if the block was broken or replaced mid-
-            // action, "ate the air" is the consistent outcome at
-            // every upstream layer. Captures `target_cell` so the
-            // generic post-action block below can eject / unlock.
-            if let Goal::Consuming {
-                need,
-                restores,
-                target_cell,
-                ..
-            } = &brain.goal
-            {
-                if let Some(value) = needs.0.get_mut(need) {
-                    *value = (*value - *restores).max(0.0);
-                    info!(
-                        npc = npc_id.0,
-                        need = %need,
-                        restored = restores,
-                        remaining_deficit = *value,
-                        "consumption complete",
-                    );
-                } else {
-                    warn!(
-                        npc = npc_id.0,
-                        need = %need,
-                        "consumption complete but NPC has no entry for need; ignoring",
-                    );
-                }
-                interact_done = Some(*target_cell);
-            }
-        }
-        if sleep_done {
-            // Action-specific completion: apply restore, release
-            // the per-bed claim. Generic post-action handling
-            // (eject + unlock + transition to Idle) runs below
-            // off `interact_done`.
-            if let Goal::Sleeping {
-                need,
-                restores,
+        if interact_completed {
+            // Generic completion path for every interactable. Apply
+            // the captured need delta if any, release the claim if
+            // the block was exclusive. Captured values come from the
+            // planner snapshot — if the block was broken or replaced
+            // between commit and completion, "did the action against
+            // a stale snapshot" is the consistent outcome at every
+            // upstream layer, and we still credit the NPC for
+            // sticking it out.
+            if let Goal::Interacting {
+                need_restore,
                 anchor_cell,
                 target_cell,
+                exclusive,
                 ..
             } = &brain.goal
             {
-                if let Some(value) = needs.0.get_mut(need) {
-                    *value = (*value - *restores).max(0.0);
+                if let Some(nr) = need_restore {
+                    if let Some(value) = needs.0.get_mut(&nr.need) {
+                        *value = (*value - nr.restores).max(0.0);
+                        info!(
+                            npc = npc_id.0,
+                            need = %nr.need,
+                            restored = nr.restores,
+                            remaining_deficit = *value,
+                            "interaction complete",
+                        );
+                    } else {
+                        warn!(
+                            npc = npc_id.0,
+                            need = %nr.need,
+                            "interaction complete but NPC has no entry for need; ignoring",
+                        );
+                    }
+                } else {
                     info!(
                         npc = npc_id.0,
-                        need = %need,
-                        restored = restores,
-                        remaining_deficit = *value,
-                        "sleep complete",
-                    );
-                } else {
-                    warn!(
-                        npc = npc_id.0,
-                        need = %need,
-                        "sleep complete but NPC has no entry for need; ignoring",
+                        target = ?target_cell.to_array(),
+                        "interaction complete (no need change)",
                     );
                 }
-                bed_claims.release(*anchor_cell, *npc_id);
+                if *exclusive {
+                    interaction_claims.release(*anchor_cell, *npc_id);
+                }
                 interact_done = Some(*target_cell);
             }
         }
@@ -1012,9 +953,8 @@ fn npc_brain_tick(
                 &pose,
                 &needs,
                 &room_map,
-                &consumable_index,
-                &sleeper_index,
-                &bed_claims,
+                &interactable_index,
+                &interaction_claims,
                 &plans,
                 &plan_claims,
                 &chunk_entities_q,
@@ -1033,8 +973,7 @@ fn npc_brain_tick(
                 is_night = snapshot.is_night,
                 hunger = ?need_hunger,
                 sleep = ?need_sleep,
-                nearby_consumables = snapshot.nearby_consumables.len(),
-                nearby_sleepers = snapshot.nearby_sleepers.len(),
+                nearby_interactions = snapshot.nearby_interactions.len(),
                 "planner snapshot",
             );
             let planner_goal = match mods.0.call_planner(&kind_id, &snapshot) {
@@ -1051,7 +990,7 @@ fn npc_brain_tick(
                     // shouldn't lock a bed or plan for the rest of
                     // the session. Drop the kinematic lock too so a
                     // disabled NPC isn't frozen mid-action.
-                    bed_claims.release_all_for(*npc_id);
+                    interaction_claims.release_all_for(*npc_id);
                     plan_claims.release_all_for(*npc_id);
                     commands
                         .entity(entity)
@@ -1213,15 +1152,16 @@ fn npc_brain_tick(
                         }
                     }
                 }
-                PlannerGoal::Sleep { cell, timeout_secs } => {
-                    let timeout = timeout_secs.clamp(1.0, MAX_SLEEP_TIMEOUT_SECS);
+                PlannerGoal::Interact { cell, timeout_secs } => {
+                    let timeout = timeout_secs.clamp(1.0, MAX_INTERACT_TIMEOUT_SECS);
                     let target_cell = IVec3::new(cell.x, cell.y, cell.z);
-                    // Re-resolve the sleeper on current world state +
-                    // pull the full def so we can read the optional
-                    // `use_slot`. Slot data is what tells the brain
-                    // *where* and *how* to position the body — there
-                    // is no bed-shaped knowledge in the engine.
-                    let Some((sleeper, slot, def_id)) = sleeper_with_slot_at_cell(
+                    // Re-resolve the block on current world state +
+                    // pull its `interactable` and optional `use_slot`.
+                    // Action-agnostic: the engine doesn't ask whether
+                    // the block "is a bed" vs "is a basket," only what
+                    // the def's metadata says about claim semantics,
+                    // duration, and need delta.
+                    let Some((interactable, slot, def_id)) = interactable_with_slot_at_cell(
                         target_cell,
                         &chunks,
                         &chunk_map,
@@ -1230,7 +1170,7 @@ fn npc_brain_tick(
                         info!(
                             npc = npc_id.0,
                             target = ?target_cell.to_array(),
-                            "sleep target no longer a sleeper; parking briefly",
+                            "interact target no longer interactable; parking briefly",
                         );
                         brain.goal = Goal::Resting {
                             remaining_secs: MIN_REST_SECS,
@@ -1238,24 +1178,29 @@ fn npc_brain_tick(
                         *intent = MovementIntent::default();
                         continue;
                     };
-                    // Anchor is the claim key (multi-cell sleepers
-                    // contend on a single slot). Orientation rotates
-                    // both `use_slot.approach` and `use_slot.pose`
-                    // into world space.
+                    // Anchor is the claim key for exclusive blocks
+                    // (multi-cell entities contend on one slot).
+                    // Orientation rotates both `use_slot.approach`
+                    // and `use_slot.pose` into world space.
                     let (anchor_cell, orientation) = resolve_anchor_with_orientation(
                         target_cell,
                         &chunk_entities_q,
                         &chunk_map,
                     );
-                    // Atomic claim. Loss means another NPC took the
-                    // bed between snapshot construction and now —
-                    // brief rest, planner re-picks next tick.
-                    if !bed_claims.try_claim(anchor_cell, *npc_id) {
+                    // Atomic claim — only attempted for exclusive
+                    // blocks. Non-exclusive interactions (food on a
+                    // shelf, water at a well) don't contend; a
+                    // queue of NPCs can use them in parallel from
+                    // different cells.
+                    if interactable.exclusive
+                        && !interaction_claims.try_claim(anchor_cell, *npc_id)
+                    {
                         info!(
                             npc = npc_id.0,
                             target = ?target_cell.to_array(),
                             anchor = ?anchor_cell.to_array(),
-                            "sleep target claimed by another NPC; parking briefly",
+                            block = %def_id,
+                            "exclusive interact target taken by another NPC; parking briefly",
                         );
                         brain.goal = Goal::Resting {
                             remaining_secs: MIN_REST_SECS,
@@ -1265,13 +1210,13 @@ fn npc_brain_tick(
                     }
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                    // Resolve approach cell + snap from the use_slot.
-                    // Slotless sleepers (mod-defined without a slot)
-                    // fall back to the consume-pattern: stand at any
-                    // standable cardinal neighbour of the target cell,
-                    // no snap, no kinematic lock. They function as
-                    // "lie wherever you arrived" — degraded, but the
-                    // need still gets satisfied.
+                    // Resolve approach cell + (optional) snap from the
+                    // use_slot. Slot-bearing blocks land the NPC on
+                    // a precise pose with KinematicLock applied;
+                    // slotless blocks fall back to any standable
+                    // cardinal neighbour with no snap and no lock —
+                    // works for any-angle interactions like a fruit
+                    // basket or a water well.
                     let (stand_cell, snap) = match resolve_use_slot_target(
                         slot.as_ref(),
                         anchor_cell,
@@ -1286,9 +1231,11 @@ fn npc_brain_tick(
                                 npc = npc_id.0,
                                 target = ?target_cell.to_array(),
                                 block = %def_id,
-                                "no standable approach for sleeper; releasing claim and parking briefly",
+                                "no standable approach for interactable; releasing claim and parking briefly",
                             );
-                            bed_claims.release(anchor_cell, *npc_id);
+                            if interactable.exclusive {
+                                interaction_claims.release(anchor_cell, *npc_id);
+                            }
                             brain.goal = Goal::Resting {
                                 remaining_secs: MIN_REST_SECS,
                             };
@@ -1296,13 +1243,16 @@ fn npc_brain_tick(
                             continue;
                         }
                     };
-                    let duration = sleeper
+                    let duration = interactable
                         .duration_secs
-                        .clamp(MIN_SLEEP_DURATION_SECS, MAX_SLEEP_DURATION_SECS);
+                        .clamp(MIN_INTERACT_DURATION_SECS, MAX_INTERACT_DURATION_SECS);
+                    let need_restore = interactable.need_restore.clone();
+                    let exclusive = interactable.exclusive;
                     if stand_cell == foot {
-                        // Already standing on the approach cell — apply
-                        // the snap in place and enter Sleeping. Same
-                        // arrival semantics as the MoveTo path.
+                        // Already standing on the approach cell —
+                        // apply the snap in place and enter
+                        // Interacting. Same arrival semantics as
+                        // the MoveTo path, just without the path.
                         if !npc_path.0.is_empty() {
                             npc_path.0.clear();
                         }
@@ -1311,12 +1261,12 @@ fn npc_brain_tick(
                             pose.yaw = s.yaw;
                             commands.entity(entity).insert(KinematicLock);
                         }
-                        brain.goal = Goal::Sleeping {
+                        brain.goal = Goal::Interacting {
                             remaining_secs: duration,
-                            need: sleeper.need.clone(),
-                            restores: sleeper.restores,
+                            need_restore,
                             target_cell,
                             anchor_cell,
+                            exclusive,
                         };
                         *intent = MovementIntent::default();
                         continue;
@@ -1339,12 +1289,12 @@ fn npc_brain_tick(
                                 deadline_secs: timeout,
                                 last_pos: pose.translation,
                                 stuck_secs: 0.0,
-                                on_arrive: ArrivalAction::Sleep {
-                                    need: sleeper.need.clone(),
-                                    restores: sleeper.restores,
+                                on_arrive: ArrivalAction::Interact {
+                                    need_restore,
                                     duration_secs: duration,
                                     target_cell,
                                     anchor_cell,
+                                    exclusive,
                                 },
                                 snap,
                             };
@@ -1355,126 +1305,11 @@ fn npc_brain_tick(
                                 foot = ?foot.to_array(),
                                 target = ?target_cell.to_array(),
                                 stand = ?stand_cell.to_array(),
-                                "sleep failed: no A* path to approach cell, releasing claim and parking briefly"
+                                "interact failed: no A* path to approach cell, releasing claim and parking briefly"
                             );
-                            bed_claims.release(anchor_cell, *npc_id);
-                            if !npc_path.0.is_empty() {
-                                npc_path.0.clear();
+                            if exclusive {
+                                interaction_claims.release(anchor_cell, *npc_id);
                             }
-                            brain.goal = Goal::Resting {
-                                remaining_secs: MIN_REST_SECS,
-                            };
-                            *intent = MovementIntent::default();
-                        }
-                    }
-                }
-                PlannerGoal::Consume { cell, timeout_secs } => {
-                    let timeout = timeout_secs.clamp(1.0, MAX_CONSUME_TIMEOUT_SECS);
-                    let target_cell = IVec3::new(cell.x, cell.y, cell.z);
-                    // Re-resolve the consumable on the current world
-                    // state (not the snapshot). Mods can in principle
-                    // hand back any cell — we only path to it if it
-                    // still has consumable metadata. Stale references
-                    // become a no-op + brief rest, identical to a
-                    // failed path.
-                    let consumable = match consumable_at_cell(
-                        target_cell,
-                        &chunks,
-                        &chunk_map,
-                        &block_registry,
-                    ) {
-                        Some(c) => c,
-                        None => {
-                            info!(
-                                npc = npc_id.0,
-                                target = ?target_cell.to_array(),
-                                "consume target no longer consumable; parking briefly",
-                            );
-                            brain.goal = Goal::Resting {
-                                remaining_secs: MIN_REST_SECS,
-                            };
-                            *intent = MovementIntent::default();
-                            continue;
-                        }
-                    };
-                    let foot = pose_to_standable_foot(&pose, &world)
-                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                    // Consumables are typically solid blocks, so the
-                    // NPC's actual stand cell is one of their
-                    // neighbours. Pick the standable neighbour
-                    // closest to the NPC's current foot so the path
-                    // bends toward the side the NPC's already
-                    // approaching from.
-                    let Some(stand_cell) = nearest_standable_neighbor(target_cell, foot, &world)
-                    else {
-                        info!(
-                            npc = npc_id.0,
-                            target = ?target_cell.to_array(),
-                            "no standable neighbour of consumable; parking briefly",
-                        );
-                        brain.goal = Goal::Resting {
-                            remaining_secs: MIN_REST_SECS,
-                        };
-                        *intent = MovementIntent::default();
-                        continue;
-                    };
-                    let duration = consumable
-                        .duration_secs
-                        .clamp(MIN_CONSUME_DURATION_SECS, MAX_CONSUME_DURATION_SECS);
-                    // Already standing where we'd path to: no MoveTo
-                    // needed, fire the consumption timer immediately.
-                    // Common when the planner re-targets the same
-                    // basket on a subsequent tick and the NPC hasn't
-                    // moved, or when the NPC happens to wander into the
-                    // standable cell before the planner runs.
-                    if stand_cell == foot {
-                        if !npc_path.0.is_empty() {
-                            npc_path.0.clear();
-                        }
-                        brain.goal = Goal::Consuming {
-                            remaining_secs: duration,
-                            need: consumable.need.clone(),
-                            restores: consumable.restores,
-                            target_cell,
-                        };
-                        *intent = MovementIntent::default();
-                        continue;
-                    }
-                    let path = find_path(
-                        foot,
-                        stand_cell,
-                        &world,
-                        ASTAR_NODE_BUDGET,
-                        ASTAR_PATH_BUDGET,
-                    )
-                    .map(|raw| smooth_path(raw, &world))
-                    .filter(|p| p.len() >= 2);
-                    match path {
-                        Some(path) => {
-                            npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal = Goal::MoveTo {
-                                path,
-                                progress: 0.0,
-                                deadline_secs: timeout,
-                                last_pos: pose.translation,
-                                stuck_secs: 0.0,
-                                on_arrive: ArrivalAction::Consume {
-                                    need: consumable.need.clone(),
-                                    restores: consumable.restores,
-                                    duration_secs: duration,
-                                    target_cell,
-                                },
-                                snap: None,
-                            };
-                        }
-                        None => {
-                            warn!(
-                                npc = npc_id.0,
-                                foot = ?foot.to_array(),
-                                target = ?target_cell.to_array(),
-                                stand = ?stand_cell.to_array(),
-                                "consume failed: no A* path to standable neighbour, parking briefly"
-                            );
                             if !npc_path.0.is_empty() {
                                 npc_path.0.clear();
                             }
@@ -1623,7 +1458,7 @@ fn npc_brain_tick(
                     dyaw,
                 };
             }
-            Goal::Consuming { target_cell, .. } | Goal::Working { target_cell, .. } => {
+            Goal::Working { target_cell, .. } => {
                 let aim = waypoint_xz(*target_cell);
                 let Some(dyaw) = aim_yaw_step(pose_xz, pose.yaw, aim, dt) else {
                     *intent = MovementIntent::default();
@@ -1637,15 +1472,33 @@ fn npc_brain_tick(
                     dyaw,
                 };
             }
-            // Sleeping deliberately doesn't aim_yaw_step: the body yaw
-            // was snapped to the bed orientation at goal-entry by
-            // `sleep_yaw_for`, and a sleeping NPC standing *on* the
-            // bed has aim == pose, so the step would no-op anyway —
-            // but if arrival ever lands them off-cell (low ceiling
-            // fallback, edge of cell), aiming at the bed cell would
-            // drift their yaw away from the bed orientation toward
-            // facing-the-cell, which reads as random angles.
-            Goal::Sleeping { .. } | Goal::Idle | Goal::Resting { .. } => {
+            Goal::Interacting { target_cell, .. } => {
+                // Locked interactions (snapped onto a use_slot pose)
+                // freeze yaw — the snap already chose the right
+                // direction and aiming at the target cell would
+                // drift the yaw away when the snap landed the NPC
+                // off the target cell's centre. Unlocked
+                // interactions (consume-pattern stand-and-wait)
+                // face the target so the body visibly engages
+                // with the block.
+                if is_locked {
+                    *intent = MovementIntent::default();
+                } else {
+                    let aim = waypoint_xz(*target_cell);
+                    let Some(dyaw) = aim_yaw_step(pose_xz, pose.yaw, aim, dt) else {
+                        *intent = MovementIntent::default();
+                        continue;
+                    };
+                    *intent = MovementIntent {
+                        wishdir: [0, 0, 0],
+                        jump: false,
+                        toggle_mode: false,
+                        interact: false,
+                        dyaw,
+                    };
+                }
+            }
+            Goal::Idle | Goal::Resting { .. } => {
                 *intent = MovementIntent::default();
             }
         }
@@ -1740,9 +1593,8 @@ fn build_snapshot(
     pose: &AvatarPose,
     needs: &Needs,
     rooms: &RoomMap,
-    consumables: &ConsumableIndex,
-    sleepers: &SleeperIndex,
-    bed_claims: &BedClaims,
+    interactables: &InteractableIndex,
+    interaction_claims: &InteractionClaims,
     plans: &Plans,
     plan_claims: &PlanClaims,
     chunk_entities: &Query<&'static ChunkEntities>,
@@ -1752,23 +1604,16 @@ fn build_snapshot(
 ) -> NpcSnapshot {
     let foot = pose_to_foot_cell(pose);
     let nearby_rooms = collect_nearby_rooms(rooms, foot, SNAPSHOT_ROOM_LIMIT);
-    let nearby_consumables = collect_nearby_consumables(
-        consumables,
-        block_registry,
-        foot,
-        SNAPSHOT_CONSUMABLE_RADIUS_CELLS,
-        SNAPSHOT_CONSUMABLE_LIMIT,
-    );
-    let nearby_sleepers = collect_nearby_sleepers(
-        sleepers,
-        bed_claims,
+    let nearby_interactions = collect_nearby_interactions(
+        interactables,
+        interaction_claims,
         block_registry,
         chunk_entities,
         chunk_map,
         id,
         foot,
-        SNAPSHOT_SLEEPER_RADIUS_CELLS,
-        SNAPSHOT_SLEEPER_LIMIT,
+        SNAPSHOT_INTERACTION_RADIUS_CELLS,
+        SNAPSHOT_INTERACTION_LIMIT,
     );
     let nearby_plans = collect_nearby_plans(
         plans,
@@ -1788,8 +1633,7 @@ fn build_snapshot(
         },
         needs: needs.0.clone(),
         nearby_rooms,
-        nearby_consumables,
-        nearby_sleepers,
+        nearby_interactions,
         nearby_plans,
         is_night: world_clock.is_night(),
     }
@@ -1833,66 +1677,6 @@ fn collect_nearby_plans(
         });
     }
     out.sort_by_key(|p| p.distance);
-    out.truncate(limit);
-    out
-}
-
-/// K nearest *unclaimed* beds within `radius_cells` (Chebyshev) of
-/// `foot`, one entry per bed (not per cell). Multi-cell beds appear
-/// in [`SleeperIndex`] once per cell (foot + head); collapsing to one
-/// entry per anchor is what makes the claim check correct — without
-/// it, a claimed bed's *anchor* cell filters out as taken but its
-/// non-anchor cells still look free, so planners route to the same
-/// bed from a different cell and the brain's `try_claim` rejects
-/// them in a loop.
-///
-/// The emitted entry uses the anchor cell as its target (the brain's
-/// Sleep handler re-resolves it to the same anchor anyway) so the
-/// planner-side pick already names the claim key.
-fn collect_nearby_sleepers(
-    index: &SleeperIndex,
-    bed_claims: &BedClaims,
-    block_registry: &BlockRegistry,
-    chunk_entities: &Query<&'static ChunkEntities>,
-    chunk_map: &ChunkMap,
-    self_id: NpcId,
-    foot: IVec3,
-    radius_cells: i32,
-    limit: usize,
-) -> Vec<NearbySleeper> {
-    let mut seen_anchors: HashSet<IVec3> = HashSet::new();
-    let mut out: Vec<NearbySleeper> = Vec::new();
-    for (cell, slot) in index.iter_within(foot, radius_cells) {
-        let Some(s) = block_registry.def(slot).sleeper.as_ref() else {
-            continue;
-        };
-        let anchor = resolve_anchor_cell(cell, chunk_entities, chunk_map);
-        // Dedupe: a 2-cell bed's foot + head both index into the same
-        // anchor. Only emit one entry per bed.
-        if !seen_anchors.insert(anchor) {
-            continue;
-        }
-        // Filter beds claimed by *other* NPCs. Keying on anchor (not
-        // cell) is what fixes the multi-cell-bed contention bug —
-        // checking just the iterator's `cell` lets the head cell of
-        // a claimed bed look free even when the foot is taken.
-        if bed_claims.is_taken_by_other(anchor, self_id) {
-            continue;
-        }
-        let d = anchor - foot;
-        let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
-        out.push(NearbySleeper {
-            cell: BlockPos {
-                x: anchor.x,
-                y: anchor.y,
-                z: anchor.z,
-            },
-            need: s.need.clone(),
-            restores: s.restores,
-            distance,
-        });
-    }
-    out.sort_by_key(|s| s.distance);
     out.truncate(limit);
     out
 }
@@ -1960,18 +1744,18 @@ fn resolve_anchor_with_orientation(
     }
 }
 
-/// Resolve a sleeper-bearing block at a cell, returning its
-/// [`Sleeper`] metadata, optional [`UseSlot`], and id (for log lines).
-/// `None` when the cell is empty, the chunk isn't loaded, or the def
-/// has no sleeper metadata. Pulled into one lookup so the planner
-/// commit path doesn't make three separate trips through the same
-/// chunk + registry.
-fn sleeper_with_slot_at_cell(
+/// Resolve an interactable-bearing block at a cell, returning its
+/// [`Interactable`] metadata, optional [`UseSlot`], and id (for log
+/// lines). `None` when the cell is empty, the chunk isn't loaded,
+/// or the def has no interactable metadata. Pulled into one lookup
+/// so the planner commit path doesn't make three separate trips
+/// through the same chunk + registry.
+fn interactable_with_slot_at_cell(
     cell: IVec3,
     chunks: &Query<&Chunk>,
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
-) -> Option<(Sleeper, Option<UseSlot>, block_junk_mod_api::blocks::BlockId)> {
+) -> Option<(Interactable, Option<UseSlot>, block_junk_mod_api::blocks::BlockId)> {
     let (coord, local) = world_to_chunk(cell);
     let entity = *chunk_map.0.get(&coord)?;
     let chunk = chunks.get(entity).ok()?;
@@ -1980,8 +1764,8 @@ fn sleeper_with_slot_at_cell(
         return None;
     }
     let def = registry.def(slot);
-    let sleeper = def.sleeper.clone()?;
-    Some((sleeper, def.use_slot.clone(), def.id.clone()))
+    let interactable = def.interactable.clone()?;
+    Some((interactable, def.use_slot.clone(), def.id.clone()))
 }
 
 /// Pick a stand cell + (optional) snap for a goal whose target block
@@ -2163,71 +1947,80 @@ fn compute_use_slot_snap(slot: &UseSlot, anchor_cell: IVec3, orientation: Cardin
     UseSlotSnap { translation, yaw }
 }
 
-/// K nearest consumable cells within `radius_cells` (Chebyshev) of
-/// `foot`. Each entry pulls its `need` + `restores` from the block's
-/// [`Consumable`](Consumable) def via the registry — the index only
-/// stores `(cell, BlockSlot)` to avoid duplicating data that ultimately
-/// lives in the def.
+/// K nearest interactable cells within `radius_cells` (Chebyshev) of
+/// `foot`, one entry per *block* (collapsed by anchor so multi-cell
+/// interactables don't appear twice). Each entry pulls its
+/// `need_restore` and `exclusive` from the block's
+/// [`Interactable`](block_junk_mod_api::blocks::Interactable) def via
+/// the registry — the index only stores `(cell, BlockSlot)` to avoid
+/// duplicating data that ultimately lives in the def.
 ///
-/// Distance is Manhattan (consistent with `nearby_rooms.distance`); the
-/// radius filter uses Chebyshev because that matches how the index's
-/// internal `iter_within` is bounded. The two metrics agree on "closer
-/// is closer" for ranking purposes.
-fn collect_nearby_consumables(
-    index: &ConsumableIndex,
+/// **Already filtered**: exclusive interactables currently claimed
+/// by a different NPC are excluded. Race-on-claim is still possible
+/// (two planners tick the same instant) but resolved atomically at
+/// the brain's `try_claim` step.
+///
+/// Distance is Manhattan (consistent with `nearby_rooms.distance`);
+/// the radius filter uses Chebyshev because that matches how the
+/// index's `iter_within` is bounded.
+#[allow(clippy::too_many_arguments, reason = "merges per-cell + per-anchor lookups")]
+fn collect_nearby_interactions(
+    index: &InteractableIndex,
+    claims: &InteractionClaims,
     block_registry: &BlockRegistry,
+    chunk_entities: &Query<&'static ChunkEntities>,
+    chunk_map: &ChunkMap,
+    self_id: NpcId,
     foot: IVec3,
     radius_cells: i32,
     limit: usize,
-) -> Vec<NearbyConsumable> {
-    let mut out: Vec<NearbyConsumable> = index
-        .iter_within(foot, radius_cells)
-        .filter_map(|(cell, slot)| {
-            // Defensive: the index *should* never carry a slot whose def
-            // lacks `consumable`, but the path from CellEdit insert →
-            // def lookup goes through the registry once and the data
-            // here a second time; if a future mod-reload path changes a
-            // block to no longer be consumable while a stale index
-            // entry remains, we just skip rather than panic.
-            let c = block_registry.def(slot).consumable.as_ref()?;
-            let d = cell - foot;
-            let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
-            Some(NearbyConsumable {
-                cell: BlockPos {
-                    x: cell.x,
-                    y: cell.y,
-                    z: cell.z,
-                },
-                need: c.need.clone(),
-                restores: c.restores,
-                distance,
-            })
-        })
-        .collect();
-    out.sort_by_key(|c| c.distance);
+) -> Vec<NearbyInteraction> {
+    let mut seen_anchors: HashSet<IVec3> = HashSet::new();
+    let mut out: Vec<NearbyInteraction> = Vec::new();
+    for (cell, slot) in index.iter_within(foot, radius_cells) {
+        let Some(i) = block_registry.def(slot).interactable.as_ref() else {
+            // Defensive: stale index entry whose def is no longer
+            // interactable (would happen if a future mod-reload
+            // changed metadata under us). Just skip.
+            continue;
+        };
+        let anchor = resolve_anchor_cell(cell, chunk_entities, chunk_map);
+        // Collapse multi-cell blocks to one entry. Without this a
+        // 2-cell bed's foot + head both surface as separate
+        // candidates and a planner that already routed to the
+        // anchor still sees the "other" cell as available.
+        if !seen_anchors.insert(anchor) {
+            continue;
+        }
+        // Exclusive + taken by someone else ⇒ exclude. Non-
+        // exclusive blocks ignore claims entirely (anyone may use
+        // a water well at the same time).
+        if i.exclusive && claims.is_taken_by_other(anchor, self_id) {
+            continue;
+        }
+        let d = anchor - foot;
+        let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
+        let (need, restores) = match &i.need_restore {
+            Some(nr) => (Some(nr.need.clone()), nr.restores),
+            None => (None, 0.0),
+        };
+        out.push(NearbyInteraction {
+            cell: BlockPos {
+                x: anchor.x,
+                y: anchor.y,
+                z: anchor.z,
+            },
+            need,
+            restores,
+            exclusive: i.exclusive,
+            distance,
+        });
+    }
+    out.sort_by_key(|n| n.distance);
     out.truncate(limit);
     out
 }
 
-/// Resolve the [`Consumable`] at a world cell, if any. Returns `None`
-/// when the cell is empty, the chunk isn't loaded, or the block's def
-/// has no `consumable` metadata. Used by the Consume goal handler to
-/// re-validate the planner's choice against current world state.
-fn consumable_at_cell(
-    cell: IVec3,
-    chunks: &Query<&Chunk>,
-    chunk_map: &ChunkMap,
-    registry: &BlockRegistry,
-) -> Option<Consumable> {
-    let (coord, local) = world_to_chunk(cell);
-    let entity = *chunk_map.0.get(&coord)?;
-    let chunk = chunks.get(entity).ok()?;
-    let slot = chunk.get(local);
-    if slot.is_empty() {
-        return None;
-    }
-    registry.def(slot).consumable.clone()
-}
 
 /// Find a standable cell adjacent to `target` that an NPC can stand on
 /// while interacting with `target`. Consumables are typically solid

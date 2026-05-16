@@ -8,16 +8,19 @@
 -- a goal). Return value is the next abstract goal the engine should
 -- execute. Possible shapes:
 --
---   { kind = "idle" }                            — defer to next tick (engine arms a short rest)
+--   { kind = "idle" }                              — defer to next tick (engine arms a short rest)
 --   { kind = "wander", radius_cells = N, timeout_secs = T }
 --   { kind = "rest",   duration_secs = T }
---   { kind = "goto",    cell = {x,y,z}, timeout_secs = T }
---   { kind = "consume", cell = {x,y,z}, timeout_secs = T }
+--   { kind = "goto",     cell = {x,y,z}, timeout_secs = T }
+--   { kind = "interact", cell = {x,y,z}, timeout_secs = T }
+--   { kind = "work_plan", cell = {x,y,z}, timeout_secs = T }
 --
 -- The native brain side already handles path selection, A*, steering,
--- stuck-detection, consumption duration, and physics; the planner only
--- chooses between these primitives. Adding new primitives requires
--- engine-side support.
+-- stuck-detection, interaction duration, and physics; the planner only
+-- chooses between these primitives. New interaction *kinds* (eat,
+-- sleep, enchant, sit) don't need a new primitive — they're all
+-- `interact`, distinguished by the block def's `interactable`
+-- metadata, which the engine reads when committing the goal.
 
 -- Per-NPC bookkeeping. Keyed by snapshot.id (the engine guarantees this
 -- is stable across save/load and unique between live NPCs); we use it
@@ -59,28 +62,17 @@ local WORK_THRESHOLD = 0.3
 -- demolished rooms are noticed by the next planner call.
 local VISIT_PROBABILITY = 0.5
 
--- Pick the nearest consumable that addresses `need_id` above the
--- threshold, if any. `snapshot.nearby_consumables` is engine-sorted
--- nearest-first so the first match is the closest; we don't have to
--- sort or score beyond the need-id filter today. Returns the cell
--- table the engine will path to.
-local function nearest_consumable_for(snapshot, need_id)
-    for _, c in ipairs(snapshot.nearby_consumables) do
-        if c.need == need_id then
-            return c.cell
-        end
-    end
-    return nil
-end
-
--- Mirror of `nearest_consumable_for` for sleepers. The engine already
--- excludes beds claimed by other NPCs, so the first match is one this
--- NPC could actually claim (modulo the rare same-tick race the engine
--- catches at try_claim time).
-local function nearest_sleeper_for(snapshot, need_id)
-    for _, s in ipairs(snapshot.nearby_sleepers) do
-        if s.need == need_id then
-            return s.cell
+-- Pick the nearest interactable whose `need_restore.need` is
+-- `need_id`, if any. `snapshot.nearby_interactions` is engine-sorted
+-- nearest-first and already filters out exclusive entries claimed by
+-- another NPC, so the first match is one this NPC could actually
+-- claim (modulo the rare same-tick race the engine catches at
+-- try_claim). Returns the cell table the engine will path to, or
+-- nil if no nearby interactable serves this need.
+local function nearest_interaction_for(snapshot, need_id)
+    for _, n in ipairs(snapshot.nearby_interactions) do
+        if n.need == need_id then
+            return n.cell
         end
     end
     return nil
@@ -98,12 +90,15 @@ local function nearest_plan(snapshot)
 end
 
 engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
-    -- snapshot.id                — stable u64 id of this NPC (table key)
-    -- snapshot.kind              — NpcKindId we registered
-    -- snapshot.foot              — { x, y, z } NPC's current foot cell
-    -- snapshot.needs             — table keyed by need id (e.g. needs.hunger)
-    -- snapshot.nearby_rooms      — sorted nearest-first list
-    -- snapshot.nearby_consumables — sorted nearest-first list
+    -- snapshot.id                  — stable u64 id of this NPC (table key)
+    -- snapshot.kind                 — NpcKindId we registered
+    -- snapshot.foot                 — { x, y, z } NPC's current foot cell
+    -- snapshot.needs                — table keyed by need id (e.g. needs.hunger)
+    -- snapshot.nearby_rooms         — sorted nearest-first list
+    -- snapshot.nearby_interactions  — sorted nearest-first list of every
+    --                                 reachable interactable; each entry
+    --                                 has `need` (string or nil),
+    --                                 `restores`, and `exclusive`.
 
     -- Highest priority: tired-at-night with a free bed reachable.
     -- The night gate is what stops NPCs from collapsing into a bed at
@@ -112,13 +107,18 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- Ordered above hunger so a tired hungry NPC sleeps now and eats
     -- in the morning (a tired NPC mid-meal at sunrise would be
     -- disorienting to watch; the simple rule reads cleaner).
+    --
+    -- The planner doesn't distinguish "consume" from "sleep" at the
+    -- emit step — both are `interact` against an interactable whose
+    -- need_restore.need matches. The engine reads the block def to
+    -- find duration, exclusivity, and slot data.
     local sleep_need = snapshot.needs.sleep or 0.0
     if snapshot.is_night and sleep_need >= SLEEP_THRESHOLD then
-        local bed_cell = nearest_sleeper_for(snapshot, "sleep")
+        local bed_cell = nearest_interaction_for(snapshot, "sleep")
         if bed_cell ~= nil then
             last_action[snapshot.id] = "sleep"
             return {
-                kind = "sleep",
+                kind = "interact",
                 cell = bed_cell,
                 timeout_secs = 60.0,
             }
@@ -134,11 +134,11 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- way to fix it.
     local hunger = snapshot.needs.hunger or 0.0
     if hunger >= HUNGER_THRESHOLD then
-        local food_cell = nearest_consumable_for(snapshot, "hunger")
+        local food_cell = nearest_interaction_for(snapshot, "hunger")
         if food_cell ~= nil then
             last_action[snapshot.id] = "consume"
             return {
-                kind = "consume",
+                kind = "interact",
                 cell = food_cell,
                 timeout_secs = 30.0,
             }

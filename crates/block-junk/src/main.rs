@@ -3,9 +3,9 @@ mod blocks;
 mod camera;
 mod client;
 mod collision;
-mod consumables;
 mod debug;
 mod inspect_panel;
+mod interactables;
 mod menu;
 mod network;
 mod npc;
@@ -21,7 +21,6 @@ mod rooms;
 mod save;
 mod scripting;
 mod server;
-mod sleepers;
 mod target_outline;
 mod voxel;
 
