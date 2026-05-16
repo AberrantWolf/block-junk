@@ -64,6 +64,7 @@ fn draw_plan_outlines(plans: Res<Plans>, mut gizmos: Gizmos) {
 
 fn draw_target_outline(
     mode: Res<PlayerMode>,
+    keys: Res<ButtonInput<KeyCode>>,
     cam: Query<&GlobalTransform, With<Camera3d>>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
@@ -80,10 +81,22 @@ fn draw_target_outline(
         return;
     };
 
+    // Outline cell = where the next click's *result* lands. For builder
+    // semantics that's the empty cell on the outward face in Build mode,
+    // and in Plan mode when Shift is held (= tag-build verb). For
+    // Destroy / plain-L Plan / Select, the next click acts on the cell
+    // under the cursor itself.
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let target = match *mode {
+        PlayerMode::Build => hit.cell + hit.face_normal,
+        PlayerMode::Plan if shift => hit.cell + hit.face_normal,
+        _ => hit.cell,
+    };
+
     // Voxel cells are unit cubes with `cell` as the integer min corner.
     // Gizmos::cube uses the transform origin as the cube *centre*, so
     // shift by half a unit on each axis to land on the cell.
-    let centre = hit.cell.as_vec3() + Vec3::splat(0.5);
+    let centre = target.as_vec3() + Vec3::splat(0.5);
     let colour = match *mode {
         PlayerMode::Select => Color::srgb(1.0, 1.0, 1.0),
         PlayerMode::Plan => Color::srgb(1.0, 0.85, 0.2),
