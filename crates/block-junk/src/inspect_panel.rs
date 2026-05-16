@@ -156,7 +156,7 @@ fn handle_inspect_input(
     // distance as the centre of the cell — close enough for tie-
     // breaking under normal play (mistargets dissolve once we add
     // proper picking later).
-    let block_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, &chunks, &chunk_map, &registry);
+    let block_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, &chunks, &chunk_map, &registry, None);
     let npc_hit = raycast_npcs(origin, dir, RAYCAST_REACH, &npcs);
 
     let block_dist = block_hit.as_ref().map(|h| {

@@ -245,6 +245,17 @@ fn plan_mode_input(
             // too — Shift+L on a wall, the rectangle expands across
             // the wall face, and each rect cell's outward neighbour
             // gets tagged-build.
+            //
+            // Remove sees through cells already tagged for removal so
+            // the player can stack tags through a wall. Build keeps
+            // current behaviour — its outward offset would otherwise
+            // land on a still-solid Remove cell, which the server
+            // rejects anyway. Cancel needs to land on the tagged cell
+            // itself to clear it.
+            let skip_plan_remove: Option<&Plans> = match verb {
+                DragVerb::Remove => Some(&plans),
+                DragVerb::Build | DragVerb::Cancel => None,
+            };
             let Some(hit) = entity_aware_raycast(
                 origin,
                 dir,
@@ -252,6 +263,7 @@ fn plan_mode_input(
                 &chunks,
                 &chunk_map,
                 &registry,
+                skip_plan_remove,
             ) else {
                 // Cancel falls back to the plan-aware raycast so a
                 // floating-in-air Build tag can still be one-shot

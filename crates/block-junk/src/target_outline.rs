@@ -70,6 +70,7 @@ fn draw_target_outline(
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
+    plans: Res<Plans>,
     mut gizmos: Gizmos,
 ) {
     // During an in-flight Plan-mode drag the rectangle preview is the
@@ -84,8 +85,24 @@ fn draw_target_outline(
     };
     let origin = cam_t.translation();
     let dir = *cam_t.forward();
-    let Some(hit) = entity_aware_raycast(origin, dir, RAYCAST_REACH, &chunks, &chunk_map, &registry)
-    else {
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    // Plan-mode Remove preview (L without Shift) sees through tagged-
+    // remove cells, matching `plan_mode_input`. Build preview keeps
+    // the cursor on the actually-visible block so it can offset
+    // outward correctly.
+    let skip_plan_remove: Option<&Plans> = match (*mode, shift) {
+        (PlayerMode::Plan, false) => Some(&plans),
+        _ => None,
+    };
+    let Some(hit) = entity_aware_raycast(
+        origin,
+        dir,
+        RAYCAST_REACH,
+        &chunks,
+        &chunk_map,
+        &registry,
+        skip_plan_remove,
+    ) else {
         return;
     };
 
@@ -94,7 +111,6 @@ fn draw_target_outline(
     // and in Plan mode when Shift is held (= tag-build verb). For
     // Destroy / plain-L Plan / Select, the next click acts on the cell
     // under the cursor itself.
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let target = match *mode {
         PlayerMode::Build => hit.cell + hit.face_normal,
         PlayerMode::Plan if shift => hit.cell + hit.face_normal,
