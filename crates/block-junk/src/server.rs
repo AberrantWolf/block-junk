@@ -11,9 +11,9 @@ use lightyear::prelude::*;
 use lightyear::input::native::prelude::*;
 
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
-use crate::collision::WorldCollision;
+use crate::collision::{Aabb, WorldCollision};
 use crate::menu::{ServerSaveConfig, ServerSaveRequestFlag, ServerShutdownFlag};
-use crate::physics::apply_walk_step;
+use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
 use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
@@ -99,7 +99,11 @@ impl Plugin for ServerPlugin {
         // client mirrors drop the now-stale outline.
         app.add_systems(
             Update,
-            (apply_npc_work, auto_clear_stale_plans)
+            (
+                apply_npc_work,
+                auto_clear_stale_plans,
+                push_actors_out_of_new_blocks,
+            )
                 .chain()
                 .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
@@ -1235,6 +1239,129 @@ fn auto_clear_stale_plans(
             &NetworkTarget::All,
         ) {
             warn!("auto-clear PlanEdit broadcast failed: {err}");
+        }
+    }
+}
+
+/// Push any actor (player or NPC) out of a cell that just became solid.
+///
+/// Observed when an NPC finishes a Build plan while their head cell is
+/// the build target — `PATH_ARRIVE_RADIUS` is wider than the body, and
+/// the standable-neighbour picker only checks the foot's cell, so a
+/// body straddling target_cell vertically is possible. After the
+/// block lands, the body is embedded.
+///
+/// Mechanism: listens to the same `CellEdit` bus as
+/// `auto_clear_stale_plans`. For each cell that became blocking (solid +
+/// !walkable_boundary), find every actor whose AABB overlaps and pick
+/// the smallest axis-aligned push **whose destination is itself clear of
+/// other solids** — earlier versions picked the unconditionally-smallest
+/// push and could shove an actor sideways into an adjacent wall, leaving
+/// them embedded with no further `CellEdit` to trigger another rescue.
+/// Tiny `PUSH_EPS` clears the face cleanly so the next collision sweep
+/// doesn't re-detect overlap.
+///
+/// General by design: also fixes the case where a player Build-mode
+/// places a block on a tile their predicted owner avatar happens to
+/// straddle, and any future case (explosions, falling-block sim, etc.)
+/// where a cell goes from empty to solid under an actor.
+fn push_actors_out_of_new_blocks(
+    mut reader: MessageReader<CellEdit>,
+    registry: Res<BlockRegistry>,
+    chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    mut actors: Query<&mut AvatarPose>,
+) {
+    /// Microscopic gap left between the actor's face and the cell's
+    /// face after a push. Without it, the next sweep finds them
+    /// exactly touching, classifies that as overlap, and re-pushes.
+    const PUSH_EPS: f32 = 1e-3;
+
+    let world = WorldCollision {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+
+    for edit in reader.read() {
+        if edit.slot.is_empty() {
+            continue;
+        }
+        let def = registry.def(edit.slot);
+        if !def.flags.solid || def.flags.walkable_boundary {
+            continue;
+        }
+        let cell = edit.world;
+        let cell_min = cell.as_vec3();
+        let cell_max = cell_min + Vec3::ONE;
+        for mut pose in actors.iter_mut() {
+            let centre = pose.translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
+            let aabb_min = centre - PLAYER_HALF_EXTENTS;
+            let aabb_max = centre + PLAYER_HALF_EXTENTS;
+            if aabb_max.x <= cell_min.x || aabb_min.x >= cell_max.x {
+                continue;
+            }
+            if aabb_max.y <= cell_min.y || aabb_min.y >= cell_max.y {
+                continue;
+            }
+            if aabb_max.z <= cell_min.z || aabb_min.z >= cell_max.z {
+                continue;
+            }
+            // Per-face escape distance. Each is the signed delta that
+            // would just clear the actor's relevant face past the cell
+            // face on the same axis.
+            let mut candidates = [
+                Vec3::new(cell_min.x - aabb_max.x - PUSH_EPS, 0.0, 0.0),
+                Vec3::new(cell_max.x - aabb_min.x + PUSH_EPS, 0.0, 0.0),
+                Vec3::new(0.0, cell_min.y - aabb_max.y - PUSH_EPS, 0.0),
+                Vec3::new(0.0, cell_max.y - aabb_min.y + PUSH_EPS, 0.0),
+                Vec3::new(0.0, 0.0, cell_min.z - aabb_max.z - PUSH_EPS),
+                Vec3::new(0.0, 0.0, cell_max.z - aabb_min.z + PUSH_EPS),
+            ];
+            // Sort smallest-first, then take the first push that lands
+            // the actor in a region clear of all solids. The unfiltered-
+            // smallest pick was the bug — it could shove the actor into
+            // an adjacent wall and the second-embedment had no CellEdit
+            // to re-trigger a rescue.
+            candidates.sort_by(|a, b| {
+                a.length_squared()
+                    .partial_cmp(&b.length_squared())
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            });
+            let chosen = candidates.iter().copied().find(|push| {
+                let new_min = aabb_min + *push;
+                let new_max = aabb_max + *push;
+                let region = Aabb::from_min_max(new_min, new_max);
+                let solids = world.candidates(region);
+                !solids.iter().any(|s| {
+                    new_max.x > s.min.x
+                        && new_min.x < s.max.x
+                        && new_max.y > s.min.y
+                        && new_min.y < s.max.y
+                        && new_max.z > s.min.z
+                        && new_min.z < s.max.z
+                })
+            });
+            match chosen {
+                Some(push) => {
+                    pose.translation += push;
+                    info!(
+                        cell = ?cell.to_array(),
+                        push = ?push.to_array(),
+                        "pushed actor out of newly-solid cell",
+                    );
+                }
+                None => {
+                    // Sealed pocket — every escape direction is also
+                    // solid. Better to leave the actor in place and
+                    // surface the situation than teleport blindly.
+                    warn!(
+                        cell = ?cell.to_array(),
+                        actor_centre = ?centre.to_array(),
+                        "no clear push direction — actor remains embedded; pathfinding will fail",
+                    );
+                }
+            }
         }
     }
 }
