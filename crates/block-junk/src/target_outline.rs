@@ -19,7 +19,7 @@ use bevy::prelude::*;
 use crate::blocks::BlockRegistry;
 use crate::client::{RAYCAST_REACH, entity_aware_raycast};
 use crate::menu::AppState;
-use crate::plans::Plans;
+use crate::plans::{PlanDragState, Plans};
 use crate::player_mode::PlayerMode;
 use crate::protocol::{GameSet, PlanKind};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
@@ -65,12 +65,20 @@ fn draw_plan_outlines(plans: Res<Plans>, mut gizmos: Gizmos) {
 fn draw_target_outline(
     mode: Res<PlayerMode>,
     keys: Res<ButtonInput<KeyCode>>,
+    drag: Res<PlanDragState>,
     cam: Query<&GlobalTransform, With<Camera3d>>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
     mut gizmos: Gizmos,
 ) {
+    // During an in-flight Plan-mode drag the rectangle preview is the
+    // authoritative indicator; the cursor wireframe would just chase
+    // background blocks and add noise. The drag preview gizmo takes
+    // over until release.
+    if drag.active.is_some() {
+        return;
+    }
     let Ok(cam_t) = cam.single() else {
         return;
     };
