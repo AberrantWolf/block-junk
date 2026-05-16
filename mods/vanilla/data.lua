@@ -28,6 +28,7 @@ register {
         support_below = true,
     },
     color = { 0.55, 0.55, 0.58 },
+    pattern = "speckle",
 }
 
 register {
@@ -39,6 +40,7 @@ register {
         support_below = true,
     },
     color = { 0.45, 0.32, 0.20 },
+    pattern = "noise",
 }
 
 register {
@@ -50,6 +52,7 @@ register {
         support_below = true,
     },
     color = { 0.36, 0.62, 0.30 },
+    pattern = "noise",
 }
 
 register {
@@ -61,6 +64,7 @@ register {
         support_below = true,
     },
     color = { 0.55, 0.40, 0.22 },
+    pattern = "planks",
 }
 
 register {
@@ -72,6 +76,7 @@ register {
         support_below = true,
     },
     color = { 0.20, 0.50, 0.25 },
+    pattern = "leaves",
 }
 
 -- Doors. `walkable_boundary` marks them as access points the room
@@ -88,6 +93,7 @@ register {
         support_below = true,
     },
     color = { 0.40, 0.18, 0.05 },
+    pattern = "door",
 }
 
 -- KayKit "bed_single_A" mesh. The asset's local frame is the KayKit

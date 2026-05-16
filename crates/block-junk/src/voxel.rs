@@ -196,14 +196,21 @@ impl Chunk {
             .zip(RIGHT_HANDED_Y_UP_CONFIG.faces.iter())
         {
             for quad in group {
-                // Look up the block this quad belongs to so each face's
-                // four verts get the right colour (Bevy's StandardMaterial
-                // multiplies vertex colour by base_color when ATTRIBUTE_COLOR
-                // is present).
+                // Encode the block slot in the vertex colour's alpha
+                // channel: `slot.0 as f32 / 255.0`. The chunk fragment
+                // shader decodes this back to an integer and uses it to
+                // index the texture-2D-array. RGB stays at 1.0 so the
+                // base PBR colour multiply is a no-op (the texture
+                // provides the actual hue).
+                //
+                // Caps the placeable slot space at 255 — far above the
+                // ~10 block types vanilla ships and any plausible mod
+                // surface. A higher multiplier would erode rounding
+                // headroom on the f32 vertex-interpolated value.
                 let cell_idx = ChunkShape::linearize(quad.minimum) as usize;
                 let slot = voxels[cell_idx].slot;
-                let [r, g, b] = registry.def(slot).color;
-                let rgba = [r, g, b, 1.0];
+                let slot_a = (slot.0 as f32) / 255.0;
+                let rgba = [1.0, 1.0, 1.0, slot_a];
 
                 indices.extend_from_slice(&face.quad_mesh_indices(positions.len() as u32));
                 positions.extend_from_slice(&face.quad_mesh_positions(quad, 1.0));

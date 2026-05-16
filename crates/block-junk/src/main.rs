@@ -1,3 +1,4 @@
+mod block_textures;
 mod blocks;
 mod camera;
 mod client;

@@ -113,10 +113,18 @@ pub struct BlockDef {
     /// [`TagId`] for the namespace convention.
     #[serde(default)]
     pub tags: Vec<TagId>,
-    /// Per-vertex tint for voxel-meshed blocks; also the swatch colour in
-    /// the hotbar UI. Ignored when `mesh` is `Some`. RGB only — alpha is
-    /// added at the render call site.
+    /// Base colour for the block's procedurally-generated 16×16 texture and
+    /// the hotbar icon. Ignored when `mesh` is `Some` (mesh blocks bring
+    /// their own materials). RGB only — alpha is added at the render call
+    /// site.
     pub color: [f32; 3],
+    /// Procedural pattern applied over `color` when generating the block's
+    /// texture and hotbar icon. See the `Pattern` enum in
+    /// `block_textures.rs` for the recognised values. `None` defaults to
+    /// `"noise"` (a subtle per-pixel jitter) — a uniform colour reads as
+    /// flat, which is the look this whole field exists to fix.
+    #[serde(default)]
+    pub pattern: Option<String>,
     /// Optional asset path for a non-cube visual. When set, the client
     /// renders this block as a separate ECS entity loaded from the given
     /// glTF (or scene) path, instead of baking cube faces into the chunk

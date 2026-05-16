@@ -13,6 +13,7 @@ use bevy::scene::SceneInstanceReady;
 use lightyear::frame_interpolation::prelude::*;
 use lightyear::input::native::prelude::*;
 
+use crate::block_textures::{BlockTextures, BlockTextureExt, BlockTexturesPlugin, ChunkMaterial};
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
@@ -47,6 +48,10 @@ impl Plugin for ClientPlugin {
             // the same position for multiple frames between ticks.
             .add_plugins(FrameInterpolationPlugin::<AvatarPose>::default())
             .add_plugins(crate::scripting::ClientScriptingPlugin)
+            // BlockTexturesPlugin reads BlockRegistry in its build() to
+            // generate one 16×16 procedural texture per slot, so it must
+            // run after ClientScriptingPlugin (which inserts the registry).
+            .add_plugins(BlockTexturesPlugin)
             .add_plugins(crate::debug::DebugClientPlugin);
         // ClientScriptingPlugin inserts BlockRegistry. Derive client-side
         // resources from it.
@@ -359,7 +364,7 @@ fn setup_scene(
     mut anim_graphs: ResMut<Assets<AnimationGraph>>,
     asset_server: Res<AssetServer>,
     palette: Res<PlaceablePalette>,
-    registry: Res<BlockRegistry>,
+    textures: Res<BlockTextures>,
     existing: Option<Res<AvatarAssets>>,
 ) {
     // `OnEnter(InGame)` re-fires on every un-pause, but the scene
@@ -512,7 +517,10 @@ fn setup_scene(
         });
 
     // Hotbar on the right edge: vertical column of slots. Selected slot
-    // gets a white border via update_hotbar_highlight.
+    // gets a white border via update_hotbar_highlight. The inner image is
+    // the block's procedural 16×16 texture rendered at 32×32 with
+    // nearest-neighbour sampling (configured on the source `Image` in
+    // BlockTexturesPlugin) so the pattern reads as crisp pixel art.
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -531,7 +539,7 @@ fn setup_scene(
             })
             .with_children(|row| {
                 for (i, &slot) in palette.0.iter().enumerate() {
-                    let [r, g, b] = registry.def(slot).color;
+                    let icon = textures.icons[slot.0 as usize].clone();
                     row.spawn((
                         Node {
                             width: Val::Px(44.0),
@@ -545,14 +553,14 @@ fn setup_scene(
                         BackgroundColor(Color::srgba(0.1, 0.1, 0.1, 0.6)),
                         HotbarSlot(i),
                     ))
-                    .with_children(|slot| {
-                        slot.spawn((
+                    .with_children(|slot_parent| {
+                        slot_parent.spawn((
+                            ImageNode::new(icon),
                             Node {
                                 width: Val::Px(32.0),
                                 height: Val::Px(32.0),
                                 ..default()
                             },
-                            BackgroundColor(Color::srgb(r, g, b)),
                         ));
                     });
                 }
@@ -2138,16 +2146,10 @@ fn draw_npc_paths(mut gizmos: Gizmos, paths: Query<&NpcPath>) {
 fn mesh_chunks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<ChunkMaterial>>,
     registry: Res<BlockRegistry>,
-    chunks: Query<
-        (
-            Entity,
-            &Chunk,
-            Option<&MeshMaterial3d<StandardMaterial>>,
-        ),
-        Changed<Chunk>,
-    >,
+    textures: Res<BlockTextures>,
+    chunks: Query<(Entity, &Chunk, Option<&MeshMaterial3d<ChunkMaterial>>), Changed<Chunk>>,
 ) {
     for (entity, chunk, material) in chunks.iter() {
         let Some(mesh) = chunk.build_mesh(&registry) else {
@@ -2157,12 +2159,21 @@ fn mesh_chunks(
         let mut e = commands.entity(entity);
         e.insert(Mesh3d(mesh_handle));
         if material.is_none() {
-            // base_color WHITE so the per-vertex colours emitted by the
-            // mesher are passed through unmodulated; PBR still adds shading.
-            e.insert(MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::WHITE,
-                perceptual_roughness: 0.9,
-                ..default()
+            // base_color WHITE so the texture-array sample (which the
+            // extension writes into pbr_input.material.base_color) is
+            // unmodulated. PBR still applies sun + ambient on top.
+            e.insert(MeshMaterial3d(materials.add(ChunkMaterial {
+                base: StandardMaterial {
+                    base_color: Color::WHITE,
+                    perceptual_roughness: 0.9,
+                    ..default()
+                },
+                extension: BlockTextureExt {
+                    atlas: textures.array_handle.clone(),
+                    mask_atlas: textures.mask_atlas.clone(),
+                    ramp_atlas: textures.ramp_atlas.clone(),
+                    stacks: textures.stacks.clone(),
+                },
             })));
         }
     }
