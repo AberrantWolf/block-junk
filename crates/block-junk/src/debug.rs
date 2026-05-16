@@ -127,6 +127,7 @@ fn toggle_debug_panel(
 const BUMPABLE_NEEDS: &[(&str, &str)] = &[
     ("hunger", "Hunger"),
     ("sleep", "Tiredness"),
+    ("work", "Purpose"),
 ];
 
 fn debug_panel_ui(
