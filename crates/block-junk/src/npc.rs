@@ -73,9 +73,12 @@ pub struct NpcPath(pub Vec<IVec3>);
 
 /// Stable identifier for an NPC across save/load. Distinct from Bevy
 /// `Entity` because Entity values aren't preserved across reboots.
-/// Server-only today; allocated from a monotonic counter and exposed
-/// to mods in [`NpcSnapshot::id`].
-#[derive(Component, Clone, Copy, Debug)]
+/// Allocated server-side from a monotonic counter and exposed to mods
+/// in [`NpcSnapshot::id`]. Replicated so the client can refer to a
+/// specific NPC across the wire — needed for inspection requests
+/// (the client raycasts an entity, looks up the NpcId, and sends it
+/// to the server in a RequestNpcDetails).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NpcId(pub u64);
 
 /// Mod-namespaced kind, e.g. `vanilla:wanderer`. Selects which planner

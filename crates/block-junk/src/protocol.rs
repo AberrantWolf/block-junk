@@ -394,3 +394,29 @@ pub struct DebugBumpNeed {
     pub need: String,
     pub delta: f32,
 }
+
+/// Client → server: ask the server to dump the current authoritative
+/// state of one NPC so the requesting client's inspection panel can
+/// show needs, current goal, and goal target. `npc_id` mirrors
+/// [`crate::npc::NpcId`]'s inner u64 — kept as a plain u64 in the
+/// protocol so `protocol.rs` doesn't have to import `npc.rs` and
+/// invert the existing dependency.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct RequestNpcDetails {
+    pub npc_id: u64,
+}
+
+/// Server → client: targeted reply to a [`RequestNpcDetails`]. Sent on
+/// `WorldChannel` to the requesting connection only — clients don't
+/// see each other's inspection traffic. `current_goal` is a
+/// pre-formatted human string ("sleeping (12.4s)", "moving to 14
+/// cells, on_arrive: work") so the client UI doesn't need to mirror
+/// the engine's full Goal enum to render it.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct NpcDetails {
+    pub npc_id: u64,
+    pub kind: String,
+    pub needs: std::collections::HashMap<String, f32>,
+    pub current_goal: String,
+    pub target_cell: Option<IVec3>,
+}

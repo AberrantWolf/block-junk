@@ -17,11 +17,12 @@ use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
 use crate::menu::{AppState, JoinTarget};
-use crate::npc::{Npc, NpcPath};
+use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, MovementIntent, MovementMode,
-    PlanEdit, PlanEditBatch, PlanFullSync, WorldChannel, WorldClockSync,
+    NpcDetails, PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails, WorldChannel,
+    WorldClockSync,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +90,13 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DebugBumpNeed>()
             .add_direction(NetworkDirection::ClientToServer);
+        // NPC inspection RPC. Targeted reply — server uses the
+        // requesting connection entity's MessageSender so other
+        // clients don't see the response.
+        app.register_message::<RequestNpcDetails>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<NpcDetails>()
+            .add_direction(NetworkDirection::ServerToClient);
 
         // Player-avatar replication. Server owns the avatar entities; the
         // marker tells receivers "attach a mesh," and `AvatarPose` is the
@@ -98,6 +106,7 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<Actor>();
         app.register_component::<Avatar>();
         app.register_component::<Npc>();
+        app.register_component::<NpcId>();
         app.register_component::<NpcPath>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between

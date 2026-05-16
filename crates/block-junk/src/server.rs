@@ -18,7 +18,8 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
-    MovementIntent, MovementMode, PlanEdit, PlanKind, WorldChannel, WorldClock, WorldClockSync,
+    MovementIntent, MovementMode, NpcDetails, PlanEdit, PlanKind, RequestNpcDetails,
+    WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
@@ -105,6 +106,10 @@ impl Plugin for ServerPlugin {
         );
         app.add_systems(
             Update,
+            receive_npc_inspection_requests.in_set(GameSet::Simulation),
+        );
+        app.add_systems(
+            Update,
             (poll_chunk_gen, update_aoi)
                 .chain()
                 .in_set(GameSet::Simulation),
@@ -146,12 +151,14 @@ pub struct PendingSpawnPose(pub Option<AvatarPose>);
 ///
 /// A load failure does NOT abort startup — we log and continue with an
 /// empty world. Better than an unbootable session if a save is corrupt.
+#[allow(clippy::too_many_arguments, reason = "load_from_save touches every persisted system")]
 fn load_from_save(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut pending_pose: ResMut<PendingSpawnPose>,
     mut dirty: ResMut<DetectionDirty>,
     mut clock: ResMut<WorldClock>,
+    mut plans: ResMut<Plans>,
     config: Option<Res<ServerSaveConfig>>,
     block_registry: Res<BlockRegistry>,
     kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
@@ -173,10 +180,16 @@ fn load_from_save(
         }
     };
     info!(
-        "loading {} edited chunks + {} NPCs from save {name:?}",
+        "loading {} edited chunks + {} NPCs + {} plans from save {name:?}",
         save.edited_chunks.len(),
-        save.npcs.len()
+        save.npcs.len(),
+        save.plans.len(),
     );
+    // Restore the plan map before chunk spawn so `auto_clear_stale_plans`
+    // running on the load's CellEdits doesn't see a partial state.
+    if !save.plans.is_empty() {
+        plans.replace_all(save.plans);
+    }
     pending_pose.0 = save.last_player_pose;
     // Restore the world clock if the save carries one. Saves predating
     // v4 don't (Option::None); fall back to the resource's default
@@ -292,10 +305,12 @@ fn spawn_loaded_npc(
 /// the world to disk and clear the flag. Unlike `save_then_shutdown` this
 /// is multi-shot (the user might "Save Now" several times per session) so
 /// no Local guard.
+#[allow(clippy::too_many_arguments, reason = "save_on_request touches every persisted system")]
 fn save_on_request(
     flag: Option<Res<ServerSaveRequestFlag>>,
     config: Option<Res<ServerSaveConfig>>,
     clock: Res<WorldClock>,
+    plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<&AvatarPose, With<Avatar>>,
     npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
@@ -323,15 +338,20 @@ fn save_on_request(
     let saved_npcs = collect_saved_npcs(&npcs);
     let chunk_count = edited.len();
     let npc_count = saved_npcs.len();
+    let saved_plans = plans.snapshot();
+    let plan_count = saved_plans.len();
     let save = SaveFile {
         version: SAVE_VERSION,
         edited_chunks: edited,
         last_player_pose: avatars.iter().next().copied(),
         npcs: saved_npcs,
         world_clock: Some(*clock),
+        plans: saved_plans,
     };
     match write_save(name, &save) {
-        Ok(()) => info!("save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs to {name:?}"),
+        Ok(()) => info!(
+            "save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans to {name:?}",
+        ),
         Err(e) => error!("save-on-request to {name:?} failed: {e}"),
     }
 }
@@ -365,10 +385,12 @@ fn collect_saved_npcs(
 /// The `Local<bool>` guards against running the save loop more than once
 /// per session; the runner won't actually exit until the next tick reads
 /// the AppExit message.
+#[allow(clippy::too_many_arguments, reason = "save_then_shutdown touches every persisted system")]
 fn save_then_shutdown(
     flag: Option<Res<ServerShutdownFlag>>,
     config: Option<Res<ServerSaveConfig>>,
     clock: Res<WorldClock>,
+    plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<&AvatarPose, With<Avatar>>,
     npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
@@ -398,17 +420,22 @@ fn save_then_shutdown(
                     })
                     .collect();
                 let saved_npcs = collect_saved_npcs(&npcs);
+                let saved_plans = plans.snapshot();
                 let chunk_count = edited.len();
                 let npc_count = saved_npcs.len();
+                let plan_count = saved_plans.len();
                 let save = SaveFile {
                     version: SAVE_VERSION,
                     edited_chunks: edited,
                     last_player_pose: avatars.iter().next().copied(),
                     npcs: saved_npcs,
                     world_clock: Some(*clock),
+                    plans: saved_plans,
                 };
                 match write_save(name, &save) {
-                    Ok(()) => info!("saved {chunk_count} chunks + {npc_count} NPCs to {name:?}"),
+                    Ok(()) => info!(
+                        "saved {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans to {name:?}",
+                    ),
                     Err(e) => error!("save to {name:?} failed: {e}"),
                 }
             }
@@ -1077,6 +1104,91 @@ fn apply_npc_work(
             &mut broadcast,
             &mut bus,
         );
+    }
+}
+
+/// Server side of the NPC inspection RPC. Iterates each connection's
+/// `RequestNpcDetails` queue, looks up the named NPC's state, and
+/// sends a single `NpcDetails` reply over the requesting connection.
+/// Targeted (per-connection sender) — other clients don't see this
+/// traffic.
+fn receive_npc_inspection_requests(
+    mut receivers: Query<(Entity, &mut MessageReceiver<RequestNpcDetails>)>,
+    npcs: Query<(&NpcId, &NpcKind, &Needs, &Brain, &AvatarPose), With<Npc>>,
+    mut senders: Query<&mut MessageSender<NpcDetails>>,
+) {
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let requests: Vec<RequestNpcDetails> = receiver.receive().collect();
+        for req in requests {
+            let Some((id, kind, needs, brain, _pose)) = npcs
+                .iter()
+                .find(|(id, _, _, _, _)| id.0 == req.npc_id)
+            else {
+                // NPC despawned between client raycast and server
+                // receive. Silently drop — the requester will time
+                // out and the panel will close on its own.
+                continue;
+            };
+            let (current_goal, target_cell) = summarize_goal(&brain.goal);
+            let details = NpcDetails {
+                npc_id: id.0,
+                kind: kind.0.clone(),
+                needs: needs.0.clone(),
+                current_goal,
+                target_cell,
+            };
+            if let Ok(mut sender) = senders.get_mut(connection) {
+                sender.send::<WorldChannel>(details);
+            }
+        }
+    }
+}
+
+/// Convert the engine-side [`Goal`] into a human-readable summary +
+/// the cell the goal is targeted at (if any). Used in the inspection
+/// RPC reply. Includes the remaining timer so the panel re-fetched
+/// mid-action visibly counts down.
+fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
+    match goal {
+        Goal::Idle => ("idle".into(), None),
+        Goal::Resting { remaining_secs } => {
+            (format!("resting ({remaining_secs:.1}s)"), None)
+        }
+        Goal::MoveTo { path, .. } => {
+            let target = path.last().copied();
+            (format!("moving ({} cells)", path.len()), target)
+        }
+        Goal::Consuming {
+            remaining_secs,
+            need,
+            target_cell,
+            ..
+        } => (
+            format!("consuming {need} ({remaining_secs:.1}s)"),
+            Some(*target_cell),
+        ),
+        Goal::Sleeping {
+            remaining_secs,
+            target_cell,
+            ..
+        } => (
+            format!("sleeping ({remaining_secs:.1}s)"),
+            Some(*target_cell),
+        ),
+        Goal::Working {
+            remaining_secs,
+            target_cell,
+            plan_kind,
+        } => {
+            let verb = match plan_kind {
+                PlanKind::Remove => "removing",
+                PlanKind::Build { .. } => "building",
+            };
+            (
+                format!("{verb} ({remaining_secs:.1}s)"),
+                Some(*target_cell),
+            )
+        }
     }
 }
 

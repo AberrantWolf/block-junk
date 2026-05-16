@@ -78,3 +78,66 @@ impl Plugin for PlanClaimsPlugin {
         app.init_resource::<PlanClaims>();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CELL_A: IVec3 = IVec3::new(0, 0, 0);
+    const CELL_B: IVec3 = IVec3::new(1, 2, 3);
+    const NPC_1: NpcId = NpcId(1);
+    const NPC_2: NpcId = NpcId(2);
+
+    #[test]
+    fn first_claim_succeeds_second_fails() {
+        let mut claims = PlanClaims::default();
+        assert!(claims.try_claim(CELL_A, NPC_1));
+        assert!(!claims.try_claim(CELL_A, NPC_2));
+    }
+
+    #[test]
+    fn reclaim_by_same_npc_is_idempotent() {
+        let mut claims = PlanClaims::default();
+        assert!(claims.try_claim(CELL_A, NPC_1));
+        assert!(claims.try_claim(CELL_A, NPC_1));
+    }
+
+    #[test]
+    fn release_lets_another_npc_claim() {
+        let mut claims = PlanClaims::default();
+        claims.try_claim(CELL_A, NPC_1);
+        claims.release(CELL_A, NPC_1);
+        assert!(claims.try_claim(CELL_A, NPC_2));
+    }
+
+    #[test]
+    fn release_by_non_owner_is_a_no_op() {
+        let mut claims = PlanClaims::default();
+        claims.try_claim(CELL_A, NPC_1);
+        // NPC_2 tries to release a claim it doesn't hold — nothing happens.
+        claims.release(CELL_A, NPC_2);
+        assert!(!claims.try_claim(CELL_A, NPC_2));
+        // Original owner still holds it.
+        assert!(claims.try_claim(CELL_A, NPC_1));
+    }
+
+    #[test]
+    fn release_all_for_drops_only_that_npc_claims() {
+        let mut claims = PlanClaims::default();
+        claims.try_claim(CELL_A, NPC_1);
+        claims.try_claim(CELL_B, NPC_2);
+        claims.release_all_for(NPC_1);
+        // NPC_1's cell is free, NPC_2's cell is still held.
+        assert!(claims.try_claim(CELL_A, NPC_2));
+        assert!(!claims.try_claim(CELL_B, NPC_1));
+    }
+
+    #[test]
+    fn is_taken_by_other_excludes_self() {
+        let mut claims = PlanClaims::default();
+        claims.try_claim(CELL_A, NPC_1);
+        assert!(claims.is_taken_by_other(CELL_A, NPC_2));
+        assert!(!claims.is_taken_by_other(CELL_A, NPC_1));
+        assert!(!claims.is_taken_by_other(CELL_B, NPC_1));
+    }
+}

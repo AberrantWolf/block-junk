@@ -22,7 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::protocol::{AvatarPose, ChunkCoord, MovementMode, WorldClock};
+use bevy::math::IVec3;
+
+use crate::protocol::{AvatarPose, ChunkCoord, MovementMode, PlanKind, WorldClock};
 use crate::voxel::{Chunk, ChunkEntities};
 
 /// Bump on any breaking shape change. Loaders will refuse mismatched
@@ -30,7 +32,8 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v2 (2026-05-13): added `last_player_pose` to `SaveFile`.
 /// v3 (2026-05-15): added `npcs` to `SaveFile`.
 /// v4 (2026-05-15): added `world_clock` to `SaveFile`.
-pub const SAVE_VERSION: u32 = 4;
+/// v5 (2026-05-16): added `plans` to `SaveFile`.
+pub const SAVE_VERSION: u32 = 5;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -97,6 +100,12 @@ pub struct SaveFile {
     /// default sunrise position when this is missing.
     #[serde(default)]
     pub world_clock: Option<WorldClock>,
+    /// Player-issued plan tags alive at save time. Sparse: only cells
+    /// the player tagged. PlanClaims is *not* saved — the brain resets
+    /// to Idle on load, so any in-flight work restarts from scratch
+    /// and the claim is naturally re-acquired.
+    #[serde(default)]
+    pub plans: Vec<(IVec3, PlanKind)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -278,16 +287,28 @@ pub fn delete_save(name: &str) -> Result<(), SaveError> {
 mod tests {
     use super::*;
     use bevy::math::Vec3;
+    use block_junk_mod_api::blocks::Cardinal;
+
+    use crate::blocks::BlockSlot;
 
     /// Round-trip a SaveFile through bincode to catch serde regressions
-    /// at the shape level — covers the v3 `npcs` field and the v4
-    /// `world_clock` field including its enum (MovementMode), HashMap,
-    /// and float fields. File-IO failures are caught by the existing
-    /// v1/v2 code paths; this only needs to guard the new fields.
+    /// at the shape level — covers v3 `npcs`, v4 `world_clock`, and v5
+    /// `plans` (sparse vec of (cell, PlanKind) including both Remove
+    /// and Build variants).
     #[test]
-    fn savefile_round_trips_with_npcs_and_clock() {
+    fn savefile_round_trips_with_npcs_clock_and_plans() {
         let mut needs = HashMap::new();
         needs.insert("hunger".to_owned(), 0.42);
+        let plans = vec![
+            (IVec3::new(1, 2, 3), PlanKind::Remove),
+            (
+                IVec3::new(-4, 5, -6),
+                PlanKind::Build {
+                    slot: BlockSlot(7),
+                    orientation: Cardinal::North,
+                },
+            ),
+        ];
         let original = SaveFile {
             version: SAVE_VERSION,
             edited_chunks: vec![],
@@ -310,6 +331,7 @@ mod tests {
                 day: 3,
                 time_of_day: 0.625,
             }),
+            plans: plans.clone(),
         };
 
         let bytes =
@@ -331,5 +353,6 @@ mod tests {
         let clock = decoded.world_clock.unwrap();
         assert_eq!(clock.day, 3);
         assert_eq!(clock.time_of_day, 0.625);
+        assert_eq!(decoded.plans, plans);
     }
 }

@@ -17,8 +17,9 @@ use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
 use crate::menu::AppState;
-use crate::npc::{Npc, NpcPath};
+use crate::npc::{Npc, NpcId, NpcPath};
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
+use crate::inspect_panel::InspectPanelPlugin;
 use crate::plans::PlansClientPlugin;
 use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
@@ -39,6 +40,7 @@ impl Plugin for ClientPlugin {
             .add_plugins(PlayerModePlugin)
             .add_plugins(TargetOutlinePlugin)
             .add_plugins(PlansClientPlugin)
+            .add_plugins(InspectPanelPlugin)
             // Frame interpolation smooths AvatarPose between FixedUpdate
             // ticks during PostUpdate render. Without it, on a high-refresh
             // display you see 64 Hz physics steps with the renderer drawing
@@ -897,6 +899,55 @@ fn place_break_input(
 pub(crate) struct EntityAwareHit {
     pub(crate) cell: IVec3,
     pub(crate) face_normal: IVec3,
+}
+
+/// Closest NPC AABB hit, paired with the ray distance to that hit so
+/// callers can compare against a block raycast distance and pick the
+/// closer one. The AABB matches the physics shape: centre =
+/// `pose.translation - Y * EYE_OFFSET_FROM_CENTRE`, half-extents =
+/// `PLAYER_HALF_EXTENTS`.
+pub(crate) struct NpcRaycastHit {
+    pub(crate) npc_id: NpcId,
+    pub(crate) distance: f32,
+}
+
+/// Slab-test the camera ray against every NPC's body AABB; return the
+/// closest hit within `max_distance`. Linear in NPC count — fine while
+/// NPCs are counted in the low tens; will need spatial pruning if we
+/// ever reach hundreds.
+pub(crate) fn raycast_npcs(
+    origin: Vec3,
+    dir: Vec3,
+    max_distance: f32,
+    npcs: &Query<(&NpcId, &AvatarPose), With<Npc>>,
+) -> Option<NpcRaycastHit> {
+    let inv_dir = Vec3::ONE / dir;
+    let mut best: Option<NpcRaycastHit> = None;
+    for (id, pose) in npcs.iter() {
+        let centre = pose.translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
+        let min = centre - PLAYER_HALF_EXTENTS;
+        let max = centre + PLAYER_HALF_EXTENTS;
+        let t1 = (min - origin) * inv_dir;
+        let t2 = (max - origin) * inv_dir;
+        let tmin_v = t1.min(t2);
+        let tmax_v = t1.max(t2);
+        let tmin = tmin_v.x.max(tmin_v.y).max(tmin_v.z);
+        let tmax = tmax_v.x.min(tmax_v.y).min(tmax_v.z);
+        if tmax < tmin || tmax < 0.0 {
+            continue;
+        }
+        let t = if tmin >= 0.0 { tmin } else { tmax };
+        if t > max_distance {
+            continue;
+        }
+        if best.as_ref().map(|b| t < b.distance).unwrap_or(true) {
+            best = Some(NpcRaycastHit {
+                npc_id: *id,
+                distance: t,
+            });
+        }
+    }
+    best
 }
 
 /// Walks world cells like the plain voxel raycast, but treats block-entity

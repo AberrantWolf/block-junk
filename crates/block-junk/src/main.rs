@@ -4,6 +4,7 @@ mod client;
 mod collision;
 mod consumables;
 mod debug;
+mod inspect_panel;
 mod menu;
 mod network;
 mod npc;
