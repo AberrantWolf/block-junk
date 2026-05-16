@@ -224,6 +224,28 @@ pub struct PlanFullSync {
     pub entries: Vec<(IVec3, PlanKind)>,
 }
 
+/// Bulk version of [`PlanEdit`]. All cells in `cells` are tagged with
+/// the same `kind` (or cleared if `kind` is `None`). Server validates
+/// each cell against the same rules as `PlanEdit` and drops the ones
+/// that fail — partial application is OK; the user sees the diff in
+/// the broadcast that comes back. Bidirectional shape mirrors
+/// [`PlanEdit`].
+///
+/// Plan rectangles can get large; the client caps the per-message cell
+/// count at [`PLAN_EDIT_BATCH_MAX`] and splits bigger selections into
+/// multiple messages.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct PlanEditBatch {
+    pub kind: Option<PlanKind>,
+    pub cells: Vec<IVec3>,
+}
+
+/// Max cells per [`PlanEditBatch`] message. Chosen to keep a single
+/// message comfortably under the lightyear reliable-channel fragment
+/// budget; 4096 IVec3 cells = ~48 KB raw. A 64×64 face drag is 4096
+/// cells — at that size we split into two messages.
+pub const PLAN_EDIT_BATCH_MAX: usize = 4096;
+
 /// Channel marker. One ordered-reliable channel for all world events
 /// (BlockEdit, ChunkSnapshot, building events…). Future work may split
 /// priorities; for now KISS.
