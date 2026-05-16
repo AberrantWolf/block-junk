@@ -165,6 +165,21 @@ pub struct BlockDef {
     /// default) ⇒ NPCs never consider this block for a Consume goal.
     #[serde(default)]
     pub consumable: Option<Consumable>,
+    /// Optional dedicated "use slot" — anchor-relative pose and yaw an
+    /// NPC snaps to when actively using this block, plus the set of
+    /// standable cells from which the action may begin. Present ⇒ the
+    /// brain paths to one of `approach`, then on arrival sets
+    /// `pose.translation = anchor + Cardinal::rotate(slot.pose)` and
+    /// `pose.yaw = orientation.yaw() + slot.yaw`, marks the NPC
+    /// kinematic for the duration of the action, and stops trying to
+    /// derive the body's position from generic standable-neighbour
+    /// search. Absent ⇒ existing "stand at any standable neighbour"
+    /// behaviour applies (fruit basket today). Mods opt blocks in
+    /// when the visible action *requires* exact positioning (sleeping
+    /// in a bed, sitting in a chair, striking at a forge); blocks
+    /// that read naturally from any side leave it as `None`.
+    #[serde(default)]
+    pub use_slot: Option<UseSlot>,
     /// Marks this block as a sleeper (a bed, a bedroll, a sarcophagus —
     /// anything one NPC can use to satisfy a need over a long stretch
     /// of time). Mechanically similar to `consumable` but with two
@@ -232,6 +247,70 @@ pub struct Sleeper {
     /// is much larger than the consumable bound — sleep is allowed to
     /// feel like minutes.
     pub duration_secs: f32,
+}
+
+/// Dedicated "use slot" for an interactable block — bed, chair, forge,
+/// bicycle. Tells the engine *exactly* where an NPC's body should sit
+/// while the interaction is active, instead of trying to coerce the
+/// generic walk/collide pipeline into producing that position.
+///
+/// **Coordinates** are in default-orientation model space, with the
+/// origin at the anchor cell's bottom-centre — the same frame
+/// [`EntityAabb`] uses, so authors can think about slot position the
+/// same way they think about bounding boxes. The engine rotates
+/// `pose` and each `approach` cell by the block's stored
+/// [`Cardinal`] at runtime, so a single authored slot survives all
+/// four placement rotations.
+///
+/// **Activation flow.** When the NPC's brain commits to using this
+/// block, it pathfinds to whichever cell in `approach` (rotated +
+/// anchor-offset) is closest and standable in the live world. On
+/// arrival the brain *snaps* the NPC's pose translation to
+/// `anchor_bottom_centre + Cardinal::rotate(pose)` and pose yaw to
+/// `orientation.yaw() + yaw`, and inserts a kinematic-lock so the
+/// physics tick and the soft-actor-separation pass leave the body
+/// alone for the duration. On goal completion / abandonment the lock
+/// is removed and the NPC re-enters the normal grounded simulation.
+///
+/// Blocks where any-angle interaction reads correctly (a basket of
+/// berries) skip this entirely; their `use_slot` stays `None` and the
+/// brain falls back to the existing nearest-standable-neighbour
+/// behaviour.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UseSlot {
+    /// Where the body's **model origin** (the rig's "feet" point —
+    /// the model y=0 plane the rig was authored around) lands when
+    /// the action is active, in default-orientation anchor-space.
+    /// XZ origin is the anchor cell's bottom-centre. The engine
+    /// internally adds the standing eye-offset when writing
+    /// `pose.translation`, so authors think in concrete terms —
+    /// "the body's feet/base goes here" — instead of having to add
+    /// 1.62 to every Y value to compensate for the eye-position
+    /// pose convention.
+    ///
+    /// For a 2-cell bed where the body should lie centred on the
+    /// mattress, use `(1.0, 1.0, 0.0)`: mid-bed in X (between the
+    /// foot cell at x=0 and the head cell at x=1), Y=1.0 (top of the
+    /// 1m-tall mattress), Z=0 (centre of the bed's width).
+    pub pose: [f32; 3],
+    /// Body yaw while the action is active, added to the block's
+    /// [`Cardinal::yaw`]. `0.0` ⇒ body faces the block's
+    /// extends-direction (`Cardinal::East` default = +X). Authors tune
+    /// per-rig: if the lying animation extends the body opposite to
+    /// the standing-forward axis, set `yaw = π` so the head still
+    /// lands at the head end of the bed.
+    pub yaw: f32,
+    /// Standable cells from which the NPC may begin the action, in
+    /// default-orientation, anchor-relative cell coords. The engine
+    /// rotates each entry by the block's [`Cardinal`] and offsets by
+    /// the anchor cell, then picks the closest reachable one to path
+    /// to. Authors list every cell that "faces the right side" of the
+    /// block — for a bed, the three cells around the foot plus the
+    /// three cells around the head, omitting the cells the bed itself
+    /// occupies. A block that's reachable from any side can list all
+    /// 4–8 neighbours; a block that *must* be approached from one
+    /// face (a forge facing into the wall) lists just that face.
+    pub approach: Vec<[i32; 3]>,
 }
 
 /// Default footprint helper for serde. A single cell at the anchor.

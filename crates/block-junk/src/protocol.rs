@@ -100,6 +100,29 @@ pub enum ChunkData {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Actor;
 
+/// Marker for "this actor's body is currently being driven by a
+/// dedicated use-slot, not by the physics tick." Inserted when an NPC
+/// enters a goal that snaps them onto a block's [`UseSlot`] (sleeping
+/// in a bed, eventually sitting in a chair, striking at a forge);
+/// removed on goal exit. While present:
+///
+/// - The NPC physics step skips them (no gravity, no walk_step sweep,
+///   so the snapped pose translation isn't pulled back to the floor or
+///   nudged by the AABB sweep).
+/// - The server-side soft-actor-separation pass skips them (a
+///   passer-by who shoulder-bumps the bed shouldn't slide the
+///   sleeping body off it).
+///
+/// Server-only state — not replicated. Clients infer the equivalent
+/// "don't touch this body" behaviour from their existing filters
+/// (the client soft-separate pass only mutates `Predicted` actors,
+/// and interpolated NPCs were never client-pushable in the first
+/// place). When a player ever enters a use-slot (chair, vehicle) we
+/// will need to flip this to a replicated marker so the predicted
+/// owner skips physics on their end too.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct KinematicLock;
+
 /// Marker component on the server-side player-avatar entity. Replicated to
 /// every client so they can render a body (or, on the owner side, attach a
 /// camera). Paired with the predicted state components below. Coexists

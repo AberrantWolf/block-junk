@@ -85,6 +85,14 @@ pub enum BootstrapError {
     BlockLayerMaskUnknown { block: BlockId, mask: MaskId },
     #[error("block {block} layer references unregistered ramp {ramp}")]
     BlockLayerRampUnknown { block: BlockId, ramp: RampId },
+    #[error(
+        "block {block} use_slot.approach is empty — at least one standable cell is required, or omit use_slot to fall back to nearest-neighbour"
+    )]
+    UseSlotApproachEmpty { block: BlockId },
+    #[error(
+        "block {block} use_slot.approach cell {cell:?} overlaps the block's own footprint — NPCs can't stand inside the block"
+    )]
+    UseSlotApproachInsideFootprint { block: BlockId, cell: [i32; 3] },
 }
 
 /// The live, finalised registry. Held as a Bevy `Resource` on each side.
@@ -229,6 +237,36 @@ impl BlockRegistry {
                     return Err(BootstrapError::BlockLayerRampUnknown {
                         block: def.id.clone(),
                         ramp: layer.ramp.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate `use_slot` declarations on blocks that opt into snap-
+    /// to-slot positioning. Two rules: there must be at least one
+    /// approach cell (an empty list means "no way to start using the
+    /// block," which is almost certainly a typo — authors who want
+    /// the old "any cardinal neighbour" behaviour omit the whole
+    /// `use_slot`), and no approach cell may sit inside the block's
+    /// own footprint (an NPC can't stand inside the block they're
+    /// trying to use). Approach cells are in default orientation —
+    /// the engine rotates them at use time, so the "inside the
+    /// footprint" check happens in the same frame.
+    pub fn validate_use_slots(&self) -> Result<(), BootstrapError> {
+        for def in &self.defs_by_slot {
+            let Some(slot) = &def.use_slot else { continue };
+            if slot.approach.is_empty() {
+                return Err(BootstrapError::UseSlotApproachEmpty {
+                    block: def.id.clone(),
+                });
+            }
+            for cell in &slot.approach {
+                if def.footprint.iter().any(|f| f == cell) {
+                    return Err(BootstrapError::UseSlotApproachInsideFootprint {
+                        block: def.id.clone(),
+                        cell: *cell,
                     });
                 }
             }

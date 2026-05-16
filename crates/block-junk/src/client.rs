@@ -20,7 +20,8 @@ use crate::collision::WorldCollision;
 use crate::menu::AppState;
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::physics::{
-    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, soft_separate_actors,
+    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_separation_push_swept, apply_walk_step,
+    compute_actor_separation_pushes,
 };
 use crate::inspect_panel::InspectPanelPlugin;
 use crate::plans::{Plans, PlansClientPlugin};
@@ -28,9 +29,9 @@ use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::target_outline::TargetOutlinePlugin;
 use crate::protocol::{
-    Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
-    ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode, NpcActivity,
-    PlanKind, WorldChannel, WorldClock, WorldClockSync,
+    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
+    ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode,
+    NpcActivity, PlanKind, WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -113,13 +114,17 @@ impl Plugin for ClientPlugin {
             // Soft actor separation runs after the predicted step so
             // the local player's prediction matches the server's
             // outcome when walking into NPCs (server runs the same
-            // pass post-physics on its side). Interpolated remote
-            // actors participate as pushable bodies — they get nudged
-            // in the local prediction, then the next server snapshot
-            // corrects them, which is fine for cosmetic pushes.
+            // pass post-physics on its side). The client variant
+            // only writes to *Predicted* actors — interpolated
+            // remotes contribute to the pairwise push direction
+            // (so the predicted owner gets pushed away from them
+            // correctly) but their pose is left to the next
+            // server snapshot, since locally mutating an
+            // interpolated pose drifts the rendered position away
+            // from the authoritative one tick by tick.
             .add_systems(
                 FixedUpdate,
-                (client_player_step, soft_separate_actors)
+                (client_player_step, soft_separate_predicted_actors)
                     .chain()
                     .run_if(in_state(AppState::InGame)),
             )
@@ -1579,6 +1584,52 @@ fn buffer_input(
     }
 
     state.0 = input;
+}
+
+/// Client-side soft separation. Same pairwise overlap pass as
+/// [`crate::physics::soft_separate_actors`], but only writes pushes
+/// back to *Predicted* actors. Interpolated remote actors (other
+/// players, NPCs) take part in the pairwise direction calculation
+/// — without them the local owner would walk through bodies — but
+/// they aren't moved locally, since their pose is owned by lightyear's
+/// interpolation against authoritative server snapshots. Locally
+/// pushing them would drift each tick away from the snapshot value
+/// and stay drifted (a clean fix instead of "next snapshot corrects
+/// it," which empirically didn't recover under sustained contact).
+fn soft_separate_predicted_actors(
+    chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut actors: Query<(Entity, &mut AvatarPose), With<Actor>>,
+    predicted_only: Query<(), With<Predicted>>,
+) {
+    let snapshot: Vec<(Entity, Vec3)> = actors
+        .iter()
+        .map(|(e, pose)| (e, pose.translation))
+        .collect();
+    let pushes = compute_actor_separation_pushes(&snapshot);
+    let world = WorldCollision {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    for (i, (entity, _)) in snapshot.iter().enumerate() {
+        let push = pushes[i];
+        if push.x == 0.0 && push.y == 0.0 {
+            continue;
+        }
+        // Skip the apply step for interpolated remotes (no
+        // `Predicted` marker). They still contributed to the
+        // pairwise direction so the local owner gets pushed off
+        // them correctly.
+        if predicted_only.get(*entity).is_err() {
+            continue;
+        }
+        let Ok((_, mut pose)) = actors.get_mut(*entity) else {
+            continue;
+        };
+        apply_separation_push_swept(&mut pose.translation, push, &world);
+    }
 }
 
 /// Owner-side prediction tick: run the same controller the server runs,

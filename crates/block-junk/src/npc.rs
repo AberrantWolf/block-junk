@@ -25,7 +25,7 @@
 //! when no mods load.
 
 use bevy::prelude::*;
-use block_junk_mod_api::blocks::{Cardinal, Consumable, Sleeper};
+use block_junk_mod_api::blocks::{Cardinal, Consumable, Sleeper, UseSlot};
 use block_junk_mod_api::npcs::{
     NearbyConsumable, NearbyPlan, NearbyRoom, NearbySleeper, NpcKindId, NpcSnapshot,
     PlanKindHint, PlannerGoal,
@@ -46,8 +46,8 @@ use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_ste
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
-    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementIntent, MovementMode, NpcActivity,
-    PlanKind, WorldClock,
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, KinematicLock, MovementIntent, MovementMode,
+    NpcActivity, PlanKind, WorldClock,
 };
 use crate::scripting::ServerMods;
 use crate::sleepers::{BedClaims, SleeperIndex};
@@ -153,6 +153,20 @@ pub enum Goal {
         last_pos: Vec3,
         stuck_secs: f32,
         on_arrive: ArrivalAction,
+        /// Optional snap-on-arrival. Independent of [`ArrivalAction`]:
+        /// any goal whose destination block carries a
+        /// [`UseSlot`](block_junk_mod_api::blocks::UseSlot) populates
+        /// this with the pre-computed world-space pose. On arrival the
+        /// engine teleports the body onto that pose, sets pose.yaw to
+        /// the slot's stored yaw, and inserts [`KinematicLock`] so the
+        /// physics tick + soft-actor-separation pass leave the body
+        /// alone for the duration of the follow-on action. `None`
+        /// means "no special positioning" — the NPC lands wherever the
+        /// path's last cell led them, and any action-specific behaviour
+        /// (yaw aiming, etc.) takes over from there. The planner
+        /// resolves slot data once at goal commit so arrival doesn't
+        /// need to re-read the block def.
+        snap: Option<UseSlotSnap>,
     },
     /// Stand still for a while. Duration is whatever the planner
     /// returned in [`PlannerGoal::Rest`], clamped to
@@ -208,6 +222,26 @@ pub enum Goal {
     },
 }
 
+/// Pre-computed pose-snap for a
+/// [`UseSlot`](block_junk_mod_api::blocks::UseSlot) interaction. Built
+/// once at goal-commit (when the brain knows the anchor + orientation
+/// + slot data) and carried on [`Goal::MoveTo`] so the arrival handler
+/// doesn't need to re-resolve the block def. Action-agnostic: any
+/// goal that lands the NPC at a slot-bearing block populates this the
+/// same way, the arrival applies it uniformly, and the follow-on
+/// [`ArrivalAction`] decides what the NPC *does* once snapped (sleep,
+/// consume, work).
+///
+/// `translation` is world-space (anchor cell origin + rotated slot
+/// pose); `yaw` is body yaw in radians (same convention pose.yaw uses,
+/// already including the block's [`Cardinal::yaw`](block_junk_mod_api::blocks::Cardinal::yaw) + the slot's
+/// authored yaw offset).
+#[derive(Clone, Copy, Debug)]
+pub struct UseSlotSnap {
+    pub translation: Vec3,
+    pub yaw: f32,
+}
+
 /// What the engine does after the NPC arrives at the end of a
 /// [`Goal::MoveTo`] path. `None` means "just stop, drop to Idle, let
 /// the planner pick the next thing." `Consume` triggers a transition
@@ -249,11 +283,6 @@ pub enum ArrivalAction {
         duration_secs: f32,
         target_cell: IVec3,
         anchor_cell: IVec3,
-        /// Bed's stored placement orientation. Snapped onto the NPC's
-        /// pose yaw at arrival so they end up aligned with the bed's
-        /// long axis instead of facing whatever direction their last
-        /// walk segment happened to leave them in.
-        orientation: Cardinal,
     },
     /// Begin a work action at the plan target cell. Carries the snapshot
     /// of the `PlanKind` at the moment the goal was committed so a
@@ -624,6 +653,7 @@ fn npc_brain_tick(
             &mut MovementIntent,
             &mut NpcPath,
             &NpcKind,
+            Has<KinematicLock>,
         ),
         (With<Npc>, Without<BrainDisabled>),
     >,
@@ -635,8 +665,17 @@ fn npc_brain_tick(
         registry: &block_registry,
     };
 
-    for (entity, npc_id, mut pose, mut needs, mut brain, mut intent, mut npc_path, kind) in
-        npcs.iter_mut()
+    for (
+        entity,
+        npc_id,
+        mut pose,
+        mut needs,
+        mut brain,
+        mut intent,
+        mut npc_path,
+        kind,
+        is_locked,
+    ) in npcs.iter_mut()
     {
         // Phase 1: decay every subscribed need by its registry-defined
         // rate. Unknown ids decay at 0 (the rate-lookup returns 0) so
@@ -652,7 +691,11 @@ fn npc_brain_tick(
         // run `on_arrive`) or `abandoned` (timed out or stuck; drop
         // straight to Idle with no follow-on). Consuming and Resting
         // both complete by timer expiry.
-        let mut move_arrived: Option<ArrivalAction> = None;
+        // (action_to_run, optional pose-snap captured from MoveTo).
+        // Snap lives on Goal::MoveTo (independent of the action), so
+        // we capture it here when the path arrives and apply it before
+        // dispatching to the action-specific transition below.
+        let mut move_arrived: Option<(ArrivalAction, Option<UseSlotSnap>)> = None;
         let mut move_abandoned = false;
         let mut rest_done = false;
         let mut consume_done = false;
@@ -691,6 +734,7 @@ fn npc_brain_tick(
                 last_pos,
                 stuck_secs,
                 on_arrive,
+                snap,
             } => {
                 *deadline_secs -= dt;
                 let moved = (pose.translation - *last_pos).length();
@@ -709,11 +753,22 @@ fn npc_brain_tick(
 
                 // PATH_ARRIVE_RADIUS is wider than the NPC's turn
                 // radius so this fires reliably; otherwise an NPC
-                // could orbit its target forever.
-                let end_xz = waypoint_xz(*path.last().expect("path non-empty"));
+                // could orbit its target forever. The feet-Y match
+                // prevents a step-up path (sleep onto a bed, climb
+                // onto a podium) from firing arrival before the NPC
+                // has actually settled on the destination cell: XZ-
+                // only would let it fire 1 cell short, and an integer
+                // cell-Y check would still spuriously fire at jump
+                // apex when the cell floor maps inside the destination
+                // cell but the NPC is mid-air. Use settled feet (≈ the
+                // cell's bottom face) instead.
+                let last_cell = *path.last().expect("path non-empty");
+                let end_xz = waypoint_xz(last_cell);
                 let dist_to_end = (pose_xz - end_xz).length();
-                if dist_to_end < PATH_ARRIVE_RADIUS {
-                    move_arrived = Some(on_arrive.clone());
+                let feet_y = pose.translation.y - EYE_OFFSET_FROM_CENTRE - PLAYER_HALF_EXTENTS.y;
+                let foot_y_settled = (feet_y - last_cell.y as f32).abs() < 0.1;
+                if dist_to_end < PATH_ARRIVE_RADIUS && foot_y_settled {
+                    move_arrived = Some((on_arrive.clone(), *snap));
                 } else if *deadline_secs <= 0.0 || *stuck_secs > STUCK_REPLAN_SECS {
                     move_abandoned = true;
                 }
@@ -726,11 +781,21 @@ fn npc_brain_tick(
         // straight to Idle. Consuming's expiry applies the
         // restoration after re-validating the block (mods may have
         // changed it mid-action).
-        if let Some(action) = move_arrived {
+        if let Some((action, snap)) = move_arrived {
             if !npc_path.0.is_empty() {
                 npc_path.0.clear();
             }
             *intent = MovementIntent::default();
+            // Apply pose snap + kinematic lock uniformly *before* the
+            // action dispatch. The snap is action-agnostic — any goal
+            // whose target block had a `use_slot` populated this. The
+            // follow-on action just decides what the locked body
+            // does (sleep/consume/work).
+            if let Some(s) = snap {
+                pose.translation = s.translation;
+                pose.yaw = s.yaw;
+                commands.entity(entity).insert(KinematicLock);
+            }
             match action {
                 ArrivalAction::None => {
                     brain.goal = Goal::Idle;
@@ -754,9 +819,7 @@ fn npc_brain_tick(
                     duration_secs,
                     target_cell,
                     anchor_cell,
-                    orientation,
                 } => {
-                    pose.yaw = sleep_yaw_for(orientation);
                     brain.goal = Goal::Sleeping {
                         remaining_secs: duration_secs,
                         need,
@@ -801,17 +864,26 @@ fn npc_brain_tick(
                 npc_path.0.clear();
             }
         }
+        // Target cell of whichever interaction just finished
+        // (consume / sleep / work). Set by the matching per-action
+        // branch; consumed once by the generic post-interaction
+        // block to drive eject + kinematic unlock + Idle transition.
+        let mut interact_done: Option<IVec3> = None;
         if consume_done {
-            // Re-resolve the consumable at the current goal's stored
-            // need/restores: capture happened at planner-call time,
-            // but the block may have been broken or replaced since.
-            // We trust the captured values (the NPC saw them when
-            // committing) and just decrement — if the block was
-            // removed, the NPC still "ate the air" once, which is
-            // the same as accepting the stale snapshot at all
-            // upstream layers. Player can't exploit it because the
-            // duration_secs hold them in place for the full action.
-            if let Goal::Consuming { need, restores, .. } = &brain.goal {
+            // Action-specific completion: re-resolve the need and
+            // apply the captured restore. We trust the captured
+            // values (the NPC committed to them at planner-call
+            // time) — if the block was broken or replaced mid-
+            // action, "ate the air" is the consistent outcome at
+            // every upstream layer. Captures `target_cell` so the
+            // generic post-action block below can eject / unlock.
+            if let Goal::Consuming {
+                need,
+                restores,
+                target_cell,
+                ..
+            } = &brain.goal
+            {
                 if let Some(value) = needs.0.get_mut(need) {
                     *value = (*value - *restores).max(0.0);
                     info!(
@@ -828,18 +900,19 @@ fn npc_brain_tick(
                         "consumption complete but NPC has no entry for need; ignoring",
                     );
                 }
+                interact_done = Some(*target_cell);
             }
-            brain.goal = Goal::Idle;
         }
         if sleep_done {
-            // Same logic as consume_done plus releasing the per-bed
-            // claim. Captured `need` / `restores` are trusted — if the
-            // bed was destroyed mid-sleep, the NPC still wakes refreshed
-            // (the action played out from their point of view).
+            // Action-specific completion: apply restore, release
+            // the per-bed claim. Generic post-action handling
+            // (eject + unlock + transition to Idle) runs below
+            // off `interact_done`.
             if let Goal::Sleeping {
                 need,
                 restores,
                 anchor_cell,
+                target_cell,
                 ..
             } = &brain.goal
             {
@@ -860,16 +933,13 @@ fn npc_brain_tick(
                     );
                 }
                 bed_claims.release(*anchor_cell, *npc_id);
+                interact_done = Some(*target_cell);
             }
-            brain.goal = Goal::Idle;
         }
         if work_done {
-            // Reduce `work` need, release the claim, and emit a local
-            // message for the server-side consumer to apply the world
-            // mutation (place or break) + clear the plan tag. Splitting
-            // it across systems keeps the brain tick under the
-            // SystemParam cap — the consumer needs the broadcast
-            // sender + chunk-write params the brain doesn't carry.
+            // Action-specific completion: apply restore, release
+            // the plan claim, emit the world-mutation message.
+            // Generic post-action handling runs below.
             if let Goal::Working {
                 target_cell,
                 plan_kind,
@@ -897,6 +967,40 @@ fn npc_brain_tick(
                     plan_kind: *plan_kind,
                 });
                 plan_claims.release(*target_cell, *npc_id);
+                interact_done = Some(*target_cell);
+            }
+        }
+        // Generic post-interaction cleanup. Eject + unlock happen
+        // only if the NPC was actually [`KinematicLock`]ked into a
+        // slot — otherwise their pose is wherever the regular
+        // physics tick left them (e.g. standing at a slotless
+        // berry basket), so there's nothing to recover from. When
+        // we were locked, the body is sitting at the snap pose
+        // inside the block; the eject walks the block's authored
+        // approach cells (NPC leaves the way they came in), then
+        // "on top of the anchor" as a universal fallback, before
+        // dropping the lock so physics resumes from a standable
+        // position rather than an embedded one.
+        if let Some(target_cell) = interact_done {
+            if is_locked {
+                let slot = slot_at_cell(target_cell, &chunks, &chunk_map, &block_registry);
+                let (anchor_cell, orientation) = resolve_anchor_with_orientation(
+                    target_cell,
+                    &chunk_entities_q,
+                    &chunk_map,
+                );
+                if !try_eject_to_cells(
+                    &mut pose,
+                    eject_candidates_for_slot(slot.as_ref(), anchor_cell, orientation),
+                    &world,
+                ) {
+                    warn!(
+                        npc = npc_id.0,
+                        anchor = ?anchor_cell.to_array(),
+                        "post-interaction eject: no standable approach or fallback; NPC may be embedded",
+                    );
+                }
+                commands.entity(entity).remove::<KinematicLock>();
             }
             brain.goal = Goal::Idle;
         }
@@ -945,12 +1049,16 @@ fn npc_brain_tick(
                     );
                     // Release any held claims — a disabled brain
                     // shouldn't lock a bed or plan for the rest of
-                    // the session.
+                    // the session. Drop the kinematic lock too so a
+                    // disabled NPC isn't frozen mid-action.
                     bed_claims.release_all_for(*npc_id);
                     plan_claims.release_all_for(*npc_id);
-                    commands.entity(entity).insert(BrainDisabled {
-                        reason: e.to_string(),
-                    });
+                    commands
+                        .entity(entity)
+                        .remove::<KinematicLock>()
+                        .insert(BrainDisabled {
+                            reason: e.to_string(),
+                        });
                     *intent = MovementIntent::default();
                     continue;
                 }
@@ -1004,6 +1112,7 @@ fn npc_brain_tick(
                                 last_pos: pose.translation,
                                 stuck_secs: 0.0,
                                 on_arrive: ArrivalAction::None,
+                                snap: None,
                             };
                         }
                         None => {
@@ -1078,6 +1187,7 @@ fn npc_brain_tick(
                                 last_pos: pose.translation,
                                 stuck_secs: 0.0,
                                 on_arrive: ArrivalAction::None,
+                                snap: None,
                             };
                         }
                         None => {
@@ -1106,44 +1216,40 @@ fn npc_brain_tick(
                 PlannerGoal::Sleep { cell, timeout_secs } => {
                     let timeout = timeout_secs.clamp(1.0, MAX_SLEEP_TIMEOUT_SECS);
                     let target_cell = IVec3::new(cell.x, cell.y, cell.z);
-                    // Re-resolve the sleeper on current world state. A
-                    // planner that picked a bed seconds ago might now
-                    // be looking at empty air or a non-bed replacement.
-                    let sleeper = match sleeper_at_cell(
+                    // Re-resolve the sleeper on current world state +
+                    // pull the full def so we can read the optional
+                    // `use_slot`. Slot data is what tells the brain
+                    // *where* and *how* to position the body — there
+                    // is no bed-shaped knowledge in the engine.
+                    let Some((sleeper, slot, def_id)) = sleeper_with_slot_at_cell(
                         target_cell,
                         &chunks,
                         &chunk_map,
                         &block_registry,
-                    ) {
-                        Some(s) => s,
-                        None => {
-                            info!(
-                                npc = npc_id.0,
-                                target = ?target_cell.to_array(),
-                                "sleep target no longer a sleeper; parking briefly",
-                            );
-                            brain.goal = Goal::Resting {
-                                remaining_secs: MIN_REST_SECS,
-                            };
-                            *intent = MovementIntent::default();
-                            continue;
-                        }
+                    ) else {
+                        info!(
+                            npc = npc_id.0,
+                            target = ?target_cell.to_array(),
+                            "sleep target no longer a sleeper; parking briefly",
+                        );
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
                     };
-                    // Resolve the bed's anchor + its stored orientation.
-                    // Anchor doubles as the claim key (foot and head of a
-                    // multi-cell bed contend for the same slot); the
-                    // orientation feeds the yaw snap on arrival so the
-                    // sleeping NPC ends up aligned with the bed's long
-                    // axis instead of pointing wherever the last walk
-                    // segment left them.
-                    let (anchor_cell, bed_orientation) = resolve_anchor_with_orientation(
+                    // Anchor is the claim key (multi-cell sleepers
+                    // contend on a single slot). Orientation rotates
+                    // both `use_slot.approach` and `use_slot.pose`
+                    // into world space.
+                    let (anchor_cell, orientation) = resolve_anchor_with_orientation(
                         target_cell,
                         &chunk_entities_q,
                         &chunk_map,
                     );
-                    // Atomic claim. Failure means another NPC took the
-                    // bed between snapshot construction and now — fall
-                    // through to a brief rest, the planner will re-pick.
+                    // Atomic claim. Loss means another NPC took the
+                    // bed between snapshot construction and now —
+                    // brief rest, planner re-picks next tick.
                     if !bed_claims.try_claim(anchor_cell, *npc_id) {
                         info!(
                             npc = npc_id.0,
@@ -1159,41 +1265,52 @@ fn npc_brain_tick(
                     }
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                    // Sleep stands the NPC *on* the bed (cell directly
-                    // above the anchor), not next to it like a consumable.
-                    // `support_below = true` on the bed makes the cell
-                    // above standable for free; if it isn't (overhang /
-                    // low ceiling), fall back to the cardinal-neighbour
-                    // search so a placed-in-a-tight-spot bed still gives
-                    // *some* sleep target rather than refusing to sleep.
-                    let atop_anchor = anchor_cell + IVec3::Y;
-                    let stand_cell = if standable(&world, atop_anchor) {
-                        atop_anchor
-                    } else if let Some(c) =
-                        nearest_standable_neighbor(target_cell, foot, &world)
-                    {
-                        c
-                    } else {
-                        info!(
-                            npc = npc_id.0,
-                            target = ?target_cell.to_array(),
-                            "no standable cell atop sleeper or in its cardinal neighbours; releasing claim and parking briefly",
-                        );
-                        bed_claims.release(anchor_cell, *npc_id);
-                        brain.goal = Goal::Resting {
-                            remaining_secs: MIN_REST_SECS,
-                        };
-                        *intent = MovementIntent::default();
-                        continue;
+                    // Resolve approach cell + snap from the use_slot.
+                    // Slotless sleepers (mod-defined without a slot)
+                    // fall back to the consume-pattern: stand at any
+                    // standable cardinal neighbour of the target cell,
+                    // no snap, no kinematic lock. They function as
+                    // "lie wherever you arrived" — degraded, but the
+                    // need still gets satisfied.
+                    let (stand_cell, snap) = match resolve_use_slot_target(
+                        slot.as_ref(),
+                        anchor_cell,
+                        orientation,
+                        target_cell,
+                        foot,
+                        &world,
+                    ) {
+                        Some(pair) => pair,
+                        None => {
+                            info!(
+                                npc = npc_id.0,
+                                target = ?target_cell.to_array(),
+                                block = %def_id,
+                                "no standable approach for sleeper; releasing claim and parking briefly",
+                            );
+                            bed_claims.release(anchor_cell, *npc_id);
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            *intent = MovementIntent::default();
+                            continue;
+                        }
                     };
                     let duration = sleeper
                         .duration_secs
                         .clamp(MIN_SLEEP_DURATION_SECS, MAX_SLEEP_DURATION_SECS);
                     if stand_cell == foot {
+                        // Already standing on the approach cell — apply
+                        // the snap in place and enter Sleeping. Same
+                        // arrival semantics as the MoveTo path.
                         if !npc_path.0.is_empty() {
                             npc_path.0.clear();
                         }
-                        pose.yaw = sleep_yaw_for(bed_orientation);
+                        if let Some(s) = snap {
+                            pose.translation = s.translation;
+                            pose.yaw = s.yaw;
+                            commands.entity(entity).insert(KinematicLock);
+                        }
                         brain.goal = Goal::Sleeping {
                             remaining_secs: duration,
                             need: sleeper.need.clone(),
@@ -1228,8 +1345,8 @@ fn npc_brain_tick(
                                     duration_secs: duration,
                                     target_cell,
                                     anchor_cell,
-                                    orientation: bed_orientation,
                                 },
+                                snap,
                             };
                         }
                         None => {
@@ -1238,7 +1355,7 @@ fn npc_brain_tick(
                                 foot = ?foot.to_array(),
                                 target = ?target_cell.to_array(),
                                 stand = ?stand_cell.to_array(),
-                                "sleep failed: no A* path to standable neighbour, releasing claim and parking briefly"
+                                "sleep failed: no A* path to approach cell, releasing claim and parking briefly"
                             );
                             bed_claims.release(anchor_cell, *npc_id);
                             if !npc_path.0.is_empty() {
@@ -1347,6 +1464,7 @@ fn npc_brain_tick(
                                     duration_secs: duration,
                                     target_cell,
                                 },
+                                snap: None,
                             };
                         }
                         None => {
@@ -1450,6 +1568,7 @@ fn npc_brain_tick(
                                     target_cell,
                                     plan_kind,
                                 },
+                                snap: None,
                             };
                         }
                         None => {
@@ -1504,9 +1623,7 @@ fn npc_brain_tick(
                     dyaw,
                 };
             }
-            Goal::Consuming { target_cell, .. }
-            | Goal::Sleeping { target_cell, .. }
-            | Goal::Working { target_cell, .. } => {
+            Goal::Consuming { target_cell, .. } | Goal::Working { target_cell, .. } => {
                 let aim = waypoint_xz(*target_cell);
                 let Some(dyaw) = aim_yaw_step(pose_xz, pose.yaw, aim, dt) else {
                     *intent = MovementIntent::default();
@@ -1520,7 +1637,15 @@ fn npc_brain_tick(
                     dyaw,
                 };
             }
-            Goal::Idle | Goal::Resting { .. } => {
+            // Sleeping deliberately doesn't aim_yaw_step: the body yaw
+            // was snapped to the bed orientation at goal-entry by
+            // `sleep_yaw_for`, and a sleeping NPC standing *on* the
+            // bed has aim == pose, so the step would no-op anyway —
+            // but if arrival ever lands them off-cell (low ceiling
+            // fallback, edge of cell), aiming at the bed cell would
+            // drift their yaw away from the bed orientation toward
+            // facing-the-cell, which reads as random angles.
+            Goal::Sleeping { .. } | Goal::Idle | Goal::Resting { .. } => {
                 *intent = MovementIntent::default();
             }
         }
@@ -1835,26 +1960,18 @@ fn resolve_anchor_with_orientation(
     }
 }
 
-/// NPC pose yaw that aligns the body with a bed of the given placement
-/// orientation — forward points from the bed's foot toward its head.
-///
-/// `Cardinal::yaw()` is the *mesh* rotation (model-space +X → cardinal
-/// direction). The NPC mesh's model-space forward is -Z (Bevy
-/// convention), so we shift by -π/2 to convert mesh-yaw into NPC-yaw
-/// for the same direction.
-fn sleep_yaw_for(orientation: Cardinal) -> f32 {
-    orientation.yaw() - core::f32::consts::FRAC_PI_2
-}
-
-/// Resolve the [`Sleeper`] at a world cell, if any. Returns `None`
-/// when the cell is empty, the chunk isn't loaded, or the block's
-/// def has no `sleeper` metadata.
-fn sleeper_at_cell(
+/// Resolve a sleeper-bearing block at a cell, returning its
+/// [`Sleeper`] metadata, optional [`UseSlot`], and id (for log lines).
+/// `None` when the cell is empty, the chunk isn't loaded, or the def
+/// has no sleeper metadata. Pulled into one lookup so the planner
+/// commit path doesn't make three separate trips through the same
+/// chunk + registry.
+fn sleeper_with_slot_at_cell(
     cell: IVec3,
     chunks: &Query<&Chunk>,
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
-) -> Option<Sleeper> {
+) -> Option<(Sleeper, Option<UseSlot>, block_junk_mod_api::blocks::BlockId)> {
     let (coord, local) = world_to_chunk(cell);
     let entity = *chunk_map.0.get(&coord)?;
     let chunk = chunks.get(entity).ok()?;
@@ -1862,7 +1979,188 @@ fn sleeper_at_cell(
     if slot.is_empty() {
         return None;
     }
-    registry.def(slot).sleeper.clone()
+    let def = registry.def(slot);
+    let sleeper = def.sleeper.clone()?;
+    Some((sleeper, def.use_slot.clone(), def.id.clone()))
+}
+
+/// Pick a stand cell + (optional) snap for a goal whose target block
+/// may carry a [`UseSlot`]. Two modes:
+///
+/// - **Slot present**: rotate each `slot.approach` cell offset by the
+///   block's [`Cardinal`] and add the anchor cell to get a world-space
+///   candidate. Among the candidates that are currently `standable`,
+///   pick whichever has the smallest Manhattan distance to the NPC's
+///   foot (ties broken by listing order — authors put the "preferred"
+///   approach first if it matters). Compute the snap once from the
+///   anchor + rotated `slot.pose` + `slot.yaw`; arrival just teleports
+///   to it.
+/// - **Slot absent**: fall back to the consume-pattern. Pick a
+///   standable cardinal neighbour of `target_cell` closest to `foot`,
+///   and return `snap = None`. The body lands at the path's last cell
+///   with no pose snap and no kinematic lock — the legacy behaviour
+///   for blocks that read naturally from any side (fruit basket).
+///
+/// Returns `None` only when neither a slot-approach nor a neighbour
+/// stand cell is available — the goal should abandon and let the
+/// planner pick something else.
+fn resolve_use_slot_target<W: Walkability>(
+    slot: Option<&UseSlot>,
+    anchor_cell: IVec3,
+    orientation: Cardinal,
+    target_cell: IVec3,
+    foot: IVec3,
+    world: &W,
+) -> Option<(IVec3, Option<UseSlotSnap>)> {
+    match slot {
+        Some(slot) => {
+            let mut best: Option<(IVec3, i32)> = None;
+            for off in &slot.approach {
+                let rotated = orientation.rotate_offset(*off);
+                let cand = anchor_cell + IVec3::new(rotated[0], rotated[1], rotated[2]);
+                if !standable(world, cand) {
+                    continue;
+                }
+                let d = cand - foot;
+                let dist = d.x.abs() + d.y.abs() + d.z.abs();
+                match best {
+                    None => best = Some((cand, dist)),
+                    Some((_, prev)) if dist < prev => best = Some((cand, dist)),
+                    _ => {}
+                }
+            }
+            let stand = best?.0;
+            Some((stand, Some(compute_use_slot_snap(slot, anchor_cell, orientation))))
+        }
+        None => {
+            let stand = nearest_standable_neighbor(target_cell, foot, world)?;
+            Some((stand, None))
+        }
+    }
+}
+
+/// World-space pose snap implied by a slot at a given anchor +
+/// orientation. The author writes `slot.pose` in default-orientation
+/// model space (origin at the anchor cell's bottom-centre, +X = the
+/// default extends direction), so converting to world is: rotate the
+/// XZ components by the block's [`Cardinal`], shift Y by the anchor's
+/// cell-origin Y, and shift XZ by the anchor cell's *centre* (the
+/// model frame's origin is the bottom-*centre* of the anchor, not the
+/// cell's min corner). Yaw is the block's cardinal yaw plus the
+/// slot's authored offset — that's where "while using, orient this
+/// way" lives.
+/// Look up the optional [`UseSlot`] for whatever block lives at this
+/// cell. Generic over interaction type — the slot is the same field
+/// on the def regardless of whether the block is a sleeper,
+/// consumable, or future workstation, so ejection can read it the
+/// same way for all of them. Returns `None` for empty cells,
+/// unloaded chunks, or defs without a slot.
+fn slot_at_cell(
+    cell: IVec3,
+    chunks: &Query<&Chunk>,
+    chunk_map: &ChunkMap,
+    registry: &BlockRegistry,
+) -> Option<UseSlot> {
+    let (coord, local) = world_to_chunk(cell);
+    let entity = *chunk_map.0.get(&coord)?;
+    let chunk = chunks.get(entity).ok()?;
+    let slot = chunk.get(local);
+    if slot.is_empty() {
+        return None;
+    }
+    registry.def(slot).use_slot.clone()
+}
+
+/// Teleport `pose` onto the first standable cell in `candidates`.
+/// Pose is set to "standing at cell centre, feet on cell floor" —
+/// the same eye-position math the spawn path and `walk_step` rest
+/// at. Returns `true` on a successful eject (pose mutated), `false`
+/// if every candidate was unstandable (pose unchanged; caller
+/// surfaces this with a warning).
+///
+/// Used as the post-use eject — when a [`KinematicLock`] is about
+/// to be released, the NPC's body is typically sitting inside the
+/// block they just used (on the mattress, in the chair, atop the
+/// forge), and the next physics tick alone won't pull them out.
+/// Callers pass an ordered candidate list with the block's
+/// `use_slot.approach` cells first (NPCs leave the way they came
+/// in), then "above the AABB" fallbacks so a sealed-in NPC still
+/// has somewhere to go.
+fn try_eject_to_cells<W: Walkability>(
+    pose: &mut AvatarPose,
+    candidates: impl IntoIterator<Item = IVec3>,
+    world: &W,
+) -> bool {
+    for cell in candidates {
+        if !standable(world, cell) {
+            continue;
+        }
+        pose.translation = Vec3::new(
+            cell.x as f32 + 0.5,
+            cell.y as f32 + EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
+            cell.z as f32 + 0.5,
+        );
+        return true;
+    }
+    false
+}
+
+/// World-space eject candidates for an actor leaving a use-slot
+/// interaction. Order:
+/// 1. Each `slot.approach` cell, rotated by `orientation` and
+///    offset from `anchor_cell`. Author-listed order is preserved
+///    — the first entry is the "preferred exit." NPCs going back
+///    the way they came in feels right for most blocks.
+/// 2. `anchor + Y` and `anchor + 2Y` as a last-resort "pop on top
+///    of the AABB" fallback when every approach is now blocked
+///    (a corral the NPC was sealed into mid-sleep).
+///
+/// Slot-less blocks skip step 1 and fall straight to step 2.
+fn eject_candidates_for_slot(
+    slot: Option<&UseSlot>,
+    anchor_cell: IVec3,
+    orientation: Cardinal,
+) -> Vec<IVec3> {
+    let mut out = Vec::new();
+    if let Some(slot) = slot {
+        for off in &slot.approach {
+            let (rx, rz) = match orientation {
+                Cardinal::East => (off[0], off[2]),
+                Cardinal::North => (off[2], -off[0]),
+                Cardinal::West => (-off[0], -off[2]),
+                Cardinal::South => (-off[2], off[0]),
+            };
+            out.push(anchor_cell + IVec3::new(rx, off[1], rz));
+        }
+    }
+    out.push(anchor_cell + IVec3::Y);
+    out.push(anchor_cell + IVec3::Y * 2);
+    out
+}
+
+fn compute_use_slot_snap(slot: &UseSlot, anchor_cell: IVec3, orientation: Cardinal) -> UseSlotSnap {
+    // Float rotation matches Cardinal::rotate_offset's integer matrix
+    // — fractional pose components (mid-cell, half-height) survive
+    // the trip into world space.
+    let (rx, rz) = match orientation {
+        Cardinal::East => (slot.pose[0], slot.pose[2]),
+        Cardinal::North => (slot.pose[2], -slot.pose[0]),
+        Cardinal::West => (-slot.pose[0], -slot.pose[2]),
+        Cardinal::South => (-slot.pose[2], slot.pose[0]),
+    };
+    let anchor_origin = anchor_cell.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+    // `slot.pose` puts the rig's model origin (its "feet" plane)
+    // at this point. `pose.translation` is the eye position, so we
+    // raise by the standing eye-offset to get the actual translation.
+    // This is the symmetric of `attach_npc_visuals`'s `foot_offset`
+    // — the child Transform shifts the model origin down by that
+    // same amount, so the round trip leaves the body where the
+    // author asked.
+    let model_origin = anchor_origin + Vec3::new(rx, slot.pose[1], rz);
+    let translation =
+        model_origin + Vec3::Y * (EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y);
+    let yaw = orientation.yaw() + slot.yaw;
+    UseSlotSnap { translation, yaw }
 }
 
 /// K nearest consumable cells within `radius_cells` (Chebyshev) of
@@ -2212,7 +2510,7 @@ pub(crate) fn npc_physics_step(
             &mut MovementMode,
             &MovementIntent,
         ),
-        With<Npc>,
+        (With<Npc>, Without<KinematicLock>),
     >,
 ) {
     let dt = time.delta_secs();

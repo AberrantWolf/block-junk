@@ -205,6 +205,51 @@ register {
         restores = 0.7,
         duration_secs = 25.0,
     },
+    -- Snap-to-slot positioning for the sleep action. Without this the
+    -- brain would try to derive "stand atop the foot cell + face the
+    -- bed's extends axis" through the regular walk/collide pipeline,
+    -- which is awkward (the lying animation pivots around the rig's
+    -- origin, not whichever cell A* happened to land them on). With
+    -- this, the engine pathfinds to one of `approach`, then on
+    -- arrival snaps pose.translation to anchor + rotated(pose) and
+    -- pose.yaw to orientation.yaw() + yaw, and marks the NPC
+    -- kinematic for the sleep duration so the physics tick and
+    -- soft-actor-separation pass don't budge them.
+    --
+    -- `pose = (1.0, 1.0, 0.0)` places the rig's model origin (the
+    -- "feet" plane the lying clip pivots around) mid-bed in X
+    -- (between the foot cell at x=0 and the head cell at x=1), on
+    -- top of the mattress (Y=1 = top of the 1m-tall bed mesh), Z=0
+    -- (centre of the bed's width). The engine adds the standing
+    -- eye-offset to derive pose.translation, so authors don't have
+    -- to think about Bevy's eye-vs-feet pose convention.
+    --
+    -- `yaw = π/2` orients the body along the bed's extends axis
+    -- with the head at the +X (head-of-bed) end. The KayKit lying
+    -- clip extends the body in the rig's +Z direction (opposite of
+    -- standing-forward), so we face the NPC at -X = west, which
+    -- then maps the rig's +Z to world +X.
+    --
+    -- `approach` covers the three cells around the foot end of the
+    -- bed (West/North/South neighbours) plus the three around the
+    -- head (East/North/South neighbours). NPCs that walk up from
+    -- any side can reach a slot to start sleeping; the two cells the
+    -- bed itself occupies are deliberately omitted (the validator
+    -- would reject them anyway). The same cells are reused as
+    -- ejection targets when the NPC wakes — they go back out the
+    -- way they came in.
+    use_slot = {
+        pose = { 1.0, 1.0, 0.0 },
+        yaw = 1.5707963,
+        approach = {
+            { -1, 0, 0 },   -- West of foot
+            { 0, 0, -1 },   -- North of foot
+            { 0, 0, 1 },    -- South of foot
+            { 2, 0, 0 },    -- East of head
+            { 1, 0, -1 },   -- North of head
+            { 1, 0, 1 },    -- South of head
+        },
+    },
 }
 
 -- Seed room patterns. The detector isn't wired yet (next chunk of work);

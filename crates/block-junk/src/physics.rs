@@ -12,7 +12,9 @@ use bevy::prelude::*;
 
 use crate::blocks::BlockRegistry;
 use crate::collision::{Aabb, WorldCollision, sweep_axis};
-use crate::protocol::{Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementMode, MovementIntent};
+use crate::protocol::{
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, KinematicLock, MovementIntent, MovementMode,
+};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
 /// Player AABB half-extents. 0.6 × 1.8 × 0.6 matches the avatar mesh and
@@ -66,23 +68,47 @@ pub fn soft_separate_actors(
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    mut actors: Query<(Entity, &mut AvatarPose), With<Actor>>,
+    mut actors: Query<(Entity, &mut AvatarPose), (With<Actor>, Without<KinematicLock>)>,
 ) {
     let snapshot: Vec<(Entity, Vec3)> = actors
         .iter()
         .map(|(e, pose)| (e, pose.translation))
         .collect();
-    let n = snapshot.len();
-    if n < 2 {
-        return;
+    let pushes = compute_actor_separation_pushes(&snapshot);
+    let world = WorldCollision {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    for (i, (entity, _)) in snapshot.iter().enumerate() {
+        let push = pushes[i];
+        if push.x == 0.0 && push.y == 0.0 {
+            continue;
+        }
+        let Ok((_, mut pose)) = actors.get_mut(*entity) else {
+            continue;
+        };
+        apply_separation_push_swept(&mut pose.translation, push, &world);
     }
+}
 
+/// Pairwise XZ push set for a snapshot of actor positions. Index of
+/// each returned push matches the index in `snapshot`. Extracted from
+/// [`soft_separate_actors`] so the client variant can run the same
+/// pairwise pass but choose which entities to actually move (the
+/// client should not push *interpolated* remotes — those are
+/// server-authoritative and any local mutation drifts the host's
+/// rendered position of remote avatars away from the truth tick by
+/// tick).
+pub fn compute_actor_separation_pushes(snapshot: &[(Entity, Vec3)]) -> Vec<Vec2> {
+    let n = snapshot.len();
+    let mut pushes = vec![Vec2::ZERO; n];
+    if n < 2 {
+        return pushes;
+    }
     let min_xz = 2.0 * ACTOR_SEPARATION_HALF_XZ;
     let min_xz_sq = min_xz * min_xz;
     let min_dy = 2.0 * PLAYER_HALF_EXTENTS.y;
-
-    // Accumulate XZ push per entity. Index aligned with `snapshot`.
-    let mut pushes: Vec<Vec2> = vec![Vec2::ZERO; n];
     for i in 0..n {
         for j in (i + 1)..n {
             let dy = snapshot[i].1.y - snapshot[j].1.y;
@@ -113,33 +139,25 @@ pub fn soft_separate_actors(
             pushes[j].y -= nz * share;
         }
     }
+    pushes
+}
 
-    // Apply pushes through the sweep so walls clip them.
-    let world = WorldCollision {
-        chunks: &chunks,
-        chunk_map: &chunk_map,
-        registry: &registry,
-    };
-    for (i, (entity, _)) in snapshot.iter().enumerate() {
-        let push = pushes[i];
-        if push.x == 0.0 && push.y == 0.0 {
-            continue;
-        }
-        let Ok((_, mut pose)) = actors.get_mut(*entity) else {
-            continue;
-        };
-        let centre = pose.translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
-        let mut aabb = Aabb::from_centre_half(centre, PLAYER_HALF_EXTENTS);
-        let mut total = Vec3::ZERO;
-        for (axis, want) in [(0, push.x), (2, push.y)] {
-            let mut step = Vec3::ZERO;
-            step[axis] = want;
-            let resolved = sweep_axis(&aabb, step, axis, &world);
-            aabb = aabb.translated(resolved);
-            total += resolved;
-        }
-        pose.translation += total;
+/// Apply a single XZ push to an eye-position translation, sweeping
+/// against the world so a corner push doesn't tunnel through a wall.
+/// Returns nothing; the translation is mutated in place. Pulled out
+/// of [`soft_separate_actors`] for reuse by the client-side variant.
+pub fn apply_separation_push_swept(translation: &mut Vec3, push: Vec2, world: &WorldCollision) {
+    let centre = *translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
+    let mut aabb = Aabb::from_centre_half(centre, PLAYER_HALF_EXTENTS);
+    let mut total = Vec3::ZERO;
+    for (axis, want) in [(0, push.x), (2, push.y)] {
+        let mut step = Vec3::ZERO;
+        step[axis] = want;
+        let resolved = sweep_axis(&aabb, step, axis, world);
+        aabb = aabb.translated(resolved);
+        total += resolved;
     }
+    *translation += total;
 }
 
 /// Walking speed on the ground (m/s). Between Minecraft (~4.3) and Quake (~9).
