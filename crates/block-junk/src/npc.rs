@@ -46,8 +46,8 @@ use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_ste
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
-    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementIntent, MovementMode, PlanKind,
-    WorldClock,
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementIntent, MovementMode, NpcActivity,
+    PlanKind, WorldClock,
 };
 use crate::scripting::ServerMods;
 use crate::sleepers::{BedClaims, SleeperIndex};
@@ -413,6 +413,30 @@ impl Plugin for NpcServerPlugin {
         // the brain writes this tick. Both run in FixedUpdate alongside
         // the player physics so all actors advance together.
         app.add_systems(FixedUpdate, (npc_brain_tick, npc_physics_step).chain());
+        // Activity is derived from Goal and replicated to drive client
+        // animation. Updates after the brain tick so the broadcast
+        // reflects the just-decided goal.
+        app.add_systems(FixedUpdate, refresh_npc_activity.after(npc_brain_tick));
+    }
+}
+
+/// Map [`Brain::goal`] onto the coarse [`NpcActivity`] enum the client
+/// reads for animation. Walking is decided client-side from velocity
+/// (its hysteresis prevents strobing on stop/start), so MoveTo here
+/// maps to `Idle` — the client takes over once velocity rises.
+/// Resting and Consuming also map to `Idle` until we have dedicated
+/// clips for them.
+fn refresh_npc_activity(mut npcs: Query<(&Brain, &mut NpcActivity), With<Npc>>) {
+    for (brain, mut activity) in npcs.iter_mut() {
+        let next = match &brain.goal {
+            Goal::Sleeping { .. } => NpcActivity::Sleeping,
+            Goal::Working { .. } => NpcActivity::Working,
+            _ => NpcActivity::Idle,
+        };
+        // `set_if_neq` keeps the replication channel quiet on the common
+        // path (the activity changes once per goal transition, not per
+        // tick).
+        activity.set_if_neq(next);
     }
 }
 
@@ -493,16 +517,21 @@ fn spawn_initial_npc_on_first_connect(
     ];
     for (i, translation) in cluster.into_iter().enumerate() {
         let id: u64 = (i + 1) as u64;
+        // Nested tuples work around Bevy's 15-element Bundle cap. Two
+        // groups: identity/brain (cheap markers + structured state) and
+        // physics + replication (per-frame state + lightyear).
         commands.spawn((
-            Actor,
-            Npc,
-            NpcId(id),
-            NpcKind(kind_id.into()),
-            Needs(default_needs.clone()),
-            Brain {
-                goal: Goal::Idle,
-                rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
-            },
+            (
+                Actor,
+                Npc,
+                NpcId(id),
+                NpcKind(kind_id.into()),
+                Needs(default_needs.clone()),
+                Brain {
+                    goal: Goal::Idle,
+                    rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
+                },
+            ),
             AvatarPose {
                 translation,
                 yaw: 0.0,
@@ -512,6 +541,7 @@ fn spawn_initial_npc_on_first_connect(
             MovementMode::Walk,
             MovementIntent::default(),
             NpcPath::default(),
+            NpcActivity::default(),
             Replicate::to_clients(NetworkTarget::All),
             InterpolationTarget::to_clients(NetworkTarget::All),
             Name::new(format!("npc:{id}")),

@@ -108,6 +108,21 @@ pub struct Actor;
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Avatar;
 
+/// Coarse "what is this NPC doing right now" — derived server-side
+/// from [`crate::npc::Brain::goal`] and replicated to drive client
+/// animation selection. Walking is decided client-side from velocity
+/// (hysteresis on motion onset/offset), so this enum only carries the
+/// states the client *can't* infer from pose: stationary work-flavoured
+/// actions. Consuming and Resting both render as Idle today since we
+/// don't have dedicated clips for them.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+pub enum NpcActivity {
+    #[default]
+    Idle,
+    Working,
+    Sleeping,
+}
+
 /// Per-avatar movement mode. Server-authoritative — the server decides
 /// when a creative-mode toggle is allowed; today the request is granted
 /// unconditionally. Replicated + predicted so the owner client stays in

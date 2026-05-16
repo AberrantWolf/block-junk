@@ -26,8 +26,8 @@ use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::target_outline::TargetOutlinePlugin;
 use crate::protocol::{
     Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
-    ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode, WorldChannel,
-    WorldClock, WorldClockSync,
+    ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode, NpcActivity,
+    WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -210,6 +210,8 @@ struct CharacterAssets {
     anim_graph: Handle<AnimationGraph>,
     idle: AnimationNodeIndex,
     walk: AnimationNodeIndex,
+    sleep: AnimationNodeIndex,
+    work: AnimationNodeIndex,
 }
 
 /// Clip indices inside the KayKit `Rig_Medium_*` glbs. Probed once with
@@ -217,12 +219,19 @@ struct CharacterAssets {
 /// stay valid. If the pack ever changes, re-probe with `python3 -c …`
 /// reading `animations[].name` and update both.
 ///
-///   Rig_Medium_General.glb[6]       = "Idle_A"
-///   Rig_Medium_MovementBasic.glb[8] = "Walking_A"
+///   Rig_Medium_General.glb[6]        = "Idle_A"
+///   Rig_Medium_MovementBasic.glb[8]  = "Walking_A"
+///   Rig_Medium_Simulation.glb[2]     = "Lie_Idle"     (Goal::Sleeping)
+///   Rig_Medium_Tools.glb[26]         = "Working_A"    (Goal::Working)
 const KAYKIT_IDLE_A_INDEX: usize = 6;
 const KAYKIT_WALKING_A_INDEX: usize = 8;
+const KAYKIT_LIE_IDLE_INDEX: usize = 2;
+const KAYKIT_WORKING_A_INDEX: usize = 26;
 const KAYKIT_GENERAL_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_General.glb";
 const KAYKIT_MOVEMENT_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_MovementBasic.glb";
+const KAYKIT_SIMULATION_GLB: &str =
+    "mods://vanilla/models/characters/Rig_Medium_Simulation.glb";
+const KAYKIT_TOOLS_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_Tools.glb";
 const KAYKIT_KNIGHT_GLB: &str = "mods://vanilla/models/characters/Knight.glb";
 
 /// Tracks the ECS entity rendering each placed block-entity (a block
@@ -386,13 +395,20 @@ fn setup_scene(
         .load(GltfAssetLabel::Animation(KAYKIT_IDLE_A_INDEX).from_asset(KAYKIT_GENERAL_GLB));
     let walk_clip = asset_server
         .load(GltfAssetLabel::Animation(KAYKIT_WALKING_A_INDEX).from_asset(KAYKIT_MOVEMENT_GLB));
-    let (anim_graph, clip_indices) = AnimationGraph::from_clips([idle_clip, walk_clip]);
+    let sleep_clip = asset_server
+        .load(GltfAssetLabel::Animation(KAYKIT_LIE_IDLE_INDEX).from_asset(KAYKIT_SIMULATION_GLB));
+    let work_clip = asset_server
+        .load(GltfAssetLabel::Animation(KAYKIT_WORKING_A_INDEX).from_asset(KAYKIT_TOOLS_GLB));
+    let (anim_graph, clip_indices) =
+        AnimationGraph::from_clips([idle_clip, walk_clip, sleep_clip, work_clip]);
     commands.insert_resource(CharacterAssets {
         knight_scene: asset_server
             .load(GltfAssetLabel::Scene(0).from_asset(KAYKIT_KNIGHT_GLB)),
         anim_graph: anim_graphs.add(anim_graph),
         idle: clip_indices[0],
         walk: clip_indices[1],
+        sleep: clip_indices[2],
+        work: clip_indices[3],
     });
 
 
@@ -1796,14 +1812,16 @@ fn attach_avatar_visuals(
 #[derive(Component)]
 struct NpcSceneRoot;
 
-/// Coarse animation state for an NPC. Only Idle/Walk this slice; Run
-/// + jump variants land when the threshold ladder is more interesting
-/// than "are we moving."
+/// Coarse animation state for an NPC. Walk vs. stationary comes from
+/// velocity hysteresis; Sleep and Work come from the replicated
+/// `NpcActivity` the server publishes from the Brain's goal.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum NpcAnimState {
     #[default]
     Idle,
     Walk,
+    Sleep,
+    Work,
 }
 
 /// Marker on the NPC root entity once we've spawned its visual rig
@@ -2042,40 +2060,61 @@ fn find_npc_ancestor(
     None
 }
 
-/// Crossfade Idle ↔ Walk based on horizontal speed. Hysteresis (walk
-/// in at 0.5 m/s, fall back to idle at 0.2 m/s) stops the animation
-/// from strobing when the NPC's velocity hovers near a single
-/// threshold (e.g. at the end of a wander before Resting kicks in).
-/// 200 ms crossfade is short enough to feel responsive but long enough
-/// that the blend isn't a visible pop.
+/// Pick the right clip for each NPC based on its replicated
+/// `NpcActivity` + horizontal velocity. Velocity decides Walk vs.
+/// stationary (with hysteresis to stop strobing near the threshold);
+/// the activity then selects which stationary clip to play. Sleeping
+/// and Working override walk: a server-driven Sleep state holds even
+/// if the body's velocity hasn't settled all the way to zero
+/// (interpolation noise).
 fn drive_npc_animation(
-    mut npcs: Query<(&AvatarVelocity, &mut NpcVisuals), With<Npc>>,
+    mut npcs: Query<(&AvatarVelocity, &NpcActivity, &mut NpcVisuals), With<Npc>>,
     mut players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
     assets: Res<CharacterAssets>,
 ) {
     const WALK_ENTER: f32 = 0.5;
     const WALK_EXIT: f32 = 0.2;
     const CROSSFADE: Duration = Duration::from_millis(200);
-    for (velocity, mut visuals) in npcs.iter_mut() {
+    for (velocity, activity, mut visuals) in npcs.iter_mut() {
         let Some(player_entity) = visuals.player else {
             continue;
         };
         let speed_xz = Vec2::new(velocity.0.x, velocity.0.z).length();
-        let next = match visuals.state {
-            NpcAnimState::Idle if speed_xz > WALK_ENTER => Some(NpcAnimState::Walk),
-            NpcAnimState::Walk if speed_xz < WALK_EXIT => Some(NpcAnimState::Idle),
-            _ => None,
+        // Activity overrides walk for stationary actions — an NPC
+        // standing at a plan target shouldn't flip back to walk on a
+        // stray interpolation wobble. Walk only owns motion between
+        // goals.
+        let target = match *activity {
+            NpcActivity::Sleeping => NpcAnimState::Sleep,
+            NpcActivity::Working => NpcAnimState::Work,
+            NpcActivity::Idle => {
+                // Hysteresis: only switch to walk above 0.5 m/s and only
+                // back to idle below 0.2 m/s. Anything in between holds
+                // the current state.
+                match visuals.state {
+                    NpcAnimState::Idle if speed_xz > WALK_ENTER => NpcAnimState::Walk,
+                    NpcAnimState::Walk if speed_xz < WALK_EXIT => NpcAnimState::Idle,
+                    NpcAnimState::Walk => NpcAnimState::Walk,
+                    // Sleep / Work falling back to Idle while the server
+                    // still says Idle — pick idle until velocity climbs.
+                    _ => NpcAnimState::Idle,
+                }
+            }
         };
-        let Some(new_state) = next else { continue };
+        if target == visuals.state {
+            continue;
+        }
         let Ok((mut player, mut transitions)) = players.get_mut(player_entity) else {
             continue;
         };
-        let node = match new_state {
+        let node = match target {
             NpcAnimState::Idle => assets.idle,
             NpcAnimState::Walk => assets.walk,
+            NpcAnimState::Sleep => assets.sleep,
+            NpcAnimState::Work => assets.work,
         };
         transitions.play(&mut player, node, CROSSFADE).repeat();
-        visuals.state = new_state;
+        visuals.state = target;
     }
 }
 

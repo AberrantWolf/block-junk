@@ -18,7 +18,7 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
-    MovementIntent, MovementMode, NpcDetails, PlanEdit, PlanKind, RequestNpcDetails,
+    MovementIntent, MovementMode, NpcActivity, NpcDetails, PlanEdit, PlanKind, RequestNpcDetails,
     WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
@@ -279,22 +279,27 @@ fn spawn_loaded_npc(
             needs.entry(need_id.clone()).or_insert(*default_value);
         }
     }
+    // Nested tuple: same 15-element Bundle workaround as the spawn-
+    // cluster path. Identity/brain group + per-frame state + lightyear.
     commands.spawn((
-        Actor,
-        Npc,
-        NpcId(npc.id),
-        NpcKind(npc.kind),
-        Needs(needs),
-        Brain {
-            goal: Goal::Idle,
-            rng: npc.rng,
-        },
+        (
+            Actor,
+            Npc,
+            NpcId(npc.id),
+            NpcKind(npc.kind),
+            Needs(needs),
+            Brain {
+                goal: Goal::Idle,
+                rng: npc.rng,
+            },
+        ),
         npc.pose,
         AvatarVelocity::default(),
         AvatarOnGround::default(),
         npc.movement_mode,
         MovementIntent::default(),
         NpcPath::default(),
+        NpcActivity::default(),
         Replicate::to_clients(NetworkTarget::All),
         InterpolationTarget::to_clients(NetworkTarget::All),
         Name::new(format!("npc:{}", npc.id)),

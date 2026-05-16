@@ -163,15 +163,17 @@ commands.spawn(Node {
 
 `BackgroundColor` and `BorderColor` are still standalone components — only `BorderRadius` was folded into `Node`. The asymmetry is jarring but real.
 
-## `SystemParam` and tuple caps in Bevy 0.18
+## `SystemParam`, Bundle, and tuple caps in Bevy 0.18
 
-Two distinct ceilings will bite you when systems grow:
+Three distinct ceilings will bite you when systems and spawns grow:
 
 1. **A single system can take at most 16 system params.** Adding a 17th gives a cryptic `no method named "in_set" found for fn item …` error at the call site — the compiler is really saying "`IntoSystem`/`SystemParam` doesn't reach 17," but it surfaces on `.in_set` / `.run_if` / `.chain` rather than on the system definition. Fix: combine related params under a `#[derive(SystemParam)]` struct, or — usually simpler — extract gating logic into a `run_if` so the gated param isn't needed inside the system at all.
 
-2. **`add_systems(Update, (a, b, c, …))` tuples cap at ~5–8 systems** before the trait-resolution chain explodes. The threshold isn't fixed — it depends on each system's signature complexity (more params per system = lower system count). If one of your systems has many params, the whole tuple's trait resolution gets monstrous and fails. Fix: split into multiple `.add_systems(Update, …)` calls. The server's `Simulation` set in `server.rs` uses this workaround on purpose.
+2. **`commands.spawn(...)` tuples cap at 15 elements.** Adding a 16th component gives `(..., ..., ...) is not a Bundle`. Fix: nest into tuple-of-tuples — `spawn((inner_group_of_components, outer_components...))` — Bundle is implemented recursively, so nested tuples count as one element of the outer. The NPC spawn paths in `npc.rs::spawn_initial_npc_on_first_connect` and `server.rs::spawn_loaded_npc` use this workaround.
 
-Both caps surface as the same E0599 "no method named in_set found" pattern, with the long type name written to `target/debug/deps/…long-type-….txt`. When you see that error, count params (cap 1) and tuple size (cap 2) before chasing other leads.
+3. **`add_systems(Update, (a, b, c, …))` tuples cap at ~5–8 systems** before the trait-resolution chain explodes. The threshold isn't fixed — it depends on each system's signature complexity (more params per system = lower system count). If one of your systems has many params, the whole tuple's trait resolution gets monstrous and fails. Fix: split into multiple `.add_systems(Update, …)` calls. The server's `Simulation` set in `server.rs` uses this workaround on purpose.
+
+Caps 1 and 3 surface as the same E0599 "no method named in_set found" pattern, with the long type name written to `target/debug/deps/…long-type-….txt`. Cap 2 surfaces as `(...) is not a Bundle`. When you see either, count params/tuple size before chasing other leads.
 
 ## bevy_ui: `Text` and `ImageNode` constructors
 
