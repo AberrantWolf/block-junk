@@ -144,6 +144,12 @@ pub fn sweep_axis(mover: &Aabb, step: Vec3, axis: usize, world: &WorldCollision)
 /// the Query is invariant and concretely `&'static Chunk`. Without the
 /// explicit `'static`, the struct field's elided lifetime can't unify
 /// with the system-arg Query.
+///
+/// Actor-vs-actor collision deliberately lives outside this struct —
+/// blocks are hard obstacles in the sweep, but actors only experience
+/// each other through the per-tick soft-separation pass
+/// (`soft_separate_actors`) so they can gently push one another instead
+/// of getting hard-stopped at contact.
 pub struct WorldCollision<'w, 's, 'a> {
     pub chunks: &'a Query<'w, 's, (&'static Chunk, &'static ChunkEntities)>,
     pub chunk_map: &'a ChunkMap,

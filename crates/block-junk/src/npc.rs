@@ -1033,7 +1033,17 @@ fn npc_brain_tick(
                     let timeout = timeout_secs.clamp(1.0, MAX_GOTO_TIMEOUT_SECS);
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                    let target = IVec3::new(cell.x, cell.y, cell.z);
+                    let planner_target = IVec3::new(cell.x, cell.y, cell.z);
+                    // If the planner picked the floor anchor of a known
+                    // room, jitter to *any* floor cell of that room.
+                    // Stops every villager visiting the same building
+                    // from converging on one tile and tripping the new
+                    // actor-vs-actor collision into a stampede. For
+                    // out-of-room Gotos (raw waypoint cells) the helper
+                    // returns None and the planner cell is used as-is.
+                    let target = room_map
+                        .random_floor_cell_in_same_room(planner_target, rand_unit(&mut brain.rng))
+                        .unwrap_or(planner_target);
                     // Already at the target: the planner picked a cell
                     // the NPC's already standing on (typically the
                     // anchor of the room they're currently in). Drop
@@ -2185,8 +2195,11 @@ fn lookahead_point(path: &[IVec3], start_progress: f32, distance: f32) -> Vec2 {
 /// Run the same physics controller players use, against the brain-
 /// written `MovementIntent`. Mirrors `server_player_step` in server.rs
 /// modulo the source of the intent — NPC brain vs replicated player
-/// input.
-fn npc_physics_step(
+/// input. Actor-vs-actor contact is handled post-physics by
+/// `soft_separate_actors`, not in the sweep, so two actors can briefly
+/// overlap then get pushed apart gently rather than hard-stopping at
+/// contact.
+pub(crate) fn npc_physics_step(
     time: Res<Time>,
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,

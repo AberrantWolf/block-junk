@@ -19,16 +19,18 @@ use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
 use crate::menu::AppState;
 use crate::npc::{Npc, NpcId, NpcPath};
-use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
+use crate::physics::{
+    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, soft_separate_actors,
+};
 use crate::inspect_panel::InspectPanelPlugin;
-use crate::plans::PlansClientPlugin;
+use crate::plans::{Plans, PlansClientPlugin};
 use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::target_outline::TargetOutlinePlugin;
 use crate::protocol::{
     Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, ChunkCoord,
     ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode, NpcActivity,
-    WorldChannel, WorldClock, WorldClockSync,
+    PlanKind, WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -107,9 +109,19 @@ impl Plugin for ClientPlugin {
             // runs, against the same inputs, so we don't wait for the
             // server's reply to see ourselves move. Lightyear rolls back
             // and replays this when it receives a server correction.
+            //
+            // Soft actor separation runs after the predicted step so
+            // the local player's prediction matches the server's
+            // outcome when walking into NPCs (server runs the same
+            // pass post-physics on its side). Interpolated remote
+            // actors participate as pushable bodies — they get nudged
+            // in the local prediction, then the next server snapshot
+            // corrects them, which is fine for cosmetic pushes.
             .add_systems(
                 FixedUpdate,
-                client_player_step.run_if(in_state(AppState::InGame)),
+                (client_player_step, soft_separate_actors)
+                    .chain()
+                    .run_if(in_state(AppState::InGame)),
             )
             // Chained: receive_snapshots inserts new chunks via Commands;
             // receive_block_edit_broadcasts queries those chunks. Without
@@ -848,6 +860,7 @@ fn place_break_input(
         &chunks,
         &chunk_map,
         &registry,
+        None,
     ) else {
         action.active = None;
         return;
@@ -981,6 +994,12 @@ pub(crate) fn raycast_npcs(
 /// land on whatever is behind it. On hit, return the entity cell.
 ///
 /// For non-entity cells the behaviour is identical to `world_raycast`.
+///
+/// `skip_plan_remove`: when `Some`, cells whose [`Plans`] entry is
+/// [`PlanKind::Remove`] are treated as empty for the purpose of the cast.
+/// Lets Plan-mode tag a block queued behind one already tagged for removal.
+/// Callers that need to land on the tagged cell itself (Plan-mode Cancel,
+/// Build/Destroy targeting) pass `None`.
 pub(crate) fn entity_aware_raycast(
     origin: Vec3,
     dir: Vec3,
@@ -988,6 +1007,7 @@ pub(crate) fn entity_aware_raycast(
     chunks: &Query<(&Chunk, &ChunkEntities)>,
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
+    skip_plan_remove: Option<&Plans>,
 ) -> Option<EntityAwareHit> {
     let lookup = |world: IVec3| -> (BlockSlot, Option<EntryKind>) {
         let (coord, local) = crate::voxel::world_to_chunk(world);
@@ -999,6 +1019,11 @@ pub(crate) fn entity_aware_raycast(
         };
         (chunk.get(local), entities.get(world))
     };
+    let is_passable = |cell: IVec3, slot: BlockSlot| -> bool {
+        slot.is_empty()
+            || skip_plan_remove
+                .is_some_and(|p| matches!(p.get(cell), Some(PlanKind::Remove)))
+    };
 
     // Two-pass: first find the nearest cell whose block-entity AABB
     // genuinely contains the ray, OR a non-entity solid cell (cube AABB).
@@ -1008,7 +1033,7 @@ pub(crate) fn entity_aware_raycast(
     let mut entered_face = IVec3::ZERO;
 
     let (slot, kind) = lookup(cell);
-    if !slot.is_empty()
+    if !is_passable(cell, slot)
         && cell_passes_test(
             origin,
             dir,
@@ -1056,7 +1081,7 @@ pub(crate) fn entity_aware_raycast(
         t_max[axis] += t_delta[axis];
 
         let (slot, kind) = lookup(cell);
-        if slot.is_empty() {
+        if is_passable(cell, slot) {
             continue;
         }
         if cell_passes_test(
@@ -1290,6 +1315,7 @@ fn update_placement_preview(
         &chunks,
         &chunk_map,
         &registry,
+        None,
     ) else {
         hide(state.cube_root, &mut roots);
         hide(state.scene_root, &mut roots);

@@ -192,6 +192,31 @@ impl RoomMap {
             Some((id, pattern, anchor))
         })
     }
+
+    /// If `cell` is a floor cell of a matched room, return a floor cell
+    /// from the same room picked by `rng_unit` (a uniform `[0, 1)`
+    /// value). Otherwise return `None`.
+    ///
+    /// Used by the NPC brain to spread multiple villagers heading to
+    /// the "same room" across its footprint instead of converging on
+    /// the single centroid anchor — that convergence is what made the
+    /// actor-vs-actor collision register as a stampede at the door.
+    /// Every floor cell is walkable by construction (it's how the
+    /// flood-fill defines them), so the returned cell is always a
+    /// valid pathfinding target.
+    pub fn random_floor_cell_in_same_room(&self, cell: IVec3, rng_unit: f32) -> Option<IVec3> {
+        let room_id = self.cell_to_room.get(&cell)?;
+        let room = self.rooms.get(room_id)?;
+        if room.floor_cells.is_empty() {
+            return None;
+        }
+        let n = room.floor_cells.len();
+        // Multiply-and-truncate instead of `% n` so we don't reuse a
+        // PRNG bit pattern that would bias toward low indices on
+        // non-power-of-two room sizes.
+        let idx = ((rng_unit.clamp(0.0, 1.0) * n as f32) as usize).min(n - 1);
+        Some(room.floor_cells[idx])
+    }
 }
 
 /// Floor cell nearest the geometric centroid of `cells`. Returns

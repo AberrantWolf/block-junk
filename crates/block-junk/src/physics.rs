@@ -10,8 +10,10 @@
 
 use bevy::prelude::*;
 
+use crate::blocks::BlockRegistry;
 use crate::collision::{Aabb, WorldCollision, sweep_axis};
-use crate::protocol::{AvatarOnGround, AvatarPose, AvatarVelocity, MovementMode, MovementIntent};
+use crate::protocol::{Actor, AvatarOnGround, AvatarPose, AvatarVelocity, MovementMode, MovementIntent};
+use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
 /// Player AABB half-extents. 0.6 × 1.8 × 0.6 matches the avatar mesh and
 /// is close to Minecraft's player hitbox.
@@ -22,6 +24,123 @@ pub const PLAYER_HALF_EXTENTS: Vec3 = Vec3::new(0.3, 0.9, 0.3);
 /// natural FPV head height. `AvatarPose.translation` stores the eye
 /// position; the AABB centre is derived as `eye - (0, EYE_OFFSET, 0)`.
 pub const EYE_OFFSET_FROM_CENTRE: f32 = 0.72;
+
+/// XZ half-extent for the actor-vs-actor soft-separation pass. Actors
+/// closer than `2 * ACTOR_SEPARATION_HALF_XZ` on XZ are considered
+/// overlapping for separation purposes. Half of the body's XZ extent so
+/// shoulder-brushing in a doorway doesn't fire the push — overlap only
+/// counts once their *cores* meet, not their outer cuboids.
+pub const ACTOR_SEPARATION_HALF_XZ: f32 = 0.15;
+
+/// What fraction of an actor-vs-actor overlap each actor absorbs per
+/// tick. 0.5 splits the displacement evenly: if A walks into a
+/// stationary B, A advances less than its walk wanted, B drifts forward
+/// in the same direction, and the equilibrium is "both moving at half
+/// A's walk speed, A trailing B." That's the "gently push" feel.
+pub const ACTOR_SEPARATION_PUSH_FRACTION: f32 = 0.5;
+
+/// Tiny gap restored after the separation push so the next tick's
+/// overlap test doesn't immediately re-fire on a floating-point
+/// touching configuration.
+pub const ACTOR_SEPARATION_PUSH_EPS: f32 = 1e-3;
+
+/// Per-tick actor-vs-actor soft separation. Runs after the physics
+/// steps; for every pair of actors whose XZ centres are closer than
+/// `2 * ACTOR_SEPARATION_HALF_XZ`, applies a swept push to each in
+/// opposite directions so they spread apart. The push is bidirectional
+/// and equal-share, so the "pusher" still makes forward progress —
+/// just at roughly half their walk speed while in contact.
+///
+/// **Why not in the sweep itself.** Doing this inside `apply_walk_step`
+/// would either hard-stop the pusher (current state before this system
+/// existed) or require mutating the pushee's pose from inside another
+/// actor's sweep — both worse than a post-physics pairwise pass.
+///
+/// **Why swept.** A direct `pose.translation += push` can shove an
+/// actor into a wall. Running each per-axis push component through
+/// `sweep_axis` against the block grid lets the wall stop the push,
+/// leaving the cornered actor where it was and the pusher with their
+/// half of the displacement consumed against the wall — they don't
+/// magically tunnel.
+pub fn soft_separate_actors(
+    chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut actors: Query<(Entity, &mut AvatarPose), With<Actor>>,
+) {
+    let snapshot: Vec<(Entity, Vec3)> = actors
+        .iter()
+        .map(|(e, pose)| (e, pose.translation))
+        .collect();
+    let n = snapshot.len();
+    if n < 2 {
+        return;
+    }
+
+    let min_xz = 2.0 * ACTOR_SEPARATION_HALF_XZ;
+    let min_xz_sq = min_xz * min_xz;
+    let min_dy = 2.0 * PLAYER_HALF_EXTENTS.y;
+
+    // Accumulate XZ push per entity. Index aligned with `snapshot`.
+    let mut pushes: Vec<Vec2> = vec![Vec2::ZERO; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dy = snapshot[i].1.y - snapshot[j].1.y;
+            if dy.abs() >= min_dy {
+                // Vertically far apart (one on a roof, one on ground)
+                // — different "floor," no pushing.
+                continue;
+            }
+            let dx = snapshot[i].1.x - snapshot[j].1.x;
+            let dz = snapshot[i].1.z - snapshot[j].1.z;
+            let d_sq = dx * dx + dz * dz;
+            if d_sq >= min_xz_sq {
+                continue;
+            }
+            let dist = d_sq.sqrt();
+            // Coincident centres: any direction works; pick +X so two
+            // load-time-stacked NPCs deterministically end up east/west.
+            let (nx, nz) = if dist > 1e-4 {
+                (dx / dist, dz / dist)
+            } else {
+                (1.0, 0.0)
+            };
+            let overlap = min_xz - dist + ACTOR_SEPARATION_PUSH_EPS;
+            let share = overlap * ACTOR_SEPARATION_PUSH_FRACTION;
+            pushes[i].x += nx * share;
+            pushes[i].y += nz * share;
+            pushes[j].x -= nx * share;
+            pushes[j].y -= nz * share;
+        }
+    }
+
+    // Apply pushes through the sweep so walls clip them.
+    let world = WorldCollision {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    for (i, (entity, _)) in snapshot.iter().enumerate() {
+        let push = pushes[i];
+        if push.x == 0.0 && push.y == 0.0 {
+            continue;
+        }
+        let Ok((_, mut pose)) = actors.get_mut(*entity) else {
+            continue;
+        };
+        let centre = pose.translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
+        let mut aabb = Aabb::from_centre_half(centre, PLAYER_HALF_EXTENTS);
+        let mut total = Vec3::ZERO;
+        for (axis, want) in [(0, push.x), (2, push.y)] {
+            let mut step = Vec3::ZERO;
+            step[axis] = want;
+            let resolved = sweep_axis(&aabb, step, axis, &world);
+            aabb = aabb.translated(resolved);
+            total += resolved;
+        }
+        pose.translation += total;
+    }
+}
 
 /// Walking speed on the ground (m/s). Between Minecraft (~4.3) and Quake (~9).
 pub const WALK_SPEED: f32 = 5.0;

@@ -13,7 +13,9 @@ use lightyear::input::native::prelude::*;
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::collision::{Aabb, WorldCollision};
 use crate::menu::{ServerSaveConfig, ServerSaveRequestFlag, ServerShutdownFlag};
-use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
+use crate::physics::{
+    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, soft_separate_actors,
+};
 use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
@@ -124,6 +126,25 @@ impl Plugin for ServerPlugin {
         // compares this against the client's predicted state and replays
         // unacked inputs on disagreement.
         app.add_systems(FixedUpdate, server_player_step);
+        // Soft actor separation runs after both physics systems have
+        // moved everyone for this tick. The pairwise push then nudges
+        // any overlapping actors apart 50/50 — gentle pushing instead
+        // of hard contact-stop. Also runs on the first tick after
+        // load and incidentally separates pre-stacked NPCs.
+        app.add_systems(
+            FixedUpdate,
+            soft_separate_actors
+                .after(server_player_step)
+                .after(crate::npc::npc_physics_step),
+        );
+        // Block-stuck NPCs from a save (or any load-time edge case
+        // where an actor is inside a solid cell) get one pushout
+        // attempt on the first Update tick after chunks have flushed
+        // in from `load_from_save`.
+        app.add_systems(
+            Update,
+            rescue_embedded_actors_after_load.in_set(GameSet::Simulation),
+        );
         app.add_systems(FixedUpdate, tick_world_clock);
         app.add_systems(Update, broadcast_world_clock);
         // Save/load wiring. `load_from_save` runs before any other Startup
@@ -1360,6 +1381,128 @@ fn push_actors_out_of_new_blocks(
                         actor_centre = ?centre.to_array(),
                         "no clear push direction — actor remains embedded; pathfinding will fail",
                     );
+                }
+            }
+        }
+    }
+}
+
+/// One-shot rescue for actors that load already embedded in a solid
+/// cell. `load_from_save` spawns chunks via `Commands` without driving
+/// the `CellEdit` bus, so `push_actors_out_of_new_blocks` (which is
+/// edit-driven) never fires for them — an NPC that the world was saved
+/// inside what's now a wall would otherwise stay stuck.
+///
+/// Per-actor: probe the body AABB against the current world, and if it
+/// overlaps any solid, run the same smallest-clearing-push selection
+/// `push_actors_out_of_new_blocks` uses. We try a few iterations so an
+/// actor wedged into a corner can hop out face-by-face.
+///
+/// The `Local<bool>` gates this to one execution; the chunk-map guard
+/// defers the run until `load_from_save`'s spawned chunks are flushed
+/// into the ECS (otherwise the world looks empty and every actor is
+/// "trivially clear"). On a fresh world with no save and no chunks yet,
+/// the system parks at the guard and runs once chunks appear via the
+/// AoI procedural fallback — also harmless, no actors will be in a
+/// solid then either.
+fn rescue_embedded_actors_after_load(
+    mut ran: Local<bool>,
+    chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut actors: Query<(Entity, &mut AvatarPose), With<Actor>>,
+) {
+    if *ran {
+        return;
+    }
+    if chunk_map.0.is_empty() {
+        return;
+    }
+    *ran = true;
+
+    const PUSH_EPS: f32 = 1e-3;
+    const MAX_ITERS: usize = 4;
+    let world = WorldCollision {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    for (entity, mut pose) in actors.iter_mut() {
+        let mut iter = 0;
+        loop {
+            if iter >= MAX_ITERS {
+                warn!(
+                    entity = ?entity,
+                    centre = ?(pose.translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE).to_array(),
+                    "stuck-on-load actor still embedded after {MAX_ITERS} pushout iterations",
+                );
+                break;
+            }
+            iter += 1;
+            let centre = pose.translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
+            let aabb_min = centre - PLAYER_HALF_EXTENTS;
+            let aabb_max = centre + PLAYER_HALF_EXTENTS;
+            let probe = Aabb::from_min_max(aabb_min, aabb_max);
+            let solids = world.candidates(probe);
+            let overlap = solids.iter().find(|s| {
+                aabb_max.x > s.min.x
+                    && aabb_min.x < s.max.x
+                    && aabb_max.y > s.min.y
+                    && aabb_min.y < s.max.y
+                    && aabb_max.z > s.min.z
+                    && aabb_min.z < s.max.z
+            });
+            let Some(s) = overlap else {
+                break;
+            };
+            // Same smallest-clearing-push selection as
+            // `push_actors_out_of_new_blocks`. Picking the
+            // unconditionally smallest delta could shove the actor
+            // into an adjacent solid; iterate against the full
+            // candidate set so a corner case yields a corner-escape.
+            let mut candidates = [
+                Vec3::new(s.min.x - aabb_max.x - PUSH_EPS, 0.0, 0.0),
+                Vec3::new(s.max.x - aabb_min.x + PUSH_EPS, 0.0, 0.0),
+                Vec3::new(0.0, s.min.y - aabb_max.y - PUSH_EPS, 0.0),
+                Vec3::new(0.0, s.max.y - aabb_min.y + PUSH_EPS, 0.0),
+                Vec3::new(0.0, 0.0, s.min.z - aabb_max.z - PUSH_EPS),
+                Vec3::new(0.0, 0.0, s.max.z - aabb_min.z + PUSH_EPS),
+            ];
+            candidates.sort_by(|a, b| {
+                a.length_squared()
+                    .partial_cmp(&b.length_squared())
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            });
+            let chosen = candidates.iter().copied().find(|push| {
+                let new_min = aabb_min + *push;
+                let new_max = aabb_max + *push;
+                let region = Aabb::from_min_max(new_min, new_max);
+                let solids = world.candidates(region);
+                !solids.iter().any(|s| {
+                    new_max.x > s.min.x
+                        && new_min.x < s.max.x
+                        && new_max.y > s.min.y
+                        && new_min.y < s.max.y
+                        && new_max.z > s.min.z
+                        && new_min.z < s.max.z
+                })
+            });
+            match chosen {
+                Some(push) => {
+                    pose.translation += push;
+                    info!(
+                        entity = ?entity,
+                        push = ?push.to_array(),
+                        "rescued stuck-on-load actor",
+                    );
+                }
+                None => {
+                    warn!(
+                        entity = ?entity,
+                        centre = ?centre.to_array(),
+                        "stuck-on-load actor: every push direction lands in another solid",
+                    );
+                    break;
                 }
             }
         }
