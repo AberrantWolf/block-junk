@@ -21,7 +21,7 @@ use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, MovementIntent, MovementMode,
-    NpcActivity, NpcDetails, PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails,
+    NpcAnimOverride, NpcDetails, PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails,
     WorldChannel, WorldClockSync,
 };
 
@@ -107,7 +107,8 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<Avatar>();
         app.register_component::<Npc>();
         app.register_component::<NpcId>();
-        app.register_component::<NpcActivity>();
+        app.register_component::<crate::npc::NpcKind>();
+        app.register_component::<NpcAnimOverride>();
         app.register_component::<NpcPath>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between

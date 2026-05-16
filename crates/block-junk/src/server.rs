@@ -20,7 +20,7 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
-    MovementIntent, MovementMode, NpcActivity, NpcDetails, PlanEdit, PlanKind, RequestNpcDetails,
+    MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PlanEdit, PlanKind, RequestNpcDetails,
     WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
@@ -323,7 +323,7 @@ fn spawn_loaded_npc(
         npc.movement_mode,
         MovementIntent::default(),
         NpcPath::default(),
-        NpcActivity::default(),
+        NpcAnimOverride::default(),
         Replicate::to_clients(NetworkTarget::All),
         InterpolationTarget::to_clients(NetworkTarget::All),
         Name::new(format!("npc:{}", npc.id)),

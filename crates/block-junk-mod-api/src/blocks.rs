@@ -311,6 +311,16 @@ pub struct UseSlot {
     /// 4–8 neighbours; a block that *must* be approached from one
     /// face (a forge facing into the wall) lists just that face.
     pub approach: Vec<[i32; 3]>,
+    /// Optional registered [`AnimationId`](crate::animations::AnimationId)
+    /// to play while the NPC is locked to this slot. `Some` ⇒ the
+    /// client crossfades to this clip when the kinematic lock comes
+    /// on and back to the NPC kind's idle / walk default when the
+    /// lock comes off. `None` ⇒ no override, the NPC keeps playing
+    /// whatever the kind defaults pick — useful when a slot exists
+    /// only for positioning (sit-down without a custom clip).
+    /// Validated at boot against the [`AnimationRegistry`].
+    #[serde(default)]
+    pub animation: Option<String>,
 }
 
 /// Default footprint helper for serde. A single cell at the anchor.

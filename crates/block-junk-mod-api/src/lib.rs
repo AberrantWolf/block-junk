@@ -29,6 +29,7 @@
 //!   planner callbacks live in server-only `events.lua`.
 //! - [`rooms`] — room pattern registry types. Side-agnostic.
 
+pub mod animations;
 pub mod blocks;
 pub mod npcs;
 pub mod rooms;

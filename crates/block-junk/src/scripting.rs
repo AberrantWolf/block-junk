@@ -14,7 +14,7 @@ use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
 use crate::block_textures::{MaskRegistry, RampRegistry};
 use crate::blocks::{BlockRegistry, WorldSlots};
-use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
+use crate::npc_registry::{AnimationRegistry, NeedRegistry, NpcKindRegistry};
 use crate::protocol::{CellEdit, GameSet};
 use crate::rooms::{RoomEventMsg, RoomPatternRegistry};
 
@@ -42,6 +42,7 @@ impl Plugin for ServerScriptingPlugin {
             npc_kinds,
             masks,
             ramps,
+            animations,
         } = load_side(Side::Server);
         app.insert_resource(ServerMods(mods));
         app.insert_resource(blocks);
@@ -51,6 +52,7 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(npc_kinds);
         app.insert_resource(masks);
         app.insert_resource(ramps);
+        app.insert_resource(animations);
         app.add_systems(
             Update,
             (dispatch_block_placed, dispatch_room_events).in_set(GameSet::PostSimulation),
@@ -71,6 +73,7 @@ impl Plugin for ClientScriptingPlugin {
             npc_kinds,
             masks,
             ramps,
+            animations,
         } = load_side(Side::Client);
         app.insert_resource(ClientMods(mods));
         app.insert_resource(blocks);
@@ -80,6 +83,7 @@ impl Plugin for ClientScriptingPlugin {
         app.insert_resource(npc_kinds);
         app.insert_resource(masks);
         app.insert_resource(ramps);
+        app.insert_resource(animations);
         // No client-only hooks yet — the registry is in place so adding one
         // is a single-system addition rather than a wiring change.
     }
@@ -94,6 +98,7 @@ struct LoadResult {
     npc_kinds: NpcKindRegistry,
     masks: MaskRegistry,
     ramps: RampRegistry,
+    animations: AnimationRegistry,
 }
 
 /// Run mod loading for one side, then build the resulting registries.
@@ -141,7 +146,23 @@ fn load_side(side: Side) -> LoadResult {
     if let Err(e) = blocks.validate_use_slots() {
         panic!("{} use_slot validation failed: {e}", side.as_str());
     }
-    let npc_kinds = match NpcKindRegistry::build(ctx.take_npc_kinds(), &needs) {
+    // Animations need to exist before kinds + use-slots can reference
+    // them. Build them before the cross-validators so the failure
+    // mode is "unknown animation id," not "kind/use-slot references
+    // something the registry hasn't built yet."
+    let animations = match AnimationRegistry::build(ctx.take_animations()) {
+        Ok(r) => r,
+        Err(e) => panic!("{} animation registry build failed: {e}", side.as_str()),
+    };
+    info!(
+        "[{}] animation registry: {} clip(s)",
+        side.as_str(),
+        animations.len()
+    );
+    if let Err(e) = blocks.validate_use_slot_animations(&animations) {
+        panic!("{} use_slot animation validation failed: {e}", side.as_str());
+    }
+    let npc_kinds = match NpcKindRegistry::build(ctx.take_npc_kinds(), &needs, &animations) {
         Ok(r) => r,
         Err(e) => panic!("{} npc kind registry build failed: {e}", side.as_str()),
     };
@@ -179,6 +200,7 @@ fn load_side(side: Side) -> LoadResult {
         npc_kinds,
         masks,
         ramps,
+        animations,
     }
 }
 

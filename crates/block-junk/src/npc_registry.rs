@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
+use block_junk_mod_api::animations::AnimationDef;
 use block_junk_mod_api::npcs::{NeedDef, NpcKindDef};
 use thiserror::Error;
 
@@ -30,6 +31,14 @@ pub enum NpcBootstrapError {
     DuplicateNeed(String),
     #[error("npc kind {kind} references unregistered need {need}")]
     KindNeedsUnknownNeed { kind: String, need: String },
+    #[error("duplicate animation id {0}")]
+    DuplicateAnimation(String),
+    #[error("npc kind {kind} animations.{slot} references unregistered animation {anim}")]
+    KindAnimationUnknown {
+        kind: String,
+        slot: &'static str,
+        anim: String,
+    },
 }
 
 /// Registered NPC kinds, keyed by full string id. Spawned NPCs reference
@@ -47,6 +56,7 @@ impl NpcKindRegistry {
     pub fn build(
         pending: Vec<NpcKindDef>,
         needs: &NeedRegistry,
+        animations: &AnimationRegistry,
     ) -> Result<Self, NpcBootstrapError> {
         let mut defs = HashMap::with_capacity(pending.len());
         for def in pending {
@@ -55,6 +65,19 @@ impl NpcKindRegistry {
                     return Err(NpcBootstrapError::KindNeedsUnknownNeed {
                         kind: def.id.0.clone(),
                         need: need_id.clone(),
+                    });
+                }
+            }
+            for (slot, anim) in [
+                ("idle", &def.animations.idle),
+                ("walk", &def.animations.walk),
+                ("work", &def.animations.work),
+            ] {
+                if !animations.contains(anim) {
+                    return Err(NpcBootstrapError::KindAnimationUnknown {
+                        kind: def.id.0.clone(),
+                        slot,
+                        anim: anim.clone(),
                     });
                 }
             }
@@ -108,5 +131,54 @@ impl NeedRegistry {
 
     pub fn need_count(&self) -> usize {
         self.defs.len()
+    }
+}
+
+/// Registered animation clips, keyed by id. Both sides build identical
+/// copies — the client uses them to load assets + build the unified
+/// [`bevy::animation::AnimationGraph`]; the server uses them only to
+/// validate references from [`NpcKindDef::animations`] +
+/// [`UseSlot.animation`].
+#[derive(Resource, Default, Debug)]
+pub struct AnimationRegistry {
+    defs: HashMap<String, AnimationDef>,
+    /// Insertion order, so the client can build its AnimationGraph
+    /// deterministically (slot index matches order).
+    order: Vec<String>,
+}
+
+impl AnimationRegistry {
+    pub fn build(pending: Vec<AnimationDef>) -> Result<Self, NpcBootstrapError> {
+        let mut defs = HashMap::with_capacity(pending.len());
+        let mut order = Vec::with_capacity(pending.len());
+        for def in pending {
+            let key = def.id.0.clone();
+            order.push(key.clone());
+            if defs.insert(key.clone(), def).is_some() {
+                return Err(NpcBootstrapError::DuplicateAnimation(key));
+            }
+        }
+        Ok(Self { defs, order })
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.defs.contains_key(id)
+    }
+
+    pub fn get(&self, id: &str) -> Option<&AnimationDef> {
+        self.defs.get(id)
+    }
+
+    /// Registered ids in insertion order. The client's AnimationGraph
+    /// build follows this so the cached id → AnimationNodeIndex map is
+    /// deterministic across runs and across both sides.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &AnimationDef)> + '_ {
+        self.order
+            .iter()
+            .map(move |id| (id, self.defs.get(id).expect("order entry must resolve")))
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
     }
 }

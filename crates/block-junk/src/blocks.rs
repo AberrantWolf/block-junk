@@ -18,7 +18,7 @@ use block_mesh::{MergeVoxel, Voxel, VoxelVisibility};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::npc_registry::NeedRegistry;
+use crate::npc_registry::{AnimationRegistry, NeedRegistry};
 
 /// Compact numeric handle for a registered block. Two bytes per cell in
 /// chunk storage, stable for a session (and across sessions once
@@ -83,6 +83,8 @@ pub enum BootstrapError {
         "block {block} use_slot.approach cell {cell:?} overlaps the block's own footprint — NPCs can't stand inside the block"
     )]
     UseSlotApproachInsideFootprint { block: BlockId, cell: [i32; 3] },
+    #[error("block {block} use_slot.animation references unregistered animation {anim}")]
+    UseSlotAnimationUnknown { block: BlockId, anim: String },
 }
 
 /// The live, finalised registry. Held as a Bevy `Resource` on each side.
@@ -253,6 +255,28 @@ impl BlockRegistry {
     /// trying to use). Approach cells are in default orientation —
     /// the engine rotates them at use time, so the "inside the
     /// footprint" check happens in the same frame.
+    /// Validate that any `use_slot.animation` resolves in the
+    /// [`AnimationRegistry`]. Runs after the animation registry has
+    /// been built so a typo in a slot's animation id fails the boot
+    /// loudly instead of silently leaving the NPC in idle when they
+    /// snap to the slot.
+    pub fn validate_use_slot_animations(
+        &self,
+        animations: &AnimationRegistry,
+    ) -> Result<(), BootstrapError> {
+        for def in &self.defs_by_slot {
+            let Some(slot) = &def.use_slot else { continue };
+            let Some(anim) = &slot.animation else { continue };
+            if !animations.contains(anim) {
+                return Err(BootstrapError::UseSlotAnimationUnknown {
+                    block: def.id.clone(),
+                    anim: anim.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_use_slots(&self) -> Result<(), BootstrapError> {
         for def in &self.defs_by_slot {
             let Some(slot) = &def.use_slot else { continue };

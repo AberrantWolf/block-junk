@@ -131,20 +131,22 @@ pub struct KinematicLock;
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Avatar;
 
-/// Coarse "what is this NPC doing right now" — derived server-side
-/// from [`crate::npc::Brain::goal`] and replicated to drive client
-/// animation selection. Walking is decided client-side from velocity
-/// (hysteresis on motion onset/offset), so this enum only carries the
-/// states the client *can't* infer from pose: stationary work-flavoured
-/// actions. Consuming and Resting both render as Idle today since we
-/// don't have dedicated clips for them.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Reflect)]
-pub enum NpcActivity {
-    #[default]
-    Idle,
-    Working,
-    Sleeping,
-}
+/// Server-set animation clip override for an NPC. Replicated so every
+/// client renders the same clip.
+///
+/// `None` ⇒ no override: the client picks idle vs walk via velocity
+/// hysteresis against the NPC kind's default clips. This is the
+/// common case — every NPC sits in this state outside of explicit
+/// stationary actions.
+///
+/// `Some(id)` ⇒ play this clip until cleared. Server sets this on
+/// transitions into stationary states (Working, Interacting with a
+/// use-slot animation) and clears it on transitions back out.
+/// `id` is an [`AnimationId`](block_junk_mod_api::animations::AnimationId)
+/// the client resolves through its cached registry to an
+/// `AnimationNodeIndex`.
+#[derive(Component, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+pub struct NpcAnimOverride(pub Option<String>);
 
 /// Per-avatar movement mode. Server-authoritative — the server decides
 /// when a creative-mode toggle is allowed; today the request is granted

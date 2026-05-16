@@ -251,6 +251,11 @@ register {
             { 1, 0, -1 },   -- North of head
             { 1, 0, 1 },    -- South of head
         },
+        -- Body clip played while the NPC is locked to this slot.
+        -- vanilla:lie_idle is the KayKit "Lie_Idle" — extends the
+        -- body horizontally around the rig's origin, which the
+        -- engine snap places on the mattress.
+        animation = "vanilla:lie_idle",
     },
 }
 
@@ -377,6 +382,43 @@ engine.needs.register {
     decay_per_sec = 1.0 / 240.0,
 }
 
+-- Animation clips. The client loads each one's glTF asset at session
+-- start, indexed via `clip_index` into that file's clip list, and
+-- builds a unified AnimationGraph keyed by id. KayKit ships rig
+-- clips split across themed glbs (General / MovementBasic /
+-- Simulation / Tools); we register the four we currently use plus
+-- any others a mod wants to reference.
+--
+-- Probed clip indices for the frozen KayKit pack (regenerate with
+-- a glTF parser if the pack ever ships a new revision):
+--   Rig_Medium_General.glb[6]       = "Idle_A"
+--   Rig_Medium_MovementBasic.glb[8] = "Walking_A"
+--   Rig_Medium_Simulation.glb[2]    = "Lie_Idle"
+--   Rig_Medium_Tools.glb[26]        = "Working_A"
+engine.animations.register {
+    id = "vanilla:idle",
+    asset = "mods://vanilla/models/characters/Rig_Medium_General.glb",
+    clip_index = 6,
+}
+
+engine.animations.register {
+    id = "vanilla:walk",
+    asset = "mods://vanilla/models/characters/Rig_Medium_MovementBasic.glb",
+    clip_index = 8,
+}
+
+engine.animations.register {
+    id = "vanilla:lie_idle",
+    asset = "mods://vanilla/models/characters/Rig_Medium_Simulation.glb",
+    clip_index = 2,
+}
+
+engine.animations.register {
+    id = "vanilla:work",
+    asset = "mods://vanilla/models/characters/Rig_Medium_Tools.glb",
+    clip_index = 26,
+}
+
 -- The smoke-test NPC kind. The planner that drives it lives in
 -- events.lua; this block is just the declarative half (which side both
 -- the client and server need to agree on for any future networked kind
@@ -384,6 +426,12 @@ engine.needs.register {
 -- spawning a partial deficit means the eat behaviour is observable
 -- within ~30 s of session start rather than after the full decay
 -- runway.
+--
+-- `animations.{idle, walk, work}` drive the client's animation
+-- selection: idle/walk via velocity hysteresis when no goal-set
+-- override is active, work when the NPC is pursuing a player plan.
+-- Use-slot interactions (sleeping in a bed) override these with
+-- the slot's `animation` field — see vanilla:bed below.
 engine.npcs.register {
     id = "vanilla:wanderer",
     display_name = "Wanderer",
@@ -399,5 +447,10 @@ engine.npcs.register {
         -- with a pre-tagged plan gets observable NPC activity within
         -- ~30 s rather than after the full 4-minute decay runway.
         work = 0.2,
+    },
+    animations = {
+        idle = "vanilla:idle",
+        walk = "vanilla:walk",
+        work = "vanilla:work",
     },
 }

@@ -46,7 +46,7 @@ use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
     Actor, AvatarOnGround, AvatarPose, AvatarVelocity, KinematicLock, MovementIntent, MovementMode,
-    NpcActivity, PlanKind, WorldClock,
+    NpcAnimOverride, PlanKind, WorldClock,
 };
 use crate::scripting::ServerMods;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, world_to_chunk};
@@ -81,8 +81,12 @@ pub struct NpcId(pub u64);
 
 /// Mod-namespaced kind, e.g. `vanilla:wanderer`. Selects which planner
 /// the engine calls on goal completion and which need table the spawn
-/// path initialises from the [`NpcKindRegistry`].
-#[derive(Component, Clone, Debug)]
+/// path initialises from the [`NpcKindRegistry`]. Replicated to every
+/// client so the client-side animation driver can look up the kind's
+/// default idle / walk / work clips in its local [`AnimationRegistry`].
+#[derive(
+    Component, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Reflect,
+)]
 pub struct NpcKind(pub String);
 
 /// Floating-point need state. 0.0 = fully satisfied, 1.0 = critical.
@@ -196,6 +200,15 @@ pub enum Goal {
         target_cell: IVec3,
         anchor_cell: IVec3,
         exclusive: bool,
+        /// Animation override captured from the block's
+        /// [`UseSlot::animation`](block_junk_mod_api::blocks::UseSlot::animation)
+        /// at goal-commit time. `Some` when the slot author named a
+        /// clip — the per-tick activity refresh writes it through to
+        /// [`NpcAnimOverride`](crate::protocol::NpcAnimOverride). `None`
+        /// when the slot didn't override (or the block had no slot
+        /// at all) — animation falls back to the kind defaults
+        /// (idle / walk) via the client's velocity hysteresis.
+        animation: Option<String>,
     },
     /// Working a player-tagged plan at `target_cell` until the timer
     /// expires, at which point the engine applies the world mutation
@@ -262,6 +275,10 @@ pub enum ArrivalAction {
         target_cell: IVec3,
         anchor_cell: IVec3,
         exclusive: bool,
+        /// Carries the slot's animation override through to the
+        /// `Goal::Interacting` that the arrival transition creates.
+        /// See [`Goal::Interacting::animation`].
+        animation: Option<String>,
     },
     /// Begin a work action at the plan target cell. Carries the snapshot
     /// of the `PlanKind` at the moment the goal was committed so a
@@ -425,31 +442,32 @@ impl Plugin for NpcServerPlugin {
     }
 }
 
-/// Map [`Brain::goal`] onto the coarse [`NpcActivity`] enum the client
-/// reads for animation. Walking is decided client-side from velocity
-/// (its hysteresis prevents strobing on stop/start), so MoveTo here
-/// maps to `Idle` — the client takes over once velocity rises.
-/// Resting and Consuming also map to `Idle` until we have dedicated
-/// clips for them.
+/// Map [`Brain::goal`] onto the replicated [`NpcAnimOverride`]. The
+/// client uses this to pick a clip; when the override is `None`, the
+/// client falls back to velocity-based idle/walk hysteresis against
+/// the NPC kind's defaults.
+///
+/// - `Goal::Interacting` with a slot-supplied animation ⇒ override
+///   to that clip (sleep in the bed → "vanilla:lie_idle"; sit in the
+///   chair → "mymod:sit_idle"; etc.).
+/// - `Goal::Working` ⇒ override to the NPC kind's `animations.work`.
+/// - Everything else ⇒ clear the override.
+///
+/// `set_if_neq` keeps the replication channel quiet between goal
+/// transitions; the override doesn't change every tick.
 fn refresh_npc_activity(
-    mut npcs: Query<(&Brain, &mut NpcActivity, Has<KinematicLock>), With<Npc>>,
+    kinds: Res<NpcKindRegistry>,
+    mut npcs: Query<(&Brain, &NpcKind, &mut NpcAnimOverride), With<Npc>>,
 ) {
-    for (brain, mut activity, is_locked) in npcs.iter_mut() {
-        // Goal::Interacting covers everything from "stand at a basket
-        // and eat" to "lie in a bed and sleep" — the engine doesn't
-        // know which animation suits the action. Use the kinematic
-        // lock as the proxy: snapped-and-locked ⇒ Sleeping (Lie_Idle
-        // clip), unlocked ⇒ Idle. Once per-interactable animation
-        // clip data lands, this mapping moves into the def too.
+    for (brain, kind, mut override_) in npcs.iter_mut() {
         let next = match &brain.goal {
-            Goal::Interacting { .. } if is_locked => NpcActivity::Sleeping,
-            Goal::Working { .. } => NpcActivity::Working,
-            _ => NpcActivity::Idle,
+            Goal::Interacting { animation, .. } => NpcAnimOverride(animation.clone()),
+            Goal::Working { .. } => NpcAnimOverride(
+                kinds.get(&kind.0).map(|k| k.animations.work.clone()),
+            ),
+            _ => NpcAnimOverride(None),
         };
-        // `set_if_neq` keeps the replication channel quiet on the common
-        // path (the activity changes once per goal transition, not per
-        // tick).
-        activity.set_if_neq(next);
+        override_.set_if_neq(next);
     }
 }
 
@@ -554,7 +572,7 @@ fn spawn_initial_npc_on_first_connect(
             MovementMode::Walk,
             MovementIntent::default(),
             NpcPath::default(),
-            NpcActivity::default(),
+            NpcAnimOverride::default(),
             Replicate::to_clients(NetworkTarget::All),
             InterpolationTarget::to_clients(NetworkTarget::All),
             Name::new(format!("npc:{id}")),
@@ -777,6 +795,7 @@ fn npc_brain_tick(
                     target_cell,
                     anchor_cell,
                     exclusive,
+                    animation,
                 } => {
                     brain.goal = Goal::Interacting {
                         remaining_secs: duration_secs,
@@ -784,6 +803,7 @@ fn npc_brain_tick(
                         target_cell,
                         anchor_cell,
                         exclusive,
+                        animation,
                     };
                 }
                 ArrivalAction::Work {
@@ -1248,6 +1268,12 @@ fn npc_brain_tick(
                         .clamp(MIN_INTERACT_DURATION_SECS, MAX_INTERACT_DURATION_SECS);
                     let need_restore = interactable.need_restore.clone();
                     let exclusive = interactable.exclusive;
+                    // Capture the slot's animation override (if any)
+                    // at goal-commit time. Carried through to
+                    // Goal::Interacting so the per-tick activity
+                    // refresh doesn't have to re-look-up the block
+                    // def to drive the client's anim override.
+                    let animation = slot.as_ref().and_then(|s| s.animation.clone());
                     if stand_cell == foot {
                         // Already standing on the approach cell —
                         // apply the snap in place and enter
@@ -1267,6 +1293,7 @@ fn npc_brain_tick(
                             target_cell,
                             anchor_cell,
                             exclusive,
+                            animation,
                         };
                         *intent = MovementIntent::default();
                         continue;
@@ -1295,6 +1322,7 @@ fn npc_brain_tick(
                                     target_cell,
                                     anchor_cell,
                                     exclusive,
+                                    animation,
                                 },
                                 snap,
                             };

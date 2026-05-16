@@ -109,6 +109,29 @@ pub struct NpcKindDef {
     /// planner sees an absent entry, not a zero.
     #[serde(default)]
     pub default_needs: HashMap<String, f32>,
+    /// Default animation clips for this NPC kind. Required so a
+    /// freshly-spawned NPC has *something* to render — the client's
+    /// drive-animation system uses these as the velocity-hysteresis
+    /// fallback (`idle` when stationary, `walk` when moving) and as
+    /// the goal-driven defaults (`work` while pursuing a player
+    /// plan). Each value is an [`AnimationId`](crate::animations::AnimationId)
+    /// string registered via `engine.animations.register`; the
+    /// engine validates that all three resolve at boot.
+    ///
+    /// Use-slot interactions override these by setting
+    /// [`UseSlot.animation`](crate::blocks::UseSlot::animation).
+    pub animations: NpcKindAnimations,
+}
+
+/// Per-kind default animation set. All three slots are mandatory —
+/// every NPC kind needs *some* clip to play in the three core states
+/// (stationary, moving, working a plan). When more states show up
+/// (jumping, falling, dying) they get their own slots here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NpcKindAnimations {
+    pub idle: String,
+    pub walk: String,
+    pub work: String,
 }
 
 /// Live state handed to the planner. Today carries id, kind, position,

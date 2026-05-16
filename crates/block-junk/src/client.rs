@@ -18,7 +18,8 @@ use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
 use crate::menu::AppState;
-use crate::npc::{Npc, NpcId, NpcPath};
+use crate::npc::{Npc, NpcId, NpcKind, NpcPath};
+use crate::npc_registry::NpcKindRegistry;
 use crate::physics::{
     EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_separation_push_swept, apply_walk_step,
     compute_actor_separation_pushes,
@@ -31,7 +32,7 @@ use crate::target_outline::TargetOutlinePlugin;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode,
-    NpcActivity, PlanKind, WorldChannel, WorldClock, WorldClockSync,
+    NpcAnimOverride, PlanKind, WorldChannel, WorldClock, WorldClockSync,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -217,43 +218,34 @@ struct AvatarAssets {
 }
 
 /// Skinned character mesh + animation graph for NPCs. Built once when
-/// the first session enters InGame; survives pause/unpause via the same
-/// existence-check that gates `AvatarAssets`. The `idle` / `walk`
-/// indices point at clip nodes inside `anim_graph` — what we pass to
-/// `AnimationTransitions::play`.
+/// the first session enters InGame; survives pause/unpause via the
+/// same existence-check that gates `AvatarAssets`.
 ///
-/// Clips and the character mesh live in *separate* KayKit glbs that
-/// share the Rig_Medium skeleton. They retarget cleanly because Bevy
-/// keys animation targets by hashed bone path, not by the file they
-/// came from.
+/// Clips and the character mesh live in *separate* glbs that share
+/// the same rig skeleton. They retarget cleanly because Bevy keys
+/// animation targets by hashed bone path, not by the file they came
+/// from. With the animation registry now data-driven, the engine
+/// loads every registered clip into one unified graph at session
+/// start and caches `AnimationId → AnimationNodeIndex` in
+/// `clip_nodes` — `drive_npc_animation` looks up nodes by name
+/// instead of dispatching on a hardcoded enum.
+///
+/// `knight_scene` is the visible body. We currently only ship one
+/// rig variant; per-kind body meshes land later as a `NpcKindDef`
+/// field alongside the animation set.
 #[derive(Resource)]
 struct CharacterAssets {
     knight_scene: Handle<Scene>,
     anim_graph: Handle<AnimationGraph>,
-    idle: AnimationNodeIndex,
-    walk: AnimationNodeIndex,
-    sleep: AnimationNodeIndex,
-    work: AnimationNodeIndex,
+    /// Resolved clip → graph-node index for every registered
+    /// [`AnimationId`](block_junk_mod_api::animations::AnimationId).
+    /// Keyed by the id string the wire carries, so
+    /// [`NpcAnimOverride`] + [`NpcKindAnimations`] lookups are O(1).
+    clip_nodes: HashMap<String, AnimationNodeIndex>,
 }
 
-/// Clip indices inside the KayKit `Rig_Medium_*` glbs. Probed once with
-/// a Python parser; the vendor pack is frozen, so hardcoded indices
-/// stay valid. If the pack ever changes, re-probe with `python3 -c …`
-/// reading `animations[].name` and update both.
-///
-///   Rig_Medium_General.glb[6]        = "Idle_A"
-///   Rig_Medium_MovementBasic.glb[8]  = "Walking_A"
-///   Rig_Medium_Simulation.glb[2]     = "Lie_Idle"     (Goal::Sleeping)
-///   Rig_Medium_Tools.glb[26]         = "Working_A"    (Goal::Working)
-const KAYKIT_IDLE_A_INDEX: usize = 6;
-const KAYKIT_WALKING_A_INDEX: usize = 8;
-const KAYKIT_LIE_IDLE_INDEX: usize = 2;
-const KAYKIT_WORKING_A_INDEX: usize = 26;
-const KAYKIT_GENERAL_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_General.glb";
-const KAYKIT_MOVEMENT_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_MovementBasic.glb";
-const KAYKIT_SIMULATION_GLB: &str =
-    "mods://vanilla/models/characters/Rig_Medium_Simulation.glb";
-const KAYKIT_TOOLS_GLB: &str = "mods://vanilla/models/characters/Rig_Medium_Tools.glb";
+/// Knight body asset path. The animation clips live in separate glbs
+/// declared in `mods/vanilla/data.lua` via `engine.animations.register`.
 const KAYKIT_KNIGHT_GLB: &str = "mods://vanilla/models/characters/Knight.glb";
 
 /// Tracks the ECS entity rendering each placed block-entity (a block
@@ -382,6 +374,7 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     palette: Res<PlaceablePalette>,
     textures: Res<BlockTextures>,
+    animations: Res<crate::npc_registry::AnimationRegistry>,
     existing: Option<Res<AvatarAssets>>,
 ) {
     // `OnEnter(InGame)` re-fires on every un-pause, but the scene
@@ -408,29 +401,29 @@ fn setup_scene(
         }),
     });
 
-    // KayKit Knight + Rig_Medium animation graph. The two anim glbs ship
-    // separate clips (Idle in General, Walk in MovementBasic) against the
-    // same skeleton the Knight mesh uses, so a single graph drives any
-    // Rig_Medium character. Switching to a different KayKit body (Mage,
-    // Rogue) is a one-line scene-handle swap; the graph stays.
-    let idle_clip = asset_server
-        .load(GltfAssetLabel::Animation(KAYKIT_IDLE_A_INDEX).from_asset(KAYKIT_GENERAL_GLB));
-    let walk_clip = asset_server
-        .load(GltfAssetLabel::Animation(KAYKIT_WALKING_A_INDEX).from_asset(KAYKIT_MOVEMENT_GLB));
-    let sleep_clip = asset_server
-        .load(GltfAssetLabel::Animation(KAYKIT_LIE_IDLE_INDEX).from_asset(KAYKIT_SIMULATION_GLB));
-    let work_clip = asset_server
-        .load(GltfAssetLabel::Animation(KAYKIT_WORKING_A_INDEX).from_asset(KAYKIT_TOOLS_GLB));
-    let (anim_graph, clip_indices) =
-        AnimationGraph::from_clips([idle_clip, walk_clip, sleep_clip, work_clip]);
+    // Build the unified animation graph from every registered
+    // AnimationDef. The registry is populated by the scripting layer
+    // at app build time — vanilla's data.lua calls
+    // `engine.animations.register` for each rig clip, and mods add
+    // their own. Order matches the registry's insertion order so
+    // clip_nodes is deterministic across runs.
+    let mut clip_handles: Vec<Handle<AnimationClip>> = Vec::with_capacity(animations.len());
+    let mut clip_ids: Vec<String> = Vec::with_capacity(animations.len());
+    for (id, def) in animations.iter() {
+        let path = def.asset.clone();
+        clip_handles.push(
+            asset_server.load(GltfAssetLabel::Animation(def.clip_index as usize).from_asset(path)),
+        );
+        clip_ids.push(id.clone());
+    }
+    let (anim_graph, node_indices) = AnimationGraph::from_clips(clip_handles);
+    let clip_nodes: HashMap<String, AnimationNodeIndex> =
+        clip_ids.into_iter().zip(node_indices.into_iter()).collect();
     commands.insert_resource(CharacterAssets {
         knight_scene: asset_server
             .load(GltfAssetLabel::Scene(0).from_asset(KAYKIT_KNIGHT_GLB)),
         anim_graph: anim_graphs.add(anim_graph),
-        idle: clip_indices[0],
-        walk: clip_indices[1],
-        sleep: clip_indices[2],
-        work: clip_indices[3],
+        clip_nodes,
     });
 
 
@@ -1897,32 +1890,25 @@ fn attach_avatar_visuals(
 #[derive(Component)]
 struct NpcSceneRoot;
 
-/// Coarse animation state for an NPC. Walk vs. stationary comes from
-/// velocity hysteresis; Sleep and Work come from the replicated
-/// `NpcActivity` the server publishes from the Brain's goal.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum NpcAnimState {
-    #[default]
-    Idle,
-    Walk,
-    Sleep,
-    Work,
-}
-
 /// Marker on the NPC root entity once we've spawned its visual rig
 /// (SceneRoot child + future animation hookup). `attach_npc_visuals`
 /// adds this to gate the once-only attach; `setup_npc_anim_once_loaded`
 /// later fills `player` with the Entity carrying the auto-inserted
 /// `AnimationPlayer` so the per-frame state driver can find it without
-/// walking the hierarchy every tick.
+/// walking the hierarchy every tick. `current_clip` is the
+/// [`AnimationId`](block_junk_mod_api::animations::AnimationId) currently
+/// playing — used by `drive_npc_animation` to skip the
+/// `AnimationTransitions::play` call when the target clip hasn't
+/// changed (which is the common path; the override changes once per
+/// goal transition).
 ///
 /// Not a `Resource` because per-NPC: in the future, different NPC
-/// kinds will use different scenes (and thus different player entities)
-/// in the same world.
+/// kinds will use different scenes (and thus different player
+/// entities) in the same world.
 #[derive(Component, Default)]
 struct NpcVisuals {
     player: Option<Entity>,
-    state: NpcAnimState,
+    current_clip: Option<String>,
 }
 
 /// NPC visual attach: spawn the KayKit character as a child of the NPC
@@ -2108,9 +2094,11 @@ fn tag_animation_targets(
 fn start_npc_anim_idle(
     mut commands: Commands,
     assets: Res<CharacterAssets>,
+    kinds: Res<NpcKindRegistry>,
     mut new_players: Query<(Entity, &mut AnimationPlayer), Without<AnimationTransitions>>,
     parents: Query<&ChildOf>,
     mut npc_visuals_q: Query<&mut NpcVisuals>,
+    npc_kinds: Query<&NpcKind>,
 ) {
     for (player_entity, mut player) in new_players.iter_mut() {
         let Some(npc_root) = find_npc_ancestor(player_entity, &parents, &npc_visuals_q) else {
@@ -2118,13 +2106,28 @@ fn start_npc_anim_idle(
             // e.g. future player-character rigs. Leave it alone.
             continue;
         };
+        // The first clip to play is the kind's authored idle. Skip
+        // the start if the kind isn't replicated yet (would happen
+        // if the AnimationPlayer's scene loaded before the NpcKind
+        // component arrived via replication — defensive, drive_npc
+        // _animation will pick it up next tick).
+        let Ok(kind) = npc_kinds.get(npc_root) else {
+            continue;
+        };
+        let Some(kind_def) = kinds.get(&kind.0) else {
+            continue;
+        };
+        let Some(&idle_node) = assets.clip_nodes.get(&kind_def.animations.idle) else {
+            continue;
+        };
         let mut transitions = AnimationTransitions::new();
         transitions
-            .play(&mut player, assets.idle, Duration::ZERO)
+            .play(&mut player, idle_node, Duration::ZERO)
             .repeat();
         commands.entity(player_entity).insert(transitions);
         if let Ok(mut visuals) = npc_visuals_q.get_mut(npc_root) {
             visuals.player = Some(player_entity);
+            visuals.current_clip = Some(kind_def.animations.idle.clone());
         }
         info!("npc anim ready: root {npc_root:?} player {player_entity:?}");
     }
@@ -2146,60 +2149,86 @@ fn find_npc_ancestor(
 }
 
 /// Pick the right clip for each NPC based on its replicated
-/// `NpcActivity` + horizontal velocity. Velocity decides Walk vs.
-/// stationary (with hysteresis to stop strobing near the threshold);
-/// the activity then selects which stationary clip to play. Sleeping
-/// and Working override walk: a server-driven Sleep state holds even
-/// if the body's velocity hasn't settled all the way to zero
-/// (interpolation noise).
+/// Per-frame animation driver. Decides which clip plays via:
+///
+/// 1. **Server-set override.** [`NpcAnimOverride`] carries an
+///    [`AnimationId`](block_junk_mod_api::animations::AnimationId)
+///    when the server wants a specific clip — set on transitions
+///    into Goal::Interacting (via the slot's animation) and
+///    Goal::Working (via the kind's `animations.work`). When
+///    present, this wins over any velocity-based default.
+/// 2. **Velocity hysteresis against kind defaults.** No override ⇒
+///    fall through to the NPC's kind animations: `walk` above the
+///    WALK_ENTER threshold, `idle` below WALK_EXIT, hold otherwise.
+///    Hysteresis prevents strobing at the threshold from
+///    interpolation noise.
+///
+/// The chosen clip is resolved to an `AnimationNodeIndex` through
+/// [`CharacterAssets::clip_nodes`]; if the registered id doesn't map
+/// (mod typo, unloaded asset), the NPC keeps whatever it was
+/// already playing.
 fn drive_npc_animation(
-    mut npcs: Query<(&AvatarVelocity, &NpcActivity, &mut NpcVisuals), With<Npc>>,
+    mut npcs: Query<
+        (
+            &AvatarVelocity,
+            &NpcAnimOverride,
+            &NpcKind,
+            &mut NpcVisuals,
+        ),
+        With<Npc>,
+    >,
     mut players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
     assets: Res<CharacterAssets>,
+    kinds: Res<NpcKindRegistry>,
 ) {
     const WALK_ENTER: f32 = 0.5;
     const WALK_EXIT: f32 = 0.2;
     const CROSSFADE: Duration = Duration::from_millis(200);
-    for (velocity, activity, mut visuals) in npcs.iter_mut() {
+    for (velocity, override_, kind, mut visuals) in npcs.iter_mut() {
         let Some(player_entity) = visuals.player else {
             continue;
         };
+        let Some(kind_def) = kinds.get(&kind.0) else {
+            continue;
+        };
         let speed_xz = Vec2::new(velocity.0.x, velocity.0.z).length();
-        // Activity overrides walk for stationary actions — an NPC
-        // standing at a plan target shouldn't flip back to walk on a
-        // stray interpolation wobble. Walk only owns motion between
-        // goals.
-        let target = match *activity {
-            NpcActivity::Sleeping => NpcAnimState::Sleep,
-            NpcActivity::Working => NpcAnimState::Work,
-            NpcActivity::Idle => {
-                // Hysteresis: only switch to walk above 0.5 m/s and only
-                // back to idle below 0.2 m/s. Anything in between holds
-                // the current state.
-                match visuals.state {
-                    NpcAnimState::Idle if speed_xz > WALK_ENTER => NpcAnimState::Walk,
-                    NpcAnimState::Walk if speed_xz < WALK_EXIT => NpcAnimState::Idle,
-                    NpcAnimState::Walk => NpcAnimState::Walk,
-                    // Sleep / Work falling back to Idle while the server
-                    // still says Idle — pick idle until velocity climbs.
-                    _ => NpcAnimState::Idle,
+        // Resolve the clip id. Override always wins; falling through
+        // to walk/idle uses the previous clip as the hysteresis hold.
+        let target_clip = match &override_.0 {
+            Some(id) => id.clone(),
+            None => {
+                let walk = kind_def.animations.walk.as_str();
+                let idle = kind_def.animations.idle.as_str();
+                match visuals.current_clip.as_deref() {
+                    Some(c) if c == idle && speed_xz > WALK_ENTER => walk.to_string(),
+                    Some(c) if c == walk && speed_xz < WALK_EXIT => idle.to_string(),
+                    Some(c) if c == walk => walk.to_string(),
+                    // Coming out of an override or starting fresh:
+                    // pick idle until velocity climbs.
+                    _ => idle.to_string(),
                 }
             }
         };
-        if target == visuals.state {
+        if visuals
+            .current_clip
+            .as_deref()
+            .map(|c| c == target_clip)
+            .unwrap_or(false)
+        {
             continue;
         }
+        let Some(&node) = assets.clip_nodes.get(&target_clip) else {
+            // Unregistered or unresolved id — leave the NPC on its
+            // current clip rather than panic. Mods get a warning at
+            // boot via the validator; a runtime miss here is the
+            // fallback.
+            continue;
+        };
         let Ok((mut player, mut transitions)) = players.get_mut(player_entity) else {
             continue;
         };
-        let node = match target {
-            NpcAnimState::Idle => assets.idle,
-            NpcAnimState::Walk => assets.walk,
-            NpcAnimState::Sleep => assets.sleep,
-            NpcAnimState::Work => assets.work,
-        };
         transitions.play(&mut player, node, CROSSFADE).repeat();
-        visuals.state = target;
+        visuals.current_clip = Some(target_clip);
     }
 }
 

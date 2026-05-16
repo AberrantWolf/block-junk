@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use block_junk_mod_api::{
     API_VERSION, ApiVersion, ModManifest, Side,
+    animations::AnimationDef,
     blocks::BlockDef,
     npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal},
     rooms::{RoomEvent, RoomPattern},
@@ -76,6 +77,7 @@ pub struct LoadContext {
     pub pending_needs: Arc<Mutex<Vec<NeedDef>>>,
     pub pending_masks: Arc<Mutex<Vec<MaskDef>>>,
     pub pending_ramps: Arc<Mutex<Vec<RampDef>>>,
+    pub pending_animations: Arc<Mutex<Vec<AnimationDef>>>,
 }
 
 impl LoadContext {
@@ -112,6 +114,11 @@ impl LoadContext {
     /// Drain the accumulated ramp defs.
     pub fn take_ramps(&self) -> Vec<RampDef> {
         std::mem::take(&mut *self.pending_ramps.lock().unwrap())
+    }
+
+    /// Drain the accumulated animation defs.
+    pub fn take_animations(&self) -> Vec<AnimationDef> {
+        std::mem::take(&mut *self.pending_animations.lock().unwrap())
     }
 }
 
@@ -427,6 +434,27 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     })?;
     needs_table.set("register", register_need)?;
     engine.set("needs", needs_table)?;
+
+    // engine.animations.register(def) — both sides; the client loads
+    // each registered clip's glTF asset at boot and builds a unified
+    // AnimationGraph keyed by id, while the server only validates
+    // that references from NpcKindDef + UseSlot resolve.
+    let animations_table = lua.create_table()?;
+    let pending_animations = ctx.pending_animations.clone();
+    let register_animation = lua.create_function(move |lua, value: Value| {
+        let def: AnimationDef = lua.from_value(value)?;
+        let mut buf = pending_animations.lock().unwrap();
+        if buf.iter().any(|a| a.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate animation id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    animations_table.set("register", register_animation)?;
+    engine.set("animations", animations_table)?;
 
     // engine.npcs.register(def) — both sides accumulate. set_planner is
     // server-only because planners run against authoritative state.
