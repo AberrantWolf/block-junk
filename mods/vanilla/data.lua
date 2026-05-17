@@ -77,7 +77,7 @@ register {
             ramp = "vanilla:grass_green",
             scale = 1.0,
             threshold = 0.70,
-            softness = 0.10,
+            softness = 0.20,
         },
     },
 }
@@ -387,6 +387,19 @@ engine.needs.register {
     id = "work",
     display_name = "Purpose",
     decay_per_sec = 1.0 / 240.0,
+}
+
+-- Work-action balance defaults. Read by the engine at WorkPlan goal
+-- commit whenever the targeted block has no `work_action` of its own.
+-- `restores = 0.35` matches the floor a sleeper restores — one
+-- completed tag moves a villager from "looking for purpose" back
+-- toward content. `duration_secs = 4.0` is long enough for a work
+-- animation to read on screen without making each plan feel like a
+-- chore. Individual blocks can override either knob via their own
+-- `work_action = { ... }` table.
+engine.npcs.set_work_defaults {
+    need_restore = { need = "work", restores = 0.1 },
+    duration_secs = 4.0,
 }
 
 -- Animation clips. The client loads each one's glTF asset at session

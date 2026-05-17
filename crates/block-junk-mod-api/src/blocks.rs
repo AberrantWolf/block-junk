@@ -169,6 +169,16 @@ pub struct BlockDef {
     /// for planner purposes.
     #[serde(default)]
     pub interactable: Option<Interactable>,
+    /// Optional knobs for the work-action pipeline (player-tagged
+    /// build/remove plans). When an NPC completes a [`PlannerGoal::WorkPlan`](crate::npcs::PlannerGoal::WorkPlan)
+    /// against this block kind, the engine reads `duration_secs` and the
+    /// optional `need_restore` from here in preference to
+    /// [`WorkDefaults`](crate::npcs::WorkDefaults). For Build plans the
+    /// block being placed is consulted; for Remove plans, the existing
+    /// block at the cell. `None` ⇒ fall back to the engine-wide
+    /// defaults registered via `engine.npcs.set_work_defaults`.
+    #[serde(default)]
+    pub work_action: Option<WorkAction>,
     /// Optional dedicated "use slot" — anchor-relative pose and yaw an
     /// NPC snaps to when actively using this block, plus the set of
     /// standable cells from which the action may begin. Present ⇒ the
@@ -232,9 +242,28 @@ pub struct Interactable {
     pub exclusive: bool,
 }
 
-/// Need + magnitude pair for [`Interactable::need_restore`]. Split
-/// from the parent so a pure-positional interaction (no need change)
-/// is just `None` instead of having to encode "ignore these values."
+/// Block-level "completing a player-tagged plan against this block
+/// affects an NPC's needs" declaration. Parallel to [`Interactable`]
+/// but for the build/remove work-action pipeline rather than the
+/// "stand and use" interaction pipeline. The two are independent:
+/// a block can carry one, both, or neither.
+///
+/// `need_restore` mirrors [`Interactable::need_restore`] — `None` ⇒
+/// completing the plan has no need effect (engine still applies the
+/// world mutation and frees the claim). `duration_secs` overrides the
+/// engine-default work duration so a chunky castle wall can feel
+/// weightier than a sapling.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkAction {
+    #[serde(default)]
+    pub need_restore: Option<NeedRestore>,
+    pub duration_secs: f32,
+}
+
+/// Need + magnitude pair shared by [`Interactable::need_restore`] and
+/// [`WorkAction::need_restore`]. Split from the parents so a pure-
+/// positional interaction (no need change) is just `None` instead of
+/// having to encode "ignore these values."
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NeedRestore {
     /// Id of the need this interaction reduces. Cross-validated

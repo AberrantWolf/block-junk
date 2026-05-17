@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::blocks::NeedRestore;
 use crate::shared::BlockPos;
 
 /// Stable string identifier for a need, "namespace:name" by convention.
@@ -80,6 +81,38 @@ impl core::fmt::Display for NpcKindId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Engine-wide fallback for the work-action pipeline (player-tagged
+/// build/remove plans). Mods set this via
+/// `engine.npcs.set_work_defaults({ need_restore = {...}, duration_secs = ... })`
+/// in `data.lua`; the engine consults it whenever the targeted block's
+/// own [`BlockDef::work_action`](crate::blocks::BlockDef::work_action)
+/// is `None`.
+///
+/// `need_restore` is optional — leaving it unset means a work completion
+/// only mutates world state and frees the plan claim, with no need
+/// delta. `duration_secs` defaults to 4.0 (an NPC visibly stands at
+/// the target for a few seconds).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkDefaults {
+    #[serde(default)]
+    pub need_restore: Option<NeedRestore>,
+    #[serde(default = "default_work_duration_secs")]
+    pub duration_secs: f32,
+}
+
+impl Default for WorkDefaults {
+    fn default() -> Self {
+        Self {
+            need_restore: None,
+            duration_secs: default_work_duration_secs(),
+        }
+    }
+}
+
+fn default_work_duration_secs() -> f32 {
+    4.0
 }
 
 /// Registered need definition. The engine decays each need value by
@@ -214,6 +247,22 @@ pub struct NearbyPlan {
     /// (where the new block should land).
     pub cell: BlockPos,
     pub kind: PlanKindHint,
+    /// Need id this plan reduces on completion (e.g. `"work"`).
+    /// `None` ⇒ neither the targeted block's
+    /// [`BlockDef::work_action`](crate::blocks::BlockDef::work_action) nor
+    /// the engine-wide [`WorkDefaults`] declare a need restore for this
+    /// plan — completing it only mutates world state. Lets planners
+    /// score plans by which need they'd satisfy ("my villager's `work`
+    /// is high, take the nearest plan whose `need == work`").
+    #[serde(default)]
+    pub need: Option<String>,
+    /// Pre-clamp magnitude of the deficit reduction. Meaningful only
+    /// when `need.is_some()`; `0.0` when the plan has no need effect.
+    /// Mirrors how
+    /// [`NearbyInteraction::restores`](crate::npcs::NearbyInteraction::restores)
+    /// surfaces the same value for interactables.
+    #[serde(default)]
+    pub restores: f32,
     /// Manhattan distance from the NPC's foot, same metric as
     /// `nearby_interactions.distance`.
     pub distance: u32,

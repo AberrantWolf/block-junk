@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 use block_junk_mod_api::animations::AnimationDef;
-use block_junk_mod_api::npcs::{NeedDef, NpcKindDef};
+use block_junk_mod_api::npcs::{NeedDef, NpcKindDef, WorkDefaults};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,6 +39,10 @@ pub enum NpcBootstrapError {
         slot: &'static str,
         anim: String,
     },
+    #[error("work defaults reference unregistered need {0}")]
+    WorkDefaultsUnknownNeed(String),
+    #[error("work defaults duration_secs must be > 0, got {0}")]
+    WorkDefaultsBadDuration(f32),
 }
 
 /// Registered NPC kinds, keyed by full string id. Spawned NPCs reference
@@ -131,6 +135,39 @@ impl NeedRegistry {
 
     pub fn need_count(&self) -> usize {
         self.defs.len()
+    }
+}
+
+/// Engine-side fallback for the work-action pipeline. Built from the
+/// optional `engine.npcs.set_work_defaults` call in a mod's `data.lua`,
+/// or [`WorkDefaults::default`] (no need restore, 4s duration) when
+/// no mod sets one. Read by the brain at WorkPlan goal commit when
+/// the targeted block's own `work_action` is `None`, and by the
+/// snapshot builder so planners can score plans by payoff.
+#[derive(Resource, Debug, Default)]
+pub struct WorkDefaultsRes(pub WorkDefaults);
+
+impl WorkDefaultsRes {
+    /// Cross-validate the (optionally Lua-supplied) defaults against
+    /// the finished [`NeedRegistry`] and wrap into the resource type.
+    /// Same "loud at boot" pattern as the other registries — a
+    /// reference to an unregistered need fails the load.
+    pub fn build(
+        pending: Option<WorkDefaults>,
+        needs: &NeedRegistry,
+    ) -> Result<Self, NpcBootstrapError> {
+        let defaults = pending.unwrap_or_default();
+        if defaults.duration_secs <= 0.0 {
+            return Err(NpcBootstrapError::WorkDefaultsBadDuration(
+                defaults.duration_secs,
+            ));
+        }
+        if let Some(nr) = &defaults.need_restore
+            && !needs.contains(&nr.need)
+        {
+            return Err(NpcBootstrapError::WorkDefaultsUnknownNeed(nr.need.clone()));
+        }
+        Ok(Self(defaults))
     }
 }
 

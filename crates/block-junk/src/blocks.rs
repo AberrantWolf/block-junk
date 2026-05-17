@@ -59,6 +59,16 @@ pub enum BootstrapError {
         "block {block} interactable.duration_secs = {value}; must be ≥ {min} (exclusive interactions should feel substantive; non-exclusive ones still need long enough to register visually)"
     )]
     InteractableDurationOutOfRange { block: BlockId, value: f32, min: f32 },
+    #[error("block {block} work_action.need_restore references unregistered need {need}")]
+    WorkActionNeedUnknown { block: BlockId, need: String },
+    #[error(
+        "block {block} work_action.need_restore.restores = {value}; must be > 0 and ≤ 1 (need values are deficits in [0, 1])"
+    )]
+    WorkActionRestoresOutOfRange { block: BlockId, value: f32 },
+    #[error(
+        "block {block} work_action.duration_secs = {value}; must be > 0 (use the engine default by omitting work_action)"
+    )]
+    WorkActionDurationOutOfRange { block: BlockId, value: f32 },
     #[error("duplicate mask id {0}")]
     DuplicateMaskId(MaskId),
     #[error("duplicate ramp id {0}")]
@@ -211,6 +221,39 @@ impl BlockRegistry {
                     block: def.id.clone(),
                     value: i.duration_secs,
                     min: min_duration,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Cross-validate block-level `work_action` against the
+    /// [`NeedRegistry`]. Same shape as `validate_interactables` —
+    /// referenced need ids must exist, magnitudes must land in (0, 1],
+    /// duration must be positive. Engine-wide
+    /// [`WorkDefaults`](block_junk_mod_api::npcs::WorkDefaults) are
+    /// validated separately in `WorkDefaultsRes::build`.
+    pub fn validate_work_actions(&self, needs: &NeedRegistry) -> Result<(), BootstrapError> {
+        for def in &self.defs_by_slot {
+            let Some(w) = &def.work_action else { continue };
+            if let Some(nr) = &w.need_restore {
+                if !needs.contains(&nr.need) {
+                    return Err(BootstrapError::WorkActionNeedUnknown {
+                        block: def.id.clone(),
+                        need: nr.need.clone(),
+                    });
+                }
+                if !(nr.restores > 0.0 && nr.restores <= 1.0) {
+                    return Err(BootstrapError::WorkActionRestoresOutOfRange {
+                        block: def.id.clone(),
+                        value: nr.restores,
+                    });
+                }
+            }
+            if w.duration_secs <= 0.0 {
+                return Err(BootstrapError::WorkActionDurationOutOfRange {
+                    block: def.id.clone(),
+                    value: w.duration_secs,
                 });
             }
         }

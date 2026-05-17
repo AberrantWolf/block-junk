@@ -14,7 +14,7 @@ use block_junk_mod_api::{
     API_VERSION, ApiVersion, ModManifest, Side,
     animations::AnimationDef,
     blocks::BlockDef,
-    npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal},
+    npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal, WorkDefaults},
     rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
     textures::{MaskDef, RampDef},
@@ -78,6 +78,10 @@ pub struct LoadContext {
     pub pending_masks: Arc<Mutex<Vec<MaskDef>>>,
     pub pending_ramps: Arc<Mutex<Vec<RampDef>>>,
     pub pending_animations: Arc<Mutex<Vec<AnimationDef>>>,
+    /// At most one set of work-action defaults across all mods. Loud
+    /// failure on second call so two mods can't silently overwrite each
+    /// other's balance — matches the "never silently degrade" rule.
+    pub pending_work_defaults: Arc<Mutex<Option<WorkDefaults>>>,
 }
 
 impl LoadContext {
@@ -119,6 +123,13 @@ impl LoadContext {
     /// Drain the accumulated animation defs.
     pub fn take_animations(&self) -> Vec<AnimationDef> {
         std::mem::take(&mut *self.pending_animations.lock().unwrap())
+    }
+
+    /// Take the optional work-action defaults. `None` ⇒ no mod called
+    /// `engine.npcs.set_work_defaults`; the engine uses
+    /// [`WorkDefaults::default`].
+    pub fn take_work_defaults(&self) -> Option<WorkDefaults> {
+        std::mem::take(&mut *self.pending_work_defaults.lock().unwrap())
     }
 }
 
@@ -473,6 +484,25 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
         Ok(())
     })?;
     npcs_table.set("register", register_npc)?;
+
+    // engine.npcs.set_work_defaults(def) — both sides accumulate; only
+    // one mod may set this per session. The validator (engine-side, in
+    // npc_registry.rs) cross-checks the need against the registered
+    // NeedRegistry at boot. A nil call clears the slot; mods can use
+    // this in shared.lua to express "I want the engine fallback."
+    let pending_work_defaults = ctx.pending_work_defaults.clone();
+    let set_work_defaults = lua.create_function(move |lua, value: Value| {
+        let def: WorkDefaults = lua.from_value(value)?;
+        let mut slot = pending_work_defaults.lock().unwrap();
+        if slot.is_some() {
+            return Err(mlua::Error::external(
+                "engine.npcs.set_work_defaults called twice; only one mod may set work defaults",
+            ));
+        }
+        *slot = Some(def);
+        Ok(())
+    })?;
+    npcs_table.set("set_work_defaults", set_work_defaults)?;
 
     if side == Side::Server {
         // Pre-create the planners table so set_planner's writes never

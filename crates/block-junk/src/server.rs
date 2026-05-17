@@ -1203,6 +1203,7 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
             remaining_secs,
             target_cell,
             plan_kind,
+            ..
         } => {
             let verb = match plan_kind {
                 PlanKind::Remove => "removing",

@@ -14,7 +14,7 @@ use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
 use crate::block_textures::{MaskRegistry, RampRegistry};
 use crate::blocks::{BlockRegistry, WorldSlots};
-use crate::npc_registry::{AnimationRegistry, NeedRegistry, NpcKindRegistry};
+use crate::npc_registry::{AnimationRegistry, NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::protocol::{CellEdit, GameSet};
 use crate::rooms::{RoomEventMsg, RoomPatternRegistry};
 
@@ -43,6 +43,7 @@ impl Plugin for ServerScriptingPlugin {
             masks,
             ramps,
             animations,
+            work_defaults,
         } = load_side(Side::Server);
         app.insert_resource(ServerMods(mods));
         app.insert_resource(blocks);
@@ -53,6 +54,7 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(masks);
         app.insert_resource(ramps);
         app.insert_resource(animations);
+        app.insert_resource(work_defaults);
         app.add_systems(
             Update,
             (dispatch_block_placed, dispatch_room_events).in_set(GameSet::PostSimulation),
@@ -74,6 +76,7 @@ impl Plugin for ClientScriptingPlugin {
             masks,
             ramps,
             animations,
+            work_defaults,
         } = load_side(Side::Client);
         app.insert_resource(ClientMods(mods));
         app.insert_resource(blocks);
@@ -84,6 +87,7 @@ impl Plugin for ClientScriptingPlugin {
         app.insert_resource(masks);
         app.insert_resource(ramps);
         app.insert_resource(animations);
+        app.insert_resource(work_defaults);
         // No client-only hooks yet — the registry is in place so adding one
         // is a single-system addition rather than a wiring change.
     }
@@ -99,6 +103,7 @@ struct LoadResult {
     masks: MaskRegistry,
     ramps: RampRegistry,
     animations: AnimationRegistry,
+    work_defaults: WorkDefaultsRes,
 }
 
 /// Run mod loading for one side, then build the resulting registries.
@@ -136,12 +141,28 @@ fn load_side(side: Side) -> LoadResult {
         Err(e) => panic!("{} need registry build failed: {e}", side.as_str()),
     };
     info!("[{}] need registry: {} need(s)", side.as_str(), needs.need_count());
+    // Work-action defaults reference a need id, so the need registry
+    // must exist first. Either side might consult these (the snapshot
+    // builder runs server-side today but the resource is mirrored).
+    let work_defaults = match WorkDefaultsRes::build(ctx.take_work_defaults(), &needs) {
+        Ok(r) => r,
+        Err(e) => panic!("{} work defaults build failed: {e}", side.as_str()),
+    };
+    info!(
+        "[{}] work defaults: need={:?} duration={}s",
+        side.as_str(),
+        work_defaults.0.need_restore.as_ref().map(|nr| &nr.need),
+        work_defaults.0.duration_secs,
+    );
     // Consumable blocks reference need ids; the need registry has to
     // exist before we can validate them. Failing here at boot beats
     // discovering "this food doesn't satisfy anything" the first time
     // an NPC tries to eat it.
     if let Err(e) = blocks.validate_interactables(&needs) {
         panic!("{} interactable validation failed: {e}", side.as_str());
+    }
+    if let Err(e) = blocks.validate_work_actions(&needs) {
+        panic!("{} work action validation failed: {e}", side.as_str());
     }
     if let Err(e) = blocks.validate_use_slots() {
         panic!("{} use_slot validation failed: {e}", side.as_str());
@@ -201,6 +222,7 @@ fn load_side(side: Side) -> LoadResult {
         masks,
         ramps,
         animations,
+        work_defaults,
     }
 }
 

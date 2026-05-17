@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
 use crate::interactables::{InteractableIndex, InteractionClaims};
-use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
+use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
 use crate::physics::{
@@ -215,16 +215,20 @@ pub enum Goal {
     /// Working a player-tagged plan at `target_cell` until the timer
     /// expires, at which point the engine applies the world mutation
     /// captured in `plan_kind`, clears the tag, releases the claim,
-    /// and the brain reduces the `work` need. Entered only via a
-    /// successful arrival on a [`ArrivalAction::Work`].
+    /// and the brain applies the captured `need_restore` (if any).
+    /// Entered only via a successful arrival on a [`ArrivalAction::Work`].
     ///
     /// `plan_kind` is snapshot-at-goal-commit-time so a player who
     /// re-tags the cell mid-traversal can't redirect what the NPC
     /// builds — they get to cancel the plan, but not silently swap it.
+    /// `need_restore` is likewise captured at commit — the block
+    /// being placed (Build) or removed (Remove) at *that* moment
+    /// determined the payoff; the mid-action picture doesn't matter.
     Working {
         remaining_secs: f32,
         target_cell: IVec3,
         plan_kind: PlanKind,
+        need_restore: Option<NeedRestore>,
     },
 }
 
@@ -286,11 +290,16 @@ pub enum ArrivalAction {
     /// of the `PlanKind` at the moment the goal was committed so a
     /// mid-traversal tag swap (player edits the tag while NPC is en
     /// route) doesn't redirect the work — the player gets to cancel
-    /// but not silently re-aim.
+    /// but not silently re-aim. `need_restore` and `duration_secs`
+    /// were resolved from the target block's
+    /// [`WorkAction`](block_junk_mod_api::blocks::WorkAction) (or the
+    /// engine-wide [`WorkDefaults`](block_junk_mod_api::npcs::WorkDefaults))
+    /// at goal commit; arrival doesn't re-read the block def.
     Work {
         duration_secs: f32,
         target_cell: IVec3,
         plan_kind: PlanKind,
+        need_restore: Option<NeedRestore>,
     },
 }
 
@@ -336,18 +345,14 @@ const MAX_INTERACT_DURATION_SECS: f32 = 120.0;
 /// the map shouldn't keep luring a villager from local tasks.
 const SNAPSHOT_PLAN_RADIUS_CELLS: i32 = 48;
 const SNAPSHOT_PLAN_LIMIT: usize = 8;
-/// How long a single-cell work action takes the NPC. Picked so a
-/// villager visibly stands at the target for a few seconds (matches
-/// the player's own [`crate::client::PLAYER_ACTION_DURATION_SECS`] in
-/// feel without being identical — NPCs are slower at hand-crafting).
-/// Tune as work animations land.
-const WORK_DURATION_SECS: f32 = 4.0;
+/// Maximum walk-deadline for a WorkPlan goal. Same magnitude as the
+/// other A*-driven goals — past two minutes the NPC abandons and lets
+/// the planner pick again. The actual *work* duration (how long the
+/// NPC stands at the cell) is per-block via
+/// [`BlockDef::work_action`](block_junk_mod_api::blocks::BlockDef::work_action)
+/// with [`WorkDefaults`](block_junk_mod_api::npcs::WorkDefaults) as the
+/// fallback — no engine constant needed.
 const MAX_WORK_TIMEOUT_SECS: f32 = 120.0;
-/// How much of the `work` need a completed action satisfies. Same
-/// magnitude as a sleeper's `restores` floor — one job moves the
-/// villager from "looking for purpose" back toward content.
-const WORK_RESTORES: f32 = 0.35;
-const WORK_NEED_ID: &str = "work";
 /// How many nearby matched rooms to include in each planner snapshot.
 /// Cap exists so a world with hundreds of registered rooms doesn't
 /// blow up the per-call serialization cost; 8 is enough headroom for
@@ -642,6 +647,7 @@ fn npc_brain_tick(
     block_registry: Res<BlockRegistry>,
     mods: Res<ServerMods>,
     need_registry: Res<NeedRegistry>,
+    work_defaults: Res<WorkDefaultsRes>,
     room_map: Res<RoomMap>,
     interactable_index: Res<InteractableIndex>,
     mut interaction_claims: ResMut<InteractionClaims>,
@@ -820,11 +826,13 @@ fn npc_brain_tick(
                     duration_secs,
                     target_cell,
                     plan_kind,
+                    need_restore,
                 } => {
                     brain.goal = Goal::Working {
                         remaining_secs: duration_secs,
                         target_cell,
                         plan_kind,
+                        need_restore,
                     };
                 }
             }
@@ -910,27 +918,42 @@ fn npc_brain_tick(
         if work_done {
             // Action-specific completion: apply restore, release
             // the plan claim, emit the world-mutation message.
-            // Generic post-action handling runs below.
+            // Generic post-action handling runs below. `need_restore`
+            // was captured at goal commit from the targeted block's
+            // `work_action` or the engine-wide `WorkDefaults` — a
+            // mod that wants per-block payoff scales it from there.
             if let Goal::Working {
                 target_cell,
                 plan_kind,
+                need_restore,
                 ..
             } = &brain.goal
             {
-                if let Some(value) = needs.0.get_mut(WORK_NEED_ID) {
-                    *value = (*value - WORK_RESTORES).max(0.0);
+                if let Some(nr) = need_restore {
+                    if let Some(value) = needs.0.get_mut(&nr.need) {
+                        *value = (*value - nr.restores).max(0.0);
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?target_cell.to_array(),
+                            kind = ?plan_kind,
+                            need = %nr.need,
+                            restored = nr.restores,
+                            remaining_deficit = *value,
+                            "work complete",
+                        );
+                    } else {
+                        warn!(
+                            npc = npc_id.0,
+                            need = %nr.need,
+                            "work complete but NPC has no entry for need; ignoring",
+                        );
+                    }
+                } else {
                     info!(
                         npc = npc_id.0,
                         cell = ?target_cell.to_array(),
                         kind = ?plan_kind,
-                        restored = WORK_RESTORES,
-                        remaining_deficit = *value,
-                        "work complete",
-                    );
-                } else {
-                    warn!(
-                        npc = npc_id.0,
-                        "work complete but NPC has no `work` need entry; ignoring",
+                        "work complete (no need change)",
                     );
                 }
                 commands.write_message(NpcWorkCompleted {
@@ -1027,9 +1050,11 @@ fn npc_brain_tick(
                 &interaction_claims,
                 &plans,
                 &plan_claims,
+                &chunks,
                 &chunk_entities_q,
                 &chunk_map,
                 &block_registry,
+                &work_defaults.0,
                 *world_clock,
             );
             // One-line per-NPC trace at every planner call so a
@@ -1445,6 +1470,21 @@ fn npc_brain_tick(
                         *intent = MovementIntent::default();
                         continue;
                     }
+                    // Capture work-action knobs (need + magnitude + duration)
+                    // *once* at goal commit. Build plans consult the block
+                    // being placed (in the plan slot); Remove plans consult
+                    // the live block at the cell. Either falls back to the
+                    // engine-wide WorkDefaults when the block has no
+                    // `work_action`. A subsequent re-tag or re-block can't
+                    // retroactively change what this NPC was rewarded for.
+                    let (work_duration_secs, work_need_restore) = resolve_work_action(
+                        plan_kind,
+                        target_cell,
+                        &chunks,
+                        &chunk_map,
+                        &block_registry,
+                        &work_defaults.0,
+                    );
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     let Some(stand_cell) =
@@ -1467,9 +1507,10 @@ fn npc_brain_tick(
                             npc_path.0.clear();
                         }
                         brain.goal = Goal::Working {
-                            remaining_secs: WORK_DURATION_SECS,
+                            remaining_secs: work_duration_secs,
                             target_cell,
                             plan_kind,
+                            need_restore: work_need_restore,
                         };
                         *intent = MovementIntent::default();
                         continue;
@@ -1493,9 +1534,10 @@ fn npc_brain_tick(
                                 last_pos: pose.translation,
                                 stuck_secs: 0.0,
                                 on_arrive: ArrivalAction::Work {
-                                    duration_secs: WORK_DURATION_SECS,
+                                    duration_secs: work_duration_secs,
                                     target_cell,
                                     plan_kind,
+                                    need_restore: work_need_restore,
                                 },
                                 snap: None,
                             };
@@ -1699,9 +1741,11 @@ fn build_snapshot(
     interaction_claims: &InteractionClaims,
     plans: &Plans,
     plan_claims: &PlanClaims,
+    chunks: &Query<&Chunk>,
     chunk_entities: &Query<&'static ChunkEntities>,
     chunk_map: &ChunkMap,
     block_registry: &BlockRegistry,
+    work_defaults: &block_junk_mod_api::npcs::WorkDefaults,
     world_clock: WorldClock,
 ) -> NpcSnapshot {
     let foot = pose_to_foot_cell(pose);
@@ -1724,6 +1768,10 @@ fn build_snapshot(
         foot,
         SNAPSHOT_PLAN_RADIUS_CELLS,
         SNAPSHOT_PLAN_LIMIT,
+        chunks,
+        chunk_map,
+        block_registry,
+        work_defaults,
     );
     NpcSnapshot {
         id: id.0,
@@ -1746,6 +1794,13 @@ fn build_snapshot(
 /// sort by distance, truncate to limit. The `kind` is mapped from the
 /// full engine-side `PlanKind` to the simpler `PlanKindHint` exposed
 /// to mods (which don't need slot + orientation to make the decision).
+///
+/// `need`/`restores` mirror what the brain would actually apply on
+/// completion — resolved per plan from the targeted block's
+/// `work_action` (Build: block being placed; Remove: live block at
+/// cell) with `WorkDefaults` as the fallback. Planners use these to
+/// pick the highest-payoff nearby plan when several are equidistant.
+#[allow(clippy::too_many_arguments, reason = "snapshot collector mirrors live brain lookups")]
 fn collect_nearby_plans(
     plans: &Plans,
     plan_claims: &PlanClaims,
@@ -1753,6 +1808,10 @@ fn collect_nearby_plans(
     foot: IVec3,
     radius_cells: i32,
     limit: usize,
+    chunks: &Query<&Chunk>,
+    chunk_map: &ChunkMap,
+    block_registry: &BlockRegistry,
+    work_defaults: &block_junk_mod_api::npcs::WorkDefaults,
 ) -> Vec<NearbyPlan> {
     let mut out: Vec<NearbyPlan> = Vec::new();
     for (cell, kind) in plans.iter() {
@@ -1768,6 +1827,18 @@ fn collect_nearby_plans(
             PlanKind::Remove => PlanKindHint::Remove,
             PlanKind::Build { .. } => PlanKindHint::Build,
         };
+        let (_duration, need_restore) = resolve_work_action(
+            *kind,
+            *cell,
+            chunks,
+            chunk_map,
+            block_registry,
+            work_defaults,
+        );
+        let (need, restores) = match need_restore {
+            Some(nr) => (Some(nr.need), nr.restores),
+            None => (None, 0.0),
+        };
         out.push(NearbyPlan {
             cell: BlockPos {
                 x: cell.x,
@@ -1775,6 +1846,8 @@ fn collect_nearby_plans(
                 z: cell.z,
             },
             kind: hint,
+            need,
+            restores,
             distance,
         });
     }
@@ -1955,6 +2028,43 @@ fn slot_at_cell(
         return None;
     }
     registry.def(slot).use_slot.clone()
+}
+
+/// Resolve the work-action knobs (`duration_secs`, optional `need_restore`)
+/// for a WorkPlan goal at commit time. Reads `block.work_action` from
+/// the block being placed (Build) or the live block at the cell
+/// (Remove), with [`WorkDefaults`] as the fallback when either the
+/// block lookup misses or the block has no `work_action`.
+///
+/// Returns the **engine defaults** if the Remove cell is unloaded or
+/// empty rather than failing — the brain still wants to commit a goal,
+/// and the alternative (silent abort) hides the underlying issue at a
+/// layer the planner can't react to.
+fn resolve_work_action(
+    plan_kind: PlanKind,
+    target_cell: IVec3,
+    chunks: &Query<&Chunk>,
+    chunk_map: &ChunkMap,
+    registry: &BlockRegistry,
+    defaults: &block_junk_mod_api::npcs::WorkDefaults,
+) -> (f32, Option<NeedRestore>) {
+    let block_action = match plan_kind {
+        PlanKind::Build { slot, .. } => registry.def(slot).work_action.as_ref().cloned(),
+        PlanKind::Remove => {
+            let (coord, local) = world_to_chunk(target_cell);
+            chunk_map
+                .0
+                .get(&coord)
+                .and_then(|&entity| chunks.get(entity).ok())
+                .map(|chunk| chunk.get(local))
+                .filter(|slot| !slot.is_empty())
+                .and_then(|slot| registry.def(slot).work_action.clone())
+        }
+    };
+    match block_action {
+        Some(w) => (w.duration_secs, w.need_restore),
+        None => (defaults.duration_secs, defaults.need_restore.clone()),
+    }
 }
 
 /// Teleport `pose` onto the first standable cell in `candidates`.
