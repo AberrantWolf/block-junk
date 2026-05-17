@@ -1,13 +1,13 @@
 //! Per-frame wireframe outline on the world cell under the crosshair.
 //!
 //! Independent of mode in *behaviour* (always drawn when the raycast
-//! hits something) but tinted by [`PlayerMode`] so the player gets a
-//! quick read on what the next click will do:
+//! hits something) but tinted to read what the next L-click will do:
 //!
 //! - Select: white — neutral inspect target
-//! - Plan: yellow — about to tag (or untag)
-//! - Build: green — about to place
-//! - Destroy: red — about to break
+//! - Plan + Destroy slot: red — about to tag for removal
+//! - Plan + block slot: green — about to tag for build
+//! - Build + Destroy slot: red — about to break
+//! - Build + block slot: green — about to place
 //!
 //! Drawn with Bevy gizmos rather than a spawned wireframe entity. Cheap
 //! enough to redo every frame; saves us a Transform-sync pass and the
@@ -17,7 +17,9 @@
 use bevy::prelude::*;
 
 use crate::blocks::BlockRegistry;
-use crate::client::{RAYCAST_REACH, entity_aware_raycast};
+use crate::client::{
+    PlaceablePalette, RAYCAST_REACH, SelectedBlock, entity_aware_raycast,
+};
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans};
 use crate::player_mode::PlayerMode;
@@ -49,8 +51,8 @@ impl Plugin for TargetOutlinePlugin {
 
 /// Render every tagged cell as a persistent gizmo wireframe so the
 /// player can see their queue. Visible in every mode, not just Plan —
-/// once you're in Build or Destroy you still want to see what your
-/// villagers are about to work on. Red for Remove, green for Build.
+/// once you're in Build you still want to see what your villagers are
+/// about to work on. Red for Remove, green for Build.
 fn draw_plan_outlines(plans: Res<Plans>, mut gizmos: Gizmos) {
     for (cell, kind) in plans.iter() {
         let centre = cell.as_vec3() + Vec3::splat(0.5);
@@ -62,15 +64,17 @@ fn draw_plan_outlines(plans: Res<Plans>, mut gizmos: Gizmos) {
     }
 }
 
+#[allow(clippy::too_many_arguments, reason = "outline pulls from many resources")]
 fn draw_target_outline(
     mode: Res<PlayerMode>,
-    keys: Res<ButtonInput<KeyCode>>,
     drag: Res<PlanDragState>,
     cam: Query<&GlobalTransform, With<Camera3d>>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
     plans: Res<Plans>,
+    selected: Res<SelectedBlock>,
+    palette: Res<PlaceablePalette>,
     mut gizmos: Gizmos,
 ) {
     // During an in-flight Plan-mode drag the rectangle preview is the
@@ -85,13 +89,13 @@ fn draw_target_outline(
     };
     let origin = cam_t.translation();
     let dir = *cam_t.forward();
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    // Plan-mode Remove preview (L without Shift) sees through tagged-
-    // remove cells, matching `plan_mode_input`. Build preview keeps
-    // the cursor on the actually-visible block so it can offset
-    // outward correctly.
-    let skip_plan_remove: Option<&Plans> = match (*mode, shift) {
-        (PlayerMode::Plan, false) => Some(&plans),
+    // In Plan mode the Remove verb sees through already-tagged cells so
+    // the cursor can preview a Remove behind another Remove tag — same
+    // trick `plan_mode_input` uses on the actual press. Build / Select
+    // keep the cursor on the actually-visible block.
+    let destroy_selected = selected.current_block(&palette).is_none();
+    let skip_plan_remove: Option<&Plans> = match *mode {
+        PlayerMode::Plan if destroy_selected => Some(&plans),
         _ => None,
     };
     let Some(hit) = entity_aware_raycast(
@@ -106,14 +110,12 @@ fn draw_target_outline(
         return;
     };
 
-    // Outline cell = where the next click's *result* lands. For builder
-    // semantics that's the empty cell on the outward face in Build mode,
-    // and in Plan mode when Shift is held (= tag-build verb). For
-    // Destroy / plain-L Plan / Select, the next click acts on the cell
-    // under the cursor itself.
-    let target = match *mode {
-        PlayerMode::Build => hit.cell + hit.face_normal,
-        PlayerMode::Plan if shift => hit.cell + hit.face_normal,
+    // Outline cell = where the next L-click's *result* lands. A
+    // placement (real block in hotbar) lands on the outward-face cell;
+    // a removal (Destroy slot) acts on the cell under the cursor.
+    let target = match (*mode, destroy_selected) {
+        (PlayerMode::Build, false) => hit.cell + hit.face_normal,
+        (PlayerMode::Plan, false) => hit.cell + hit.face_normal,
         _ => hit.cell,
     };
 
@@ -121,11 +123,10 @@ fn draw_target_outline(
     // Gizmos::cube uses the transform origin as the cube *centre*, so
     // shift by half a unit on each axis to land on the cell.
     let centre = target.as_vec3() + Vec3::splat(0.5);
-    let colour = match *mode {
-        PlayerMode::Select => Color::srgb(1.0, 1.0, 1.0),
-        PlayerMode::Plan => Color::srgb(1.0, 0.85, 0.2),
-        PlayerMode::Build => Color::srgb(0.3, 1.0, 0.4),
-        PlayerMode::Destroy => Color::srgb(1.0, 0.35, 0.3),
+    let colour = match (*mode, destroy_selected) {
+        (PlayerMode::Select, _) => Color::srgb(1.0, 1.0, 1.0),
+        (_, true) => Color::srgb(1.0, 0.35, 0.3),
+        (_, false) => Color::srgb(0.3, 1.0, 0.4),
     };
     gizmos.cube(Transform::from_translation(centre), colour);
 }

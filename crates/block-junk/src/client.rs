@@ -61,7 +61,11 @@ impl Plugin for ClientPlugin {
         // resources from it.
         let palette = {
             let reg = app.world().resource::<BlockRegistry>();
-            PlaceablePalette(reg.iter_placeable().collect())
+            // Destroy lives at index 0 so 1-key intuition (`top of the
+            // bar = break`) matches the visual ordering.
+            let mut entries: Vec<PaletteSlot> = vec![PaletteSlot::Destroy];
+            entries.extend(reg.iter_placeable().map(PaletteSlot::Block));
+            PlaceablePalette(entries)
         };
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
         app.insert_resource(palette);
@@ -173,7 +177,7 @@ impl Plugin for ClientPlugin {
             .add_systems(
                 Update,
                 update_placement_preview
-                    .run_if(in_build_mode)
+                    .run_if(show_placement_preview)
                     .in_set(GameSet::PostSimulation),
             )
             .add_systems(
@@ -186,6 +190,7 @@ impl Plugin for ClientPlugin {
                     mesh_chunks,
                     refresh_block_entities,
                     update_hotbar_highlight,
+                    update_hotbar_visibility,
                     update_action_progress_ui,
                     draw_npc_paths,
                 )
@@ -258,20 +263,46 @@ pub struct BlockEntities {
     by_chunk: HashMap<ChunkCoord, HashSet<IVec3>>,
 }
 
-/// Cached list of placeable blocks for hotbar / cycling. Built once at
-/// startup from `BlockRegistry::iter_placeable`. If/when mods can add
-/// blocks at runtime this will need invalidation; for now it's static.
-#[derive(Resource)]
-pub struct PlaceablePalette(pub Vec<BlockSlot>);
+/// One hotbar entry. `Destroy` is the synthetic top slot whose L-click
+/// breaks the cell under the cursor (in Build mode) or tags it for
+/// removal (in Plan mode). `Block` is a regular placeable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteSlot {
+    Destroy,
+    Block(BlockSlot),
+}
 
-/// Index into [`PlaceablePalette`] of the currently selected block. Mouse
-/// wheel cycles; right-click places.
+impl PaletteSlot {
+    pub fn block(self) -> Option<BlockSlot> {
+        match self {
+            PaletteSlot::Destroy => None,
+            PaletteSlot::Block(slot) => Some(slot),
+        }
+    }
+}
+
+/// Hotbar entries shown to the player. Always begins with a synthetic
+/// [`PaletteSlot::Destroy`] slot at index 0; the remaining entries are
+/// pulled from [`BlockRegistry::iter_placeable`]. Built once at startup;
+/// if/when mods can add blocks at runtime this will need invalidation.
+#[derive(Resource)]
+pub struct PlaceablePalette(pub Vec<PaletteSlot>);
+
+/// Index into [`PlaceablePalette`] of the currently selected entry.
+/// Mouse wheel cycles; in Build mode L-click acts on the cursor's
+/// target, in Plan mode it tags the cell for NPCs.
 #[derive(Resource, Default)]
 pub struct SelectedBlock(pub usize);
 
 impl SelectedBlock {
-    pub fn current(&self, palette: &PlaceablePalette) -> BlockSlot {
+    pub fn current(&self, palette: &PlaceablePalette) -> PaletteSlot {
         palette.0[self.0]
+    }
+
+    /// Convenience: the selected entry as a placeable block, or `None`
+    /// if the synthetic [`PaletteSlot::Destroy`] slot is selected.
+    pub fn current_block(&self, palette: &PlaceablePalette) -> Option<BlockSlot> {
+        self.current(palette).block()
     }
 }
 
@@ -283,10 +314,10 @@ impl SelectedBlock {
 #[derive(Resource, Default)]
 pub struct PlacementRotation(pub Cardinal);
 
-/// In-flight player action in Build/Destroy mode. The timer ticks up
-/// while L is held against a stable target; when it reaches 1.0 the
-/// underlying `BlockEdit` is sent. Releasing L or aiming at a different
-/// cell drops the state and the next frame starts fresh from 0.
+/// In-flight player action in Build mode. The timer ticks up while L
+/// is held against a stable target; when it reaches 1.0 the underlying
+/// `BlockEdit` is sent. Releasing L or aiming at a different cell drops
+/// the state and the next frame starts fresh from 0.
 #[derive(Resource, Default)]
 pub struct PlayerActionState {
     pub active: Option<ActiveAction>,
@@ -307,13 +338,19 @@ pub enum ActionKind {
     Break,
 }
 
-/// Real seconds to complete one Build or Destroy action with the timer
-/// path. Picked so a sweep across a 3-block-wide wall feels deliberate
-/// without being tedious — tune as the feature settles.
+/// Real seconds to complete one Build-mode action (place or break) with
+/// the timer path. Picked so a sweep across a 3-block-wide wall feels
+/// deliberate without being tedious — tune as the feature settles.
 pub const PLAYER_ACTION_DURATION_SECS: f32 = 0.6;
 
 #[derive(Component)]
 struct HotbarSlot(usize);
+
+/// Marker on the absolute-positioned root Node holding the hotbar
+/// column. Used to flip the whole column's `Visibility` in modes that
+/// don't read from the hotbar (Select/Examine).
+#[derive(Component)]
+struct HotbarRoot;
 
 #[derive(Component)]
 struct ActionProgressBar;
@@ -489,10 +526,10 @@ fn setup_scene(
             ));
         });
 
-    // Action-progress bar: shown while an L-hold Build/Destroy action
-    // is in flight. Absolute-anchored at screen centre + a 14 px gap
-    // below the crosshair; negative left margin = half the bar width
-    // so the centre lines up with the crosshair.
+    // Action-progress bar: shown while an L-hold Build action is in
+    // flight (place or break). Absolute-anchored at screen centre + a
+    // 14 px gap below the crosshair; negative left margin = half the
+    // bar width so the centre lines up with the crosshair.
     commands
         .spawn((
             ActionProgressBar,
@@ -527,52 +564,95 @@ fn setup_scene(
         });
 
     // Hotbar on the right edge: vertical column of slots. Selected slot
-    // gets a white border via update_hotbar_highlight. The inner image is
-    // the block's procedural 16×16 texture rendered at 32×32 with
+    // gets a white border via update_hotbar_highlight. The inner image
+    // is the block's procedural 16×16 texture rendered at 32×32 with
     // nearest-neighbour sampling (configured on the source `Image` in
     // BlockTexturesPlugin) so the pattern reads as crisp pixel art.
+    // The synthetic Destroy slot at index 0 carries the pickaxe icon
+    // and a subtle red tint instead.
+    let destroy_icon: Handle<Image> = asset_server.load("ui/mode_icons/tool_pickaxe.png");
     commands
-        .spawn(Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            position_type: PositionType::Absolute,
-            justify_content: JustifyContent::FlexEnd,
-            align_items: AlignItems::Center,
-            padding: UiRect::right(Val::Px(20.0)),
-            ..default()
-        })
+        .spawn((
+            HotbarRoot,
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                justify_content: JustifyContent::FlexEnd,
+                align_items: AlignItems::Center,
+                padding: UiRect::right(Val::Px(20.0)),
+                ..default()
+            },
+        ))
         .with_children(|root| {
             root.spawn(Node {
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
+                align_items: AlignItems::Center,
                 ..default()
             })
-            .with_children(|row| {
-                for (i, &slot) in palette.0.iter().enumerate() {
-                    let icon = textures.icons[slot.0 as usize].clone();
-                    row.spawn((
+            .with_children(|column| {
+                // Scroll-wheel hint sits at the top of the column so it
+                // visually anchors what the cycling acts on.
+                column
+                    .spawn((
                         Node {
-                            width: Val::Px(44.0),
-                            height: Val::Px(44.0),
-                            border: UiRect::all(Val::Px(2.0)),
+                            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                            margin: UiRect::bottom(Val::Px(2.0)),
                             justify_content: JustifyContent::Center,
                             align_items: AlignItems::Center,
+                            border: UiRect::all(Val::Px(1.0)),
+                            border_radius: BorderRadius::all(Val::Px(3.0)),
                             ..default()
                         },
-                        BorderColor::all(Color::BLACK),
-                        BackgroundColor(Color::srgba(0.1, 0.1, 0.1, 0.6)),
-                        HotbarSlot(i),
+                        BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.72)),
+                        BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
                     ))
-                    .with_children(|slot_parent| {
-                        slot_parent.spawn((
-                            ImageNode::new(icon),
-                            Node {
-                                width: Val::Px(32.0),
-                                height: Val::Px(32.0),
+                    .with_children(|cap| {
+                        cap.spawn((
+                            Text::new("scroll"),
+                            TextFont {
+                                font_size: 12.0,
                                 ..default()
                             },
+                            TextColor(Color::srgba(0.9, 0.9, 0.9, 1.0)),
                         ));
                     });
+                for (i, entry) in palette.0.iter().enumerate() {
+                    let (icon, bg) = match entry {
+                        PaletteSlot::Destroy => (
+                            destroy_icon.clone(),
+                            Color::srgba(0.35, 0.10, 0.10, 0.7),
+                        ),
+                        PaletteSlot::Block(slot) => (
+                            textures.icons[slot.0 as usize].clone(),
+                            Color::srgba(0.1, 0.1, 0.1, 0.6),
+                        ),
+                    };
+                    column
+                        .spawn((
+                            Node {
+                                width: Val::Px(44.0),
+                                height: Val::Px(44.0),
+                                border: UiRect::all(Val::Px(2.0)),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BorderColor::all(Color::BLACK),
+                            BackgroundColor(bg),
+                            HotbarSlot(i),
+                        ))
+                        .with_children(|slot_parent| {
+                            slot_parent.spawn((
+                                ImageNode::new(icon),
+                                Node {
+                                    width: Val::Px(32.0),
+                                    height: Val::Px(32.0),
+                                    ..default()
+                                },
+                            ));
+                        });
                 }
             });
         });
@@ -612,6 +692,11 @@ fn cycle_selected_or_rotation(
     }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     if ctrl {
+        // No orientation to rotate when the Destroy slot is selected;
+        // swallow the wheel rather than spinning a meaningless angle.
+        if selected.current_block(&palette).is_none() {
+            return;
+        }
         // CCW step on scroll-up matches the right-hand rule for +Y rotation
         // (positive yaw is CCW viewed from above) — rotating "up the wheel"
         // turns the bed's head left, which is the natural feel.
@@ -682,6 +767,30 @@ fn update_hotbar_highlight(
         } else {
             BorderColor::all(Color::BLACK)
         };
+    }
+}
+
+/// Hide the hotbar column in Select/Examine — the L-click verb in that
+/// mode doesn't read the hotbar, so the chip would just be noise. Plan
+/// and Build both drive their primary verb off the hotbar selection
+/// and need it visible.
+///
+/// Not gated by `mode.is_changed()` so the initial entry into the
+/// scene (where the mode is the default Select but the resource has
+/// already been around since plugin build) still gets the right
+/// Visibility on its first tick.
+fn update_hotbar_visibility(
+    mode: Res<PlayerMode>,
+    mut roots: Query<&mut Visibility, With<HotbarRoot>>,
+) {
+    let target = match *mode {
+        PlayerMode::Select => Visibility::Hidden,
+        PlayerMode::Plan | PlayerMode::Build => Visibility::Visible,
+    };
+    for mut v in roots.iter_mut() {
+        if *v != target {
+            *v = target;
+        }
     }
 }
 
@@ -792,19 +901,21 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
         .collect()
 }
 
-/// Held-button action timer in Build/Destroy mode. L-click is the
-/// primary verb (places in Build, removes in Destroy). Holding L
-/// against a stable target advances the timer; reaching 1.0 sends
-/// the underlying `BlockEdit`. Releasing L or aiming at a different
-/// cell drops the in-flight action.
+/// Held-button action timer in Build mode. L-click is the primary
+/// verb; what it does is decided by the hotbar selection — a real
+/// block places it, the synthetic [`PaletteSlot::Destroy`] slot breaks
+/// the cell under the cursor. Holding L against a stable target
+/// advances the timer; reaching 1.0 sends the underlying `BlockEdit`.
+/// Releasing L or aiming at a different cell drops the in-flight
+/// action.
 ///
 /// The F3 [`crate::debug::InstantPlayerBuilds`] toggle short-circuits
 /// the timer: on `just_pressed`, send the edit immediately and bypass
 /// the state machine — same dev-loop ergonomics as before Phase 5.
 ///
 /// Select and Plan modes don't run this system (mode gate); R-click is
-/// the per-mode secondary slot and remains a no-op in Build/Destroy
-/// until something claims it.
+/// the per-mode secondary slot and remains a no-op in Build until
+/// something claims it.
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
 fn place_break_input(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -822,10 +933,10 @@ fn place_break_input(
     mut action: ResMut<PlayerActionState>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
-    // Only Build and Destroy use the action timer. Switching modes or
-    // losing cursor lock mid-action cancels the in-flight progress so
+    // Only Build uses the action timer. Switching modes or losing
+    // cursor lock mid-action cancels the in-flight progress so
     // re-entering doesn't pick up a stale timer state.
-    if !matches!(*mode, PlayerMode::Build | PlayerMode::Destroy) {
+    if *mode != PlayerMode::Build {
         action.active = None;
         return;
     }
@@ -864,11 +975,22 @@ fn place_break_input(
         return;
     };
 
-    // Resolve this frame's action target + the BlockEdit it would send.
-    let (target_cell, kind, edit) = match *mode {
-        PlayerMode::Build => {
+    // Resolve this frame's action target + the BlockEdit it would
+    // send. Hotbar selection drives the verb:
+    //   - Destroy slot → break the cell under the cursor.
+    //   - Block slot → place that block on the outward face cell.
+    let (target_cell, kind, edit) = match selected.current(&palette) {
+        PaletteSlot::Destroy => (
+            hit.cell,
+            ActionKind::Break,
+            BlockEdit {
+                anchor: hit.cell,
+                slot: BlockSlot::EMPTY,
+                orientation: Cardinal::default(),
+            },
+        ),
+        PaletteSlot::Block(slot) => {
             let anchor = hit.cell + hit.face_normal;
-            let slot = selected.current(&palette);
             let orientation = placement_orientation(visible_yaw, rotation.0);
             (
                 anchor,
@@ -880,16 +1002,6 @@ fn place_break_input(
                 },
             )
         }
-        PlayerMode::Destroy => (
-            hit.cell,
-            ActionKind::Break,
-            BlockEdit {
-                anchor: hit.cell,
-                slot: BlockSlot::EMPTY,
-                orientation: Cardinal::default(),
-            },
-        ),
-        _ => unreachable!("mode gated above"),
     };
 
     // Instant path: F3 toggle skips the timer. Single send on the
@@ -1220,22 +1332,37 @@ fn setup_placement_preview(
     commands.insert_resource(PreviewMaterials { front, back });
 }
 
-/// Run-condition: only show the placement preview ghost in Build mode.
-/// Spelled as a free fn so multiple systems can share it if needed.
-fn in_build_mode(mode: Res<PlayerMode>) -> bool {
-    *mode == PlayerMode::Build
+/// Run-condition: only show the placement preview ghost in Build mode
+/// with a real block in the hotbar. The Destroy slot has no place
+/// preview — the cursor outline already indicates the target cell.
+fn show_placement_preview(
+    mode: Res<PlayerMode>,
+    selected: Res<SelectedBlock>,
+    palette: Res<PlaceablePalette>,
+) -> bool {
+    *mode == PlayerMode::Build && selected.current_block(&palette).is_some()
 }
 
-/// Hide the placement preview ghost when the player just left Build mode.
+/// Hide the placement preview ghost when the player just left Build
+/// mode, or when the hotbar selection flipped to the Destroy slot.
 /// Without this the last-frame ghost would linger on screen — the main
-/// preview system stops running thanks to the `run_if` gate, so something
-/// has to actively flip Visibility on the transition.
+/// preview system stops running thanks to the `run_if` gate, so
+/// something has to actively flip Visibility on the transition.
 fn hide_preview_on_mode_change(
     mode: Res<PlayerMode>,
+    selected: Res<SelectedBlock>,
+    palette: Res<PlaceablePalette>,
     state: Res<PreviewState>,
     mut vis: Query<&mut Visibility>,
 ) {
-    if !mode.is_changed() || *mode == PlayerMode::Build {
+    // Re-run when either the mode or the selection changed; the
+    // gate decides whether to hide based on the new state.
+    if !mode.is_changed() && !selected.is_changed() {
+        return;
+    }
+    let should_show =
+        *mode == PlayerMode::Build && selected.current_block(&palette).is_some();
+    if should_show {
         return;
     }
     for entity in [state.cube_root, state.scene_root].into_iter().flatten() {
@@ -1330,7 +1457,13 @@ fn update_placement_preview(
             .unwrap_or(BlockSlot::EMPTY)
     };
 
-    let slot = selected.current(&palette);
+    // `show_placement_preview` already proves we have a block-typed
+    // palette slot — anything else and this system wouldn't be running.
+    let Some(slot) = selected.current_block(&palette) else {
+        hide(state.cube_root, &mut roots);
+        hide(state.scene_root, &mut roots);
+        return;
+    };
     let def = registry.def(slot);
     let orientation = placement_orientation(visible_yaw, rotation.0);
     let cells = world_footprint(anchor, &def.footprint, orientation);

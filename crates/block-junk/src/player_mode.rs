@@ -3,8 +3,10 @@
 //! The mode gates what L-click / R-click / wheel actually do in the rest
 //! of the client (Phase 1+). This module owns just the state machine and
 //! a small HUD chip showing the active mode. Default is `Select`; Tab
-//! cycles forward, Shift+Tab reverses, and the number keys 1..=4 select
-//! a mode directly.
+//! cycles forward, Shift+Tab reverses, and the number keys 1..=3 select
+//! a mode directly. The Destroy verb lives in the hotbar as a synthetic
+//! slot rather than as its own mode — both Plan and Build read the
+//! hotbar to decide what an L-click does.
 
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
@@ -17,7 +19,6 @@ pub enum PlayerMode {
     Select,
     Plan,
     Build,
-    Destroy,
 }
 
 impl Default for PlayerMode {
@@ -27,19 +28,17 @@ impl Default for PlayerMode {
 }
 
 impl PlayerMode {
-    pub const ALL: [PlayerMode; 4] = [
+    pub const ALL: [PlayerMode; 3] = [
         PlayerMode::Select,
         PlayerMode::Plan,
         PlayerMode::Build,
-        PlayerMode::Destroy,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            PlayerMode::Select => "Select",
+            PlayerMode::Select => "Select/Examine",
             PlayerMode::Plan => "Plan",
             PlayerMode::Build => "Build",
-            PlayerMode::Destroy => "Destroy",
         }
     }
 
@@ -48,7 +47,6 @@ impl PlayerMode {
             PlayerMode::Select => "ui/mode_icons/hand_point.png",
             PlayerMode::Plan => "ui/mode_icons/drawing_pencil.png",
             PlayerMode::Build => "ui/mode_icons/tool_hammer.png",
-            PlayerMode::Destroy => "ui/mode_icons/tool_pickaxe.png",
         }
     }
 
@@ -139,7 +137,85 @@ fn spawn_mode_pill(
                 ModePillLabel,
             ));
         });
+
+    spawn_mode_hints(&mut commands, &asset_server);
 }
+
+/// Compact hint strip sitting just above the mode pill: one `Tab` key
+/// cap (the cycle binding) followed by `1`/`2`/`3` key caps each paired
+/// with the destination mode's icon. Always-on; cheap to leave in the
+/// HUD because the player can stop reading once they've memorised it.
+fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer) {
+    commands
+        .spawn((
+            ModeHintsRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(64.0),
+                left: Val::Px(16.0),
+                column_gap: Val::Px(6.0),
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .with_children(|row| {
+            spawn_key_cap(row, "Tab");
+            for m in PlayerMode::ALL {
+                let label = match m {
+                    PlayerMode::Select => "1",
+                    PlayerMode::Plan => "2",
+                    PlayerMode::Build => "3",
+                };
+                row.spawn(Node {
+                    column_gap: Val::Px(3.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|pair| {
+                    spawn_key_cap(pair, label);
+                    pair.spawn((
+                        ImageNode::new(asset_server.load(m.icon_path())),
+                        Node {
+                            width: Val::Px(18.0),
+                            height: Val::Px(18.0),
+                            ..default()
+                        },
+                    ));
+                });
+            }
+        });
+}
+
+/// Small dark "key cap" chip. Used for kbd hint clusters.
+fn spawn_key_cap(parent: &mut ChildSpawnerCommands<'_>, label: &str) {
+    parent
+        .spawn((
+            Node {
+                padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                min_width: Val::Px(18.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(3.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.72)),
+            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+        ))
+        .with_children(|cap| {
+            cap.spawn((
+                Text::new(label),
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
+                TextColor(Color::srgba(0.9, 0.9, 0.9, 1.0)),
+            ));
+        });
+}
+
+#[derive(Component)]
+struct ModeHintsRoot;
 
 fn handle_mode_input(
     keys: Res<ButtonInput<KeyCode>>,
@@ -171,8 +247,6 @@ fn handle_mode_input(
         Some(PlayerMode::Plan)
     } else if keys.just_pressed(KeyCode::Digit3) {
         Some(PlayerMode::Build)
-    } else if keys.just_pressed(KeyCode::Digit4) {
-        Some(PlayerMode::Destroy)
     } else {
         None
     };
