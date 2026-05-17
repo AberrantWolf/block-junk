@@ -41,7 +41,9 @@ use crate::interactables::{InteractableIndex, InteractionClaims};
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
-use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step};
+use crate::physics::{
+    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, standing_pose_translation,
+};
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
@@ -416,6 +418,14 @@ const WANDER_DROP_BUDGET: i32 = 16;
 /// whole budget on a 200-step trek.
 const ASTAR_NODE_BUDGET: usize = 2000;
 const ASTAR_PATH_BUDGET: usize = 64;
+
+/// Chebyshev search radius used by [`rescue_to_nearby_standable`]
+/// when the brain detects an NPC whose pose isn't standable at
+/// planner entry. 2 cells covers "fell one cell off a ledge" and
+/// "slid against a wall onto an unsupported corner" without giving
+/// the rescue licence to teleport the NPC across the room — a wider
+/// radius would hide the underlying bug instead of surfacing it.
+const RESCUE_RADIUS_CELLS: i32 = 2;
 
 pub struct NpcServerPlugin;
 
@@ -966,6 +976,46 @@ fn npc_brain_tick(
             brain.goal = Goal::Idle;
         }
         if matches!(brain.goal, Goal::Idle) {
+            // Self-rescue: if the NPC's pose isn't standable, A* will
+            // bail on every goal the planner picks and we'll loop
+            // forever emitting `reason=start_unstandable`. This
+            // typically means a failed post-interaction eject, a
+            // mid-sleep build dropping a block on the NPC, or
+            // soft-actor-separation sliding them onto an unsupported
+            // corner. Pop them to the nearest standable cell within
+            // a tight radius *before* the planner runs, so the
+            // snapshot's foot reflects the rescued position. Locked
+            // NPCs are excluded — KinematicLock is the engine's
+            // promise that the body is intentionally sitting where
+            // a slot snap put it (inside the bed mesh, on a chair),
+            // and rescuing them would yank them out of a valid use.
+            if !is_locked && pose_to_standable_foot(&pose, &world).is_none() {
+                match rescue_to_nearby_standable(&mut pose, &world, RESCUE_RADIUS_CELLS) {
+                    Some(cell) => {
+                        warn!(
+                            npc = npc_id.0,
+                            rescue_to = ?cell.to_array(),
+                            "rescued NPC from non-standable pose at planner entry",
+                        );
+                    }
+                    None => {
+                        warn!(
+                            npc = npc_id.0,
+                            pose = ?pose.translation.to_array(),
+                            radius = RESCUE_RADIUS_CELLS,
+                            "no standable cell within rescue radius; parking briefly",
+                        );
+                        if !npc_path.0.is_empty() {
+                            npc_path.0.clear();
+                        }
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                }
+            }
             let kind_id = NpcKindId(kind.0.clone());
             let snapshot = build_snapshot(
                 *npc_id,
@@ -1328,11 +1378,27 @@ fn npc_brain_tick(
                             };
                         }
                         None => {
+                            // Classify the A* miss: `find_path` bails
+                            // up front when either endpoint isn't
+                            // standable, otherwise it ran out of
+                            // budget or found no path. The labels are
+                            // what makes the next stuck-NPC report
+                            // diagnosable from logs alone — "embedded
+                            // start" is very different from "target
+                            // walled off."
+                            let reason = if !standable(&world, foot) {
+                                "start_unstandable"
+                            } else if !standable(&world, stand_cell) {
+                                "stand_unstandable"
+                            } else {
+                                "unreachable"
+                            };
                             warn!(
                                 npc = npc_id.0,
                                 foot = ?foot.to_array(),
                                 target = ?target_cell.to_array(),
                                 stand = ?stand_cell.to_array(),
+                                reason,
                                 "interact failed: no A* path to approach cell, releasing claim and parking briefly"
                             );
                             if exclusive {
@@ -1435,11 +1501,19 @@ fn npc_brain_tick(
                             };
                         }
                         None => {
+                            let reason = if !standable(&world, foot) {
+                                "start_unstandable"
+                            } else if !standable(&world, stand_cell) {
+                                "stand_unstandable"
+                            } else {
+                                "unreachable"
+                            };
                             warn!(
                                 npc = npc_id.0,
                                 foot = ?foot.to_array(),
                                 target = ?target_cell.to_array(),
                                 stand = ?stand_cell.to_array(),
+                                reason,
                                 "work failed: no A* path to standable neighbour, releasing claim and parking briefly"
                             );
                             plan_claims.release(target_cell, *npc_id);
@@ -1907,11 +1981,7 @@ fn try_eject_to_cells<W: Walkability>(
         if !standable(world, cell) {
             continue;
         }
-        pose.translation = Vec3::new(
-            cell.x as f32 + 0.5,
-            cell.y as f32 + EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
-            cell.z as f32 + 0.5,
-        );
+        pose.translation = standing_pose_translation(cell);
         return true;
     }
     false
@@ -2130,11 +2200,24 @@ fn collect_nearby_rooms(rooms: &RoomMap, foot: IVec3, limit: usize) -> Vec<Nearb
 /// [`pose_to_standable_foot`] — the AABB can straddle a cell boundary,
 /// in which case the literal floor lands on an unsupported cell while
 /// the actor is physically resting on an adjacent one.
+///
+/// **FP epsilon on Y.** Eject/rescue/walk-step all reconstruct
+/// `pose.y = cell.y + EYE_OFFSET + HALF_Y`. The two added constants
+/// don't have exact f32 representations, so `pose.y - EYE - HALF`
+/// can drift below `cell.y` by ~5×10⁻⁷ at certain Y values (it
+/// happens at `cell.y ∈ {1, 2, 7, 8, ...}` — anywhere the mantissa
+/// rolls). Without a tolerance, `floor(7.9999995)` returns 7 and
+/// the foot cell silently slips a cell below the actor's actual
+/// resting cell, which then fails the standable check and traps
+/// pathfinding in a loop. The 1×10⁻⁴ bias is far smaller than
+/// any meaningful Y movement (1 cell = 1.0) but comfortably
+/// larger than the worst-case FP drift.
 fn pose_to_foot_cell(pose: &AvatarPose) -> IVec3 {
+    const FOOT_Y_EPS: f32 = 1e-4;
     let feet_y = pose.translation.y - EYE_OFFSET_FROM_CENTRE - PLAYER_HALF_EXTENTS.y;
     IVec3::new(
         pose.translation.x.floor() as i32,
-        feet_y.floor() as i32,
+        (feet_y + FOOT_Y_EPS).floor() as i32,
         pose.translation.z.floor() as i32,
     )
 }
@@ -2180,6 +2263,74 @@ fn pose_to_standable_foot<W: Walkability>(pose: &AvatarPose, world: &W) -> Optio
             if standable(world, candidate) {
                 return Some(candidate);
             }
+        }
+    }
+    None
+}
+
+/// Teleport `pose` to the nearest standable cell within
+/// `max_radius_cells` (Chebyshev) of the literal foot cell. Returns
+/// the target cell on success, `None` if every cell in the search
+/// volume was unstandable (the actor is wedged in deep enough that
+/// the rescue radius can't reach a valid floor — the caller should
+/// park them and surface a warning).
+///
+/// **Why this exists.** The brain pathfinder bails when the NPC's
+/// start cell isn't standable, and there are edge cases — a failed
+/// post-interaction eject, a building dropped on the NPC mid-rest,
+/// soft-actor-separation sliding them onto a non-support cell —
+/// where the NPC ends up at a pose that fails both
+/// [`pose_to_standable_foot`] and `standable(pose_to_foot_cell)`.
+/// Without rescue, the planner loops forever picking the same goal,
+/// pathfinder bails on the same unstandable start, and the warning
+/// stream spams indefinitely. With rescue, the NPC pops to a
+/// nearby valid cell and resumes normal planning.
+///
+/// **Skipped when already standable.** The first thing the function
+/// does is call [`pose_to_standable_foot`] and return `None` (no
+/// rescue needed) if the pose is fine. Callers can treat the
+/// `Option<IVec3>` return as "did we have to move the NPC."
+///
+/// **Search order is Chebyshev rings, Manhattan tiebreak.** A cell
+/// 1 step away is always preferred over a cell 2 steps away. Within
+/// a ring the cell whose absolute integer-axis deltas sum smallest
+/// (closer to the axis-aligned neighbours) wins. This biases the
+/// rescue toward "drop the NPC straight down to the floor they're
+/// hovering above" instead of "shove them sideways across the room."
+fn rescue_to_nearby_standable<W: Walkability>(
+    pose: &mut AvatarPose,
+    world: &W,
+    max_radius_cells: i32,
+) -> Option<IVec3> {
+    if pose_to_standable_foot(pose, world).is_some() {
+        return None;
+    }
+    let centre = pose_to_foot_cell(pose);
+    for d in 1..=max_radius_cells {
+        let mut best: Option<(IVec3, i32)> = None;
+        for dx in -d..=d {
+            for dy in -d..=d {
+                for dz in -d..=d {
+                    let cheb = dx.abs().max(dy.abs()).max(dz.abs());
+                    if cheb != d {
+                        continue;
+                    }
+                    let cand = centre + IVec3::new(dx, dy, dz);
+                    if !standable(world, cand) {
+                        continue;
+                    }
+                    let manhattan = dx.abs() + dy.abs() + dz.abs();
+                    match best {
+                        None => best = Some((cand, manhattan)),
+                        Some((_, prev)) if manhattan < prev => best = Some((cand, manhattan)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some((cell, _)) = best {
+            pose.translation = standing_pose_translation(cell);
+            return Some(cell);
         }
     }
     None

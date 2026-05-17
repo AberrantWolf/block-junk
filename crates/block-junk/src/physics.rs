@@ -27,6 +27,28 @@ pub const PLAYER_HALF_EXTENTS: Vec3 = Vec3::new(0.3, 0.9, 0.3);
 /// position; the AABB centre is derived as `eye - (0, EYE_OFFSET, 0)`.
 pub const EYE_OFFSET_FROM_CENTRE: f32 = 0.72;
 
+/// Eye-position translation for an actor whose feet are centred in
+/// `cell`. The pose's X/Z sit at the cell's horizontal centre, Y
+/// stacks the AABB half-height plus eye offset above the cell's
+/// floor (the same `eye - (centre + half_y)` chain physics inverts
+/// when reading pose back into an AABB).
+///
+/// Use this everywhere a system places an actor at a known cell —
+/// post-interaction eject, the rescue path, the spawn pose
+/// fallback, debug teleports. The single source of truth keeps the
+/// write side aligned with [`pose_to_foot_cell`]'s read side; the
+/// FP epsilon there compensates for the unavoidable 1-ULP drift in
+/// `pose.y - EYE - HALF`, but only as long as the write side stays
+/// uniform — a stray ad-hoc `cell.y as f32 + offset + other_offset`
+/// could land outside the tolerance and reintroduce the drift bug.
+pub fn standing_pose_translation(cell: IVec3) -> Vec3 {
+    Vec3::new(
+        cell.x as f32 + 0.5,
+        cell.y as f32 + EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
+        cell.z as f32 + 0.5,
+    )
+}
+
 /// XZ half-extent for the actor-vs-actor soft-separation pass. Actors
 /// closer than `2 * ACTOR_SEPARATION_HALF_XZ` on XZ are considered
 /// overlapping for separation purposes. Half of the body's XZ extent so

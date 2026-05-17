@@ -218,13 +218,20 @@ register {
     -- kinematic for the sleep duration so the physics tick and
     -- soft-actor-separation pass don't budge them.
     --
-    -- `pose = (1.0, 1.0, 0.0)` places the rig's model origin (the
-    -- "feet" plane the lying clip pivots around) mid-bed in X
-    -- (between the foot cell at x=0 and the head cell at x=1), on
-    -- top of the mattress (Y=1 = top of the 1m-tall bed mesh), Z=0
-    -- (centre of the bed's width). The engine adds the standing
-    -- eye-offset to derive pose.translation, so authors don't have
-    -- to think about Bevy's eye-vs-feet pose convention.
+    -- `pose` is in model space whose origin is the anchor cell's
+    -- bottom-CENTRE (X/Z = cell centre, Y = cell floor). For a lying
+    -- pose, the rig's "feet plane" (model origin) is the centre of
+    -- the body's lying volume — not the mattress surface — because
+    -- the KayKit lie clip pivots around the rig's hip plane, with
+    -- the body's mass distributed roughly half above / half below.
+    --
+    -- `pose = (0.0, 0.5, 0.0)` places that pivot at the anchor
+    -- cell's centre in X/Z and at half the bed's height in Y. With
+    -- yaw = π/2 below, the lying body extends along the bed's +X
+    -- extends axis (foot cell → head cell), centred on the bed's
+    -- geometry. The engine adds the standing eye-offset to derive
+    -- pose.translation, so authors don't have to think about
+    -- Bevy's eye-vs-feet pose convention.
     --
     -- `yaw = π/2` orients the body along the bed's extends axis
     -- with the head at the +X (head-of-bed) end. The KayKit lying
@@ -241,7 +248,7 @@ register {
     -- ejection targets when the NPC wakes — they go back out the
     -- way they came in.
     use_slot = {
-        pose = { 1.0, 1.0, 0.0 },
+        pose = { 0.0, 0.5, 0.0 },
         yaw = 1.5707963,
         approach = {
             { -1, 0, 0 },   -- West of foot
