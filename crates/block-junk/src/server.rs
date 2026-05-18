@@ -1621,27 +1621,31 @@ fn receive_pickup_requests(
             };
             let is_tool = !item_registry.def(item_slot).tool_tags.is_empty();
             if is_tool {
-                // Swap into the tool slot. Displaced tool (if any)
-                // drops as a fresh WorldItem at the player's foot so
-                // the pickup never silently destroys an item.
+                // Swap into the tool slot. Drop the displaced tool
+                // (if any) where the picked-up item *was* —
+                // `req.target` is the client's click position, which
+                // is within `PICKUP_MATCH_RADIUS` of the item we
+                // matched. In-place swap reads as "I traded my axe
+                // for the hammer that was here," much clearer than
+                // the displaced tool landing at the player's feet
+                // (potentially inside the body collider or behind
+                // them).
                 let displaced = tool.item.replace(item_slot);
                 commands.entity(entity).despawn();
+                info!(
+                    new_tool = item_slot.0,
+                    displaced = ?displaced.map(|s| s.0),
+                    "tool pickup swap",
+                );
                 if let Some(prev_slot) = displaced
                     && prev_slot != item_slot
                 {
-                    let foot = pose.translation
-                        - Vec3::new(
-                            0.0,
-                            EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
-                            0.0,
-                        )
-                        + Vec3::new(0.0, 0.05, 0.0);
                     commands.spawn((
                         WorldItem {
                             item: prev_slot,
-                            translation: foot,
+                            translation: req.target,
                         },
-                        Transform::from_translation(foot),
+                        Transform::from_translation(req.target),
                         GlobalTransform::default(),
                         Replicate::to_clients(NetworkTarget::All),
                         Name::new(format!("WorldItem(tool_swap:{})", prev_slot.0)),

@@ -219,13 +219,17 @@ fn draw_normal_target(
 
     // Item wins outright if it's closer than the tagged cell *and* the
     // world hit. Compatible with the click-side resolver in
-    // `normal_mode_action_input`.
+    // `normal_mode_action_input`. Tools always read as pickup-ready
+    // (gold) because the server's swap path can't refuse — a full
+    // tool slot just means the previous tool drops at the same spot.
+    // Resources keep the existing carry-compat gate.
     if let Some((item_translation, item_dist, item_slot)) = item_hit {
         let tagged_dist = tagged_target.map(|(d, _)| d);
         let beats_tagged = tagged_dist.map(|td| item_dist < td).unwrap_or(true);
         let beats_world = world_hit_dist.map(|wd| item_dist < wd).unwrap_or(true);
         if beats_tagged && beats_world {
-            let colour = if carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
+            let is_tool = !items.def(item_slot).tool_tags.is_empty();
+            let colour = if is_tool || carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
                 Color::srgb(1.0, 0.78, 0.18) // gold: pickup ready
             } else {
                 Color::srgb(0.55, 0.78, 0.95) // cyan: inspect only (full / wrong type)

@@ -24,11 +24,13 @@ use lightyear::prelude::*;
 
 use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::camera::FlyCam;
-use crate::client::{RAYCAST_REACH, entity_aware_raycast, raycast_npcs};
-use crate::items::ItemRegistry;
+use crate::client::{RAYCAST_REACH, entity_aware_raycast, raycast_npcs, raycast_world_items};
+use crate::items::{ItemRegistry, ItemSlot};
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans, raycast_plans};
-use crate::protocol::{AvatarPose, GameSet, NpcDetails, PlanKind, RequestNpcDetails, WorldChannel};
+use crate::protocol::{
+    AvatarPose, GameSet, NpcDetails, PlanKind, RequestNpcDetails, WorldChannel, WorldItem,
+};
 use crate::npc::{Npc, NpcId};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
@@ -76,6 +78,14 @@ pub enum InspectState {
     /// don't snapshot here so deposits update without per-tick
     /// state-resolution churn.
     Plan { cell: IVec3 },
+    /// A loose [`WorldItem`] under the cursor — wins over block /
+    /// NPC / plan hits when it's the closest target. Keyed by
+    /// [`ItemSlot`] (not the entity) because the panel only renders
+    /// kind-info (display name, id, tool tags) and slot is what
+    /// drives same/different change detection. Stack-merging or
+    /// per-entity inspection (count badges, "who reserved this")
+    /// would need the Entity instead.
+    Item { slot: ItemSlot },
 }
 
 #[derive(Component)]
@@ -130,6 +140,7 @@ fn refresh_inspect_target(
     registry: Res<BlockRegistry>,
     plans: Res<Plans>,
     npcs: Query<(&NpcId, &AvatarPose), With<Npc>>,
+    world_items: Query<&WorldItem>,
     mut target: ResMut<InspectTarget>,
     mut sender: Query<&mut MessageSender<RequestNpcDetails>>,
 ) {
@@ -158,6 +169,7 @@ fn refresh_inspect_target(
     let block_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, &chunks, &chunk_map, &registry, None);
     let npc_hit = raycast_npcs(origin, dir, RAYCAST_REACH, &npcs);
     let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, &plans);
+    let item_hit = raycast_world_items(origin, dir, RAYCAST_REACH, &world_items);
 
     let block_dist = block_hit.as_ref().map(|h| {
         let centre = h.cell.as_vec3() + Vec3::splat(0.5);
@@ -165,6 +177,29 @@ fn refresh_inspect_target(
     });
     let npc_dist = npc_hit.as_ref().map(|h| h.distance);
     let plan_dist = plan_hit.map(|(d, _)| d);
+    let item_dist = item_hit.as_ref().map(|(_, d, _)| *d);
+
+    // Loose-item hit wins outright when it's closer than everything
+    // else. Inspect should describe what's actually under the cursor,
+    // not raycast past a small pickup-able into the terrain behind
+    // it. Mirrors the same priority `normal_mode_action_input` uses
+    // for the pickup verb.
+    let item_beats_all = item_dist
+        .map(|i| {
+            block_dist.map(|b| i < b).unwrap_or(true)
+                && npc_dist.map(|n| i < n).unwrap_or(true)
+                && plan_dist.map(|p| i < p).unwrap_or(true)
+        })
+        .unwrap_or(false);
+    if item_beats_all
+        && let Some((_, _, slot)) = item_hit
+    {
+        let same = matches!(&target.state, InspectState::Item { slot: s } if *s == slot);
+        if !same {
+            target.state = InspectState::Item { slot };
+        }
+        return;
+    }
 
     // Plan wins outright if it's closer than the block hit *and* the
     // npc hit — a tagged Build cell hangs in empty air, so the world
@@ -331,7 +366,27 @@ fn render_body(
             };
             Some(format!("{header}{body}"))
         }
+        InspectState::Item { slot } => Some(format_item(*slot, items)),
     }
+}
+
+/// Render the inspect panel body for a loose [`WorldItem`]. Display
+/// name + id + any tool tags so tools read as "what kind of action
+/// does this enable" at a glance. Stack-count surfaces here if /
+/// when items merge into multi-unit entities; today every WorldItem
+/// is one unit.
+fn format_item(slot: ItemSlot, items: &ItemRegistry) -> String {
+    let def = items.def(slot);
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", def.display_name));
+    out.push_str(&format!("id: {}\n", def.id));
+    if !def.tool_tags.is_empty() {
+        out.push_str("tool tags:\n");
+        for tag in &def.tool_tags {
+            out.push_str(&format!("  {tag}\n"));
+        }
+    }
+    out
 }
 
 /// Render the kind + materials list for a [`PlanState`]. No header —
