@@ -37,16 +37,17 @@ engine.items.register {
     color = { 0.55, 0.55, 0.58 },
 }
 
--- Tools (Phase 5a). Each tool's `tool_tags` is the engine-side handle
--- a block's `work_action.required_tool` matches against. Meshes are
--- placeholders today — the wood-log mesh stands in for all three so
--- the gameplay loop is testable now; proper KayKit RPG Tools Bits
--- meshes can replace the `mesh` paths without touching anything else.
--- Distinct colors keep them visually separable in the world + HUD.
+-- Tools (Phase 5a/b). Each tool's `tool_tags` is the engine-side
+-- handle a block's `work_action.required_tool` matches against.
+-- Meshes from KayKit RPG Tools Bits 1.0; they share
+-- `tools_bits_texture.png` the same way the resource items share
+-- `resource_bits_texture.png`. `color` is the HUD-chip fallback —
+-- the in-world model uses its textured material, but the carry /
+-- tool HUD swatches and inspect-panel tints read this RGB.
 engine.items.register {
     id = "vanilla:axe",
     display_name = "Axe",
-    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    mesh = "mods://vanilla/models/axe.gltf",
     color = { 0.78, 0.45, 0.18 },
     tool_tags = { "vanilla:axe" },
 }
@@ -54,7 +55,7 @@ engine.items.register {
 engine.items.register {
     id = "vanilla:hammer",
     display_name = "Hammer",
-    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    mesh = "mods://vanilla/models/hammer.gltf",
     color = { 0.45, 0.30, 0.20 },
     tool_tags = { "vanilla:hammer" },
 }
@@ -62,7 +63,7 @@ engine.items.register {
 engine.items.register {
     id = "vanilla:pickaxe",
     display_name = "Pickaxe",
-    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    mesh = "mods://vanilla/models/pickaxe.gltf",
     color = { 0.38, 0.40, 0.45 },
     tool_tags = { "vanilla:pickaxe" },
 }
