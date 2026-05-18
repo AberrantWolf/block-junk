@@ -29,7 +29,8 @@ use crate::menu::AppState;
 use crate::npc::{Needs, Npc};
 use crate::npc_registry::NeedRegistry;
 use crate::protocol::{
-    DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, GameSet, WorldChannel, WorldClock,
+    DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, GameSet,
+    WorldChannel, WorldClock,
 };
 
 pub struct DebugClientPlugin;
@@ -63,7 +64,11 @@ impl Plugin for DebugServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (receive_debug_advance_time, receive_debug_bump_need)
+            (
+                receive_debug_advance_time,
+                receive_debug_bump_need,
+                receive_debug_fill_nearest_plan,
+            )
                 .in_set(GameSet::Simulation),
         );
     }
@@ -131,6 +136,7 @@ const BUMPABLE_NEEDS: &[(&str, &str)] = &[
     ("work", "Purpose"),
 ];
 
+#[allow(clippy::too_many_arguments, reason = "debug panel queries several senders")]
 fn debug_panel_ui(
     mut contexts: EguiContexts,
     mut open: ResMut<DebugPanelOpen>,
@@ -138,6 +144,7 @@ fn debug_panel_ui(
     clock: Option<Res<WorldClock>>,
     mut advance_sender: Query<&mut MessageSender<DebugAdvanceTime>>,
     mut need_sender: Query<&mut MessageSender<DebugBumpNeed>>,
+    mut fill_plan_sender: Query<&mut MessageSender<DebugFillNearestPlan>>,
     mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
 ) {
     if !open.0 {
@@ -151,6 +158,7 @@ fn debug_panel_ui(
     // inside the closure.
     let mut advance_secs: Option<f32> = None;
     let mut need_bump: Option<(String, f32)> = None;
+    let mut fill_nearest_plan = false;
 
     let time_label = match clock.as_deref() {
         Some(c) => format!(
@@ -188,6 +196,9 @@ fn debug_panel_ui(
                 &mut instant_builds.0,
                 "Instant self-work (skip action timer)",
             );
+            if ui.button("Fill nearest plan").clicked() {
+                fill_nearest_plan = true;
+            }
             ui.separator();
             ui.label(egui::RichText::new("Advance time").strong());
             ui.label(time_label);
@@ -263,6 +274,11 @@ fn debug_panel_ui(
             sender.send::<WorldChannel>(DebugBumpNeed { need, delta });
         }
     }
+    if fill_nearest_plan {
+        if let Ok(mut sender) = fill_plan_sender.single_mut() {
+            sender.send::<WorldChannel>(DebugFillNearestPlan);
+        }
+    }
 }
 
 /// Apply [`DebugAdvanceTime`] — fast-forward the world by `secs`
@@ -307,6 +323,80 @@ fn receive_debug_advance_time(
                 "debug: advanced world time",
             );
         }
+    }
+}
+
+/// Apply [`DebugFillNearestPlan`]: pick the requesting player's
+/// nearest unsatisfied Build plan and set every material's `present`
+/// to `needed`. Broadcasts a `PlanEdit` so client mirrors learn the
+/// new state. Used during Phase-3/4 development to verify NPC pickup
+/// of fully-materialled plans without hauling each unit by hand.
+fn receive_debug_fill_nearest_plan(
+    mut receivers: Query<(Entity, &mut MessageReceiver<DebugFillNearestPlan>)>,
+    avatars: Res<crate::server::ClientAvatars>,
+    poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
+    mut plans: ResMut<crate::plans::Plans>,
+    mut broadcast: ServerMultiMessageSender,
+    servers: Query<&Server>,
+) {
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let count = receiver.receive().count();
+        if count == 0 {
+            continue;
+        }
+        let Some(&avatar) = avatars.0.get(&connection) else {
+            continue;
+        };
+        let Ok(pose) = poses.get(avatar) else {
+            continue;
+        };
+        // Find the closest cell with an unsatisfied Build plan.
+        let mut best: Option<(f32, bevy::math::IVec3)> = None;
+        for (cell, state) in plans.iter() {
+            if state.is_satisfied() {
+                continue;
+            }
+            let d = (cell.as_vec3() + bevy::math::Vec3::splat(0.5) - pose.translation).length();
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, *cell));
+            }
+        }
+        let Some((_, target_cell)) = best else {
+            info!("debug fill: no unsatisfied plans within reach");
+            continue;
+        };
+        // Fill the plan via deposit() with a very large count of each
+        // needed item — `Plans::deposit` caps at remaining_for, so a
+        // single saturating loop fills the plan.
+        let item_slots: Vec<crate::items::ItemSlot> = plans
+            .get(target_cell)
+            .map(|s| s.materials.iter().map(|m| m.item).collect())
+            .unwrap_or_default();
+        for slot in item_slots {
+            plans.deposit(target_cell, slot, u32::MAX);
+        }
+        // Broadcast the updated state.
+        if let Some(state) = plans.get(target_cell).cloned() {
+            let reply = crate::protocol::PlanEdit {
+                cell: target_cell,
+                kind: Some(state.kind),
+                materials: state.materials,
+            };
+            if let Err(err) = broadcast.send::<crate::protocol::PlanEdit, WorldChannel>(
+                &reply,
+                server,
+                &NetworkTarget::All,
+            ) {
+                warn!("debug fill PlanEdit broadcast failed: {err}");
+            }
+        }
+        info!(
+            cell = ?target_cell.to_array(),
+            "debug: filled plan materials",
+        );
     }
 }
 

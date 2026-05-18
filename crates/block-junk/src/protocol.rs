@@ -319,9 +319,7 @@ pub struct WorldItem {
 
 /// What a player has tagged a cell to become. Lives in the shared [`Plans`]
 /// resource (server-authoritative, mirrored on each client). Tagged cells
-/// aren't world state — they're work orders for NPCs to consume in a
-/// future phase. The world block at the cell is untouched until the work
-/// completes (Phase 6).
+/// aren't world state — they're work orders for NPCs to consume.
 ///
 /// `Remove` means "I want whatever is here to be gone." `Build` carries
 /// the slot + orientation so an NPC working the plan knows what to
@@ -337,6 +335,57 @@ pub enum PlanKind {
     },
 }
 
+/// Full state of one tagged cell: what it should become *plus* the
+/// progress of material delivery for Build plans. Remove plans have an
+/// empty `materials` vec (nothing needs to be delivered to break a
+/// block); Build plans carry one entry per item kind required, with
+/// `present` rising toward `needed` as the player or NPCs deposit
+/// resources.
+///
+/// Replicated to every client so each can render the right outline
+/// colour (desaturated green when materials still pending, full green
+/// when ready) and decide self-work eligibility locally.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlanState {
+    pub kind: PlanKind,
+    #[serde(default)]
+    pub materials: Vec<MaterialEntry>,
+}
+
+impl PlanState {
+    pub fn new(kind: PlanKind, materials: Vec<MaterialEntry>) -> Self {
+        Self { kind, materials }
+    }
+
+    /// True when every material entry has its full count delivered, or
+    /// when the plan needs no materials at all (every Remove plan).
+    pub fn is_satisfied(&self) -> bool {
+        self.materials.iter().all(|m| m.present >= m.needed)
+    }
+
+    /// How many more units of `item` can still be deposited before
+    /// this plan is satisfied for that material. `0` means the plan
+    /// doesn't accept this item kind (either not needed, or already
+    /// fully delivered).
+    pub fn remaining_for(&self, item: ItemSlot) -> u32 {
+        self.materials
+            .iter()
+            .find(|m| m.item == item)
+            .map(|m| m.needed.saturating_sub(m.present))
+            .unwrap_or(0)
+    }
+}
+
+/// One material requirement on a [`PlanState`]: which item, how many
+/// needed in total, how many delivered so far. Capped at `needed` on
+/// deposit so a deposit-too-big call doesn't overshoot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterialEntry {
+    pub item: ItemSlot,
+    pub needed: u32,
+    pub present: u32,
+}
+
 /// Client → server: tag (`kind = Some`) or untag (`kind = None`) a cell.
 /// Server → client: the canonical applied edit, broadcast to everyone in
 /// the world. Same bidirectional shape as [`BlockEdit`] for symmetry.
@@ -345,19 +394,28 @@ pub enum PlanKind {
 ///   - `Some(Remove)` rejected if the cell is currently empty.
 ///   - `Some(Build {..})` rejected if the cell is currently solid.
 ///   - `None` succeeds even if no tag exists (idempotent untag).
-#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+///
+/// `materials` is **server-set only**. Client requests leave it empty
+/// (the field defaults via `serde(default)`); the server populates it
+/// from [`BlockDef::materials`](block_junk_mod_api::blocks::BlockDef::materials)
+/// on a Build tag and rebroadcasts. Subsequent deposits / fills also
+/// fire `PlanEdit` broadcasts so clients see the updated `present`
+/// counts in their mirrors without a separate message type.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct PlanEdit {
     pub cell: IVec3,
     pub kind: Option<PlanKind>,
+    #[serde(default)]
+    pub materials: Vec<MaterialEntry>,
 }
 
 /// Server → client on connect: the current state of the [`Plans`] map.
-/// Sparse — only tagged cells. Tagged-add cells with stale orientations
-/// from an older save are not migrated; the snapshot is whatever the
-/// server resource currently holds.
+/// Sparse — only tagged cells. Each entry carries the full PlanState
+/// (kind + materials progress) so a fresh-connecting client renders
+/// the right outline state immediately.
 #[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PlanFullSync {
-    pub entries: Vec<(IVec3, PlanKind)>,
+    pub entries: Vec<(IVec3, PlanState)>,
 }
 
 /// Bulk version of [`PlanEdit`]. All cells in `cells` are tagged with
@@ -370,10 +428,32 @@ pub struct PlanFullSync {
 /// Plan rectangles can get large; the client caps the per-message cell
 /// count at [`PLAN_EDIT_BATCH_MAX`] and splits bigger selections into
 /// multiple messages.
+///
+/// `materials` is shared across the whole batch: every cell tagged
+/// Build by this batch uses the same block (the request's `kind`
+/// carries one slot), so the materials_needed list is uniform.
+/// Server-set on broadcast, defaulted empty on client request.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct PlanEditBatch {
     pub kind: Option<PlanKind>,
     pub cells: Vec<IVec3>,
+    #[serde(default)]
+    pub materials: Vec<MaterialEntry>,
+}
+
+/// Client → server: deposit one or more units of the player's
+/// [`Carrying`] stack into the Build plan at `cell`. Server reads the
+/// requesting player's carry, looks up the plan's outstanding need
+/// for the carried item, decrements the player's carry by that
+/// amount, increments `materials.present` on the plan, and broadcasts
+/// the updated state via `PlanEdit`.
+///
+/// Empty-handed clicks, mismatched item types, and plans that don't
+/// need anything more silently no-op — same degradation pattern as
+/// pickup.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DepositRequest {
+    pub cell: IVec3,
 }
 
 /// Max cells per [`PlanEditBatch`] message. Chosen to keep a single
@@ -530,6 +610,14 @@ pub struct DebugBumpNeed {
     pub need: String,
     pub delta: f32,
 }
+
+/// Client → server: instantly fill the materials of the player's
+/// nearest unsatisfied Build plan. Phase-4 testing prerequisite — lets
+/// us verify NPC pickup of fully-materialled plans without hauling
+/// each unit by hand. Server picks the nearest plan to the requesting
+/// player's avatar; no-op if no pending plans exist within range.
+#[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct DebugFillNearestPlan;
 
 /// Client → server: ask the server to dump the current authoritative
 /// state of one NPC so the requesting client's inspection panel can

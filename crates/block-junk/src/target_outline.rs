@@ -64,13 +64,21 @@ impl Plugin for TargetOutlinePlugin {
 /// Render every tagged cell as a persistent gizmo wireframe so the
 /// player can see their queue. Visible in every mode — once you're in
 /// Normal you still want to see what your villagers are about to work
-/// on. Red for Remove, green for Build.
+/// on. Red for Remove. Build plans are full green when materials are
+/// satisfied (NPCs / players can self-work), desaturated green when
+/// still waiting on materials (deposit-needed visual cue).
 fn draw_plan_outlines(plans: Res<Plans>, mut gizmos: Gizmos) {
-    for (cell, kind) in plans.iter() {
+    for (cell, state) in plans.iter() {
         let centre = cell.as_vec3() + Vec3::splat(0.5);
-        let colour = match kind {
+        let colour = match state.kind {
             PlanKind::Remove => Color::srgb(1.0, 0.2, 0.2),
-            PlanKind::Build { .. } => Color::srgb(0.2, 1.0, 0.4),
+            PlanKind::Build { .. } => {
+                if state.is_satisfied() {
+                    Color::srgb(0.2, 1.0, 0.4)
+                } else {
+                    Color::srgb(0.35, 0.55, 0.35)
+                }
+            }
         };
         gizmos.cube(Transform::from_translation(centre), colour);
     }
@@ -223,8 +231,25 @@ fn draw_normal_target(
     }
 
     if let Some((_, cell)) = tagged_target {
-        // Orange: L-click hold would self-work this cell.
-        draw_cell(gizmos, cell, Color::srgb(1.0, 0.6, 0.1));
+        // Decide the verb the next L-click would commit:
+        //   - Build plan pending materials + carry can deposit → green
+        //   - Otherwise plan-ready (Remove always, Build when satisfied)
+        //     → orange (self-work)
+        //   - Plan pending materials, carry can't help → cyan (inspect)
+        let colour = if let Some(state) = plans.get(cell) {
+            match (&state.kind, carry.item) {
+                (PlanKind::Build { .. }, Some(slot))
+                    if state.remaining_for(slot) > 0 =>
+                {
+                    Color::srgb(0.3, 1.0, 0.4) // deposit-ready green
+                }
+                _ if state.is_satisfied() => Color::srgb(1.0, 0.6, 0.1), // self-work orange
+                _ => Color::srgb(0.55, 0.78, 0.95), // pending, can't help → cyan
+            }
+        } else {
+            Color::srgb(0.55, 0.78, 0.95)
+        };
+        draw_cell(gizmos, cell, colour);
         return;
     }
     // No tag under the cursor; fall back to the world hit. Red means

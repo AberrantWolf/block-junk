@@ -20,9 +20,10 @@ use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    Carrying, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, DropRequest,
-    MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit,
-    PlanEditBatch, PlanFullSync, RequestNpcDetails, WorldChannel, WorldClockSync, WorldItem,
+    Carrying, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
+    DebugFillNearestPlan, DepositRequest, DropRequest, MovementIntent, MovementMode,
+    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync,
+    RequestNpcDetails, WorldChannel, WorldClockSync, WorldItem,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +91,8 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DebugBumpNeed>()
             .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<DebugFillNearestPlan>()
+            .add_direction(NetworkDirection::ClientToServer);
         // NPC inspection RPC. Targeted reply — server uses the
         // requesting connection entity's MessageSender so other
         // clients don't see the response.
@@ -101,6 +104,8 @@ impl Plugin for ProtocolPlugin {
         app.register_message::<PickupRequest>()
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DropRequest>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<DepositRequest>()
             .add_direction(NetworkDirection::ClientToServer);
 
         // Player-avatar replication. Server owns the avatar entities; the

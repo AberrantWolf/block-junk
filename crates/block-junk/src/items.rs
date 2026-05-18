@@ -43,6 +43,10 @@ pub enum ItemBootstrapError {
     DropItemUnknown { block: String, item: ItemId },
     #[error("block {block} drops entry for item {item} has count = 0; remove the entry or set count > 0")]
     DropCountZero { block: String, item: ItemId },
+    #[error("block {block} materials references unregistered item {item}")]
+    MaterialItemUnknown { block: String, item: ItemId },
+    #[error("block {block} materials entry for item {item} has count = 0; remove the entry or set count > 0")]
+    MaterialCountZero { block: String, item: ItemId },
 }
 
 /// Finalised item registry. Held as a Bevy `Resource` on each side.
@@ -98,10 +102,11 @@ impl ItemRegistry {
             .map(|(i, def)| (ItemSlot(i as u16), def))
     }
 
-    /// Cross-check every `BlockDef.drops` entry against this registry.
-    /// Runs at boot after both registries are built so neither side
-    /// loads with a dangling drop reference. Empty-vec drops are
-    /// always valid; this only catches typos and stale ids.
+    /// Cross-check every `BlockDef.drops` and `BlockDef.materials`
+    /// entry against this registry. Runs at boot after both registries
+    /// are built so neither side loads with a dangling reference.
+    /// Empty-vec drops/materials are always valid; this only catches
+    /// typos and stale ids.
     pub fn validate_block_drops(
         &self,
         blocks: &[BlockDef],
@@ -118,6 +123,20 @@ impl ItemRegistry {
                     return Err(ItemBootstrapError::DropCountZero {
                         block: def.id.to_string(),
                         item: drop.item.clone(),
+                    });
+                }
+            }
+            for mat in &def.materials {
+                if self.slot_of(&mat.item).is_none() {
+                    return Err(ItemBootstrapError::MaterialItemUnknown {
+                        block: def.id.to_string(),
+                        item: mat.item.clone(),
+                    });
+                }
+                if mat.count == 0 {
+                    return Err(ItemBootstrapError::MaterialCountZero {
+                        block: def.id.to_string(),
+                        item: mat.item.clone(),
                     });
                 }
             }

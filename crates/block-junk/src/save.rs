@@ -25,6 +25,10 @@ use thiserror::Error;
 use bevy::math::IVec3;
 
 use crate::protocol::{AvatarPose, ChunkCoord, MovementMode, PlanKind, WorldClock};
+// `PlanState` and `MaterialEntry` are engine-side types; the on-disk
+// shape keeps `item_id` as a string and lives in `SavedPlanState` /
+// `SavedMaterialEntry` below so item-registry slot renumbering across
+// sessions doesn't corrupt a save.
 use crate::voxel::{Chunk, ChunkEntities};
 
 /// Bump on any breaking shape change. Loaders will refuse mismatched
@@ -35,7 +39,10 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v5 (2026-05-16): added `plans` to `SaveFile`.
 /// v6 (2026-05-18): added `world_items` + `last_player_carry` to
 ///                  `SaveFile` for the Phase 2 carry/pickup feature.
-pub const SAVE_VERSION: u32 = 6;
+/// v7 (2026-05-18): `plans` value evolves from bare `PlanKind` to
+///                  `SavedPlanState` (kind + materials progress) for
+///                  the Phase 3 plan-materials feature.
+pub const SAVE_VERSION: u32 = 7;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -105,9 +112,11 @@ pub struct SaveFile {
     /// Player-issued plan tags alive at save time. Sparse: only cells
     /// the player tagged. PlanClaims is *not* saved — the brain resets
     /// to Idle on load, so any in-flight work restarts from scratch
-    /// and the claim is naturally re-acquired.
+    /// and the claim is naturally re-acquired. Each entry carries the
+    /// kind plus any materials-delivery progress so a save mid-haul
+    /// resumes exactly where the player left off.
     #[serde(default)]
-    pub plans: Vec<(IVec3, PlanKind)>,
+    pub plans: Vec<(IVec3, SavedPlanState)>,
     /// Loose items in the world at save time. Empty pre-v6 saves
     /// deserialize cleanly via `serde(default)`.
     #[serde(default)]
@@ -140,6 +149,25 @@ pub struct SavedWorldItem {
 pub struct SavedCarry {
     pub item_id: String,
     pub count: u32,
+}
+
+/// On-disk shape of a [`PlanState`](crate::protocol::PlanState).
+/// `kind` is `PlanKind` direct (cheap, stable). `materials` lives in
+/// [`SavedMaterialEntry`] so item-slot renumbering between sessions
+/// doesn't corrupt a save mid-haul.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedPlanState {
+    pub kind: PlanKind,
+    #[serde(default)]
+    pub materials: Vec<SavedMaterialEntry>,
+}
+
+/// On-disk shape of a [`MaterialEntry`](crate::protocol::MaterialEntry).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedMaterialEntry {
+    pub item_id: String,
+    pub needed: u32,
+    pub present: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -327,19 +355,32 @@ mod tests {
 
     /// Round-trip a SaveFile through bincode to catch serde regressions
     /// at the shape level. Covers every field the current version
-    /// carries: v3 npcs, v4 world_clock, v5 plans, v6 world_items +
-    /// last_player_carry.
+    /// carries: v3 npcs, v4 world_clock, v5/v7 plans, v6 world_items +
+    /// last_player_carry, v7 plan materials.
     #[test]
     fn savefile_round_trips_all_fields() {
         let mut needs = HashMap::new();
         needs.insert("hunger".to_owned(), 0.42);
         let plans = vec![
-            (IVec3::new(1, 2, 3), PlanKind::Remove),
+            (
+                IVec3::new(1, 2, 3),
+                SavedPlanState {
+                    kind: PlanKind::Remove,
+                    materials: vec![],
+                },
+            ),
             (
                 IVec3::new(-4, 5, -6),
-                PlanKind::Build {
-                    slot: BlockSlot(7),
-                    orientation: Cardinal::North,
+                SavedPlanState {
+                    kind: PlanKind::Build {
+                        slot: BlockSlot(7),
+                        orientation: Cardinal::North,
+                    },
+                    materials: vec![SavedMaterialEntry {
+                        item_id: "vanilla:wood_log".to_owned(),
+                        needed: 2,
+                        present: 1,
+                    }],
                 },
             ),
         ];
@@ -402,7 +443,11 @@ mod tests {
         let clock = decoded.world_clock.unwrap();
         assert_eq!(clock.day, 3);
         assert_eq!(clock.time_of_day, 0.625);
-        assert_eq!(decoded.plans, plans);
+        assert_eq!(decoded.plans.len(), 2);
+        assert_eq!(decoded.plans[1].1.materials.len(), 1);
+        assert_eq!(decoded.plans[1].1.materials[0].item_id, "vanilla:wood_log");
+        assert_eq!(decoded.plans[1].1.materials[0].needed, 2);
+        assert_eq!(decoded.plans[1].1.materials[0].present, 1);
         assert_eq!(decoded.world_items.len(), 2);
         assert_eq!(decoded.world_items[0].item_id, "vanilla:wood_log");
         assert_eq!(decoded.world_items[0].translation, Vec3::new(10.0, 8.5, -3.25));

@@ -20,14 +20,14 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    DropRequest, GameSet, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
-    PickupRequest, PlanEdit, PlanKind, RequestNpcDetails, WorldChannel, WorldClock,
-    WorldClockSync, WorldItem,
+    DepositRequest, DropRequest, GameSet, MaterialEntry, MovementIntent, MovementMode,
+    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind, PlanState,
+    RequestNpcDetails, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedNpc, SavedWorldItem, read_save, write_save};
+use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedWorldItem, read_save, write_save};
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
     world_to_chunk,
@@ -119,7 +119,8 @@ impl Plugin for ServerPlugin {
         );
         app.add_systems(
             Update,
-            (receive_pickup_requests, receive_drop_requests).in_set(GameSet::Simulation),
+            (receive_pickup_requests, receive_drop_requests, receive_deposit_requests)
+                .in_set(GameSet::Simulation),
         );
         app.add_systems(
             Update,
@@ -228,8 +229,43 @@ fn load_from_save(
     );
     // Restore the plan map before chunk spawn so `auto_clear_stale_plans`
     // running on the load's CellEdits doesn't see a partial state.
+    // Convert from on-disk SavedPlanState (item ids as strings) to
+    // engine PlanState (item slots) via the live item registry;
+    // entries naming an item the current registry doesn't know about
+    // are skipped with a warning rather than blocking the load.
     if !save.plans.is_empty() {
-        plans.replace_all(save.plans);
+        let restored: Vec<(IVec3, crate::protocol::PlanState)> = save
+            .plans
+            .into_iter()
+            .map(|(cell, saved)| {
+                let materials = saved
+                    .materials
+                    .into_iter()
+                    .filter_map(|m| {
+                        let id = block_junk_mod_api::items::ItemId::new(m.item_id.clone());
+                        match item_registry.slot_of(&id) {
+                            Some(slot) => Some(crate::protocol::MaterialEntry {
+                                item: slot,
+                                needed: m.needed,
+                                present: m.present,
+                            }),
+                            None => {
+                                warn!(
+                                    item = %m.item_id,
+                                    "saved plan materials reference unknown item id; dropping entry",
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                (
+                    cell,
+                    crate::protocol::PlanState::new(saved.kind, materials),
+                )
+            })
+            .collect();
+        plans.replace_all(restored);
     }
     pending_pose.0 = save.last_player_pose;
     // Restore the world clock if the save carries one. Saves predating
@@ -438,7 +474,7 @@ fn save_on_request(
     let saved_npcs = collect_saved_npcs(&npcs);
     let chunk_count = edited.len();
     let npc_count = saved_npcs.len();
-    let saved_plans = plans.snapshot();
+    let saved_plans = convert_saved_plans(&plans, &item_registry);
     let plan_count = saved_plans.len();
     let saved_items = collect_saved_world_items(&world_items, &item_registry);
     let item_count = saved_items.len();
@@ -459,6 +495,37 @@ fn save_on_request(
         ),
         Err(e) => error!("save-on-request to {name:?} failed: {e}"),
     }
+}
+
+/// Convert the engine-side `Plans` snapshot to the on-disk shape.
+/// Item slots are resolved back to their stable [`ItemId`] strings so
+/// the save survives a registry rebuild that changes slot ordering.
+fn convert_saved_plans(
+    plans: &Plans,
+    item_registry: &ItemRegistry,
+) -> Vec<(IVec3, SavedPlanState)> {
+    plans
+        .snapshot()
+        .into_iter()
+        .map(|(cell, state)| {
+            let materials = state
+                .materials
+                .into_iter()
+                .map(|m| SavedMaterialEntry {
+                    item_id: item_registry.id_of(m.item).to_string(),
+                    needed: m.needed,
+                    present: m.present,
+                })
+                .collect();
+            (
+                cell,
+                SavedPlanState {
+                    kind: state.kind,
+                    materials,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Snapshot every loose `WorldItem`. Converts the engine slot back to
@@ -564,7 +631,7 @@ fn save_then_shutdown(
                     })
                     .collect();
                 let saved_npcs = collect_saved_npcs(&npcs);
-                let saved_plans = plans.snapshot();
+                let saved_plans = convert_saved_plans(&plans, &item_registry);
                 let saved_items = collect_saved_world_items(&world_items, &item_registry);
                 let (saved_pose, saved_carry) = first_avatar_state(&avatars, &item_registry);
                 let chunk_count = edited.len();
@@ -1419,6 +1486,69 @@ fn receive_drop_requests(
     }
 }
 
+/// Apply a client's deposit request: drop carry units into a Build
+/// plan's `materials_present`. Per request: locate the player, read
+/// their `Carrying`, compute how many units the targeted plan still
+/// needs of that item, decrement the carry by that amount, increment
+/// the plan, then broadcast the updated `PlanEdit` so every client's
+/// `Plans` mirror sees the new materials. Silent no-op on:
+///   - empty carry
+///   - no plan at `cell` (was untagged between client click and server receive)
+///   - plan isn't Build (Remove plans don't accept materials)
+///   - plan doesn't need this item kind, or is already full.
+fn receive_deposit_requests(
+    mut receivers: Query<(Entity, &mut MessageReceiver<DepositRequest>)>,
+    avatars: Res<ClientAvatars>,
+    mut players: Query<&mut Carrying, With<Avatar>>,
+    mut plans: ResMut<Plans>,
+    mut broadcast: ServerMultiMessageSender,
+    servers: Query<&Server>,
+) {
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let requests: Vec<DepositRequest> = receiver.receive().collect();
+        for req in requests {
+            let Some(&avatar) = avatars.0.get(&connection) else {
+                continue;
+            };
+            let Ok(mut carry) = players.get_mut(avatar) else {
+                continue;
+            };
+            // Empty carry → nothing to deposit.
+            let (carry_item, carry_count) = match (carry.item, carry.count) {
+                (Some(slot), c) if c > 0 => (slot, c),
+                _ => continue,
+            };
+            // Plan must exist + accept this item kind.
+            let accepted = plans.deposit(req.cell, carry_item, carry_count);
+            if accepted == 0 {
+                continue;
+            }
+            carry.count = carry_count - accepted;
+            if carry.count == 0 {
+                carry.item = None;
+            }
+            // Broadcast the updated plan state so client mirrors learn
+            // the new materials.present + outline re-renders.
+            let updated_state = plans.get(req.cell).cloned();
+            if let Some(state) = updated_state {
+                let reply = PlanEdit {
+                    cell: req.cell,
+                    kind: Some(state.kind),
+                    materials: state.materials,
+                };
+                if let Err(err) =
+                    broadcast.send::<PlanEdit, WorldChannel>(&reply, server, &NetworkTarget::All)
+                {
+                    warn!("deposit PlanEdit broadcast failed: {err}");
+                }
+            }
+        }
+    }
+}
+
 /// Convert the engine-side [`Goal`] into a human-readable summary +
 /// the cell the goal is targeted at (if any). Used in the inspection
 /// RPC reply. Includes the remaining timer so the panel re-fetched
@@ -1482,7 +1612,7 @@ fn auto_clear_stale_plans(
         return;
     };
     for edit in reader.read() {
-        let stale = match plans.get(edit.world) {
+        let stale = match plans.get(edit.world).map(|s| s.kind) {
             Some(PlanKind::Remove) => edit.slot.is_empty(),
             Some(PlanKind::Build { .. }) => !edit.slot.is_empty(),
             None => false,
@@ -1494,6 +1624,7 @@ fn auto_clear_stale_plans(
         let msg = PlanEdit {
             cell: edit.world,
             kind: None,
+            materials: Vec::new(),
         };
         if let Err(err) = broadcast.send::<PlanEdit, WorldChannel>(
             &msg,

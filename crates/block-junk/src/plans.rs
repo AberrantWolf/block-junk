@@ -26,42 +26,68 @@ use crate::client::{
 use crate::menu::AppState;
 use crate::player_mode::PlayerMode;
 use crate::protocol::{
-    AvatarPose, GameSet, PLAN_EDIT_BATCH_MAX, PlanEdit, PlanEditBatch, PlanFullSync, PlanKind,
-    WorldChannel,
+    AvatarPose, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX, PlanEdit, PlanEditBatch,
+    PlanFullSync, PlanKind, PlanState, WorldChannel,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
 
 #[derive(Resource, Default, Debug)]
 pub struct Plans {
-    map: HashMap<IVec3, PlanKind>,
+    map: HashMap<IVec3, PlanState>,
 }
 
 impl Plans {
-    pub fn get(&self, cell: IVec3) -> Option<PlanKind> {
-        self.map.get(&cell).copied()
+    /// Full state at `cell`, including materials progress. Use this
+    /// when the caller needs the kind, the materials, or
+    /// [`PlanState::is_satisfied`].
+    pub fn get(&self, cell: IVec3) -> Option<&PlanState> {
+        self.map.get(&cell)
     }
 
-    pub fn set(&mut self, cell: IVec3, kind: PlanKind) {
-        self.map.insert(cell, kind);
+    /// Just the kind (the original pre-Phase-3 contract). Useful for
+    /// callers that only branch Remove vs Build and don't care about
+    /// materials. Copies so the caller doesn't borrow the map.
+    pub fn kind(&self, cell: IVec3) -> Option<PlanKind> {
+        self.map.get(&cell).map(|s| s.kind)
+    }
+
+    pub fn set(&mut self, cell: IVec3, state: PlanState) {
+        self.map.insert(cell, state);
     }
 
     pub fn clear(&mut self, cell: IVec3) {
         self.map.remove(&cell);
     }
 
-    pub fn replace_all(&mut self, entries: impl IntoIterator<Item = (IVec3, PlanKind)>) {
+    pub fn replace_all(&mut self, entries: impl IntoIterator<Item = (IVec3, PlanState)>) {
         self.map.clear();
-        for (cell, kind) in entries {
-            self.map.insert(cell, kind);
+        for (cell, state) in entries {
+            self.map.insert(cell, state);
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &PlanKind)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &PlanState)> {
         self.map.iter()
     }
 
-    pub fn snapshot(&self) -> Vec<(IVec3, PlanKind)> {
-        self.map.iter().map(|(c, k)| (*c, *k)).collect()
+    pub fn snapshot(&self) -> Vec<(IVec3, PlanState)> {
+        self.map.iter().map(|(c, s)| (*c, s.clone())).collect()
+    }
+
+    /// Deposit `count` units of `item` toward this plan's materials.
+    /// Returns how many units were actually accepted (capped at the
+    /// remaining need). 0 ⇒ plan doesn't need this item, or already
+    /// full, or no plan at this cell.
+    pub fn deposit(&mut self, cell: IVec3, item: crate::items::ItemSlot, count: u32) -> u32 {
+        let Some(state) = self.map.get_mut(&cell) else {
+            return 0;
+        };
+        let Some(entry) = state.materials.iter_mut().find(|m| m.item == item) else {
+            return 0;
+        };
+        let accepted = count.min(entry.needed.saturating_sub(entry.present));
+        entry.present += accepted;
+        accepted
     }
 }
 
@@ -386,7 +412,12 @@ fn commit_batch(
     let Ok(mut sender) = sender.single_mut() else {
         return;
     };
-    sender.send::<WorldChannel>(PlanEditBatch { kind, cells });
+    // Client request: materials is server-set. Empty on the wire here.
+    sender.send::<WorldChannel>(PlanEditBatch {
+        kind,
+        cells,
+        materials: Vec::new(),
+    });
 }
 
 /// Project the ray (`origin`, `dir`) onto the plane through
@@ -511,15 +542,45 @@ fn cell_centre_dist(cell: IVec3, origin: Vec3) -> f32 {
     (cell.as_vec3() + Vec3::splat(0.5) - origin).length()
 }
 
+/// Compute the [`MaterialEntry`] list for a Build plan from the
+/// target block's [`BlockDef::materials`](block_junk_mod_api::blocks::BlockDef::materials).
+/// `present` starts at 0; deposits fill it. Returns an empty vec for
+/// Remove plans or when the block declares no materials (Phase 0
+/// blocks with empty materials — free to build).
+fn build_initial_materials(
+    kind: PlanKind,
+    block_registry: &BlockRegistry,
+    item_registry: &crate::items::ItemRegistry,
+) -> Vec<MaterialEntry> {
+    let PlanKind::Build { slot, .. } = kind else {
+        return Vec::new();
+    };
+    let def = block_registry.def(slot);
+    let mut out = Vec::with_capacity(def.materials.len());
+    for mat in &def.materials {
+        if let Some(item_slot) = item_registry.slot_of(&mat.item) {
+            out.push(MaterialEntry {
+                item: item_slot,
+                needed: mat.count,
+                present: 0,
+            });
+        }
+    }
+    out
+}
+
 /// Server: ingest client requests, validate against live world state,
 /// apply to the authoritative `Plans`, broadcast the canonical applied
 /// edit. Reject (silently) edits that don't make sense against the
 /// world (tag-remove on empty, tag-build on solid).
+#[allow(clippy::too_many_arguments)]
 fn receive_plan_edits(
     mut receivers: Query<&mut MessageReceiver<PlanEdit>>,
     mut plans: ResMut<Plans>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
+    block_registry: Res<BlockRegistry>,
+    item_registry: Res<crate::items::ItemRegistry>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
@@ -529,31 +590,39 @@ fn receive_plan_edits(
     for mut receiver in receivers.iter_mut() {
         let edits: Vec<PlanEdit> = receiver.receive().collect();
         for edit in edits {
-            let accepted = match edit.kind {
+            let (accepted_state, materials_for_broadcast) = match edit.kind {
                 Some(PlanKind::Remove) => {
                     if !cell_is_solid(edit.cell, &chunks, &chunk_map) {
                         continue;
                     }
-                    plans.set(edit.cell, PlanKind::Remove);
-                    true
+                    (Some(PlanState::new(PlanKind::Remove, Vec::new())), Vec::new())
                 }
                 Some(kind @ PlanKind::Build { .. }) => {
                     if cell_is_solid(edit.cell, &chunks, &chunk_map) {
                         continue;
                     }
-                    plans.set(edit.cell, kind);
-                    true
+                    let materials =
+                        build_initial_materials(kind, &block_registry, &item_registry);
+                    (
+                        Some(PlanState::new(kind, materials.clone())),
+                        materials,
+                    )
                 }
                 None => {
                     plans.clear(edit.cell);
-                    true
+                    (None, Vec::new())
                 }
             };
-            if !accepted {
-                continue;
+            if let Some(state) = accepted_state {
+                plans.set(edit.cell, state);
             }
+            let reply = PlanEdit {
+                cell: edit.cell,
+                kind: edit.kind,
+                materials: materials_for_broadcast,
+            };
             if let Err(err) =
-                broadcast.send::<PlanEdit, WorldChannel>(&edit, server, &NetworkTarget::All)
+                broadcast.send::<PlanEdit, WorldChannel>(&reply, server, &NetworkTarget::All)
             {
                 warn!("PlanEdit broadcast failed: {err}");
             }
@@ -565,11 +634,14 @@ fn receive_plan_edits(
 /// against the same per-kind rules, applies the surviving cells to
 /// `Plans`, and broadcasts a new batch containing only the surviving
 /// cells so clients see exactly what the server accepted.
+#[allow(clippy::too_many_arguments)]
 fn receive_plan_edit_batches(
     mut receivers: Query<&mut MessageReceiver<PlanEditBatch>>,
     mut plans: ResMut<Plans>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
+    block_registry: Res<BlockRegistry>,
+    item_registry: Res<crate::items::ItemRegistry>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
@@ -579,6 +651,15 @@ fn receive_plan_edit_batches(
     for mut receiver in receivers.iter_mut() {
         let batches: Vec<PlanEditBatch> = receiver.receive().collect();
         for batch in batches {
+            // Compute the shared materials list once per batch — every
+            // Build cell in the batch shares the same `kind` and
+            // therefore the same materials_needed.
+            let shared_materials = match batch.kind {
+                Some(kind @ PlanKind::Build { .. }) => {
+                    build_initial_materials(kind, &block_registry, &item_registry)
+                }
+                _ => Vec::new(),
+            };
             let mut accepted: Vec<IVec3> = Vec::with_capacity(batch.cells.len());
             for cell in batch.cells {
                 match batch.kind {
@@ -586,13 +667,13 @@ fn receive_plan_edit_batches(
                         if !cell_is_solid(cell, &chunks, &chunk_map) {
                             continue;
                         }
-                        plans.set(cell, PlanKind::Remove);
+                        plans.set(cell, PlanState::new(PlanKind::Remove, Vec::new()));
                     }
                     Some(kind @ PlanKind::Build { .. }) => {
                         if cell_is_solid(cell, &chunks, &chunk_map) {
                             continue;
                         }
-                        plans.set(cell, kind);
+                        plans.set(cell, PlanState::new(kind, shared_materials.clone()));
                     }
                     None => {
                         plans.clear(cell);
@@ -606,6 +687,7 @@ fn receive_plan_edit_batches(
             let reply = PlanEditBatch {
                 kind: batch.kind,
                 cells: accepted,
+                materials: shared_materials,
             };
             if let Err(err) = broadcast.send::<PlanEditBatch, WorldChannel>(
                 &reply,
@@ -648,7 +730,8 @@ fn send_plan_full_sync_on_connect(
 }
 
 /// Client: apply a broadcast edit to the local mirror. The server has
-/// already done the validation; here we just trust the kind field.
+/// already done the validation + materials computation; we trust
+/// both fields directly.
 fn receive_plan_edit_broadcasts(
     mut receivers: Query<&mut MessageReceiver<PlanEdit>>,
     mut plans: ResMut<Plans>,
@@ -656,7 +739,7 @@ fn receive_plan_edit_broadcasts(
     for mut receiver in receivers.iter_mut() {
         for edit in receiver.receive() {
             match edit.kind {
-                Some(kind) => plans.set(edit.cell, kind),
+                Some(kind) => plans.set(edit.cell, PlanState::new(kind, edit.materials)),
                 None => plans.clear(edit.cell),
             }
         }
@@ -672,7 +755,9 @@ fn receive_plan_edit_batch_broadcasts(
         for batch in receiver.receive() {
             for cell in batch.cells {
                 match batch.kind {
-                    Some(kind) => plans.set(cell, kind),
+                    Some(kind) => {
+                        plans.set(cell, PlanState::new(kind, batch.materials.clone()));
+                    }
                     None => plans.clear(cell),
                 }
             }

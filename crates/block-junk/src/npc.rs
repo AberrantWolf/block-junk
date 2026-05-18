@@ -1445,7 +1445,10 @@ fn npc_brain_tick(
                     // Re-resolve against the authoritative `Plans`. The
                     // planner saw a snapshot — the tag may have been
                     // cancelled or auto-cleared by the time we commit.
-                    let Some(plan_kind) = plans.get(target_cell) else {
+                    // We need just the kind for the work pipeline; the
+                    // materials gate is checked when collecting nearby
+                    // plans for the snapshot (filtered out if pending).
+                    let Some(plan_kind) = plans.kind(target_cell) else {
                         info!(
                             npc = npc_id.0,
                             target = ?target_cell.to_array(),
@@ -1814,7 +1817,7 @@ fn collect_nearby_plans(
     work_defaults: &block_junk_mod_api::npcs::WorkDefaults,
 ) -> Vec<NearbyPlan> {
     let mut out: Vec<NearbyPlan> = Vec::new();
-    for (cell, kind) in plans.iter() {
+    for (cell, state) in plans.iter() {
         let d = *cell - foot;
         if d.x.abs() > radius_cells || d.y.abs() > radius_cells || d.z.abs() > radius_cells {
             continue;
@@ -1822,13 +1825,20 @@ fn collect_nearby_plans(
         if plan_claims.is_taken_by_other(*cell, self_id) {
             continue;
         }
+        // Phase-3 gate: NPCs can only commit to plans whose materials
+        // are fully delivered. Pending-materials Build plans wait for
+        // the player (or, post-Phase-4, the haul scheduler) to fill
+        // them — the planner shouldn't even see them.
+        if !state.is_satisfied() {
+            continue;
+        }
         let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
-        let hint = match kind {
+        let hint = match state.kind {
             PlanKind::Remove => PlanKindHint::Remove,
             PlanKind::Build { .. } => PlanKindHint::Build,
         };
         let (_duration, need_restore) = resolve_work_action(
-            *kind,
+            state.kind,
             *cell,
             chunks,
             chunk_map,

@@ -32,9 +32,9 @@ use crate::target_outline::TargetOutlinePlugin;
 use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DropRequest, GameSet,
-    MovementIntent, MovementMode, NpcAnimOverride, PickupRequest, PlanKind, WorldChannel,
-    WorldClock, WorldClockSync, WorldItem,
+    Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
+    GameSet, MovementIntent, MovementMode, NpcAnimOverride, PickupRequest, PlanKind,
+    WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -1062,6 +1062,7 @@ fn normal_mode_action_input(
     mut action: ResMut<PlayerActionState>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
     mut pickup_sender: Query<&mut MessageSender<PickupRequest>>,
+    mut deposit_sender: Query<&mut MessageSender<DepositRequest>>,
 ) {
     // Only Normal uses the action timer. Switching modes or losing
     // cursor lock mid-action cancels the in-flight progress so
@@ -1094,16 +1095,13 @@ fn normal_mode_action_input(
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
 
-    // Pickup fast-path: L just-pressed on a WorldItem that's *closer*
-    // than any solid block along the ray. Pickup is instant (no
-    // hold-timer), so we short-circuit before the world raycast feeds
-    // the self-work resolver. Pickup is L-click only — R-click is
-    // direct-destroy, never pickup.
+    // Two instant L-click fast-paths, in priority order:
+    //   1. Pickup a WorldItem closer than any solid block.
+    //   2. Deposit a carry unit into a Build plan that needs it.
+    // Both consume the click before the self-work timer can latch.
     if mouse.just_pressed(MouseButton::Left) {
         let item_hit = raycast_world_items(cam_pos, cam_dir, RAYCAST_REACH, &world_items);
-        // Need the world-hit distance to compare. If the world ray
-        // doesn't hit anything, an item hit always wins.
-        let world_hit_dist = entity_aware_raycast(
+        let world_hit_for_compare = entity_aware_raycast(
             cam_pos,
             cam_dir,
             RAYCAST_REACH,
@@ -1111,17 +1109,16 @@ fn normal_mode_action_input(
             &chunk_map,
             &registry,
             None,
-        )
-        .as_ref()
-        .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
+        );
+        let world_hit_dist = world_hit_for_compare
+            .as_ref()
+            .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
+        let carry = local_carry.single().copied().unwrap_or_default();
+
+        // (1) Pickup.
         if let Some((item_translation, item_dist, item_slot)) = item_hit
             && world_hit_dist.map(|wd| item_dist < wd).unwrap_or(true)
         {
-            // Client-side carry check: skip the wire request if the
-            // local carry can't accept this item kind. Saves a round-
-            // trip on obviously-can't-pickup clicks. Server re-validates
-            // — this is an ergonomic short-circuit, not a security gate.
-            let carry = local_carry.single().copied().unwrap_or_default();
             if carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
                 if let Ok(mut sender) = pickup_sender.single_mut() {
                     sender.send::<WorldChannel>(PickupRequest {
@@ -1129,11 +1126,41 @@ fn normal_mode_action_input(
                     });
                 }
             }
-            // Consume the click whether we sent or not — the player
-            // aimed at an item and tapped; we shouldn't fall through
-            // to self-work / direct-destroy on the same click.
             action.active = None;
             return;
+        }
+
+        // (2) Deposit. Resolve the targeted plan cell via the same
+        // world-or-plan-raycast comparison `resolve_self_work` uses,
+        // but only fire when (a) carry has matching item and (b) the
+        // plan still needs more of it. Lets a player drop wood into
+        // a wood-build plan without first walking onto it.
+        if let Some(carry_item) = carry.item
+            && carry.count > 0
+        {
+            let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, RAYCAST_REACH, &plans);
+            let world_tagged_dist = world_hit_for_compare
+                .as_ref()
+                .filter(|h| plans.get(h.cell).is_some())
+                .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos, h.cell))
+                .map(|(d, c)| (d.length(), c));
+            let plan_target = match (world_tagged_dist, plan_hit) {
+                (Some(a), Some(b)) if a.0 <= b.0 => Some(a.1),
+                (Some(_), Some((_, c))) => Some(c),
+                (Some(a), None) => Some(a.1),
+                (None, Some((_, c))) => Some(c),
+                (None, None) => None,
+            };
+            if let Some(cell) = plan_target
+                && let Some(state) = plans.get(cell)
+                && state.remaining_for(carry_item) > 0
+            {
+                if let Ok(mut sender) = deposit_sender.single_mut() {
+                    sender.send::<WorldChannel>(DepositRequest { cell });
+                }
+                action.active = None;
+                return;
+            }
         }
     }
 
@@ -1246,18 +1273,21 @@ fn resolve_self_work(
     world_hit: Option<&EntityAwareHit>,
     plan_hit: Option<(f32, IVec3)>,
 ) -> Option<(IVec3, ActionKind, BlockEdit, MouseButton)> {
-    let world_candidate = world_hit
-        .and_then(|h| plans.get(h.cell).map(|kind| (h.cell, kind)))
-        .map(|(cell, kind)| {
-            let dist = (cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length();
-            (dist, cell, kind)
-        });
-    let plan_candidate = plan_hit.and_then(|(dist, cell)| {
-        // raycast_plans only returns cells present in Plans, so the
-        // get() is infallible — but treating it as an Option keeps
-        // the function safe if the contract ever shifts.
-        plans.get(cell).map(|kind| (dist, cell, kind))
+    // Helper: build a candidate tuple if the cell has a tag *and* its
+    // materials are satisfied. Unsatisfied Build plans are inert to
+    // L-click self-work (the player needs to deposit first).
+    let materialize = |cell: IVec3, dist: f32| -> Option<(f32, IVec3, PlanKind)> {
+        let state = plans.get(cell)?;
+        if !state.is_satisfied() {
+            return None;
+        }
+        Some((dist, cell, state.kind))
+    };
+    let world_candidate = world_hit.and_then(|h| {
+        let dist = (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length();
+        materialize(h.cell, dist)
     });
+    let plan_candidate = plan_hit.and_then(|(dist, cell)| materialize(cell, dist));
     let (_, cell, kind) = match (world_candidate, plan_candidate) {
         (Some(a), Some(b)) if a.0 <= b.0 => a,
         (Some(_), Some(b)) => b,
@@ -1437,7 +1467,7 @@ pub(crate) fn entity_aware_raycast(
     let is_passable = |cell: IVec3, slot: BlockSlot| -> bool {
         slot.is_empty()
             || skip_plan_remove
-                .is_some_and(|p| matches!(p.get(cell), Some(PlanKind::Remove)))
+                .is_some_and(|p| matches!(p.kind(cell), Some(PlanKind::Remove)))
     };
 
     // Two-pass: first find the nearest cell whose block-entity AABB

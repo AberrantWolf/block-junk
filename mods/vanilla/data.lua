@@ -101,6 +101,9 @@ register {
     drops = {
         { item = "vanilla:stone_chunk", count = 1 },
     },
+    materials = {
+        { item = "vanilla:stone_chunk", count = 1 },
+    },
 }
 
 register {
@@ -153,6 +156,12 @@ register {
     -- a tree trunk yields wood the same way breaking a placed wood
     -- block does.
     drops = {
+        { item = "vanilla:wood_log", count = 1 },
+    },
+    -- Phase 3: building a wood block costs one Wood Log delivered to
+    -- the plan cell. Symmetric with drops — chopping a wood block
+    -- returns what it cost.
+    materials = {
         { item = "vanilla:wood_log", count = 1 },
     },
 }

@@ -25,9 +25,10 @@ use lightyear::prelude::*;
 use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::camera::FlyCam;
 use crate::client::{RAYCAST_REACH, entity_aware_raycast, raycast_npcs};
+use crate::items::ItemRegistry;
 use crate::menu::AppState;
-use crate::plans::PlanDragState;
-use crate::protocol::{AvatarPose, GameSet, NpcDetails, RequestNpcDetails, WorldChannel};
+use crate::plans::{PlanDragState, Plans, raycast_plans};
+use crate::protocol::{AvatarPose, GameSet, NpcDetails, PlanKind, RequestNpcDetails, WorldChannel};
 use crate::npc::{Npc, NpcId};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
@@ -69,6 +70,12 @@ pub enum InspectState {
         cell: IVec3,
         slot: BlockSlot,
     },
+    /// A Build plan cell (currently empty in the world, tagged for
+    /// construction). The panel reads the live `Plans` resource on
+    /// every refresh to show the current materials progress — we
+    /// don't snapshot here so deposits update without per-tick
+    /// state-resolution churn.
+    Plan { cell: IVec3 },
 }
 
 #[derive(Component)]
@@ -121,6 +128,7 @@ fn refresh_inspect_target(
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
+    plans: Res<Plans>,
     npcs: Query<(&NpcId, &AvatarPose), With<Npc>>,
     mut target: ResMut<InspectTarget>,
     mut sender: Query<&mut MessageSender<RequestNpcDetails>>,
@@ -149,12 +157,39 @@ fn refresh_inspect_target(
     // distance as the centre of the cell.
     let block_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, &chunks, &chunk_map, &registry, None);
     let npc_hit = raycast_npcs(origin, dir, RAYCAST_REACH, &npcs);
+    let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, &plans);
 
     let block_dist = block_hit.as_ref().map(|h| {
         let centre = h.cell.as_vec3() + Vec3::splat(0.5);
         (centre - origin).length()
     });
     let npc_dist = npc_hit.as_ref().map(|h| h.distance);
+    let plan_dist = plan_hit.map(|(d, _)| d);
+
+    // Plan wins outright if it's closer than the block hit *and* the
+    // npc hit — a tagged Build cell hangs in empty air, so the world
+    // raycast would otherwise return whatever's behind it. NPCs still
+    // win over plans when they're closer (you can stand on a tagged
+    // cell while pointing at a villager).
+    let plan_beats_block = match (plan_dist, block_dist) {
+        (Some(p), Some(b)) => p < b,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let plan_beats_npc = match (plan_dist, npc_dist) {
+        (Some(p), Some(n)) => p < n,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if plan_beats_block && plan_beats_npc
+        && let Some((_, cell)) = plan_hit
+    {
+        let same = matches!(&target.state, InspectState::Plan { cell: c } if *c == cell);
+        if !same {
+            target.state = InspectState::Plan { cell };
+        }
+        return;
+    }
 
     let pick_npc = match (npc_dist, block_dist) {
         (Some(n), Some(b)) => n <= b,
@@ -238,13 +273,19 @@ fn receive_npc_details(
 fn refresh_inspect_panel(
     target: Res<InspectTarget>,
     registry: Res<BlockRegistry>,
+    items: Res<ItemRegistry>,
+    plans: Res<Plans>,
     mut roots: Query<&mut Visibility, With<InspectPanelRoot>>,
     mut texts: Query<&mut Text, With<InspectPanelText>>,
 ) {
-    if !target.is_changed() {
+    // Re-render on target change *or* plans-mutation. Deposits land
+    // as `Plans` mutations that don't touch `target`, so without the
+    // plans-changed branch a hovered plan panel would freeze at the
+    // initial materials state.
+    if !target.is_changed() && !plans.is_changed() {
         return;
     }
-    let body = render_body(&target.state, &registry);
+    let body = render_body(&target.state, &registry, &items, &plans);
     let visibility = match body {
         Some(_) => Visibility::Inherited,
         None => Visibility::Hidden,
@@ -258,7 +299,12 @@ fn refresh_inspect_panel(
 }
 
 /// Format the panel's text content. `None` ⇒ panel hidden.
-fn render_body(state: &InspectState, registry: &BlockRegistry) -> Option<String> {
+fn render_body(
+    state: &InspectState,
+    registry: &BlockRegistry,
+    items: &ItemRegistry,
+    plans: &Plans,
+) -> Option<String> {
     match state {
         InspectState::None => None,
         InspectState::PendingNpc { last_seen: Some(prev), .. } => Some(format_npc(prev, true)),
@@ -266,8 +312,68 @@ fn render_body(state: &InspectState, registry: &BlockRegistry) -> Option<String>
             Some(format!("NPC #{} — fetching…", npc_id.0))
         }
         InspectState::Npc(details) => Some(format_npc(details, false)),
-        InspectState::Block { cell, slot } => Some(format_block(*cell, *slot, registry)),
+        InspectState::Block { cell, slot } => {
+            let mut out = format_block(*cell, *slot, registry);
+            // Append plan info when the inspected block is tagged
+            // (Remove plans live on solid cells, so the block raycast
+            // resolves them).
+            if let Some(plan_state) = plans.get(*cell) {
+                out.push('\n');
+                out.push_str(&format_plan_inner(plan_state, items));
+            }
+            Some(out)
+        }
+        InspectState::Plan { cell } => {
+            let header = format!("Plan ({}, {}, {})\n", cell.x, cell.y, cell.z);
+            let body = match plans.get(*cell) {
+                Some(state) => format_plan_inner(state, items),
+                None => "(tag cleared)".to_owned(),
+            };
+            Some(format!("{header}{body}"))
+        }
     }
+}
+
+/// Render the kind + materials list for a [`PlanState`]. No header —
+/// callers prepend their own ("Plan (x,y,z)" or "tagged" depending
+/// on the surrounding context).
+fn format_plan_inner(
+    state: &crate::protocol::PlanState,
+    items: &ItemRegistry,
+) -> String {
+    let mut out = String::new();
+    let kind_str = match &state.kind {
+        PlanKind::Remove => "tag: remove".to_owned(),
+        PlanKind::Build { slot, .. } => {
+            let def = std::panic::catch_unwind(|| {
+                // BlockRegistry::def panics on unknown slots; this
+                // shouldn't happen in practice (slots come from the
+                // same boot registry), but catch defensively.
+                slot.0
+            });
+            match def {
+                Ok(_) => format!("tag: build (slot {})", slot.0),
+                Err(_) => "tag: build (unknown slot)".to_owned(),
+            }
+        }
+    };
+    out.push_str(&kind_str);
+    out.push('\n');
+    if state.materials.is_empty() {
+        out.push_str("materials: (none)\n");
+    } else {
+        out.push_str("materials:\n");
+        for m in &state.materials {
+            let name = items.def(m.item).display_name.clone();
+            out.push_str(&format!("  {}: {}/{}\n", name, m.present, m.needed));
+        }
+    }
+    if state.is_satisfied() {
+        out.push_str("status: ready\n");
+    } else {
+        out.push_str("status: waiting on materials\n");
+    }
+    out
 }
 
 fn format_npc(details: &NpcDetails, stale: bool) -> String {

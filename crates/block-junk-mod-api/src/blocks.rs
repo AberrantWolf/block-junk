@@ -205,6 +205,20 @@ pub struct BlockDef {
     /// fail loudly rather than silently spawn nothing.
     #[serde(default)]
     pub drops: Vec<ItemDrop>,
+    /// Items required to *build* this block via the Plan workflow. A
+    /// player or NPC must deliver this many of each named item to the
+    /// plan cell before the work-action can run. Same shape as
+    /// [`drops`](Self::drops); empty vec means "build is free" (the
+    /// Phase 0 fallback). Cross-validated at boot against the item
+    /// registry on the same boot pass as `drops`.
+    ///
+    /// Asymmetric with drops on purpose: a block can drop items
+    /// without requiring them to build (e.g. grass dropping a dirt
+    /// clod when the block itself is free terrain), or vice versa
+    /// (a recipe-only block that costs ingredients but yields
+    /// nothing on destroy).
+    #[serde(default)]
+    pub materials: Vec<ItemDrop>,
 }
 
 /// Block-level "this is something NPCs can use" declaration. One
