@@ -19,6 +19,24 @@ register {
     color = { 0.0, 0.0, 0.0 },
 }
 
+-- Items dropped by destroyed blocks (Phase 1). Both meshes come from
+-- KayKit Resource Bits and share the same `resource_bits_texture.png`
+-- already in this directory. Registration order doesn't matter for
+-- items the way it does for blocks (no slot-0 reservation).
+engine.items.register {
+    id = "vanilla:wood_log",
+    display_name = "Wood Log",
+    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    color = { 0.55, 0.40, 0.22 },
+}
+
+engine.items.register {
+    id = "vanilla:stone_chunk",
+    display_name = "Stone Chunk",
+    mesh = "mods://vanilla/models/Stone_Chunks_Small.gltf",
+    color = { 0.55, 0.55, 0.58 },
+}
+
 -- Masks + ramps composited per-block by the chunk fragment shader.
 -- Slot order is registration order; refs from `layers` below resolve
 -- against these by id at boot. Mods can register their own with
@@ -80,6 +98,9 @@ register {
             softness = 0.20,
         },
     },
+    drops = {
+        { item = "vanilla:stone_chunk", count = 1 },
+    },
 }
 
 register {
@@ -127,6 +148,13 @@ register {
     },
     color = { 0.55, 0.40, 0.22 },
     pattern = "planks",
+    -- Phase 1: destroying a wood block drops one Wood Log item.
+    -- Trees in terrain are stamped from this same block, so chopping
+    -- a tree trunk yields wood the same way breaking a placed wood
+    -- block does.
+    drops = {
+        { item = "vanilla:wood_log", count = 1 },
+    },
 }
 
 register {

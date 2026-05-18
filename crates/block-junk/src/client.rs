@@ -29,10 +29,11 @@ use crate::plans::{Plans, PlansClientPlugin};
 use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::target_outline::TargetOutlinePlugin;
+use crate::items::ItemRegistry;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode,
-    NpcAnimOverride, PlanKind, WorldChannel, WorldClock, WorldClockSync,
+    NpcAnimOverride, PlanKind, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -86,6 +87,7 @@ impl Plugin for ClientPlugin {
             })
             .add_observer(swap_preview_scene_materials)
             .add_observer(setup_npc_skeleton_anim)
+            .add_observer(attach_world_item_visuals)
             // Scene setup runs when entering a game, not at process start.
             // Before InGame the screen is the main menu only.
             .add_systems(
@@ -2162,6 +2164,41 @@ fn attach_npc_visuals(
                     .with_rotation(Quat::from_rotation_y(core::f32::consts::PI)),
             ));
     }
+}
+
+/// Attach the visible glTF scene + Transform when a `WorldItem`
+/// component is added (whether by local spawn or by lightyear's
+/// replication apply on the client). The component carries its own
+/// translation — `Transform` is never replicated (the
+/// networking-design rule), so we derive it from the component.
+///
+/// Idempotent against re-adds; if the entity already has a SceneRoot
+/// we no-op, since multi-add only fires when an observer is registered
+/// after the entity exists, not on duplicate inserts.
+fn attach_world_item_visuals(
+    trigger: On<Add, WorldItem>,
+    items: Res<ItemRegistry>,
+    asset_server: Res<AssetServer>,
+    world_items: Query<&WorldItem>,
+    existing: Query<(), With<SceneRoot>>,
+    mut commands: Commands,
+) {
+    let entity = trigger.event_target();
+    if existing.contains(entity) {
+        return;
+    }
+    let Ok(world_item) = world_items.get(entity) else {
+        return;
+    };
+    let def = items.def(world_item.item);
+    let scene: Handle<Scene> = asset_server.load(format!("{}#Scene0", def.mesh));
+    commands.entity(entity).insert((
+        SceneRoot(scene),
+        Transform::from_translation(world_item.translation),
+        GlobalTransform::default(),
+        Visibility::default(),
+        Name::new(format!("WorldItem({})", def.id)),
+    ));
 }
 
 /// Manually replay Bevy's animation-rigging pass when the Knight's

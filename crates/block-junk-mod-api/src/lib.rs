@@ -24,6 +24,7 @@
 //! - [`client`] — types and hooks that would be exposed in client-side
 //!   contexts. None today; reserved.
 //! - [`blocks`] — block registry types (id, def, flags, tags). Side-agnostic.
+//! - [`items`] — item registry types (id, def, drops). Side-agnostic.
 //! - [`npcs`] — NPC kind + need registry types and the planner goal
 //!   surface. Side-agnostic (the same kind registers on both sides);
 //!   planner callbacks live in server-only `events.lua`.
@@ -31,6 +32,7 @@
 
 pub mod animations;
 pub mod blocks;
+pub mod items;
 pub mod npcs;
 pub mod rooms;
 pub mod textures;

@@ -22,7 +22,7 @@ use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, MovementIntent, MovementMode,
     NpcAnimOverride, NpcDetails, PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails,
-    WorldChannel, WorldClockSync,
+    WorldChannel, WorldClockSync, WorldItem,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +110,12 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<crate::npc::NpcKind>();
         app.register_component::<NpcAnimOverride>();
         app.register_component::<NpcPath>();
+        // Loose items in the world. No prediction (items don't move
+        // server-side in Phase 1) and no interpolation (no per-tick
+        // updates to lerp between). Initial replicate carries the
+        // spawn position; that's all the client needs to render the
+        // pile.
+        app.register_component::<WorldItem>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between
         // server samples instead of snapping every 50 ms).

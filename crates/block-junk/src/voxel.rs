@@ -268,20 +268,86 @@ pub fn chunk_world_transform(coord: ChunkCoord) -> Transform {
 }
 
 /// Deterministic terrain: a gentle sine-wave heightmap with grass/dirt/stone
-/// layering. Identical on every machine so an unedited chunk doesn't need
-/// its bytes shipped over the wire — both sides regenerate from the coord.
+/// layering, plus a sparse stamp-based tree population on the grass layer.
+/// Identical on every machine so an unedited chunk doesn't need its bytes
+/// shipped over the wire — both sides regenerate from the coord.
+///
+/// Tree generation is per-cell rather than per-chunk: at each cell we
+/// scan the small neighborhood of potential tree roots (every (x, z)
+/// is a candidate; an integer-hash of (x, z) decides whether a tree
+/// actually grows there). For each root within stamp radius, we test
+/// whether the current cell falls inside that tree's stamp shape and
+/// return wood/leaves accordingly. This keeps `terrain_block` pure —
+/// no shared mutable state between cells — so chunks regenerate the
+/// same way no matter the cell-iteration order.
 fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
-    let h = (world.x as f32 * 0.07).sin() * 4.0
-        + (world.z as f32 * 0.05).sin() * 4.0
-        + 8.0;
-    let h = h.floor() as i32;
-    if world.y >= h {
-        slots.empty
-    } else if world.y == h - 1 {
-        slots.grass
-    } else if world.y >= h - 4 {
-        slots.dirt
-    } else {
-        slots.stone
+    let h_here = surface_height(world.x, world.z);
+    // Ground layers first. Trees only stamp into cells the ground
+    // function would otherwise return `empty`, so a tree near a hill
+    // doesn't bury its trunk inside the slope.
+    if world.y < h_here {
+        return if world.y == h_here - 1 {
+            slots.grass
+        } else if world.y >= h_here - 4 {
+            slots.dirt
+        } else {
+            slots.stone
+        };
     }
+    // Air above the surface — check whether any nearby tree's stamp
+    // claims this cell. STAMP_RADIUS bounds the (x, z) search; bigger
+    // radius = more lookups per cell. 2 covers a 3-wide canopy.
+    const STAMP_RADIUS: i32 = 2;
+    for dx in -STAMP_RADIUS..=STAMP_RADIUS {
+        for dz in -STAMP_RADIUS..=STAMP_RADIUS {
+            let rx = world.x + dx;
+            let rz = world.z + dz;
+            if !is_tree_root(rx, rz) {
+                continue;
+            }
+            let root_h = surface_height(rx, rz);
+            let local_y = world.y - root_h;
+            // Trunk: 3-tall column of wood, centred on the root.
+            if dx == 0 && dz == 0 && (0..3).contains(&local_y) {
+                return slots.wood;
+            }
+            // Canopy: 3x3 leaves at top of trunk.
+            if local_y == 3 && dx.abs() <= 1 && dz.abs() <= 1 {
+                return slots.leaves;
+            }
+            // Single leaf cap on top.
+            if local_y == 4 && dx == 0 && dz == 0 {
+                return slots.leaves;
+            }
+        }
+    }
+    slots.empty
+}
+
+/// Floor of the sine-wave heightmap at column `(x, z)`. Pulled out so
+/// the tree generator can call it for candidate root columns without
+/// re-deriving the math.
+fn surface_height(x: i32, z: i32) -> i32 {
+    let h = (x as f32 * 0.07).sin() * 4.0 + (z as f32 * 0.05).sin() * 4.0 + 8.0;
+    h.floor() as i32
+}
+
+/// Whether column `(x, z)` is a tree root. Pure hash → bool: deterministic
+/// across runs, no per-chunk state, no neighbour communication. Density
+/// is roughly one tree per 32 columns on average; tune by tightening or
+/// loosening the mask.
+fn is_tree_root(x: i32, z: i32) -> bool {
+    // Integer hash mixing (large primes, xorshift-style finalizer). The
+    // specific constants are arbitrary; the only requirement is good
+    // bit dispersion so neighbouring columns don't cluster.
+    let mut h = (x as u32)
+        .wrapping_mul(73_856_093)
+        .wrapping_add((z as u32).wrapping_mul(19_349_663));
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^= h >> 15;
+    // ~1 in 32 columns: dense enough to recognise as "a forest" along a
+    // path, sparse enough that flat-grass-with-occasional-tree still
+    // reads as the dominant terrain.
+    (h & 0x1F) == 0
 }

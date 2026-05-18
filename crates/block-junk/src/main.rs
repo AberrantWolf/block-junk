@@ -6,6 +6,7 @@ mod collision;
 mod debug;
 mod inspect_panel;
 mod interactables;
+mod items;
 mod menu;
 mod network;
 mod npc;

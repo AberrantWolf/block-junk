@@ -14,6 +14,7 @@ use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
 use crate::block_textures::{MaskRegistry, RampRegistry};
 use crate::blocks::{BlockRegistry, WorldSlots};
+use crate::items::ItemRegistry;
 use crate::npc_registry::{AnimationRegistry, NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::protocol::{CellEdit, GameSet};
 use crate::rooms::{RoomEventMsg, RoomPatternRegistry};
@@ -37,6 +38,7 @@ impl Plugin for ServerScriptingPlugin {
             mods,
             blocks,
             slots,
+            items,
             rooms,
             needs,
             npc_kinds,
@@ -48,6 +50,7 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(ServerMods(mods));
         app.insert_resource(blocks);
         app.insert_resource(slots);
+        app.insert_resource(items);
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
@@ -70,6 +73,7 @@ impl Plugin for ClientScriptingPlugin {
             mods,
             blocks,
             slots,
+            items,
             rooms,
             needs,
             npc_kinds,
@@ -81,6 +85,7 @@ impl Plugin for ClientScriptingPlugin {
         app.insert_resource(ClientMods(mods));
         app.insert_resource(blocks);
         app.insert_resource(slots);
+        app.insert_resource(items);
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
@@ -97,6 +102,7 @@ struct LoadResult {
     mods: ModRegistry,
     blocks: BlockRegistry,
     slots: WorldSlots,
+    items: ItemRegistry,
     rooms: RoomPatternRegistry,
     needs: NeedRegistry,
     npc_kinds: NpcKindRegistry,
@@ -116,7 +122,8 @@ fn load_side(side: Side) -> LoadResult {
         Err(e) => panic!("{} mod load failed: {e}", side.as_str()),
     };
     warn_if_empty(&mods);
-    let (blocks, slots) = match BlockRegistry::build(ctx.take_blocks()) {
+    let pending_blocks = ctx.take_blocks();
+    let (blocks, slots) = match BlockRegistry::build(pending_blocks.clone()) {
         Ok(pair) => pair,
         Err(e) => panic!("{} block registry build failed: {e}", side.as_str()),
     };
@@ -125,6 +132,21 @@ fn load_side(side: Side) -> LoadResult {
         side.as_str(),
         blocks.slot_count()
     );
+    let items = match ItemRegistry::build(ctx.take_items()) {
+        Ok(r) => r,
+        Err(e) => panic!("{} item registry build failed: {e}", side.as_str()),
+    };
+    info!(
+        "[{}] item registry: {} item(s)",
+        side.as_str(),
+        items.slot_count()
+    );
+    // Cross-validate block drops against the item registry. The drops
+    // list is engine-opaque until item ids resolve, so a typo here
+    // would silently spawn nothing at runtime — fail loud at boot.
+    if let Err(e) = items.validate_block_drops(&pending_blocks) {
+        panic!("{} block drops validation failed: {e}", side.as_str());
+    }
     let rooms = match RoomPatternRegistry::build(ctx.take_rooms()) {
         Ok(r) => r,
         Err(e) => panic!("{} room pattern registry build failed: {e}", side.as_str()),
@@ -216,6 +238,7 @@ fn load_side(side: Side) -> LoadResult {
         mods,
         blocks,
         slots,
+        items,
         rooms,
         needs,
         npc_kinds,

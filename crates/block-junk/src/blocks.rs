@@ -351,6 +351,8 @@ pub struct TerrainSlots {
     pub stone: BlockSlot,
     pub dirt: BlockSlot,
     pub grass: BlockSlot,
+    pub wood: BlockSlot,
+    pub leaves: BlockSlot,
 }
 
 impl TerrainSlots {
@@ -360,6 +362,8 @@ impl TerrainSlots {
             stone: reg.require("vanilla:stone"),
             dirt: reg.require("vanilla:dirt"),
             grass: reg.require("vanilla:grass"),
+            wood: reg.require("vanilla:wood"),
+            leaves: reg.require("vanilla:leaves"),
         }
     }
 }

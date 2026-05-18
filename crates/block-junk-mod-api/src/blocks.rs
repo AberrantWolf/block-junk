@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::items::ItemDrop;
 use crate::textures::LayerDef;
 
 /// Stable string identifier for a block kind, "namespace:name" by convention.
@@ -194,6 +195,16 @@ pub struct BlockDef {
     /// that read naturally from any side leave it as `None`.
     #[serde(default)]
     pub use_slot: Option<UseSlot>,
+    /// Items spawned when this block is destroyed (by any path — NPC
+    /// Remove plan, player direct-destroy, future explosion). Each
+    /// entry names an [`ItemId`](crate::items::ItemId) and a `count`;
+    /// `count` [`WorldItem`] entities spawn at the destroyed cell. An
+    /// empty vec means destroying the block yields nothing (today: air,
+    /// leaves — saplings might land here later). Cross-validated at
+    /// boot against the item registry — references to unknown item ids
+    /// fail loudly rather than silently spawn nothing.
+    #[serde(default)]
+    pub drops: Vec<ItemDrop>,
 }
 
 /// Block-level "this is something NPCs can use" declaration. One

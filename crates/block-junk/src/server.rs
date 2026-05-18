@@ -21,8 +21,9 @@ use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
     MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PlanEdit, PlanKind, RequestNpcDetails,
-    WorldChannel, WorldClock, WorldClockSync,
+    WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
+use crate::items::ItemRegistry;
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{SAVE_VERSION, SaveFile, SavedChunk, SavedNpc, read_save, write_save};
@@ -103,6 +104,7 @@ impl Plugin for ServerPlugin {
             (
                 apply_npc_work,
                 auto_clear_stale_plans,
+                spawn_drops_on_destroy,
                 push_actors_out_of_new_blocks,
             )
                 .chain()
@@ -960,6 +962,9 @@ fn apply_place(
             bus.write(CellEdit {
                 world,
                 slot: edit.slot,
+                // Place validation rejects any non-empty footprint cell,
+                // so the prior occupant is always EMPTY.
+                prev_slot: BlockSlot::EMPTY,
             });
         }
         commands.entity(chunk_entity).insert(ChunkEdited);
@@ -1063,6 +1068,11 @@ fn apply_break(
             bus.write(CellEdit {
                 world,
                 slot: BlockSlot::EMPTY,
+                // The full footprint shares the same source block — its
+                // slot was captured at resolution above. Subscribers
+                // (drops, sidecar cleanup) read this to learn *what*
+                // was destroyed without re-querying the now-empty cell.
+                prev_slot: slot,
             });
         }
         commands.entity(chunk_entity).insert(ChunkEdited);
@@ -1255,6 +1265,84 @@ fn auto_clear_stale_plans(
             &NetworkTarget::All,
         ) {
             warn!("auto-clear PlanEdit broadcast failed: {err}");
+        }
+    }
+}
+
+/// Spawn drop items when a block is destroyed. Reads the same CellEdit
+/// bus as `auto_clear_stale_plans`; for every edit whose `prev_slot` is
+/// non-empty and whose `slot` is empty (i.e. a destroy), looks up the
+/// destroyed block's `BlockDef.drops`, and for each entry spawns
+/// `count` `WorldItem` entities at the destroyed cell's centre with a
+/// small per-unit XZ jitter so a multi-item pile doesn't z-fight.
+///
+/// Server-authoritative spawn with `Replicate::to_clients(All)` — every
+/// client gets the new entity in their next replication tick, and the
+/// client-side observer attaches the visible glTF scene. Multi-cell
+/// block destroys emit one CellEdit per footprint cell, all with the
+/// same `prev_slot`; we deliberately spawn drops per cell so a 2-cell
+/// bed dropping `{count=1}` of wood lands two logs (one per cell)
+/// rather than one — mod authors who want exact totals set counts
+/// against the number of cells the block occupies, or future stack
+/// merging dedupes piles.
+fn spawn_drops_on_destroy(
+    mut reader: MessageReader<CellEdit>,
+    mut commands: Commands,
+    blocks: Res<BlockRegistry>,
+    items: Res<ItemRegistry>,
+) {
+    use block_junk_mod_api::items::ItemId;
+
+    // Small deterministic-per-spawn hash for the jitter offset. Doesn't
+    // need to be reproducible across sessions, just unique enough that
+    // siblings don't perfectly overlap — pile reads as a heap.
+    fn jitter(cell: IVec3, unit_index: u32) -> Vec3 {
+        let h = (cell.x as i64)
+            .wrapping_mul(73_856_093)
+            .wrapping_add((cell.y as i64).wrapping_mul(19_349_663))
+            .wrapping_add((cell.z as i64).wrapping_mul(83_492_791))
+            .wrapping_add(unit_index as i64 * 2_654_435_761) as u64;
+        let fx = ((h & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.4;
+        let fz = (((h >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.4;
+        Vec3::new(fx, 0.0, fz)
+    }
+
+    for edit in reader.read() {
+        if !edit.slot.is_empty() || edit.prev_slot.is_empty() {
+            continue;
+        }
+        let def = blocks.def(edit.prev_slot);
+        if def.drops.is_empty() {
+            continue;
+        }
+        // Cell centre + a tiny lift off the floor so the mesh isn't
+        // bisected by the next-block-down's top face.
+        let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
+        for drop in &def.drops {
+            let item_id: &ItemId = &drop.item;
+            // boot validation guarantees this resolves; failing here
+            // would be an engine bug.
+            let Some(slot) = items.slot_of(item_id) else {
+                error!(
+                    block = %def.id,
+                    item = %item_id,
+                    "drops references item missing from registry after boot; skipping",
+                );
+                continue;
+            };
+            for unit in 0..drop.count {
+                let translation = centre + jitter(edit.world, unit);
+                commands.spawn((
+                    WorldItem {
+                        item: slot,
+                        translation,
+                    },
+                    Transform::from_translation(translation),
+                    GlobalTransform::default(),
+                    Replicate::to_clients(NetworkTarget::All),
+                    Name::new(format!("WorldItem({})", item_id)),
+                ));
+            }
         }
     }
 }

@@ -14,6 +14,7 @@ use block_junk_mod_api::{
     API_VERSION, ApiVersion, ModManifest, Side,
     animations::AnimationDef,
     blocks::BlockDef,
+    items::ItemDef,
     npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal, WorkDefaults},
     rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
@@ -72,6 +73,7 @@ const NPC_PLANNERS_TABLE: &str = "_npc_planners";
 #[derive(Clone, Default)]
 pub struct LoadContext {
     pub pending_blocks: Arc<Mutex<Vec<BlockDef>>>,
+    pub pending_items: Arc<Mutex<Vec<ItemDef>>>,
     pub pending_rooms: Arc<Mutex<Vec<RoomPattern>>>,
     pub pending_npc_kinds: Arc<Mutex<Vec<NpcKindDef>>>,
     pub pending_needs: Arc<Mutex<Vec<NeedDef>>>,
@@ -93,6 +95,11 @@ impl LoadContext {
     /// `load_dir` returns so it can build the real `BlockRegistry`.
     pub fn take_blocks(&self) -> Vec<BlockDef> {
         std::mem::take(&mut *self.pending_blocks.lock().unwrap())
+    }
+
+    /// Drain the accumulated item defs.
+    pub fn take_items(&self) -> Vec<ItemDef> {
+        std::mem::take(&mut *self.pending_items.lock().unwrap())
     }
 
     /// Drain the accumulated room patterns.
@@ -404,6 +411,27 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     })?;
     blocks_table.set("register", register_block)?;
     engine.set("blocks", blocks_table)?;
+
+    // engine.items.register(def) — both sides accumulate identical item
+    // sets so slot ordering matches across the wire. Items are world-
+    // physical things actors can carry; see the `items` module in the
+    // mod-API crate for the def shape.
+    let items_table = lua.create_table()?;
+    let pending_items = ctx.pending_items.clone();
+    let register_item = lua.create_function(move |lua, value: Value| {
+        let def: ItemDef = lua.from_value(value)?;
+        let mut buf = pending_items.lock().unwrap();
+        if buf.iter().any(|i| i.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate item id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    items_table.set("register", register_item)?;
+    engine.set("items", items_table)?;
 
     // engine.rooms.register(pattern) — both sides accumulate the same set
     // since shared.lua runs in both Lua states. The engine builds parallel

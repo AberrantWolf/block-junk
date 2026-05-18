@@ -4,6 +4,7 @@ use block_junk_mod_api::blocks::{BlockId, Cardinal};
 use serde::{Deserialize, Serialize};
 
 use crate::blocks::BlockSlot;
+use crate::items::ItemSlot;
 use crate::voxel::EntityEntry;
 
 pub const CHUNK_SIZE: u32 = 32;
@@ -41,13 +42,20 @@ pub struct BlockEdit {
 }
 
 /// Server-internal local-bus event, NOT a wire message. Emitted once per
-/// world cell whose slot changed. Subscribers (room dirty-marking, mod
-/// scripting hooks) react cell-by-cell without needing to know about
-/// block-entity footprints.
+/// world cell whose slot changed. Subscribers (room dirty-marking, drop
+/// spawning, mod scripting hooks) react cell-by-cell without needing to
+/// know about block-entity footprints.
+///
+/// `slot` is the *new* slot at this cell after the edit; `prev_slot` is
+/// what occupied it before. For a place: `prev_slot == EMPTY` by
+/// construction (the edit is rejected if the cell was occupied). For a
+/// break: `prev_slot` is whatever was destroyed, which is what drops /
+/// post-destroy effects need to look up in the registry.
 #[derive(Message, Clone, Copy, Debug)]
 pub struct CellEdit {
     pub world: IVec3,
     pub slot: BlockSlot,
+    pub prev_slot: BlockSlot,
 }
 
 /// Server → client on connect: the slot ↔ id table the server is using.
@@ -219,6 +227,29 @@ impl Ease for AvatarPose {
 #[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ChunkUnload {
     pub coord: ChunkCoord,
+}
+
+/// A loose item sitting in the world — what a destroyed block leaves
+/// behind, what an actor sets down when they drop their carry stack,
+/// and (Phase 4) what an NPC walks past and picks up to deliver to a
+/// plan. Server-authoritative entity; replicated to every client.
+///
+/// `item` is the registry slot (compact wire format, like `BlockSlot`
+/// for chunk storage). `translation` is the entity's world position at
+/// spawn — items don't move in Phase 1, so this is set once on the
+/// server and never updated, but lightyear still re-syncs on initial
+/// replicate and on any future server-side mutation. Yaw is omitted
+/// for now (items are tumbled visually with a per-entity random offset
+/// derived from spawn position; no facing direction to track).
+///
+/// 14 bytes on the wire (Vec3 + u16). Stacks of 5 dropped from one
+/// destroyed block are 5 entities = 70 B/spawn. Profile if drop rates
+/// climb; merging stacks into one entity with a count is the obvious
+/// next step.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorldItem {
+    pub item: ItemSlot,
+    pub translation: Vec3,
 }
 
 /// What a player has tagged a cell to become. Lives in the shared [`Plans`]
