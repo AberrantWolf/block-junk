@@ -850,6 +850,18 @@ fn server_player_step(
         registry: &registry,
     };
     for (mut pose, mut vel, mut on_ground, mut mode, input) in avatars.iter_mut() {
+        // Belt-and-braces against the controller starting embedded
+        // in a freshly-solid cell. Mirrors the client-side guard in
+        // `client_player_step`; same helper. The `Update`-scheduled
+        // `push_actors_out_of_new_blocks` handles the common case
+        // synchronously with the edit, but a save-load + edit during
+        // an in-flight tick can land the controller here with the
+        // body already inside the new geometry.
+        let rescue = crate::physics::rescue_embedded_actor(&mut pose.translation, &world);
+        if rescue != Vec3::ZERO {
+            vel.0.x = 0.0;
+            vel.0.z = 0.0;
+        }
         apply_walk_step(&mut pose, &mut vel, &mut on_ground, &mut mode, &input.0, dt, &world);
     }
 }

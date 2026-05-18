@@ -182,6 +182,85 @@ pub fn apply_separation_push_swept(translation: &mut Vec3, push: Vec2, world: &W
     *translation += total;
 }
 
+/// If this actor's body AABB overlaps any solid cell, mutate
+/// `translation` toward the smallest push that lands the AABB fully
+/// clear of solids. Iterative — corner-embedded actors may need two
+/// or three axis-aligned hops to escape. Returns the total push
+/// applied; `Vec3::ZERO` if the actor wasn't embedded.
+///
+/// Same selection rule as the `CellEdit`-driven server pushout, just
+/// keyed off a snapshot of the world rather than an edit event. Safe
+/// to call at the start of every controller tick (it's a no-op when
+/// the actor is already clear). Used by both `server_player_step`
+/// and `client_player_step` as a belt-and-braces guard against
+/// "block placed under me and I got stuck" — the edit-driven pushout
+/// runs in `Update` and the controller runs in `FixedUpdate`, so on
+/// the client side the predicted avatar can briefly see the new
+/// chunk geometry before its pose is rescued. This per-tick check
+/// closes that gap.
+///
+/// Max iterations is small (4) — beyond that the actor is in a
+/// sealed pocket and there's nothing more we can do without
+/// teleport-blind logic.
+pub fn rescue_embedded_actor(translation: &mut Vec3, world: &WorldCollision) -> Vec3 {
+    const PUSH_EPS: f32 = 1e-3;
+    const MAX_ITERS: usize = 4;
+    let mut total = Vec3::ZERO;
+    for _ in 0..MAX_ITERS {
+        let centre = *translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
+        let aabb_min = centre - PLAYER_HALF_EXTENTS;
+        let aabb_max = centre + PLAYER_HALF_EXTENTS;
+        let probe = Aabb::from_min_max(aabb_min, aabb_max);
+        let solids = world.candidates(probe);
+        let overlap = solids.iter().find(|s| {
+            aabb_max.x > s.min.x
+                && aabb_min.x < s.max.x
+                && aabb_max.y > s.min.y
+                && aabb_min.y < s.max.y
+                && aabb_max.z > s.min.z
+                && aabb_min.z < s.max.z
+        });
+        let Some(s) = overlap else {
+            return total;
+        };
+        let mut candidates = [
+            Vec3::new(s.min.x - aabb_max.x - PUSH_EPS, 0.0, 0.0),
+            Vec3::new(s.max.x - aabb_min.x + PUSH_EPS, 0.0, 0.0),
+            Vec3::new(0.0, s.min.y - aabb_max.y - PUSH_EPS, 0.0),
+            Vec3::new(0.0, s.max.y - aabb_min.y + PUSH_EPS, 0.0),
+            Vec3::new(0.0, 0.0, s.min.z - aabb_max.z - PUSH_EPS),
+            Vec3::new(0.0, 0.0, s.max.z - aabb_min.z + PUSH_EPS),
+        ];
+        candidates.sort_by(|a, b| {
+            a.length_squared()
+                .partial_cmp(&b.length_squared())
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        let chosen = candidates.iter().copied().find(|push| {
+            let new_min = aabb_min + *push;
+            let new_max = aabb_max + *push;
+            let region = Aabb::from_min_max(new_min, new_max);
+            let solids = world.candidates(region);
+            !solids.iter().any(|s| {
+                new_max.x > s.min.x
+                    && new_min.x < s.max.x
+                    && new_max.y > s.min.y
+                    && new_min.y < s.max.y
+                    && new_max.z > s.min.z
+                    && new_min.z < s.max.z
+            })
+        });
+        match chosen {
+            Some(push) => {
+                *translation += push;
+                total += push;
+            }
+            None => return total,
+        }
+    }
+    total
+}
+
 /// Walking speed on the ground (m/s). Between Minecraft (~4.3) and Quake (~9).
 pub const WALK_SPEED: f32 = 5.0;
 

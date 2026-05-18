@@ -22,7 +22,7 @@ use crate::npc::{Npc, NpcId, NpcKind, NpcPath};
 use crate::npc_registry::NpcKindRegistry;
 use crate::physics::{
     EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_separation_push_swept, apply_walk_step,
-    compute_actor_separation_pushes,
+    compute_actor_separation_pushes, rescue_embedded_actor,
 };
 use crate::inspect_panel::InspectPanelPlugin;
 use crate::plans::{Plans, PlansClientPlugin};
@@ -2121,6 +2121,20 @@ fn client_player_step(
         registry: &registry,
     };
     for (mut pose, mut vel, mut on_ground, mut mode, input) in avatars.iter_mut() {
+        // Belt-and-braces: if the predicted avatar starts the tick
+        // inside a solid cell (an NPC just built where we were
+        // standing, the server's edit-driven pushout fired in
+        // `Update` but the replicated pose hasn't reconciled here
+        // yet), nudge them clear before the walk-step would otherwise
+        // wedge them into the new wall.
+        let rescue = rescue_embedded_actor(&mut pose.translation, &world);
+        if rescue != Vec3::ZERO {
+            // Lateral component of the rescue counts as a velocity
+            // reset — we just teleported sideways, we don't want
+            // the controller carrying a "moving into a wall" vector.
+            vel.0.x = 0.0;
+            vel.0.z = 0.0;
+        }
         apply_walk_step(&mut pose, &mut vel, &mut on_ground, &mut mode, &input.0, dt, &world);
     }
 }
