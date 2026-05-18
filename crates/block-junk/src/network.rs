@@ -20,9 +20,9 @@ use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, MovementIntent, MovementMode,
-    NpcAnimOverride, NpcDetails, PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails,
-    WorldChannel, WorldClockSync, WorldItem,
+    Carrying, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, DropRequest,
+    MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit,
+    PlanEditBatch, PlanFullSync, RequestNpcDetails, WorldChannel, WorldClockSync, WorldItem,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +97,11 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<NpcDetails>()
             .add_direction(NetworkDirection::ServerToClient);
+        // Carry I/O. Client requests; server is the source of truth.
+        app.register_message::<PickupRequest>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<DropRequest>()
+            .add_direction(NetworkDirection::ClientToServer);
 
         // Player-avatar replication. Server owns the avatar entities; the
         // marker tells receivers "attach a mesh," and `AvatarPose` is the
@@ -116,6 +121,11 @@ impl Plugin for ProtocolPlugin {
         // spawn position; that's all the client needs to render the
         // pile.
         app.register_component::<WorldItem>();
+        // Actor carry stack. Replicated to every client so the owner
+        // can read their own state for HUD; no prediction because
+        // pickup/drop are discrete server-authoritative events, not
+        // continuous-per-frame updates worth rolling back.
+        app.register_component::<Carrying>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between
         // server samples instead of snapping every 50 ms).

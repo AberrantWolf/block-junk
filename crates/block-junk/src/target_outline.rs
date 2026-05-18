@@ -25,15 +25,17 @@
 //! visibility/material bookkeeping a real entity would need.
 
 use bevy::prelude::*;
+use lightyear::prelude::Predicted;
 
 use crate::blocks::BlockRegistry;
 use crate::client::{
-    PlaceablePalette, RAYCAST_REACH, SelectedBlock, entity_aware_raycast,
+    PlaceablePalette, RAYCAST_REACH, SelectedBlock, entity_aware_raycast, raycast_world_items,
 };
+use crate::items::PLAYER_CARRY_CAPACITY;
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans, raycast_plans};
 use crate::player_mode::PlayerMode;
-use crate::protocol::{GameSet, PlanKind};
+use crate::protocol::{Avatar, Carrying, GameSet, PlanKind, WorldItem};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
 pub struct TargetOutlinePlugin;
@@ -85,6 +87,8 @@ fn draw_target_outline(
     plans: Res<Plans>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
+    world_items: Query<&WorldItem>,
+    local_carry: Query<&Carrying, (With<Avatar>, With<Predicted>)>,
     mut gizmos: Gizmos,
 ) {
     // During an in-flight Plan-mode drag the rectangle preview is the
@@ -104,9 +108,13 @@ fn draw_target_outline(
         PlayerMode::Plan => draw_plan_target(
             origin, dir, &chunks, &chunk_map, &registry, &plans, &selected, &palette, &mut gizmos,
         ),
-        PlayerMode::Normal => draw_normal_target(
-            origin, dir, &chunks, &chunk_map, &registry, &plans, &mut gizmos,
-        ),
+        PlayerMode::Normal => {
+            let carry = local_carry.single().copied().unwrap_or_default();
+            draw_normal_target(
+                origin, dir, &chunks, &chunk_map, &registry, &plans, &world_items, carry,
+                &mut gizmos,
+            );
+        }
     }
 }
 
@@ -154,6 +162,7 @@ fn draw_plan_target(
     draw_cell(gizmos, target, colour);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_normal_target(
     origin: Vec3,
     dir: Vec3,
@@ -161,15 +170,22 @@ fn draw_normal_target(
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
     plans: &Plans,
+    world_items: &Query<&WorldItem>,
+    carry: Carrying,
     gizmos: &mut Gizmos,
 ) {
-    // Two candidate targets, same logic as `resolve_self_work` uses:
-    // either the world-raycast cell is itself tagged (Remove on solid)
-    // or a plan-raycast picks up a Build tag in empty space. Whichever
-    // is closer to the camera wins (tie → world).
+    // Three candidate targets, in priority order by distance:
+    //   1. World item along the ray (gold: pickup).
+    //   2. Tagged cell from world or plan raycast (orange: self-work).
+    //   3. Solid block from the world raycast (red: direct-destroy).
+    // L-click resolves to (1) or (2) at the action input; R-click acts
+    // on (3). Outline matches whichever the next click would commit.
     let world_hit = entity_aware_raycast(
         origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None,
     );
+    let world_hit_dist = world_hit
+        .as_ref()
+        .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - origin).length());
     let world_tagged = world_hit.as_ref().and_then(|h| {
         plans.get(h.cell).map(|_| {
             let dist = (h.cell.as_vec3() + Vec3::splat(0.5) - origin).length();
@@ -177,16 +193,37 @@ fn draw_normal_target(
         })
     });
     let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, plans);
+    let item_hit = raycast_world_items(origin, dir, RAYCAST_REACH, world_items);
 
+    // Pick the tagged candidate (world or plan), whichever is closer.
     let tagged_target = match (world_tagged, plan_hit) {
-        (Some(a), Some(b)) if a.0 <= b.0 => Some(a.1),
-        (Some(_), Some(b)) => Some(b.1),
-        (Some(a), None) => Some(a.1),
-        (None, Some(b)) => Some(b.1),
+        (Some(a), Some(b)) if a.0 <= b.0 => Some(a),
+        (Some(_), Some(b)) => Some(b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
         (None, None) => None,
     };
-    if let Some(cell) = tagged_target {
-        // Orange: L-click would self-work this cell.
+
+    // Item wins outright if it's closer than the tagged cell *and* the
+    // world hit. Compatible with the click-side resolver in
+    // `normal_mode_action_input`.
+    if let Some((item_translation, item_dist, item_slot)) = item_hit {
+        let tagged_dist = tagged_target.map(|(d, _)| d);
+        let beats_tagged = tagged_dist.map(|td| item_dist < td).unwrap_or(true);
+        let beats_world = world_hit_dist.map(|wd| item_dist < wd).unwrap_or(true);
+        if beats_tagged && beats_world {
+            let colour = if carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
+                Color::srgb(1.0, 0.78, 0.18) // gold: pickup ready
+            } else {
+                Color::srgb(0.55, 0.78, 0.95) // cyan: inspect only (full / wrong type)
+            };
+            draw_item_box(gizmos, item_translation, colour);
+            return;
+        }
+    }
+
+    if let Some((_, cell)) = tagged_target {
+        // Orange: L-click hold would self-work this cell.
         draw_cell(gizmos, cell, Color::srgb(1.0, 0.6, 0.1));
         return;
     }
@@ -203,4 +240,14 @@ fn draw_normal_target(
 fn draw_cell(gizmos: &mut Gizmos, cell: IVec3, colour: Color) {
     let centre = cell.as_vec3() + Vec3::splat(0.5);
     gizmos.cube(Transform::from_translation(centre), colour);
+}
+
+/// Outline a small box at a `WorldItem`'s translation. The 0.6 m cube
+/// matches the picking AABB in `raycast_world_items` — what the player
+/// sees is what they'd click.
+fn draw_item_box(gizmos: &mut Gizmos, translation: Vec3, colour: Color) {
+    gizmos.cube(
+        Transform::from_translation(translation).with_scale(Vec3::splat(0.6)),
+        colour,
+    );
 }

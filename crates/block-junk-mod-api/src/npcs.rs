@@ -142,6 +142,13 @@ pub struct NpcKindDef {
     /// planner sees an absent entry, not a zero.
     #[serde(default)]
     pub default_needs: HashMap<String, f32>,
+    /// Maximum stack size this kind can carry. Hauling NPCs (Phase 4)
+    /// read this when the assignment scheduler picks them up for a
+    /// build with multi-unit material costs — a higher cap means
+    /// fewer round-trips. Defaults to 3 (vanilla villager baseline)
+    /// so existing mod data registers unchanged.
+    #[serde(default = "default_carry_capacity")]
+    pub carry_capacity: u32,
     /// Default animation clips for this NPC kind. Required so a
     /// freshly-spawned NPC has *something* to render — the client's
     /// drive-animation system uses these as the velocity-hysteresis
@@ -435,6 +442,10 @@ pub enum PlannerGoal {
 
 fn default_wander_radius() -> i32 {
     12
+}
+
+fn default_carry_capacity() -> u32 {
+    3
 }
 
 fn default_wander_timeout() -> f32 {

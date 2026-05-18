@@ -229,6 +229,71 @@ pub struct ChunkUnload {
     pub coord: ChunkCoord,
 }
 
+/// What an `Actor` (player or NPC) is currently carrying. The whole
+/// inventory: a single stack of one item kind, or nothing. See the
+/// `ephemeral-single-stack-carry` memory for why this is intentionally
+/// minimal — the constraint is the gameplay.
+///
+/// Invariant: `count == 0` ⇒ `item == None`. The `pickup` /
+/// `drop_all` helpers maintain it; direct field writes shouldn't
+/// violate it.
+///
+/// Server-authoritative; replicated to all clients without prediction.
+/// The owner reads their own carry off their `Predicted` avatar copy,
+/// HUD lag = one server round-trip. Remote players' carry isn't
+/// rendered yet — float-above-head visualisation lands when NPC
+/// haul-state visuals do (Phase 4).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Carrying {
+    pub item: Option<ItemSlot>,
+    pub count: u32,
+}
+
+impl Carrying {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0 || self.item.is_none()
+    }
+
+    /// Whether `item` can be added to this stack given the carry cap.
+    /// Empty hand always accepts a single unit; a partial matching stack
+    /// accepts up to `cap - count` more.
+    pub fn can_accept(&self, item: ItemSlot, cap: u32) -> bool {
+        if self.is_empty() {
+            cap > 0
+        } else {
+            self.item == Some(item) && self.count < cap
+        }
+    }
+
+    /// Add one unit of `item`. Returns `true` on success, `false` if the
+    /// add would violate the cap or mix item types.
+    pub fn pickup_one(&mut self, item: ItemSlot, cap: u32) -> bool {
+        if !self.can_accept(item, cap) {
+            return false;
+        }
+        if self.is_empty() {
+            self.item = Some(item);
+            self.count = 1;
+        } else {
+            self.count += 1;
+        }
+        true
+    }
+
+    /// Empty the stack. Returns what was being held (if anything) so the
+    /// caller can spawn the corresponding `WorldItem`s.
+    pub fn drop_all(&mut self) -> Option<(ItemSlot, u32)> {
+        let item = self.item.take()?;
+        let count = self.count;
+        self.count = 0;
+        if count == 0 { None } else { Some((item, count)) }
+    }
+}
+
 /// A loose item sitting in the world — what a destroyed block leaves
 /// behind, what an actor sets down when they drop their carry stack,
 /// and (Phase 4) what an NPC walks past and picks up to deliver to a
@@ -476,6 +541,29 @@ pub struct DebugBumpNeed {
 pub struct RequestNpcDetails {
     pub npc_id: u64,
 }
+
+/// Client → server: pick up the loose item closest to `target` in world
+/// space. The client raycast resolves which `WorldItem` is under the
+/// cursor and sends its translation; the server does a fuzzy spatial
+/// match (`PICKUP_MATCH_RADIUS`) to find the actual entity. Entity ids
+/// don't cross the wire here — `WorldItem` doesn't carry a stable
+/// network id, and a fuzzy translation match is enough since loose
+/// items don't move between when the client clicks and when the
+/// server receives.
+///
+/// Server validates: the player has carry capacity for the item kind,
+/// the player isn't unreasonably far from `target`. Failure is
+/// silent — the HUD just doesn't update.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PickupRequest {
+    pub target: Vec3,
+}
+
+/// Client → server: drop the player's entire carry stack at their
+/// feet. No payload — the server reads the player's Carrying to
+/// know what to drop. No-op when the player is empty-handed.
+#[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct DropRequest;
 
 /// Server → client: targeted reply to a [`RequestNpcDetails`]. Sent on
 /// `WorldChannel` to the requesting connection only — clients don't

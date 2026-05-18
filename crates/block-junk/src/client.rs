@@ -29,11 +29,12 @@ use crate::plans::{Plans, PlansClientPlugin};
 use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::target_outline::TargetOutlinePlugin;
-use crate::items::ItemRegistry;
+use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet, MovementIntent, MovementMode,
-    NpcAnimOverride, PlanKind, WorldChannel, WorldClock, WorldClockSync, WorldItem,
+    Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DropRequest, GameSet,
+    MovementIntent, MovementMode, NpcAnimOverride, PickupRequest, PlanKind, WorldChannel,
+    WorldClock, WorldClockSync, WorldItem,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -98,6 +99,7 @@ impl Plugin for ClientPlugin {
                 Update,
                 (
                     normal_mode_action_input,
+                    drop_carry_input,
                     cycle_selected_or_rotation,
                     reset_rotation_on_selection_change,
                 )
@@ -193,6 +195,7 @@ impl Plugin for ClientPlugin {
                     refresh_block_entities,
                     update_hotbar_highlight,
                     update_hotbar_visibility,
+                    update_carry_hud,
                     update_action_progress_ui,
                     draw_npc_paths,
                 )
@@ -661,6 +664,8 @@ fn setup_scene(
                 }
             });
         });
+
+    spawn_carry_hud(&mut commands);
 }
 
 /// One scroll handler covers both jobs because Ctrl gates which one fires:
@@ -731,6 +736,119 @@ fn reset_rotation_on_selection_change(
 ) {
     if selected.is_changed() {
         rotation.0 = Cardinal::default();
+    }
+}
+
+/// Root of the bottom-centre carry HUD chip. Visibility is Hidden when
+/// the player isn't carrying anything; otherwise Inherited.
+#[derive(Component)]
+struct CarryHudRoot;
+
+/// Marker on the colour swatch — `BackgroundColor` is updated to the
+/// item def's `color` on every carry change.
+#[derive(Component)]
+struct CarryHudIcon;
+
+/// Marker on the `n / cap` text. Updated whenever the carry count
+/// changes.
+#[derive(Component)]
+struct CarryHudLabel;
+
+fn spawn_carry_hud(commands: &mut Commands) {
+    // Full-width row centred horizontally; the actual visible chip is
+    // a child that sizes to its content.
+    commands
+        .spawn((
+            CarryHudRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(24.0),
+                width: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            Visibility::Hidden,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                    column_gap: Val::Px(8.0),
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.78)),
+                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+            ))
+            .with_children(|chip| {
+                chip.spawn((
+                    CarryHudIcon,
+                    Node {
+                        width: Val::Px(28.0),
+                        height: Val::Px(28.0),
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.5, 0.5, 0.5, 1.0)),
+                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.35)),
+                ));
+                chip.spawn((
+                    CarryHudLabel,
+                    Text::new(""),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+}
+
+/// Mirror the local player's `Carrying` onto the HUD chip. Reads from
+/// the Predicted avatar (the local player's authoritative copy on the
+/// client side). Hides the chip when empty-handed.
+fn update_carry_hud(
+    local_carry: Query<&Carrying, (With<Avatar>, With<Predicted>)>,
+    items: Res<ItemRegistry>,
+    mut roots: Query<&mut Visibility, With<CarryHudRoot>>,
+    mut icons: Query<&mut BackgroundColor, With<CarryHudIcon>>,
+    mut labels: Query<&mut Text, With<CarryHudLabel>>,
+) {
+    // No predicted avatar yet → nothing to show.
+    let Ok(carry) = local_carry.single() else {
+        for mut v in roots.iter_mut() {
+            *v = Visibility::Hidden;
+        }
+        return;
+    };
+    let (vis, swatch, text) = match (carry.item, carry.count) {
+        (Some(slot), count) if count > 0 => {
+            let def = items.def(slot);
+            let [r, g, b] = def.color;
+            let label = format!(
+                "{}  {}/{}",
+                def.display_name, count, PLAYER_CARRY_CAPACITY
+            );
+            (
+                Visibility::Inherited,
+                Color::srgba(r, g, b, 1.0),
+                label,
+            )
+        }
+        _ => (Visibility::Hidden, Color::srgba(0.5, 0.5, 0.5, 1.0), String::new()),
+    };
+    for mut v in roots.iter_mut() {
+        *v = vis;
+    }
+    for mut bg in icons.iter_mut() {
+        bg.0 = swatch;
+    }
+    for mut t in labels.iter_mut() {
+        t.0 = text.clone();
     }
 }
 
@@ -939,8 +1057,11 @@ fn normal_mode_action_input(
     chunk_map: Res<ChunkMap>,
     plans: Res<Plans>,
     registry: Res<BlockRegistry>,
+    world_items: Query<&WorldItem>,
+    local_carry: Query<&Carrying, (With<Avatar>, With<Predicted>)>,
     mut action: ResMut<PlayerActionState>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
+    mut pickup_sender: Query<&mut MessageSender<PickupRequest>>,
 ) {
     // Only Normal uses the action timer. Switching modes or losing
     // cursor lock mid-action cancels the in-flight progress so
@@ -972,6 +1093,49 @@ fn normal_mode_action_input(
     };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
+
+    // Pickup fast-path: L just-pressed on a WorldItem that's *closer*
+    // than any solid block along the ray. Pickup is instant (no
+    // hold-timer), so we short-circuit before the world raycast feeds
+    // the self-work resolver. Pickup is L-click only — R-click is
+    // direct-destroy, never pickup.
+    if mouse.just_pressed(MouseButton::Left) {
+        let item_hit = raycast_world_items(cam_pos, cam_dir, RAYCAST_REACH, &world_items);
+        // Need the world-hit distance to compare. If the world ray
+        // doesn't hit anything, an item hit always wins.
+        let world_hit_dist = entity_aware_raycast(
+            cam_pos,
+            cam_dir,
+            RAYCAST_REACH,
+            &chunks,
+            &chunk_map,
+            &registry,
+            None,
+        )
+        .as_ref()
+        .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
+        if let Some((item_translation, item_dist, item_slot)) = item_hit
+            && world_hit_dist.map(|wd| item_dist < wd).unwrap_or(true)
+        {
+            // Client-side carry check: skip the wire request if the
+            // local carry can't accept this item kind. Saves a round-
+            // trip on obviously-can't-pickup clicks. Server re-validates
+            // — this is an ergonomic short-circuit, not a security gate.
+            let carry = local_carry.single().copied().unwrap_or_default();
+            if carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
+                if let Ok(mut sender) = pickup_sender.single_mut() {
+                    sender.send::<WorldChannel>(PickupRequest {
+                        target: item_translation,
+                    });
+                }
+            }
+            // Consume the click whether we sent or not — the player
+            // aimed at an item and tapped; we shouldn't fall through
+            // to self-work / direct-destroy on the same click.
+            action.active = None;
+            return;
+        }
+    }
 
     // World raycast hits whatever solid block (or block-entity) is
     // first along the ray. `skip_plan_remove = None`: in Normal mode
@@ -1036,6 +1200,29 @@ fn normal_mode_action_input(
             kind,
             progress,
         });
+    }
+}
+
+/// Q key → send a `DropRequest`. Works in any mode (carry exists
+/// across mode switches; dropping should too). Server handles the
+/// no-op when the player is empty-handed.
+fn drop_carry_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    mut sender: Query<&mut MessageSender<DropRequest>>,
+) {
+    let locked = cursors
+        .single()
+        .map(|c| c.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+    if !locked {
+        return;
+    }
+    if !keys.just_pressed(KeyCode::KeyQ) {
+        return;
+    }
+    if let Ok(mut s) = sender.single_mut() {
+        s.send::<WorldChannel>(DropRequest);
     }
 }
 
@@ -1168,6 +1355,48 @@ pub(crate) fn raycast_npcs(
                 npc_id: *id,
                 distance: t,
             });
+        }
+    }
+    best
+}
+
+/// Slab-test the camera ray against every `WorldItem`'s approximate
+/// AABB. Items have no declared bounding box yet, so we use a generous
+/// fixed 0.6 m cube centred on the item's translation — wide enough
+/// that a casual click hits, narrow enough that a stack of 5 doesn't
+/// overlap into the next item over.
+///
+/// Returns `(translation, distance, item_slot)` for the closest hit
+/// within `max_distance`, or `None` if nothing's in range. Linear in
+/// item count; fine while the world holds dozens of loose items. Will
+/// need spatial pruning if we ever push into the hundreds.
+pub(crate) fn raycast_world_items(
+    origin: Vec3,
+    dir: Vec3,
+    max_distance: f32,
+    items: &Query<&WorldItem>,
+) -> Option<(Vec3, f32, ItemSlot)> {
+    const HALF: f32 = 0.3;
+    let inv_dir = Vec3::ONE / dir;
+    let mut best: Option<(Vec3, f32, ItemSlot)> = None;
+    for wi in items.iter() {
+        let min = wi.translation - Vec3::splat(HALF);
+        let max = wi.translation + Vec3::splat(HALF);
+        let t1 = (min - origin) * inv_dir;
+        let t2 = (max - origin) * inv_dir;
+        let tmin_v = t1.min(t2);
+        let tmax_v = t1.max(t2);
+        let tmin = tmin_v.x.max(tmin_v.y).max(tmin_v.z);
+        let tmax = tmax_v.x.min(tmax_v.y).min(tmax_v.z);
+        if tmax < tmin || tmax < 0.0 {
+            continue;
+        }
+        let t = if tmin >= 0.0 { tmin } else { tmax };
+        if t > max_distance {
+            continue;
+        }
+        if best.as_ref().map(|(_, bd, _)| t < *bd).unwrap_or(true) {
+            best = Some((wi.translation, t, wi.item));
         }
     }
     best

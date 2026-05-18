@@ -19,14 +19,15 @@ use crate::physics::{
 use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    CHUNK_PADDED, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, GameSet,
-    MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PlanEdit, PlanKind, RequestNpcDetails,
-    WorldChannel, WorldClock, WorldClockSync, WorldItem,
+    CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
+    DropRequest, GameSet, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
+    PickupRequest, PlanEdit, PlanKind, RequestNpcDetails, WorldChannel, WorldClock,
+    WorldClockSync, WorldItem,
 };
-use crate::items::ItemRegistry;
+use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::save::{SAVE_VERSION, SaveFile, SavedChunk, SavedNpc, read_save, write_save};
+use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedNpc, SavedWorldItem, read_save, write_save};
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
     world_to_chunk,
@@ -57,6 +58,7 @@ impl Plugin for ServerPlugin {
         app.init_resource::<ClientChunks>();
         app.init_resource::<PendingChunks>();
         app.init_resource::<PendingSpawnPose>();
+        app.init_resource::<PendingSpawnCarry>();
         app.init_resource::<RoomMap>();
         app.init_resource::<DetectionDirty>();
         // World clock. Start at 0.25 (sunrise) so a fresh session begins
@@ -117,6 +119,10 @@ impl Plugin for ServerPlugin {
         );
         app.add_systems(
             Update,
+            (receive_pickup_requests, receive_drop_requests).in_set(GameSet::Simulation),
+        );
+        app.add_systems(
+            Update,
             (poll_chunk_gen, update_aoi)
                 .chain()
                 .in_set(GameSet::Simulation),
@@ -169,6 +175,12 @@ impl Plugin for ServerPlugin {
 #[derive(Resource, Default)]
 pub struct PendingSpawnPose(pub Option<AvatarPose>);
 
+/// Companion to [`PendingSpawnPose`] for the player's carry stack.
+/// Consumed at the same point so the reloading player lands with the
+/// same item in hand they had at save.
+#[derive(Resource, Default)]
+pub struct PendingSpawnCarry(pub Option<Carrying>);
+
 /// Server App Startup: if `ServerSaveConfig::load_existing`, read the save
 /// file and pre-populate `ChunkMap` with the persisted edited chunks. They
 /// land with the `ChunkEdited` marker so subsequent AoI sends ship the
@@ -182,11 +194,13 @@ fn load_from_save(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut pending_pose: ResMut<PendingSpawnPose>,
+    mut pending_carry: ResMut<PendingSpawnCarry>,
     mut dirty: ResMut<DetectionDirty>,
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
     config: Option<Res<ServerSaveConfig>>,
     block_registry: Res<BlockRegistry>,
+    item_registry: Res<ItemRegistry>,
     kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
 ) {
     let Some(config) = config else {
@@ -206,10 +220,11 @@ fn load_from_save(
         }
     };
     info!(
-        "loading {} edited chunks + {} NPCs + {} plans from save {name:?}",
+        "loading {} edited chunks + {} NPCs + {} plans + {} world items from save {name:?}",
         save.edited_chunks.len(),
         save.npcs.len(),
         save.plans.len(),
+        save.world_items.len(),
     );
     // Restore the plan map before chunk spawn so `auto_clear_stale_plans`
     // running on the load's CellEdits doesn't see a partial state.
@@ -280,6 +295,58 @@ fn load_from_save(
     for npc in save.npcs {
         spawn_loaded_npc(&mut commands, npc, &kind_registry);
     }
+    // Loose items in the world. Resolve item ids → slots through the
+    // current registry. An item id missing from the registry (mod
+    // removed / renamed between sessions) gets logged and skipped —
+    // the rest of the world still loads.
+    let mut loaded_items = 0usize;
+    for saved in save.world_items {
+        let id = block_junk_mod_api::items::ItemId::new(saved.item_id.clone());
+        let Some(slot) = item_registry.slot_of(&id) else {
+            warn!(
+                item = %saved.item_id,
+                "saved world item references unknown item id; skipping",
+            );
+            continue;
+        };
+        let translation = saved.translation;
+        commands.spawn((
+            WorldItem {
+                item: slot,
+                translation,
+            },
+            Transform::from_translation(translation),
+            GlobalTransform::default(),
+            Replicate::to_clients(NetworkTarget::All),
+            Name::new(format!("WorldItem(loaded:{})", id)),
+        ));
+        loaded_items += 1;
+    }
+    if loaded_items > 0 {
+        info!("spawned {loaded_items} loose world items from save");
+    }
+    // Carry: resolve item id → slot, hand off via PendingSpawnCarry so
+    // register_new_client can apply it to the spawning avatar.
+    if let Some(saved_carry) = save.last_player_carry {
+        let id = block_junk_mod_api::items::ItemId::new(saved_carry.item_id.clone());
+        match item_registry.slot_of(&id) {
+            Some(slot) => {
+                pending_carry.0 = Some(Carrying {
+                    item: Some(slot),
+                    count: saved_carry.count,
+                });
+                info!(
+                    item = %saved_carry.item_id,
+                    count = saved_carry.count,
+                    "restored player carry from save",
+                );
+            }
+            None => warn!(
+                item = %saved_carry.item_id,
+                "saved player carry references unknown item id; spawning empty-handed",
+            ),
+        }
+    }
 }
 
 /// Spawn an NPC entity restored from a save. Mirrors the cluster-spawn
@@ -343,8 +410,10 @@ fn save_on_request(
     clock: Res<WorldClock>,
     plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
-    avatars: Query<&AvatarPose, With<Avatar>>,
+    avatars: Query<(&AvatarPose, &Carrying), With<Avatar>>,
     npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
+    world_items: Query<&WorldItem>,
+    item_registry: Res<ItemRegistry>,
 ) {
     let Some(flag) = flag else {
         return;
@@ -371,20 +440,62 @@ fn save_on_request(
     let npc_count = saved_npcs.len();
     let saved_plans = plans.snapshot();
     let plan_count = saved_plans.len();
+    let saved_items = collect_saved_world_items(&world_items, &item_registry);
+    let item_count = saved_items.len();
+    let (saved_pose, saved_carry) = first_avatar_state(&avatars, &item_registry);
     let save = SaveFile {
         version: SAVE_VERSION,
         edited_chunks: edited,
-        last_player_pose: avatars.iter().next().copied(),
+        last_player_pose: saved_pose,
         npcs: saved_npcs,
         world_clock: Some(*clock),
         plans: saved_plans,
+        world_items: saved_items,
+        last_player_carry: saved_carry,
     };
     match write_save(name, &save) {
         Ok(()) => info!(
-            "save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans to {name:?}",
+            "save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items to {name:?}",
         ),
         Err(e) => error!("save-on-request to {name:?} failed: {e}"),
     }
+}
+
+/// Snapshot every loose `WorldItem`. Converts the engine slot back to
+/// the stable [`ItemId`] string so the save survives a registry
+/// rebuild that changes slot ordering.
+fn collect_saved_world_items(
+    items: &Query<&WorldItem>,
+    item_registry: &ItemRegistry,
+) -> Vec<SavedWorldItem> {
+    items
+        .iter()
+        .map(|wi| SavedWorldItem {
+            item_id: item_registry.id_of(wi.item).to_string(),
+            translation: wi.translation,
+        })
+        .collect()
+}
+
+/// Pull the first connected avatar's pose + (non-empty) carry, mirroring
+/// the "first reconnect wins" convention `last_player_pose` already
+/// uses. Returns the carry only when non-empty so a save with one
+/// player holding nothing serialises as `last_player_carry = None`.
+fn first_avatar_state(
+    avatars: &Query<(&AvatarPose, &Carrying), With<Avatar>>,
+    item_registry: &ItemRegistry,
+) -> (Option<AvatarPose>, Option<SavedCarry>) {
+    let Some((pose, carry)) = avatars.iter().next() else {
+        return (None, None);
+    };
+    let saved_carry = match (carry.item, carry.count) {
+        (Some(slot), count) if count > 0 => Some(SavedCarry {
+            item_id: item_registry.id_of(slot).to_string(),
+            count,
+        }),
+        _ => None,
+    };
+    (Some(*pose), saved_carry)
 }
 
 /// Snapshot every NPC's persistent state. `BrainDisabled` NPCs are
@@ -423,8 +534,10 @@ fn save_then_shutdown(
     clock: Res<WorldClock>,
     plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
-    avatars: Query<&AvatarPose, With<Avatar>>,
+    avatars: Query<(&AvatarPose, &Carrying), With<Avatar>>,
     npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
+    world_items: Query<&WorldItem>,
+    item_registry: Res<ItemRegistry>,
     mut exit: MessageWriter<AppExit>,
     mut handled: Local<bool>,
 ) {
@@ -452,20 +565,25 @@ fn save_then_shutdown(
                     .collect();
                 let saved_npcs = collect_saved_npcs(&npcs);
                 let saved_plans = plans.snapshot();
+                let saved_items = collect_saved_world_items(&world_items, &item_registry);
+                let (saved_pose, saved_carry) = first_avatar_state(&avatars, &item_registry);
                 let chunk_count = edited.len();
                 let npc_count = saved_npcs.len();
                 let plan_count = saved_plans.len();
+                let item_count = saved_items.len();
                 let save = SaveFile {
                     version: SAVE_VERSION,
                     edited_chunks: edited,
-                    last_player_pose: avatars.iter().next().copied(),
+                    last_player_pose: saved_pose,
                     npcs: saved_npcs,
                     world_clock: Some(*clock),
                     plans: saved_plans,
+                    world_items: saved_items,
+                    last_player_carry: saved_carry,
                 };
                 match write_save(name, &save) {
                     Ok(()) => info!(
-                        "saved {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans to {name:?}",
+                        "saved {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items to {name:?}",
                     ),
                     Err(e) => error!("save to {name:?} failed: {e}"),
                 }
@@ -534,6 +652,7 @@ fn register_new_client(
     mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
     mut pending_pose: ResMut<PendingSpawnPose>,
+    mut pending_carry: ResMut<PendingSpawnCarry>,
     registry: Res<BlockRegistry>,
     mut manifests: Query<&mut MessageSender<BlockManifest>>,
 ) {
@@ -557,6 +676,10 @@ fn register_new_client(
         translation: Vec3::new(0.0, 32.0, 60.0),
         yaw: 0.0,
     });
+    // Restore the saved carry stack if one was provided (single-player
+    // "first reconnect wins" convention, same as `PendingSpawnPose`).
+    // Otherwise start empty-handed.
+    let spawn_carry = pending_carry.0.take().unwrap_or_default();
     let avatar = commands
         .spawn((
             Actor,
@@ -565,6 +688,7 @@ fn register_new_client(
             AvatarVelocity::default(),
             AvatarOnGround::default(),
             MovementMode::default(),
+            spawn_carry,
             ActionState::<MovementIntent>::default(),
             Replicate::to_clients(NetworkTarget::All),
             PredictionTarget::to_clients(NetworkTarget::Single(remote.0)),
@@ -1179,6 +1303,118 @@ fn receive_npc_inspection_requests(
             if let Ok(mut sender) = senders.get_mut(connection) {
                 sender.send::<WorldChannel>(details);
             }
+        }
+    }
+}
+
+/// Tolerance for the fuzzy spatial match in `receive_pickup_requests`.
+/// 0.5 m is wider than any plausible client-server clock drift on the
+/// item's position (items don't move; the only "drift" is sub-tick
+/// scheduling) but tight enough that a click won't grab a neighbouring
+/// pile by accident.
+const PICKUP_MATCH_RADIUS: f32 = 0.5;
+
+/// Anti-cheat distance from player eye to the pickup target. Generous —
+/// a real reach gate based on the avatar's actual cursor raycast lives
+/// client-side; this just rejects gross outliers.
+const PICKUP_PLAYER_REACH: f32 = 12.0;
+
+/// Apply a client's pickup request. Per request: find the player's
+/// avatar, find the closest `WorldItem` to the requested translation,
+/// validate compatibility with the player's existing `Carrying` and
+/// the reach gate, then despawn the item and update the player's
+/// `Carrying`. Carry replication broadcasts the new state back to
+/// the owner; HUD picks it up next frame.
+fn receive_pickup_requests(
+    mut receivers: Query<(Entity, &mut MessageReceiver<PickupRequest>)>,
+    avatars: Res<ClientAvatars>,
+    mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
+    world_items: Query<(Entity, &WorldItem)>,
+    mut commands: Commands,
+) {
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let requests: Vec<PickupRequest> = receiver.receive().collect();
+        for req in requests {
+            let Some(&avatar) = avatars.0.get(&connection) else {
+                continue;
+            };
+            let Ok((pose, mut carry)) = players.get_mut(avatar) else {
+                continue;
+            };
+            // Anti-cheat reach. Computed against eye position to match
+            // how the client raycast measures distance.
+            if (pose.translation - req.target).length() > PICKUP_PLAYER_REACH {
+                continue;
+            }
+            // Closest WorldItem within the match radius.
+            let mut best: Option<(Entity, crate::items::ItemSlot, f32)> = None;
+            for (entity, wi) in world_items.iter() {
+                let d = (wi.translation - req.target).length();
+                if d > PICKUP_MATCH_RADIUS {
+                    continue;
+                }
+                if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+                    best = Some((entity, wi.item, d));
+                }
+            }
+            let Some((entity, item_slot, _)) = best else {
+                continue;
+            };
+            if !carry.pickup_one(item_slot, PLAYER_CARRY_CAPACITY) {
+                // Carry full or holding a different item. Silently no-op;
+                // the player keeps their stack and the world item stays
+                // in the world.
+                continue;
+            }
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+/// Apply a client's drop request. Clears the player's `Carrying` and
+/// spawns N `WorldItem` entities at their feet (one per unit in the
+/// dropped stack). A small per-unit fan jitter keeps a 5-stack pile
+/// from z-fighting at the same cell centre.
+fn receive_drop_requests(
+    mut receivers: Query<(Entity, &mut MessageReceiver<DropRequest>)>,
+    avatars: Res<ClientAvatars>,
+    mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
+    mut commands: Commands,
+) {
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let request_count = receiver.receive().count();
+        if request_count == 0 {
+            continue;
+        }
+        let Some(&avatar) = avatars.0.get(&connection) else {
+            continue;
+        };
+        let Ok((pose, mut carry)) = players.get_mut(avatar) else {
+            continue;
+        };
+        let Some((item, count)) = carry.drop_all() else {
+            continue;
+        };
+        // Drop at foot: avatar pose is at eye height by convention; the
+        // foot of the body sits `EYE_OFFSET_FROM_CENTRE + half-height`
+        // below.
+        let foot = pose.translation
+            - Vec3::new(0.0, EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y, 0.0)
+            + Vec3::new(0.0, 0.05, 0.0);
+        for unit in 0..count {
+            let angle = (unit as f32) * std::f32::consts::TAU / count.max(1) as f32;
+            let offset = Vec3::new(angle.cos() * 0.18, 0.0, angle.sin() * 0.18);
+            let translation = foot + offset;
+            commands.spawn((
+                WorldItem {
+                    item,
+                    translation,
+                },
+                Transform::from_translation(translation),
+                GlobalTransform::default(),
+                Replicate::to_clients(NetworkTarget::All),
+                Name::new(format!("WorldItem(dropped:{})", item.0)),
+            ));
         }
     }
 }

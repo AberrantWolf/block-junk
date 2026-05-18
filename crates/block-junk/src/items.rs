@@ -24,6 +24,15 @@ use thiserror::Error;
 #[serde(transparent)]
 pub struct ItemSlot(pub u16);
 
+/// How many units of a single item the player avatar can hold. About
+/// 1.5–2× a vanilla NPC's [`NpcKindDef::carry_capacity`] (currently 3)
+/// per the design intent — players feel meaningfully more capable than
+/// individual NPCs, but the gap stays narrow enough that hauling a
+/// large build by hand reads as a slog instead of a strategy. Engine
+/// const for now; lift to per-kind data if a second player kind ever
+/// ships.
+pub const PLAYER_CARRY_CAPACITY: u32 = 5;
+
 #[derive(Debug, Error)]
 pub enum ItemBootstrapError {
     #[error("duplicate item id {0}")]

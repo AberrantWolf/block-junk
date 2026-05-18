@@ -33,7 +33,9 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v3 (2026-05-15): added `npcs` to `SaveFile`.
 /// v4 (2026-05-15): added `world_clock` to `SaveFile`.
 /// v5 (2026-05-16): added `plans` to `SaveFile`.
-pub const SAVE_VERSION: u32 = 5;
+/// v6 (2026-05-18): added `world_items` + `last_player_carry` to
+///                  `SaveFile` for the Phase 2 carry/pickup feature.
+pub const SAVE_VERSION: u32 = 6;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -106,6 +108,38 @@ pub struct SaveFile {
     /// and the claim is naturally re-acquired.
     #[serde(default)]
     pub plans: Vec<(IVec3, PlanKind)>,
+    /// Loose items in the world at save time. Empty pre-v6 saves
+    /// deserialize cleanly via `serde(default)`.
+    #[serde(default)]
+    pub world_items: Vec<SavedWorldItem>,
+    /// Carry stack of the spawning player at save time (the same
+    /// "first reconnecting player wins" convention `last_player_pose`
+    /// uses). `None` ⇒ empty-handed save, or a save predating v6.
+    /// Per-player carries persistence needs a stable client identity
+    /// we don't have yet.
+    #[serde(default)]
+    pub last_player_carry: Option<SavedCarry>,
+}
+
+/// On-disk shape of a [`WorldItem`](crate::protocol::WorldItem) entity.
+/// `item_id` is the stable [`ItemId`] string rather than the slot, so
+/// the save format survives item-registry changes between sessions
+/// (slots are derived from mod load order; ids are mod-author-stable).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedWorldItem {
+    pub item_id: String,
+    pub translation: bevy::math::Vec3,
+}
+
+/// On-disk shape of an actor's
+/// [`Carrying`](crate::protocol::Carrying) stack. Same id-not-slot
+/// stability rule as [`SavedWorldItem`]. `count == 0` is canonical
+/// "empty-handed" — but in practice we serialise `None` for that
+/// case at the `SaveFile::last_player_carry` layer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedCarry {
+    pub item_id: String,
+    pub count: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -292,11 +326,11 @@ mod tests {
     use crate::blocks::BlockSlot;
 
     /// Round-trip a SaveFile through bincode to catch serde regressions
-    /// at the shape level — covers v3 `npcs`, v4 `world_clock`, and v5
-    /// `plans` (sparse vec of (cell, PlanKind) including both Remove
-    /// and Build variants).
+    /// at the shape level. Covers every field the current version
+    /// carries: v3 npcs, v4 world_clock, v5 plans, v6 world_items +
+    /// last_player_carry.
     #[test]
-    fn savefile_round_trips_with_npcs_clock_and_plans() {
+    fn savefile_round_trips_all_fields() {
         let mut needs = HashMap::new();
         needs.insert("hunger".to_owned(), 0.42);
         let plans = vec![
@@ -308,6 +342,16 @@ mod tests {
                     orientation: Cardinal::North,
                 },
             ),
+        ];
+        let world_items = vec![
+            SavedWorldItem {
+                item_id: "vanilla:wood_log".to_owned(),
+                translation: Vec3::new(10.0, 8.5, -3.25),
+            },
+            SavedWorldItem {
+                item_id: "vanilla:stone_chunk".to_owned(),
+                translation: Vec3::new(-1.0, 1.0, 1.0),
+            },
         ];
         let original = SaveFile {
             version: SAVE_VERSION,
@@ -332,6 +376,11 @@ mod tests {
                 time_of_day: 0.625,
             }),
             plans: plans.clone(),
+            world_items: world_items.clone(),
+            last_player_carry: Some(SavedCarry {
+                item_id: "vanilla:wood_log".to_owned(),
+                count: 3,
+            }),
         };
 
         let bytes =
@@ -354,5 +403,11 @@ mod tests {
         assert_eq!(clock.day, 3);
         assert_eq!(clock.time_of_day, 0.625);
         assert_eq!(decoded.plans, plans);
+        assert_eq!(decoded.world_items.len(), 2);
+        assert_eq!(decoded.world_items[0].item_id, "vanilla:wood_log");
+        assert_eq!(decoded.world_items[0].translation, Vec3::new(10.0, 8.5, -3.25));
+        let carry = decoded.last_player_carry.unwrap();
+        assert_eq!(carry.item_id, "vanilla:wood_log");
+        assert_eq!(carry.count, 3);
     }
 }
