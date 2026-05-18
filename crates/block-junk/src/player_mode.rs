@@ -1,12 +1,14 @@
 //! Top-level player intent: which "tool" the player is wielding.
 //!
-//! The mode gates what L-click / R-click / wheel actually do in the rest
-//! of the client (Phase 1+). This module owns just the state machine and
-//! a small HUD chip showing the active mode. Default is `Select`; Tab
-//! cycles forward, Shift+Tab reverses, and the number keys 1..=3 select
-//! a mode directly. The Destroy verb lives in the hotbar as a synthetic
-//! slot rather than as its own mode — both Plan and Build read the
-//! hotbar to decide what an L-click does.
+//! Two modes total since the 2026-05-18 mode-collapse: `Normal` (the
+//! avatar's default — pickup, deposit, self-work on tags, direct-destroy)
+//! and `Plan` (DF-style designation of work for NPCs). Tab toggles, `1`
+//! and `2` directly select. The Destroy verb lives in the hotbar as a
+//! synthetic slot rather than as its own mode — Plan reads the active
+//! hotbar slot to decide what an L-click tags. Normal's verb is chosen
+//! by what's under the cursor and advertised by the target-outline
+//! colour; see `feedback_player_input_scheme` memory for the full
+//! target × verb matrix.
 
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
@@ -16,37 +18,30 @@ use crate::protocol::GameSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Resource)]
 pub enum PlayerMode {
-    Select,
+    Normal,
     Plan,
-    Build,
 }
 
 impl Default for PlayerMode {
     fn default() -> Self {
-        Self::Select
+        Self::Normal
     }
 }
 
 impl PlayerMode {
-    pub const ALL: [PlayerMode; 3] = [
-        PlayerMode::Select,
-        PlayerMode::Plan,
-        PlayerMode::Build,
-    ];
+    pub const ALL: [PlayerMode; 2] = [PlayerMode::Normal, PlayerMode::Plan];
 
     pub fn label(self) -> &'static str {
         match self {
-            PlayerMode::Select => "Select/Examine",
+            PlayerMode::Normal => "Normal",
             PlayerMode::Plan => "Plan",
-            PlayerMode::Build => "Build",
         }
     }
 
     pub fn icon_path(self) -> &'static str {
         match self {
-            PlayerMode::Select => "ui/mode_icons/hand_point.png",
+            PlayerMode::Normal => "ui/mode_icons/hand_point.png",
             PlayerMode::Plan => "ui/mode_icons/drawing_pencil.png",
-            PlayerMode::Build => "ui/mode_icons/tool_hammer.png",
         }
     }
 
@@ -142,7 +137,7 @@ fn spawn_mode_pill(
 }
 
 /// Compact hint strip sitting just above the mode pill: one `Tab` key
-/// cap (the cycle binding) followed by `1`/`2`/`3` key caps each paired
+/// cap (the cycle binding) followed by `1`/`2` key caps each paired
 /// with the destination mode's icon. Always-on; cheap to leave in the
 /// HUD because the player can stop reading once they've memorised it.
 fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer) {
@@ -162,9 +157,8 @@ fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer) {
             spawn_key_cap(row, "Tab");
             for m in PlayerMode::ALL {
                 let label = match m {
-                    PlayerMode::Select => "1",
+                    PlayerMode::Normal => "1",
                     PlayerMode::Plan => "2",
-                    PlayerMode::Build => "3",
                 };
                 row.spawn(Node {
                     column_gap: Val::Px(3.0),
@@ -242,11 +236,9 @@ fn handle_mode_input(
     }
 
     let direct = if keys.just_pressed(KeyCode::Digit1) {
-        Some(PlayerMode::Select)
+        Some(PlayerMode::Normal)
     } else if keys.just_pressed(KeyCode::Digit2) {
         Some(PlayerMode::Plan)
-    } else if keys.just_pressed(KeyCode::Digit3) {
-        Some(PlayerMode::Build)
     } else {
         None
     };

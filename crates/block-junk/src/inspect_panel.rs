@@ -1,17 +1,22 @@
-//! Select-mode inspection panel: shows the cursor's target's details
-//! (NPC or block) in a bottom-right `bevy_ui` overlay.
+//! Hover-driven inspection panel: shows the cursor's current target's
+//! details (NPC or block) in a bottom-right `bevy_ui` overlay.
 //!
-//! - **NPC**: R-click an NPC body in Select mode → client sends
-//!   `RequestNpcDetails` → server replies with `NpcDetails` →
-//!   panel renders name/kind/needs/goal.
-//! - **Block**: R-click a block → client resolves the block-def from
-//!   its local `BlockRegistry` and renders id/display name/tags +
-//!   any interactable metadata. No round-trip needed.
+//! - **NPC**: hovering an NPC body sends one `RequestNpcDetails` for
+//!   that NPC's id. The reply lands as `NpcDetails` and the panel
+//!   renders name/kind/needs/goal. Subsequent frames don't re-request
+//!   for the same NPC — we just keep the last reply visible.
+//! - **Block**: hovering a block resolves the block-def from the local
+//!   `BlockRegistry` and renders id/display name/tags + any
+//!   interactable metadata. No round-trip needed.
+//!
+//! Works in every mode (Normal and Plan). Suppressed during an active
+//! Plan-mode drag so the drag-rect preview owns the visual layer.
+//!
+//! Switched from R-click to hover 2026-05-18 alongside the 2-mode
+//! collapse — clicks are commits, hover is informational.
 //!
 //! The panel is intentionally `bevy_ui`, not `egui`: egui is reserved
 //! for debug (F3) so in-game UI reads as a distinct visual layer.
-//! Skin (Kenney UI Pack adventure 9-slice) lands in a later polish
-//! pass; this phase uses a solid translucent dark panel.
 
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
@@ -21,7 +26,7 @@ use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::camera::FlyCam;
 use crate::client::{RAYCAST_REACH, entity_aware_raycast, raycast_npcs};
 use crate::menu::AppState;
-use crate::player_mode::PlayerMode;
+use crate::plans::PlanDragState;
 use crate::protocol::{AvatarPose, GameSet, NpcDetails, RequestNpcDetails, WorldChannel};
 use crate::npc::{Npc, NpcId};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
@@ -34,7 +39,7 @@ impl Plugin for InspectPanelPlugin {
         app.add_systems(OnEnter(AppState::InGame), spawn_inspect_panel);
         app.add_systems(
             Update,
-            (handle_inspect_input, receive_npc_details, refresh_inspect_panel)
+            (refresh_inspect_target, receive_npc_details, refresh_inspect_panel)
                 .chain()
                 .in_set(GameSet::Input)
                 .run_if(in_state(AppState::InGame)),
@@ -109,11 +114,9 @@ fn spawn_inspect_panel(mut commands: Commands, existing: Query<(), With<InspectP
 }
 
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
-fn handle_inspect_input(
-    mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
+fn refresh_inspect_target(
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
-    mode: Res<PlayerMode>,
+    drag: Res<PlanDragState>,
     cam: Query<&GlobalTransform, With<FlyCam>>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
@@ -122,26 +125,16 @@ fn handle_inspect_input(
     mut target: ResMut<InspectTarget>,
     mut sender: Query<&mut MessageSender<RequestNpcDetails>>,
 ) {
-    // Mode + escape: dismiss the panel when the player leaves Select
-    // mode or presses Escape. Outside Select the panel just hides.
-    if *mode != PlayerMode::Select {
-        if !matches!(target.state, InspectState::None) {
-            target.state = InspectState::None;
-        }
-        return;
-    }
-    if keys.just_pressed(KeyCode::Escape) && !matches!(target.state, InspectState::None) {
-        target.state = InspectState::None;
-        return;
-    }
-    if !mouse.just_pressed(MouseButton::Right) {
-        return;
-    }
+    // Cursor unlocked (menu / alt-tab) or mid-drag: hide the panel.
+    // Plan-mode drag preview owns the visual layer until release.
     let locked = cursors
         .single()
         .map(|c| c.grab_mode != CursorGrabMode::None)
         .unwrap_or(false);
-    if !locked {
+    if !locked || drag.active.is_some() {
+        if !matches!(target.state, InspectState::None) {
+            target.state = InspectState::None;
+        }
         return;
     }
     let Ok(cam_t) = cam.single() else {
@@ -153,9 +146,7 @@ fn handle_inspect_input(
     // Compare ray distances: pick whichever target is closer. Block
     // raycast returns the cell; NPC raycast returns the body-AABB
     // hit's t (its distance directly). For block hits we approximate
-    // distance as the centre of the cell — close enough for tie-
-    // breaking under normal play (mistargets dissolve once we add
-    // proper picking later).
+    // distance as the centre of the cell.
     let block_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, &chunks, &chunk_map, &registry, None);
     let npc_hit = raycast_npcs(origin, dir, RAYCAST_REACH, &npcs);
 
@@ -173,16 +164,25 @@ fn handle_inspect_input(
 
     if pick_npc {
         let npc_id = npc_hit.unwrap().npc_id;
-        // Preserve prior content for the same NPC so re-inspects don't
-        // flash empty while waiting for the next reply.
-        let last_seen = match &target.state {
-            InspectState::Npc(d) if d.npc_id == npc_id.0 => Some(d.clone()),
-            InspectState::PendingNpc { last_seen, .. } => last_seen.clone(),
-            _ => None,
+        // Only re-request when the targeted npc *changes* — hovering
+        // the same NPC every frame shouldn't spam the server. Already-
+        // pending and already-resolved states for this NPC count as
+        // "no need to ask again."
+        let already_targeted = match &target.state {
+            InspectState::PendingNpc { npc_id: prev, .. } => prev.0 == npc_id.0,
+            InspectState::Npc(prev) => prev.npc_id == npc_id.0,
+            _ => false,
         };
-        target.state = InspectState::PendingNpc { npc_id, last_seen };
-        if let Ok(mut sender) = sender.single_mut() {
-            sender.send::<WorldChannel>(RequestNpcDetails { npc_id: npc_id.0 });
+        if !already_targeted {
+            let last_seen = match &target.state {
+                InspectState::Npc(d) if d.npc_id == npc_id.0 => Some(d.clone()),
+                InspectState::PendingNpc { last_seen, .. } => last_seen.clone(),
+                _ => None,
+            };
+            target.state = InspectState::PendingNpc { npc_id, last_seen };
+            if let Ok(mut sender) = sender.single_mut() {
+                sender.send::<WorldChannel>(RequestNpcDetails { npc_id: npc_id.0 });
+            }
         }
     } else if let Some(hit) = block_hit {
         let (coord, local) = crate::voxel::world_to_chunk(hit.cell);
@@ -192,12 +192,21 @@ fn handle_inspect_input(
             .and_then(|&entity| chunks.get(entity).ok())
             .map(|(chunk, _)| chunk.get(local))
             .unwrap_or(BlockSlot::EMPTY);
-        target.state = InspectState::Block {
-            cell: hit.cell,
-            slot,
-        };
-    } else {
-        // R-click on nothing in Select mode dismisses the panel.
+        // Skip the resource write when the cursor is parked on the
+        // same block — keeps Bevy's change-detection from re-running
+        // refresh_inspect_panel every frame for no reason.
+        let same = matches!(
+            &target.state,
+            InspectState::Block { cell, slot: s } if *cell == hit.cell && *s == slot,
+        );
+        if !same {
+            target.state = InspectState::Block {
+                cell: hit.cell,
+                slot,
+            };
+        }
+    } else if !matches!(target.state, InspectState::None) {
+        // Cursor on empty space: dismiss the panel.
         target.state = InspectState::None;
     }
 }

@@ -469,7 +469,10 @@ fn draw_drag_preview(drag: Res<PlanDragState>, mut gizmos: Gizmos) {
 /// as long as the origin isn't exactly on an integer-aligned plane
 /// (then 0 × inf yields NaN). The camera's eye position is fractional
 /// in practice, so this is safe.
-fn raycast_plans(
+///
+/// Crate-visible so Normal-mode self-work in `client.rs` can pick a
+/// Build-plan-in-empty-space target the world raycast misses.
+pub(crate) fn raycast_plans(
     origin: Vec3,
     dir: Vec3,
     max_distance: f32,

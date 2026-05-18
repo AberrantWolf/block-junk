@@ -75,10 +75,11 @@ impl Plugin for DebugServerPlugin {
 #[derive(Resource, Default)]
 pub struct DebugPanelOpen(pub bool);
 
-/// When true, the player's Build/Destroy verbs skip the action timer
-/// and resolve immediately — the way clicks worked before mode-gated
-/// input landed. Defaults to `false`: timed actions are the gameplay
-/// baseline as of Phase 5. Toggle on for fast iteration when shaping
+/// When true, the player's Normal-mode self-work (L-click on a tagged
+/// plan) and direct-destroy (R-click on a solid block) skip the action
+/// timer and resolve immediately — the way clicks worked before mode-
+/// gated input landed. Defaults to `false`: timed actions are the
+/// gameplay baseline. Toggle on for fast iteration when shaping
 /// terrain by hand.
 #[derive(Resource)]
 pub struct InstantPlayerBuilds(pub bool);
@@ -185,7 +186,7 @@ fn debug_panel_ui(
             ui.label(egui::RichText::new("Player").strong());
             ui.checkbox(
                 &mut instant_builds.0,
-                "Instant player builds (skip action timer)",
+                "Instant self-work (skip action timer)",
             );
             ui.separator();
             ui.label(egui::RichText::new("Advance time").strong());

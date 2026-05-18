@@ -95,7 +95,7 @@ impl Plugin for ClientPlugin {
             .add_systems(
                 Update,
                 (
-                    place_break_input,
+                    normal_mode_action_input,
                     cycle_selected_or_rotation,
                     reset_rotation_on_selection_change,
                 )
@@ -264,8 +264,10 @@ pub struct BlockEntities {
 }
 
 /// One hotbar entry. `Destroy` is the synthetic top slot whose L-click
-/// breaks the cell under the cursor (in Build mode) or tags it for
-/// removal (in Plan mode). `Block` is a regular placeable.
+/// tags the cursor cell for removal in Plan mode. `Block` is a regular
+/// placeable. (Pre-2026-05-18, Build mode used the same slot to break
+/// blocks directly; Normal-mode direct-destroy is now R-click and
+/// bypasses the hotbar entirely.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteSlot {
     Destroy,
@@ -289,8 +291,8 @@ impl PaletteSlot {
 pub struct PlaceablePalette(pub Vec<PaletteSlot>);
 
 /// Index into [`PlaceablePalette`] of the currently selected entry.
-/// Mouse wheel cycles; in Build mode L-click acts on the cursor's
-/// target, in Plan mode it tags the cell for NPCs.
+/// Mouse wheel cycles. Read only by Plan-mode tagging — Normal mode
+/// drives its verb from cursor context, not the hotbar.
 #[derive(Resource, Default)]
 pub struct SelectedBlock(pub usize);
 
@@ -314,10 +316,11 @@ impl SelectedBlock {
 #[derive(Resource, Default)]
 pub struct PlacementRotation(pub Cardinal);
 
-/// In-flight player action in Build mode. The timer ticks up while L
-/// is held against a stable target; when it reaches 1.0 the underlying
-/// `BlockEdit` is sent. Releasing L or aiming at a different cell drops
-/// the state and the next frame starts fresh from 0.
+/// In-flight player action in Normal mode (L-click self-work or R-click
+/// direct-destroy). The timer ticks up while the chosen button is held
+/// against a stable target; at 1.0 the underlying `BlockEdit` is sent.
+/// Releasing the button or aiming at a different cell drops the state
+/// and the next frame starts fresh from 0.
 #[derive(Resource, Default)]
 pub struct PlayerActionState {
     pub active: Option<ActiveAction>,
@@ -348,7 +351,7 @@ struct HotbarSlot(usize);
 
 /// Marker on the absolute-positioned root Node holding the hotbar
 /// column. Used to flip the whole column's `Visibility` in modes that
-/// don't read from the hotbar (Select/Examine).
+/// don't read from the hotbar (Normal).
 #[derive(Component)]
 struct HotbarRoot;
 
@@ -680,10 +683,9 @@ fn cycle_selected_or_rotation(
     if !locked {
         return;
     }
-    // Wheel only cycles blocks while the wheel-action has a use: Build
-    // (the block being placed) and Plan (the block being planned for
-    // build via Shift+L-click).
-    if !matches!(*mode, PlayerMode::Build | PlayerMode::Plan) {
+    // Wheel only cycles blocks in Plan mode (where the selection picks
+    // what to tag); Normal has no hotbar visible.
+    if !matches!(*mode, PlayerMode::Plan) {
         return;
     }
     let dy = scroll.delta.y;
@@ -770,13 +772,12 @@ fn update_hotbar_highlight(
     }
 }
 
-/// Hide the hotbar column in Select/Examine — the L-click verb in that
-/// mode doesn't read the hotbar, so the chip would just be noise. Plan
-/// and Build both drive their primary verb off the hotbar selection
-/// and need it visible.
+/// Hide the hotbar column in Normal — the L-click verb in that mode
+/// doesn't read the hotbar, so the chip would just be noise. Plan
+/// drives its tagging off the hotbar selection and needs it visible.
 ///
 /// Not gated by `mode.is_changed()` so the initial entry into the
-/// scene (where the mode is the default Select but the resource has
+/// scene (where the mode is the default Normal but the resource has
 /// already been around since plugin build) still gets the right
 /// Visibility on its first tick.
 fn update_hotbar_visibility(
@@ -784,8 +785,8 @@ fn update_hotbar_visibility(
     mut roots: Query<&mut Visibility, With<HotbarRoot>>,
 ) {
     let target = match *mode {
-        PlayerMode::Select => Visibility::Hidden,
-        PlayerMode::Plan | PlayerMode::Build => Visibility::Visible,
+        PlayerMode::Normal => Visibility::Hidden,
+        PlayerMode::Plan => Visibility::Visible,
     };
     for mut v in roots.iter_mut() {
         if *v != target {
@@ -901,42 +902,48 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
         .collect()
 }
 
-/// Held-button action timer in Build mode. L-click is the primary
-/// verb; what it does is decided by the hotbar selection — a real
-/// block places it, the synthetic [`PaletteSlot::Destroy`] slot breaks
-/// the cell under the cursor. Holding L against a stable target
-/// advances the timer; reaching 1.0 sends the underlying `BlockEdit`.
-/// Releasing L or aiming at a different cell drops the in-flight
-/// action.
+/// Held-button action timer for Normal mode. Drives two verbs:
+///
+/// - **L-click hold** = *self-work* a player-tagged plan. If the cursor
+///   is on a tagged cell (Remove tag on a solid block, or Build tag in
+///   empty space behind the player's reach), advance the timer; on
+///   completion apply the world mutation the plan describes (break the
+///   block for Remove, place the recorded block for Build). Same
+///   primitive an NPC's [`crate::npc::Goal::Working`] runs.
+/// - **R-click hold** = *direct destroy* any solid block under the
+///   cursor, bypassing the plan step. Reads as harvesting (chop a tree,
+///   mine a stone). Drops happen via the same `auto_clear_stale_plans`
+///   / drops bus the server uses for any other destroy.
+///
+/// If both buttons are held simultaneously, L wins (self-work is the
+/// more deliberate action and lines up with the player's tagged queue).
+/// Switching aim or releasing the held button drops in-flight progress.
 ///
 /// The F3 [`crate::debug::InstantPlayerBuilds`] toggle short-circuits
 /// the timer: on `just_pressed`, send the edit immediately and bypass
-/// the state machine — same dev-loop ergonomics as before Phase 5.
+/// the state machine.
 ///
-/// Select and Plan modes don't run this system (mode gate); R-click is
-/// the per-mode secondary slot and remains a no-op in Build until
-/// something claims it.
+/// Plan mode doesn't run this system (mode gate); it has its own
+/// `plan_mode_input` for tagging.
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
-fn place_break_input(
+fn normal_mode_action_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
     mode: Res<PlayerMode>,
     time: Res<Time>,
     instant_builds: Res<crate::debug::InstantPlayerBuilds>,
-    cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
+    cam: Query<&GlobalTransform, With<FlyCam>>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
-    selected: Res<SelectedBlock>,
-    palette: Res<PlaceablePalette>,
-    rotation: Res<PlacementRotation>,
+    plans: Res<Plans>,
     registry: Res<BlockRegistry>,
     mut action: ResMut<PlayerActionState>,
     mut sender: Query<&mut MessageSender<BlockEdit>>,
 ) {
-    // Only Build uses the action timer. Switching modes or losing
+    // Only Normal uses the action timer. Switching modes or losing
     // cursor lock mid-action cancels the in-flight progress so
     // re-entering doesn't pick up a stale timer state.
-    if *mode != PlayerMode::Build {
+    if *mode != PlayerMode::Normal {
         action.active = None;
         return;
     }
@@ -948,12 +955,14 @@ fn place_break_input(
         action.active = None;
         return;
     }
-    if !mouse.pressed(MouseButton::Left) {
+    let l_held = mouse.pressed(MouseButton::Left);
+    let r_held = mouse.pressed(MouseButton::Right);
+    if !l_held && !r_held {
         action.active = None;
         return;
     }
 
-    let Ok((cam_t, fly, pose)) = cam.single() else {
+    let Ok(cam_t) = cam.single() else {
         return;
     };
     let Ok(mut sender) = sender.single_mut() else {
@@ -961,8 +970,13 @@ fn place_break_input(
     };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
-    let visible_yaw = pose.yaw + fly.pending_dyaw;
-    let Some(hit) = entity_aware_raycast(
+
+    // World raycast hits whatever solid block (or block-entity) is
+    // first along the ray. `skip_plan_remove = None`: in Normal mode
+    // we *want* the cursor to land on a tagged-Remove cell so L-click
+    // can self-work it; seeing through tagged cells is a Plan-mode
+    // affordance for stacking Remove tags through walls.
+    let world_hit = entity_aware_raycast(
         cam_pos,
         cam_dir,
         RAYCAST_REACH,
@@ -970,44 +984,27 @@ fn place_break_input(
         &chunk_map,
         &registry,
         None,
-    ) else {
+    );
+
+    // Resolve the verb for this frame. L wins over R when both held.
+    // For L we also need the plan-only raycast — Build tags float in
+    // empty space and the world raycast can't see them.
+    let resolved = if l_held {
+        let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, RAYCAST_REACH, &plans);
+        resolve_self_work(cam_pos, &plans, world_hit.as_ref(), plan_hit)
+    } else {
+        resolve_direct_destroy(world_hit.as_ref())
+    };
+    let Some((target_cell, kind, edit, button)) = resolved else {
         action.active = None;
         return;
     };
 
-    // Resolve this frame's action target + the BlockEdit it would
-    // send. Hotbar selection drives the verb:
-    //   - Destroy slot → break the cell under the cursor.
-    //   - Block slot → place that block on the outward face cell.
-    let (target_cell, kind, edit) = match selected.current(&palette) {
-        PaletteSlot::Destroy => (
-            hit.cell,
-            ActionKind::Break,
-            BlockEdit {
-                anchor: hit.cell,
-                slot: BlockSlot::EMPTY,
-                orientation: Cardinal::default(),
-            },
-        ),
-        PaletteSlot::Block(slot) => {
-            let anchor = hit.cell + hit.face_normal;
-            let orientation = placement_orientation(visible_yaw, rotation.0);
-            (
-                anchor,
-                ActionKind::Place,
-                BlockEdit {
-                    anchor,
-                    slot,
-                    orientation,
-                },
-            )
-        }
-    };
-
     // Instant path: F3 toggle skips the timer. Single send on the
-    // first frame of L-pressed; no state machine, no progress bar.
+    // first frame of the chosen button; no state machine, no
+    // progress bar.
     if instant_builds.0 {
-        if mouse.just_pressed(MouseButton::Left) {
+        if mouse.just_pressed(button) {
             sender.send::<WorldChannel>(edit);
             action.active = None;
         }
@@ -1015,8 +1012,8 @@ fn place_break_input(
     }
 
     // Timed path: accumulate progress against the same target across
-    // frames, restart from zero if the target changed (player swept
-    // the cursor to a different cell).
+    // frames, restart from zero if the target or verb changed (player
+    // swept the cursor or swapped buttons).
     let step = time.delta_secs() / PLAYER_ACTION_DURATION_SECS;
     let progress = match action.active {
         Some(a) if a.target_cell == target_cell && a.kind == kind => a.progress + step,
@@ -1025,11 +1022,11 @@ fn place_break_input(
 
     if progress >= 1.0 {
         sender.send::<WorldChannel>(edit);
-        // Drop state. If L is still held the next frame's raycast
-        // will see the updated world (or, for ~1 tick before the
-        // broadcast lands, the stale cell — server rejects the
-        // duplicate). Held-sweep mining/placing falls out naturally
-        // once the world updates and the target cell changes.
+        // Drop state. If the button is still held the next frame's
+        // raycast will see the updated world (or, for ~1 tick before
+        // the broadcast lands, the stale cell — server rejects the
+        // duplicate). Held-sweep harvesting falls out naturally once
+        // the world updates and the target cell changes.
         action.active = None;
     } else {
         action.active = Some(ActiveAction {
@@ -1037,6 +1034,83 @@ fn place_break_input(
             kind,
             progress,
         });
+    }
+}
+
+/// Pick the cell the player's L-click would self-work this frame.
+/// Prefers whichever tagged cell is *closer* to the camera between:
+///   - the world-raycast hit cell if it itself carries a plan tag
+///     (typically a Remove tag on a solid wall); or
+///   - the nearest tagged-cell hit from a Plans-only raycast (typically
+///     a Build tag floating in empty space, which the world raycast
+///     misses because the cell is empty).
+///
+/// On a tie, the world-raycast hit wins — a tagged-solid right under
+/// the cursor is the intuitive choice over a Build tag hovering at the
+/// same distance.
+///
+/// Returns `(target_cell, ActionKind, BlockEdit, MouseButton::Left)` or
+/// `None` if no tagged cell lies under the cursor.
+fn resolve_self_work(
+    cam_pos: Vec3,
+    plans: &Plans,
+    world_hit: Option<&EntityAwareHit>,
+    plan_hit: Option<(f32, IVec3)>,
+) -> Option<(IVec3, ActionKind, BlockEdit, MouseButton)> {
+    let world_candidate = world_hit
+        .and_then(|h| plans.get(h.cell).map(|kind| (h.cell, kind)))
+        .map(|(cell, kind)| {
+            let dist = (cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length();
+            (dist, cell, kind)
+        });
+    let plan_candidate = plan_hit.and_then(|(dist, cell)| {
+        // raycast_plans only returns cells present in Plans, so the
+        // get() is infallible — but treating it as an Option keeps
+        // the function safe if the contract ever shifts.
+        plans.get(cell).map(|kind| (dist, cell, kind))
+    });
+    let (_, cell, kind) = match (world_candidate, plan_candidate) {
+        (Some(a), Some(b)) if a.0 <= b.0 => a,
+        (Some(_), Some(b)) => b,
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return None,
+    };
+    let edit = plan_to_edit(cell, kind);
+    let action_kind = match kind {
+        PlanKind::Remove => ActionKind::Break,
+        PlanKind::Build { .. } => ActionKind::Place,
+    };
+    Some((cell, action_kind, edit, MouseButton::Left))
+}
+
+/// Pick the cell the player's R-click would direct-destroy this frame.
+/// Reads the world raycast's hit cell; if there's no hit, no action.
+fn resolve_direct_destroy(
+    world_hit: Option<&EntityAwareHit>,
+) -> Option<(IVec3, ActionKind, BlockEdit, MouseButton)> {
+    let hit = world_hit?;
+    let edit = BlockEdit {
+        anchor: hit.cell,
+        slot: BlockSlot::EMPTY,
+        orientation: Cardinal::default(),
+    };
+    Some((hit.cell, ActionKind::Break, edit, MouseButton::Right))
+}
+
+/// Translate a `PlanKind` into the `BlockEdit` that would satisfy it.
+fn plan_to_edit(cell: IVec3, kind: PlanKind) -> BlockEdit {
+    match kind {
+        PlanKind::Remove => BlockEdit {
+            anchor: cell,
+            slot: BlockSlot::EMPTY,
+            orientation: Cardinal::default(),
+        },
+        PlanKind::Build { slot, orientation } => BlockEdit {
+            anchor: cell,
+            slot,
+            orientation,
+        },
     }
 }
 
@@ -1332,18 +1406,20 @@ fn setup_placement_preview(
     commands.insert_resource(PreviewMaterials { front, back });
 }
 
-/// Run-condition: only show the placement preview ghost in Build mode
+/// Run-condition: only show the placement preview ghost in Plan mode
 /// with a real block in the hotbar. The Destroy slot has no place
 /// preview — the cursor outline already indicates the target cell.
+/// Plan-mode preview reads as "this is what the tag would build" while
+/// the drag is paused on a single cell.
 fn show_placement_preview(
     mode: Res<PlayerMode>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
 ) -> bool {
-    *mode == PlayerMode::Build && selected.current_block(&palette).is_some()
+    *mode == PlayerMode::Plan && selected.current_block(&palette).is_some()
 }
 
-/// Hide the placement preview ghost when the player just left Build
+/// Hide the placement preview ghost when the player just left Plan
 /// mode, or when the hotbar selection flipped to the Destroy slot.
 /// Without this the last-frame ghost would linger on screen — the main
 /// preview system stops running thanks to the `run_if` gate, so
@@ -1361,7 +1437,7 @@ fn hide_preview_on_mode_change(
         return;
     }
     let should_show =
-        *mode == PlayerMode::Build && selected.current_block(&palette).is_some();
+        *mode == PlayerMode::Plan && selected.current_block(&palette).is_some();
     if should_show {
         return;
     }
