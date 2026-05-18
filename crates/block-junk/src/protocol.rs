@@ -294,6 +294,33 @@ impl Carrying {
     }
 }
 
+/// Single-slot tool an actor is wielding. Distinct from
+/// [`Carrying`] — the carry stack is for resources (logs, ore) that
+/// get hauled and consumed; the tool slot is for items that *enable*
+/// actions (axe, pickaxe, hammer) and live on the actor until they're
+/// swapped or dropped. Splitting the two means a hauler full of logs
+/// still has their axe equipped, and picking up an axe doesn't bump
+/// your log stack.
+///
+/// `item == None` is the canonical empty state. Set via the server's
+/// pickup-routing branch (any picked-up [`crate::items::ItemSlot`]
+/// whose def has non-empty
+/// [`ItemDef::tool_tags`](block_junk_mod_api::items::ItemDef::tool_tags)
+/// goes here instead of into Carrying), and persists in v9 saves.
+/// Replicated to every client so HUDs render the local player's tool
+/// chip + future "NPC holds axe" visuals can read it; no prediction
+/// because pickup is a server-authoritative discrete event.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EquippedTool {
+    pub item: Option<ItemSlot>,
+}
+
+impl EquippedTool {
+    pub fn is_empty(&self) -> bool {
+        self.item.is_none()
+    }
+}
+
 /// A loose item sitting in the world — what a destroyed block leaves
 /// behind, what an actor sets down when they drop their carry stack,
 /// and (Phase 4) what an NPC walks past and picks up to deliver to a
@@ -618,6 +645,17 @@ pub struct DebugBumpNeed {
 /// player's avatar; no-op if no pending plans exist within range.
 #[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct DebugFillNearestPlan;
+
+/// Client → server: spawn one of each vanilla tool item
+/// (axe / hammer / pickaxe) as `WorldItem`s near the requesting
+/// player's feet. Phase-5a testing prerequisite — until Phase 5b
+/// adds NPC tool fetch (or a recipe system surfaces tools as
+/// craftable), the starter axe is the only way to get a tool, which
+/// blocks swap + tool-mismatch testing. Server resolves the ids via
+/// the live `ItemRegistry`; unknown ids are skipped silently so a
+/// mod that drops one of the three doesn't crash the button.
+#[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct DebugSpawnTools;
 
 /// Client → server: ask the server to dump the current authoritative
 /// state of one NPC so the requesting client's inspection panel can

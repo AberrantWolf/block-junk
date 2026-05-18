@@ -33,7 +33,7 @@ use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
-    GameSet, MovementIntent, MovementMode, NpcAnimOverride, PickupRequest, PlanKind,
+    EquippedTool, GameSet, MovementIntent, MovementMode, NpcAnimOverride, PickupRequest, PlanKind,
     WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
@@ -196,6 +196,7 @@ impl Plugin for ClientPlugin {
                     update_hotbar_highlight,
                     update_hotbar_visibility,
                     update_carry_hud,
+                    update_tool_hud,
                     update_action_progress_ui,
                     draw_npc_paths,
                 )
@@ -668,6 +669,7 @@ fn setup_scene(
         });
 
     spawn_carry_hud(&mut commands);
+    spawn_tool_hud(&mut commands);
 }
 
 /// One scroll handler covers both jobs because Ctrl gates which one fires:
@@ -808,6 +810,111 @@ fn spawn_carry_hud(commands: &mut Commands) {
                 ));
             });
         });
+}
+
+/// Marker for the tool HUD root (matches CarryHudRoot's role for the
+/// carry chip). Sits *above* the carry chip so a full carry + tool
+/// loadout reads as two stacked chips at the bottom-centre.
+#[derive(Component)]
+struct ToolHudRoot;
+
+#[derive(Component)]
+struct ToolHudIcon;
+
+#[derive(Component)]
+struct ToolHudLabel;
+
+fn spawn_tool_hud(commands: &mut Commands) {
+    commands
+        .spawn((
+            ToolHudRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                // 64 px above the carry chip (which sits at 24 px).
+                // Two vertically-stacked chips with breathing room.
+                bottom: Val::Px(64.0),
+                width: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            Visibility::Hidden,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                    column_gap: Val::Px(8.0),
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.78)),
+                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+            ))
+            .with_children(|chip| {
+                chip.spawn((
+                    ToolHudIcon,
+                    Node {
+                        width: Val::Px(28.0),
+                        height: Val::Px(28.0),
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.5, 0.5, 0.5, 1.0)),
+                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.35)),
+                ));
+                chip.spawn((
+                    ToolHudLabel,
+                    Text::new(""),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+}
+
+/// Mirror the local player's `EquippedTool` onto the tool HUD chip.
+/// Same shape as `update_carry_hud` — reads from the Predicted avatar,
+/// hides when the slot is empty, tints + labels otherwise.
+fn update_tool_hud(
+    local_tool: Query<&EquippedTool, (With<Avatar>, With<Predicted>)>,
+    items: Res<ItemRegistry>,
+    mut roots: Query<&mut Visibility, With<ToolHudRoot>>,
+    mut icons: Query<&mut BackgroundColor, With<ToolHudIcon>>,
+    mut labels: Query<&mut Text, With<ToolHudLabel>>,
+) {
+    let Ok(tool) = local_tool.single() else {
+        for mut v in roots.iter_mut() {
+            *v = Visibility::Hidden;
+        }
+        return;
+    };
+    let (vis, swatch, text) = match tool.item {
+        Some(slot) => {
+            let def = items.def(slot);
+            let [r, g, b] = def.color;
+            (
+                Visibility::Inherited,
+                Color::srgba(r, g, b, 1.0),
+                def.display_name.clone(),
+            )
+        }
+        None => (Visibility::Hidden, Color::srgba(0.5, 0.5, 0.5, 1.0), String::new()),
+    };
+    for mut v in roots.iter_mut() {
+        *v = vis;
+    }
+    for mut bg in icons.iter_mut() {
+        bg.0 = swatch;
+    }
+    for mut t in labels.iter_mut() {
+        t.0 = text.clone();
+    }
 }
 
 /// Mirror the local player's `Carrying` onto the HUD chip. Reads from
@@ -1048,6 +1155,24 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
 /// Plan mode doesn't run this system (mode gate); it has its own
 /// `plan_mode_input` for tagging.
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
+/// Senders + local-player reads for `normal_mode_action_input`,
+/// bundled to keep the system under Bevy 0.18's 16-SystemParam cap.
+/// Adding tool gating to the function pushed it over; consolidating
+/// the message senders + avatar queries into one slot apiece restores
+/// headroom. Same pattern as `npc::HaulCtx` in the brain tick.
+#[derive(bevy::ecs::system::SystemParam)]
+struct NormalActionIo<'w, 's> {
+    edit: Query<'w, 's, &'static mut MessageSender<BlockEdit>>,
+    pickup: Query<'w, 's, &'static mut MessageSender<PickupRequest>>,
+    deposit: Query<'w, 's, &'static mut MessageSender<DepositRequest>>,
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct LocalPlayerState<'w, 's> {
+    carry: Query<'w, 's, &'static Carrying, (With<Avatar>, With<Predicted>)>,
+    tool: Query<'w, 's, &'static EquippedTool, (With<Avatar>, With<Predicted>)>,
+}
+
 fn normal_mode_action_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
@@ -1059,12 +1184,11 @@ fn normal_mode_action_input(
     chunk_map: Res<ChunkMap>,
     plans: Res<Plans>,
     registry: Res<BlockRegistry>,
+    items: Res<ItemRegistry>,
     world_items: Query<&WorldItem>,
-    local_carry: Query<&Carrying, (With<Avatar>, With<Predicted>)>,
+    local: LocalPlayerState,
     mut action: ResMut<PlayerActionState>,
-    mut sender: Query<&mut MessageSender<BlockEdit>>,
-    mut pickup_sender: Query<&mut MessageSender<PickupRequest>>,
-    mut deposit_sender: Query<&mut MessageSender<DepositRequest>>,
+    mut io: NormalActionIo,
 ) {
     // Only Normal uses the action timer. Switching modes or losing
     // cursor lock mid-action cancels the in-flight progress so
@@ -1091,7 +1215,7 @@ fn normal_mode_action_input(
     let Ok(cam_t) = cam.single() else {
         return;
     };
-    let Ok(mut sender) = sender.single_mut() else {
+    let Ok(mut sender) = io.edit.single_mut() else {
         return;
     };
     let cam_pos = cam_t.translation();
@@ -1115,14 +1239,19 @@ fn normal_mode_action_input(
         let world_hit_dist = world_hit_for_compare
             .as_ref()
             .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
-        let carry = local_carry.single().copied().unwrap_or_default();
+        let carry = local.carry.single().copied().unwrap_or_default();
 
         // (1) Pickup.
         if let Some((item_translation, item_dist, item_slot)) = item_hit
             && world_hit_dist.map(|wd| item_dist < wd).unwrap_or(true)
         {
-            if carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
-                if let Ok(mut sender) = pickup_sender.single_mut() {
+            // Tools route to the EquippedTool slot (server-side); the
+            // client just sends the pickup unconditionally and lets
+            // the server's swap-semantics handle slot occupancy.
+            // Resources still gate on Carrying compatibility.
+            let is_tool = !items.def(item_slot).tool_tags.is_empty();
+            if is_tool || carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
+                if let Ok(mut sender) = io.pickup.single_mut() {
                     sender.send::<WorldChannel>(PickupRequest {
                         target: item_translation,
                     });
@@ -1157,7 +1286,7 @@ fn normal_mode_action_input(
                 && let Some(state) = plans.get(cell)
                 && state.remaining_for(carry_item) > 0
             {
-                if let Ok(mut sender) = deposit_sender.single_mut() {
+                if let Ok(mut sender) = io.deposit.single_mut() {
                     sender.send::<WorldChannel>(DepositRequest { cell });
                 }
                 action.active = None;
@@ -1194,6 +1323,34 @@ fn normal_mode_action_input(
         action.active = None;
         return;
     };
+
+    // Tool gate: if the targeted block's work_action requires a tool
+    // tag the player isn't holding, the click is inert. Same logic
+    // the outline uses to render grey, kept in sync via the shared
+    // `live_block_slot` / `player_can_work_slot` helpers in
+    // target_outline.rs. Symmetric with the outline so what the
+    // player sees and what the click does always agree.
+    let work_slot = match button {
+        MouseButton::Right => {
+            // direct-destroy: live block at cell
+            crate::target_outline::live_block_slot(target_cell, &chunks, &chunk_map)
+        }
+        _ => {
+            // L-click self-work: Build → block being placed;
+            // Remove → live block being destroyed.
+            match edit.slot.is_empty() {
+                true => crate::target_outline::live_block_slot(target_cell, &chunks, &chunk_map),
+                false => Some(edit.slot),
+            }
+        }
+    };
+    let tool = local.tool.single().copied().unwrap_or_default();
+    if !crate::target_outline::player_can_work_slot(work_slot, &registry, &items, tool) {
+        // Click inert. Don't tick the action timer — the player
+        // will see the outline stay grey and try a different tool.
+        action.active = None;
+        return;
+    }
 
     // Instant path: F3 toggle skips the timer. Single send on the
     // first frame of the chosen button; no state machine, no

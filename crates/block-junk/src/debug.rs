@@ -29,7 +29,8 @@ use crate::menu::AppState;
 use crate::npc::{Needs, Npc};
 use crate::npc_registry::NeedRegistry;
 use crate::protocol::{
-    DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, GameSet,
+    DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools,
+    GameSet,
     WorldChannel, WorldClock,
 };
 
@@ -68,6 +69,7 @@ impl Plugin for DebugServerPlugin {
                 receive_debug_advance_time,
                 receive_debug_bump_need,
                 receive_debug_fill_nearest_plan,
+                receive_debug_spawn_tools,
             )
                 .in_set(GameSet::Simulation),
         );
@@ -145,6 +147,7 @@ fn debug_panel_ui(
     mut advance_sender: Query<&mut MessageSender<DebugAdvanceTime>>,
     mut need_sender: Query<&mut MessageSender<DebugBumpNeed>>,
     mut fill_plan_sender: Query<&mut MessageSender<DebugFillNearestPlan>>,
+    mut spawn_tools_sender: Query<&mut MessageSender<DebugSpawnTools>>,
     mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
 ) {
     if !open.0 {
@@ -159,6 +162,7 @@ fn debug_panel_ui(
     let mut advance_secs: Option<f32> = None;
     let mut need_bump: Option<(String, f32)> = None;
     let mut fill_nearest_plan = false;
+    let mut spawn_tools = false;
 
     let time_label = match clock.as_deref() {
         Some(c) => format!(
@@ -198,6 +202,9 @@ fn debug_panel_ui(
             );
             if ui.button("Fill nearest plan").clicked() {
                 fill_nearest_plan = true;
+            }
+            if ui.button("Spawn vanilla tools").clicked() {
+                spawn_tools = true;
             }
             ui.separator();
             ui.label(egui::RichText::new("Advance time").strong());
@@ -277,6 +284,11 @@ fn debug_panel_ui(
     if fill_nearest_plan {
         if let Ok(mut sender) = fill_plan_sender.single_mut() {
             sender.send::<WorldChannel>(DebugFillNearestPlan);
+        }
+    }
+    if spawn_tools {
+        if let Ok(mut sender) = spawn_tools_sender.single_mut() {
+            sender.send::<WorldChannel>(DebugSpawnTools);
         }
     }
 }
@@ -396,6 +408,80 @@ fn receive_debug_fill_nearest_plan(
         info!(
             cell = ?target_cell.to_array(),
             "debug: filled plan materials",
+        );
+    }
+}
+
+/// Apply [`DebugSpawnTools`]: spawn one `WorldItem` for each vanilla
+/// tool kind (`vanilla:axe`, `vanilla:hammer`, `vanilla:pickaxe`) in a
+/// short line in front of the requesting player. Lets us exercise
+/// pickup swap + tool-mismatch outline gating without waiting for
+/// Phase 5b's NPC tool fetch to land.
+///
+/// Unknown ids (a mod removed one of the three) are skipped silently
+/// so the button degrades to "only the kinds we have" rather than
+/// erroring.
+fn receive_debug_spawn_tools(
+    mut receivers: Query<(Entity, &mut MessageReceiver<DebugSpawnTools>)>,
+    avatars: Res<crate::server::ClientAvatars>,
+    poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
+    item_registry: Res<crate::items::ItemRegistry>,
+    mut commands: Commands,
+) {
+    use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS};
+
+    const TOOL_IDS: &[&str] = &["vanilla:axe", "vanilla:hammer", "vanilla:pickaxe"];
+
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let count = receiver.receive().count();
+        if count == 0 {
+            continue;
+        }
+        let Some(&avatar) = avatars.0.get(&connection) else {
+            continue;
+        };
+        let Ok(pose) = poses.get(avatar) else {
+            continue;
+        };
+        // Anchor at the player's foot; spread a short distance forward
+        // and fan a small horizontal gap so the three items don't
+        // z-fight at one point.
+        let foot = pose.translation
+            - bevy::math::Vec3::new(
+                0.0,
+                EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
+                0.0,
+            )
+            + bevy::math::Vec3::new(0.0, 0.05, 0.0);
+        let yaw = pose.yaw;
+        let forward = bevy::math::Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+        let lateral = bevy::math::Vec3::new(forward.z, 0.0, -forward.x);
+        let mut spawned = 0usize;
+        for (i, id_str) in TOOL_IDS.iter().enumerate() {
+            let id = block_junk_mod_api::items::ItemId::new(*id_str);
+            let Some(slot) = item_registry.slot_of(&id) else {
+                warn!(item = id_str, "debug spawn tools: unknown id, skipping");
+                continue;
+            };
+            // Three items: lateral offsets -0.3, 0.0, +0.3 — wide
+            // enough not to clip, narrow enough to read as a group.
+            let lateral_offset = (i as f32 - 1.0) * 0.3;
+            let translation = foot + forward * 0.6 + lateral * lateral_offset;
+            commands.spawn((
+                crate::protocol::WorldItem {
+                    item: slot,
+                    translation,
+                },
+                bevy::prelude::Transform::from_translation(translation),
+                bevy::prelude::GlobalTransform::default(),
+                lightyear::prelude::Replicate::to_clients(NetworkTarget::All),
+                bevy::prelude::Name::new(format!("WorldItem(debug_tool:{id_str})")),
+            ));
+            spawned += 1;
+        }
+        info!(
+            count = spawned,
+            "debug: spawned vanilla tools near player",
         );
     }
 }

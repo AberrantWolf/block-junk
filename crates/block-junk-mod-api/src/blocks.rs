@@ -283,6 +283,17 @@ pub struct WorkAction {
     #[serde(default)]
     pub need_restore: Option<NeedRestore>,
     pub duration_secs: f32,
+    /// Tool requirement for this work action. When `Some`, an actor
+    /// attempting the action (player or NPC) must hold an item in their
+    /// tool slot whose [`ItemDef::tool_tags`](crate::items::ItemDef::tool_tags)
+    /// contains this tag. Match is byte-exact (same convention room
+    /// patterns use). `None` ⇒ no tool required, anyone can do it.
+    /// Engine doesn't validate the tag exists in any registry — mods
+    /// are trusted to spell it right; a typo silently means "no item
+    /// can satisfy this," which surfaces as "the action is always
+    /// blocked" in play and is quick to diagnose.
+    #[serde(default)]
+    pub required_tool: Option<TagId>,
 }
 
 /// Need + magnitude pair shared by [`Interactable::need_restore`] and

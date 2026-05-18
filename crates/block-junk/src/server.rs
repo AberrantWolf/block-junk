@@ -20,14 +20,14 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    DepositRequest, DropRequest, GameSet, MovementIntent, MovementMode,
+    DepositRequest, DropRequest, EquippedTool, GameSet, MovementIntent, MovementMode,
     NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind,
     RequestNpcDetails, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedWorldItem, read_save, write_save};
+use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedTool, SavedWorldItem, read_save, write_save};
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
     world_to_chunk,
@@ -60,6 +60,7 @@ impl Plugin for ServerPlugin {
         app.init_resource::<PendingChunks>();
         app.init_resource::<PendingSpawnPose>();
         app.init_resource::<PendingSpawnCarry>();
+        app.init_resource::<PendingSpawnTool>();
         app.init_resource::<RoomMap>();
         app.init_resource::<DetectionDirty>();
         // World clock. Start at 0.25 (sunrise) so a fresh session begins
@@ -183,6 +184,19 @@ pub struct PendingSpawnPose(pub Option<AvatarPose>);
 #[derive(Resource, Default)]
 pub struct PendingSpawnCarry(pub Option<Carrying>);
 
+/// Same shape as [`PendingSpawnCarry`] for the player's tool slot.
+/// Hand-off lane between save-load (or the starter-loadout fallback)
+/// and the avatar spawn observer. `None` ⇒ "use the starter axe if
+/// the item is registered, otherwise spawn empty-handed."
+#[derive(Resource, Default)]
+pub struct PendingSpawnTool(pub Option<EquippedTool>);
+
+/// Item id the engine equips on a freshly-spawned player when no save
+/// override is present. One hardcode — easy to lift to mod data when
+/// a starter-loadout system needs more than one item. Mod-side
+/// equivalent isn't worth the surface until there's a second item.
+const STARTER_TOOL_ID: &str = "vanilla:axe";
+
 /// Server App Startup: if `ServerSaveConfig::load_existing`, read the save
 /// file and pre-populate `ChunkMap` with the persisted edited chunks. They
 /// land with the `ChunkEdited` marker so subsequent AoI sends ship the
@@ -197,6 +211,7 @@ fn load_from_save(
     mut chunk_map: ResMut<ChunkMap>,
     mut pending_pose: ResMut<PendingSpawnPose>,
     mut pending_carry: ResMut<PendingSpawnCarry>,
+    mut pending_tool: ResMut<PendingSpawnTool>,
     mut dirty: ResMut<DetectionDirty>,
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
@@ -384,6 +399,36 @@ fn load_from_save(
             ),
         }
     }
+    // Tool: same lookup-or-warn pattern as carry. Distinct from the
+    // carry restore in one way — we ALWAYS set Pending to Some, even
+    // for a save that recorded an empty tool slot. The
+    // `register_new_client` starter-axe fallback only fires when
+    // Pending was left untouched (no save loaded); reaching this
+    // branch means a save loaded, so its intent (whether empty or a
+    // specific tool) is what should land.
+    let pending = match save.last_player_tool {
+        Some(saved_tool) => {
+            let id = block_junk_mod_api::items::ItemId::new(saved_tool.item_id.clone());
+            match item_registry.slot_of(&id) {
+                Some(slot) => {
+                    info!(
+                        item = %saved_tool.item_id,
+                        "restored player tool from save",
+                    );
+                    EquippedTool { item: Some(slot) }
+                }
+                None => {
+                    warn!(
+                        item = %saved_tool.item_id,
+                        "saved player tool references unknown item id; spawning empty-handed",
+                    );
+                    EquippedTool::default()
+                }
+            }
+        }
+        None => EquippedTool::default(),
+    };
+    pending_tool.0 = Some(pending);
 }
 
 /// Spawn an NPC entity restored from a save. Mirrors the cluster-spawn
@@ -434,6 +479,28 @@ fn spawn_loaded_npc(
             }
         })
         .unwrap_or_default();
+    // Tool slot: same lookup-or-drop-with-warning pattern. NPCs don't
+    // get a starter-loadout fallback (only players do via
+    // STARTER_TOOL_ID); a missing saved id just lands them with no
+    // tool.
+    let tool = npc
+        .tool
+        .as_ref()
+        .and_then(|st| {
+            let id = block_junk_mod_api::items::ItemId::new(st.item_id.clone());
+            match item_registry.slot_of(&id) {
+                Some(slot) => Some(EquippedTool { item: Some(slot) }),
+                None => {
+                    warn!(
+                        npc = npc.id,
+                        item = %st.item_id,
+                        "saved NPC tool references unknown item id; spawning toolless",
+                    );
+                    None
+                }
+            }
+        })
+        .unwrap_or_default();
     // Nested tuple: same 15-element Bundle workaround as the spawn-
     // cluster path. Identity/brain group + per-frame state + lightyear.
     commands.spawn((
@@ -448,6 +515,7 @@ fn spawn_loaded_npc(
                 rng: npc.rng,
             },
             carry,
+            tool,
         ),
         npc.pose,
         AvatarVelocity::default(),
@@ -473,8 +541,20 @@ fn save_on_request(
     clock: Res<WorldClock>,
     plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
-    avatars: Query<(&AvatarPose, &Carrying), With<Avatar>>,
-    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain, &Carrying), With<Npc>>,
+    avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
+    npcs: Query<
+        (
+            &NpcId,
+            &NpcKind,
+            &AvatarPose,
+            &MovementMode,
+            &Needs,
+            &Brain,
+            &Carrying,
+            &EquippedTool,
+        ),
+        With<Npc>,
+    >,
     world_items: Query<&WorldItem>,
     item_registry: Res<ItemRegistry>,
 ) {
@@ -505,7 +585,8 @@ fn save_on_request(
     let plan_count = saved_plans.len();
     let saved_items = collect_saved_world_items(&world_items, &item_registry);
     let item_count = saved_items.len();
-    let (saved_pose, saved_carry) = first_avatar_state(&avatars, &item_registry);
+    let (saved_pose, saved_carry, saved_player_tool) =
+        first_avatar_state(&avatars, &item_registry);
     let save = SaveFile {
         version: SAVE_VERSION,
         edited_chunks: edited,
@@ -515,6 +596,7 @@ fn save_on_request(
         plans: saved_plans,
         world_items: saved_items,
         last_player_carry: saved_carry,
+        last_player_tool: saved_player_tool,
     };
     match write_save(name, &save) {
         Ok(()) => info!(
@@ -571,16 +653,16 @@ fn collect_saved_world_items(
         .collect()
 }
 
-/// Pull the first connected avatar's pose + (non-empty) carry, mirroring
-/// the "first reconnect wins" convention `last_player_pose` already
-/// uses. Returns the carry only when non-empty so a save with one
-/// player holding nothing serialises as `last_player_carry = None`.
+/// Pull the first connected avatar's pose + (non-empty) carry + tool,
+/// mirroring the "first reconnect wins" convention `last_player_pose`
+/// already uses. Each of carry/tool serialises as `None` when its slot
+/// is empty.
 fn first_avatar_state(
-    avatars: &Query<(&AvatarPose, &Carrying), With<Avatar>>,
+    avatars: &Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
     item_registry: &ItemRegistry,
-) -> (Option<AvatarPose>, Option<SavedCarry>) {
-    let Some((pose, carry)) = avatars.iter().next() else {
-        return (None, None);
+) -> (Option<AvatarPose>, Option<SavedCarry>, Option<SavedTool>) {
+    let Some((pose, carry, tool)) = avatars.iter().next() else {
+        return (None, None, None);
     };
     let saved_carry = match (carry.item, carry.count) {
         (Some(slot), count) if count > 0 => Some(SavedCarry {
@@ -589,7 +671,10 @@ fn first_avatar_state(
         }),
         _ => None,
     };
-    (Some(*pose), saved_carry)
+    let saved_tool = tool.item.map(|slot| SavedTool {
+        item_id: item_registry.id_of(slot).to_string(),
+    });
+    (Some(*pose), saved_carry, saved_tool)
 }
 
 /// Snapshot every NPC's persistent state. `BrainDisabled` NPCs are
@@ -598,11 +683,23 @@ fn first_avatar_state(
 /// consistently broken planner will re-disable each NPC on its first
 /// tick after load (and log loudly each time).
 fn collect_saved_npcs(
-    npcs: &Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain, &Carrying), With<Npc>>,
+    npcs: &Query<
+        (
+            &NpcId,
+            &NpcKind,
+            &AvatarPose,
+            &MovementMode,
+            &Needs,
+            &Brain,
+            &Carrying,
+            &EquippedTool,
+        ),
+        With<Npc>,
+    >,
     item_registry: &ItemRegistry,
 ) -> Vec<SavedNpc> {
     npcs.iter()
-        .map(|(id, kind, pose, mode, needs, brain, carry)| {
+        .map(|(id, kind, pose, mode, needs, brain, carry, tool)| {
             let carrying = match (carry.item, carry.count) {
                 (Some(slot), count) if count > 0 => Some(SavedCarry {
                     item_id: item_registry.id_of(slot).to_string(),
@@ -610,6 +707,9 @@ fn collect_saved_npcs(
                 }),
                 _ => None,
             };
+            let saved_tool = tool.item.map(|slot| SavedTool {
+                item_id: item_registry.id_of(slot).to_string(),
+            });
             SavedNpc {
                 id: id.0,
                 kind: kind.0.clone(),
@@ -618,6 +718,7 @@ fn collect_saved_npcs(
                 needs: needs.0.clone(),
                 rng: brain.rng,
                 carrying,
+                tool: saved_tool,
             }
         })
         .collect()
@@ -639,8 +740,20 @@ fn save_then_shutdown(
     clock: Res<WorldClock>,
     plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
-    avatars: Query<(&AvatarPose, &Carrying), With<Avatar>>,
-    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain, &Carrying), With<Npc>>,
+    avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
+    npcs: Query<
+        (
+            &NpcId,
+            &NpcKind,
+            &AvatarPose,
+            &MovementMode,
+            &Needs,
+            &Brain,
+            &Carrying,
+            &EquippedTool,
+        ),
+        With<Npc>,
+    >,
     world_items: Query<&WorldItem>,
     item_registry: Res<ItemRegistry>,
     mut exit: MessageWriter<AppExit>,
@@ -671,7 +784,8 @@ fn save_then_shutdown(
                 let saved_npcs = collect_saved_npcs(&npcs, &item_registry);
                 let saved_plans = convert_saved_plans(&plans, &item_registry);
                 let saved_items = collect_saved_world_items(&world_items, &item_registry);
-                let (saved_pose, saved_carry) = first_avatar_state(&avatars, &item_registry);
+                let (saved_pose, saved_carry, saved_player_tool) =
+            first_avatar_state(&avatars, &item_registry);
                 let chunk_count = edited.len();
                 let npc_count = saved_npcs.len();
                 let plan_count = saved_plans.len();
@@ -685,6 +799,7 @@ fn save_then_shutdown(
                     plans: saved_plans,
                     world_items: saved_items,
                     last_player_carry: saved_carry,
+        last_player_tool: saved_player_tool,
                 };
                 match write_save(name, &save) {
                     Ok(()) => info!(
@@ -758,7 +873,9 @@ fn register_new_client(
     mut sent: ResMut<ClientChunks>,
     mut pending_pose: ResMut<PendingSpawnPose>,
     mut pending_carry: ResMut<PendingSpawnCarry>,
+    mut pending_tool: ResMut<PendingSpawnTool>,
     registry: Res<BlockRegistry>,
+    item_registry: Res<ItemRegistry>,
     mut manifests: Query<&mut MessageSender<BlockManifest>>,
 ) {
     let connection = trigger.entity;
@@ -785,6 +902,23 @@ fn register_new_client(
     // "first reconnect wins" convention, same as `PendingSpawnPose`).
     // Otherwise start empty-handed.
     let spawn_carry = pending_carry.0.take().unwrap_or_default();
+    // Tool slot: save override wins; if unset, hand the player a
+    // starter axe by looking up STARTER_TOOL_ID in the item registry.
+    // Missing tool id (mod removed) → empty slot + a warning, same
+    // degradation as the carry path.
+    let spawn_tool = pending_tool.0.take().unwrap_or_else(|| {
+        let id = block_junk_mod_api::items::ItemId::new(STARTER_TOOL_ID);
+        match item_registry.slot_of(&id) {
+            Some(slot) => EquippedTool { item: Some(slot) },
+            None => {
+                warn!(
+                    starter = STARTER_TOOL_ID,
+                    "starter tool id missing from item registry; spawning tool slot empty",
+                );
+                EquippedTool::default()
+            }
+        }
+    });
     let avatar = commands
         .spawn((
             Actor,
@@ -794,6 +928,7 @@ fn register_new_client(
             AvatarOnGround::default(),
             MovementMode::default(),
             spawn_carry,
+            spawn_tool,
             ActionState::<MovementIntent>::default(),
             Replicate::to_clients(NetworkTarget::All),
             PredictionTarget::to_clients(NetworkTarget::Single(remote.0)),
@@ -1438,15 +1573,22 @@ const PICKUP_PLAYER_REACH: f32 = 12.0;
 
 /// Apply a client's pickup request. Per request: find the player's
 /// avatar, find the closest `WorldItem` to the requested translation,
-/// validate compatibility with the player's existing `Carrying` and
-/// the reach gate, then despawn the item and update the player's
-/// `Carrying`. Carry replication broadcasts the new state back to
-/// the owner; HUD picks it up next frame.
+/// then route the pickup based on item kind:
+///   - tool (item def has non-empty `tool_tags`): goes into the
+///     player's `EquippedTool` slot. If the slot is full, the
+///     displaced tool drops as a fresh `WorldItem` at the player's
+///     feet (swap semantics — picking up always succeeds).
+///   - resource: goes into `Carrying`. Capacity / kind-mismatch
+///     refusals are silent no-ops.
+///
+/// Carry + tool replication broadcasts new state back to the owner;
+/// HUD picks it up next frame.
 fn receive_pickup_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<PickupRequest>)>,
     avatars: Res<ClientAvatars>,
-    mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
+    mut players: Query<(&AvatarPose, &mut Carrying, &mut EquippedTool), With<Avatar>>,
     world_items: Query<(Entity, &WorldItem)>,
+    item_registry: Res<ItemRegistry>,
     mut commands: Commands,
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
@@ -1455,7 +1597,7 @@ fn receive_pickup_requests(
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
-            let Ok((pose, mut carry)) = players.get_mut(avatar) else {
+            let Ok((pose, mut carry, mut tool)) = players.get_mut(avatar) else {
                 continue;
             };
             // Anti-cheat reach. Computed against eye position to match
@@ -1477,27 +1619,68 @@ fn receive_pickup_requests(
             let Some((entity, item_slot, _)) = best else {
                 continue;
             };
-            if !carry.pickup_one(item_slot, PLAYER_CARRY_CAPACITY) {
-                // Carry full or holding a different item. Silently no-op;
-                // the player keeps their stack and the world item stays
-                // in the world.
-                continue;
+            let is_tool = !item_registry.def(item_slot).tool_tags.is_empty();
+            if is_tool {
+                // Swap into the tool slot. Displaced tool (if any)
+                // drops as a fresh WorldItem at the player's foot so
+                // the pickup never silently destroys an item.
+                let displaced = tool.item.replace(item_slot);
+                commands.entity(entity).despawn();
+                if let Some(prev_slot) = displaced
+                    && prev_slot != item_slot
+                {
+                    let foot = pose.translation
+                        - Vec3::new(
+                            0.0,
+                            EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
+                            0.0,
+                        )
+                        + Vec3::new(0.0, 0.05, 0.0);
+                    commands.spawn((
+                        WorldItem {
+                            item: prev_slot,
+                            translation: foot,
+                        },
+                        Transform::from_translation(foot),
+                        GlobalTransform::default(),
+                        Replicate::to_clients(NetworkTarget::All),
+                        Name::new(format!("WorldItem(tool_swap:{})", prev_slot.0)),
+                    ));
+                }
+            } else {
+                if !carry.pickup_one(item_slot, PLAYER_CARRY_CAPACITY) {
+                    // Carry full or holding a different item. Silent
+                    // no-op; the player keeps their stack and the
+                    // world item stays in the world.
+                    continue;
+                }
+                commands.entity(entity).despawn();
             }
-            commands.entity(entity).despawn();
         }
     }
 }
 
 /// Apply a client's drop request. Clears the player's `Carrying` and
-/// spawns N `WorldItem` entities at their feet (one per unit in the
-/// dropped stack). A small per-unit fan jitter keeps a 5-stack pile
-/// from z-fighting at the same cell centre.
+/// spawns N `WorldItem` entities (one per unit in the dropped stack).
+/// Items land one tile ahead of the player when that cell is standable
+/// (so the player can see what they just dropped), else at the player's
+/// feet (sliding off a cliff edge or facing a wall both degrade to
+/// "right here"). A tight per-unit fan jitter keeps a stack from
+/// z-fighting at the same point.
 fn receive_drop_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<DropRequest>)>,
     avatars: Res<ClientAvatars>,
     mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
+    chunks: Query<&'static Chunk>,
+    chunk_map: Res<ChunkMap>,
+    block_registry: Res<BlockRegistry>,
     mut commands: Commands,
 ) {
+    let world = crate::npc::WorldWalk {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &block_registry,
+    };
     for (connection, mut receiver) in receivers.iter_mut() {
         let request_count = receiver.receive().count();
         if request_count == 0 {
@@ -1512,16 +1695,13 @@ fn receive_drop_requests(
         let Some((item, count)) = carry.drop_all() else {
             continue;
         };
-        // Drop at foot: avatar pose is at eye height by convention; the
-        // foot of the body sits `EYE_OFFSET_FROM_CENTRE + half-height`
-        // below.
-        let foot = pose.translation
-            - Vec3::new(0.0, EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y, 0.0)
-            + Vec3::new(0.0, 0.05, 0.0);
+        let centre = drop_target_position(pose, &world);
+        // Tight ring (0.08 m) so a 5-stack reads as "here," not "spread
+        // across half a tile."
         for unit in 0..count {
             let angle = (unit as f32) * std::f32::consts::TAU / count.max(1) as f32;
-            let offset = Vec3::new(angle.cos() * 0.18, 0.0, angle.sin() * 0.18);
-            let translation = foot + offset;
+            let offset = Vec3::new(angle.cos() * 0.08, 0.0, angle.sin() * 0.08);
+            let translation = centre + offset;
             commands.spawn((
                 WorldItem {
                     item,
@@ -1533,6 +1713,45 @@ fn receive_drop_requests(
                 Name::new(format!("WorldItem(dropped:{})", item.0)),
             ));
         }
+    }
+}
+
+/// Compute where a dropped stack should land relative to `pose`.
+/// Snaps the player's yaw to the dominant cardinal direction and
+/// looks one tile ahead; if that cell is standable (foot empty, head
+/// empty, supporting cell solid) the items drop on top of it. Else
+/// fall back to the player's actual foot position. Items always
+/// spawn slightly above the floor so visual meshes don't sink in.
+fn drop_target_position(
+    pose: &AvatarPose,
+    world: &crate::npc::WorldWalk,
+) -> Vec3 {
+    let foot_pos = pose.translation
+        - Vec3::new(0.0, EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y, 0.0);
+    let foot_cell = IVec3::new(
+        foot_pos.x.floor() as i32,
+        foot_pos.y.floor() as i32,
+        foot_pos.z.floor() as i32,
+    );
+    // Engine convention: yaw=0 → -Z (matches `apply_walk_step` /
+    // `aim_yaw_step`). Snap to whichever axis the forward vector
+    // dominates so the drop reads as "the way I'm facing" rather
+    // than at some diagonal between two cells.
+    let forward = Vec3::new(-pose.yaw.sin(), 0.0, -pose.yaw.cos());
+    let cardinal = if forward.x.abs() > forward.z.abs() {
+        IVec3::new(forward.x.signum() as i32, 0, 0)
+    } else {
+        IVec3::new(0, 0, forward.z.signum() as i32)
+    };
+    let forward_cell = foot_cell + cardinal;
+    if crate::pathfinding::standable(world, forward_cell) {
+        Vec3::new(
+            forward_cell.x as f32 + 0.5,
+            forward_cell.y as f32 + 0.05,
+            forward_cell.z as f32 + 0.5,
+        )
+    } else {
+        foot_pos + Vec3::new(0.0, 0.05, 0.0)
     }
 }
 

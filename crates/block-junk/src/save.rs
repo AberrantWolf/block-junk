@@ -47,7 +47,11 @@ use crate::voxel::{Chunk, ChunkEntities};
 ///                  + WorldItemReservations are deliberately *not* saved
 ///                  — same pattern as PlanClaims; brain resets to Idle
 ///                  on load and the scheduler re-pairs from scratch.
-pub const SAVE_VERSION: u32 = 8;
+/// v9 (2026-05-18): added `last_player_tool` to `SaveFile` and `tool`
+///                  to `SavedNpc` (Phase 5a). Single-slot tools live
+///                  separately from carry stacks so the save shape is
+///                  symmetric: each actor gets one optional tool id.
+pub const SAVE_VERSION: u32 = 9;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -133,6 +137,13 @@ pub struct SaveFile {
     /// we don't have yet.
     #[serde(default)]
     pub last_player_carry: Option<SavedCarry>,
+    /// Tool slot of the spawning player at save time. Same
+    /// first-reconnect convention as `last_player_carry`. `None` ⇒
+    /// empty tool slot at save time, OR a save predating v9 (the
+    /// load path falls back to the engine starter-axe via
+    /// `STARTER_TOOL_ID`).
+    #[serde(default)]
+    pub last_player_tool: Option<SavedTool>,
 }
 
 /// On-disk shape of a [`WorldItem`](crate::protocol::WorldItem) entity.
@@ -154,6 +165,16 @@ pub struct SavedWorldItem {
 pub struct SavedCarry {
     pub item_id: String,
     pub count: u32,
+}
+
+/// On-disk shape of an actor's
+/// [`EquippedTool`](crate::protocol::EquippedTool) slot. Just an item
+/// id — single-slot, so no count. Same stability convention as
+/// [`SavedCarry`]; the load path drops references to unknown ids
+/// (mod uninstalled between sessions) with a warning.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedTool {
+    pub item_id: String,
 }
 
 /// On-disk shape of a [`PlanState`](crate::protocol::PlanState).
@@ -212,6 +233,13 @@ pub struct SavedNpc {
     /// or sits until a Q-drop / new haul disposes of it).
     #[serde(default)]
     pub carrying: Option<SavedCarry>,
+    /// Tool slot at save time. `None` for empty-toolslot NPCs and for
+    /// v8-and-earlier saves. NPCs don't currently equip tools (no
+    /// scheduler path for that yet — Phase 5b), but the field is
+    /// already in the save shape so adding NPC tool fetch later is a
+    /// pure runtime change.
+    #[serde(default)]
+    pub tool: Option<SavedTool>,
 }
 
 pub fn save_root() -> PathBuf {
@@ -429,6 +457,9 @@ mod tests {
                     item_id: "vanilla:stone_chunk".to_owned(),
                     count: 2,
                 }),
+                tool: Some(SavedTool {
+                    item_id: "vanilla:pickaxe".to_owned(),
+                }),
             }],
             world_clock: Some(WorldClock {
                 day: 3,
@@ -439,6 +470,9 @@ mod tests {
             last_player_carry: Some(SavedCarry {
                 item_id: "vanilla:wood_log".to_owned(),
                 count: 3,
+            }),
+            last_player_tool: Some(SavedTool {
+                item_id: "vanilla:axe".to_owned(),
             }),
         };
 
@@ -475,5 +509,9 @@ mod tests {
         let carry = decoded.last_player_carry.unwrap();
         assert_eq!(carry.item_id, "vanilla:wood_log");
         assert_eq!(carry.count, 3);
+        let tool = decoded.last_player_tool.unwrap();
+        assert_eq!(tool.item_id, "vanilla:axe");
+        let npc_tool = decoded.npcs[0].tool.as_ref().unwrap();
+        assert_eq!(npc_tool.item_id, "vanilla:pickaxe");
     }
 }

@@ -37,6 +37,36 @@ engine.items.register {
     color = { 0.55, 0.55, 0.58 },
 }
 
+-- Tools (Phase 5a). Each tool's `tool_tags` is the engine-side handle
+-- a block's `work_action.required_tool` matches against. Meshes are
+-- placeholders today — the wood-log mesh stands in for all three so
+-- the gameplay loop is testable now; proper KayKit RPG Tools Bits
+-- meshes can replace the `mesh` paths without touching anything else.
+-- Distinct colors keep them visually separable in the world + HUD.
+engine.items.register {
+    id = "vanilla:axe",
+    display_name = "Axe",
+    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    color = { 0.78, 0.45, 0.18 },
+    tool_tags = { "vanilla:axe" },
+}
+
+engine.items.register {
+    id = "vanilla:hammer",
+    display_name = "Hammer",
+    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    color = { 0.45, 0.30, 0.20 },
+    tool_tags = { "vanilla:hammer" },
+}
+
+engine.items.register {
+    id = "vanilla:pickaxe",
+    display_name = "Pickaxe",
+    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    color = { 0.38, 0.40, 0.45 },
+    tool_tags = { "vanilla:pickaxe" },
+}
+
 -- Masks + ramps composited per-block by the chunk fragment shader.
 -- Slot order is registration order; refs from `layers` below resolve
 -- against these by id at boot. Mods can register their own with
@@ -104,6 +134,14 @@ register {
     materials = {
         { item = "vanilla:stone_chunk", count = 1 },
     },
+    -- Phase 5a: stone needs a pickaxe to work (chop or build). Engine
+    -- defaults supply duration_secs + need_restore; we override only
+    -- the tool gate.
+    work_action = {
+        duration_secs = 4.0,
+        need_restore = { need = "work", restores = 0.1 },
+        required_tool = "vanilla:pickaxe",
+    },
 }
 
 register {
@@ -163,6 +201,14 @@ register {
     -- returns what it cost.
     materials = {
         { item = "vanilla:wood_log", count = 1 },
+    },
+    -- Phase 5a: wood needs an axe to chop (or build). Same pattern as
+    -- stone — engine defaults for duration + need_restore, override
+    -- only the tool gate.
+    work_action = {
+        duration_secs = 4.0,
+        need_restore = { need = "work", restores = 0.1 },
+        required_tool = "vanilla:axe",
     },
 }
 

@@ -21,7 +21,8 @@ use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     Carrying, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
-    DebugFillNearestPlan, DepositRequest, DropRequest, MovementIntent, MovementMode,
+    DebugFillNearestPlan, DebugSpawnTools, DepositRequest, DropRequest, EquippedTool,
+    MovementIntent, MovementMode,
     NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync,
     RequestNpcDetails, WorldChannel, WorldClockSync, WorldItem,
 };
@@ -93,6 +94,8 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DebugFillNearestPlan>()
             .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<DebugSpawnTools>()
+            .add_direction(NetworkDirection::ClientToServer);
         // NPC inspection RPC. Targeted reply — server uses the
         // requesting connection entity's MessageSender so other
         // clients don't see the response.
@@ -131,6 +134,10 @@ impl Plugin for ProtocolPlugin {
         // pickup/drop are discrete server-authoritative events, not
         // continuous-per-frame updates worth rolling back.
         app.register_component::<Carrying>();
+        // Actor tool slot. Separate from carry — tools enable actions,
+        // resources get hauled. Same no-prediction reasoning as
+        // Carrying (pickup/swap are discrete server events).
+        app.register_component::<EquippedTool>();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between
         // server samples instead of snapping every 50 ms).

@@ -91,6 +91,21 @@ impl ItemRegistry {
         &self.defs_by_slot[slot.0 as usize].id
     }
 
+    /// Does the item in `slot` carry `tag` in its `tool_tags`? A `None`
+    /// slot (empty tool / empty carry) is always false. Used by the
+    /// tool-gating path on both client (outline tint) and server (work
+    /// validation).
+    pub fn tool_has_tag(
+        &self,
+        slot: Option<ItemSlot>,
+        tag: &block_junk_mod_api::blocks::TagId,
+    ) -> bool {
+        let Some(slot) = slot else {
+            return false;
+        };
+        self.def(slot).tool_tags.iter().any(|t| t == tag)
+    }
+
     pub fn slot_count(&self) -> usize {
         self.defs_by_slot.len()
     }

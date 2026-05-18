@@ -27,16 +27,16 @@
 use bevy::prelude::*;
 use lightyear::prelude::Predicted;
 
-use crate::blocks::BlockRegistry;
+use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::client::{
     PlaceablePalette, RAYCAST_REACH, SelectedBlock, entity_aware_raycast, raycast_world_items,
 };
-use crate::items::PLAYER_CARRY_CAPACITY;
+use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans, raycast_plans};
 use crate::player_mode::PlayerMode;
-use crate::protocol::{Avatar, Carrying, GameSet, PlanKind, WorldItem};
-use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
+use crate::protocol::{Avatar, Carrying, EquippedTool, GameSet, PlanKind, WorldItem};
+use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
 
 pub struct TargetOutlinePlugin;
 
@@ -92,11 +92,13 @@ fn draw_target_outline(
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
+    items: Res<ItemRegistry>,
     plans: Res<Plans>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
     world_items: Query<&WorldItem>,
     local_carry: Query<&Carrying, (With<Avatar>, With<Predicted>)>,
+    local_tool: Query<&EquippedTool, (With<Avatar>, With<Predicted>)>,
     mut gizmos: Gizmos,
 ) {
     // During an in-flight Plan-mode drag the rectangle preview is the
@@ -118,9 +120,10 @@ fn draw_target_outline(
         ),
         PlayerMode::Normal => {
             let carry = local_carry.single().copied().unwrap_or_default();
+            let tool = local_tool.single().copied().unwrap_or_default();
             draw_normal_target(
-                origin, dir, &chunks, &chunk_map, &registry, &plans, &world_items, carry,
-                &mut gizmos,
+                origin, dir, &chunks, &chunk_map, &registry, &items, &plans, &world_items,
+                carry, tool, &mut gizmos,
             );
         }
     }
@@ -177,9 +180,11 @@ fn draw_normal_target(
     chunks: &Query<(&Chunk, &ChunkEntities)>,
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
+    items: &ItemRegistry,
     plans: &Plans,
     world_items: &Query<&WorldItem>,
     carry: Carrying,
+    tool: EquippedTool,
     gizmos: &mut Gizmos,
 ) {
     // Three candidate targets, in priority order by distance:
@@ -234,7 +239,8 @@ fn draw_normal_target(
         // Decide the verb the next L-click would commit:
         //   - Build plan pending materials + carry can deposit → green
         //   - Otherwise plan-ready (Remove always, Build when satisfied)
-        //     → orange (self-work)
+        //     → orange (self-work), BUT grey if the work needs a tool
+        //     the player isn't carrying.
         //   - Plan pending materials, carry can't help → cyan (inspect)
         let colour = if let Some(state) = plans.get(cell) {
             match (&state.kind, carry.item) {
@@ -243,7 +249,14 @@ fn draw_normal_target(
                 {
                     Color::srgb(0.3, 1.0, 0.4) // deposit-ready green
                 }
-                _ if state.is_satisfied() => Color::srgb(1.0, 0.6, 0.1), // self-work orange
+                _ if state.is_satisfied() => {
+                    let work_slot = self_work_block_slot(cell, state.kind, chunks, chunk_map);
+                    if player_can_work_slot(work_slot, registry, items, tool) {
+                        Color::srgb(1.0, 0.6, 0.1) // self-work orange
+                    } else {
+                        TOOL_GATED_GREY
+                    }
+                }
                 _ => Color::srgb(0.55, 0.78, 0.95), // pending, can't help → cyan
             }
         } else {
@@ -252,11 +265,81 @@ fn draw_normal_target(
         draw_cell(gizmos, cell, colour);
         return;
     }
-    // No tag under the cursor; fall back to the world hit. Red means
-    // R-click would direct-destroy whatever block is here.
+    // No tag under the cursor; fall back to the world hit. R-click
+    // direct-destroy is red, OR grey if the live block needs a tool
+    // the player isn't holding.
     if let Some(hit) = world_hit {
-        draw_cell(gizmos, hit.cell, Color::srgb(1.0, 0.35, 0.3));
+        let live_slot = live_block_slot(hit.cell, chunks, chunk_map);
+        let colour = if player_can_work_slot(live_slot, registry, items, tool) {
+            Color::srgb(1.0, 0.35, 0.3)
+        } else {
+            TOOL_GATED_GREY
+        };
+        draw_cell(gizmos, hit.cell, colour);
     }
+}
+
+/// Shared tint for "this verb is real but you're holding the wrong
+/// tool." Same intensity / saturation as the inspect-cyan so the
+/// gating reads as informational, not error-coloured.
+const TOOL_GATED_GREY: Color = Color::srgb(0.55, 0.55, 0.55);
+
+/// True when `slot`'s block either has no work-action or its
+/// work-action's `required_tool` is satisfied by the player's
+/// equipped tool. `None` slot (empty cell) → true (nothing to gate).
+///
+/// Exported so `normal_mode_action_input` in `client.rs` uses the
+/// exact same predicate the outline uses — keeps what the player
+/// sees and what the click does in sync.
+pub(crate) fn player_can_work_slot(
+    slot: Option<BlockSlot>,
+    registry: &BlockRegistry,
+    items: &ItemRegistry,
+    tool: EquippedTool,
+) -> bool {
+    let Some(slot) = slot else {
+        return true;
+    };
+    let def = registry.def(slot);
+    let Some(work_action) = &def.work_action else {
+        return true;
+    };
+    let Some(required) = &work_action.required_tool else {
+        return true;
+    };
+    items.tool_has_tag(tool.item, required)
+}
+
+/// The BlockSlot whose work-action drives gating for a self-work
+/// verb. Build plans gate on the *block being placed*; Remove plans
+/// gate on the *live block being destroyed*. Empty cells / unloaded
+/// chunks return None (no gate — same fall-through as
+/// `player_can_work_slot`).
+fn self_work_block_slot(
+    cell: IVec3,
+    kind: PlanKind,
+    chunks: &Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: &ChunkMap,
+) -> Option<BlockSlot> {
+    match kind {
+        PlanKind::Build { slot, .. } => Some(slot),
+        PlanKind::Remove => live_block_slot(cell, chunks, chunk_map),
+    }
+}
+
+/// Read the live block slot at a world cell. Returns None for unloaded
+/// chunks or empty cells. Exported alongside `player_can_work_slot`
+/// so the click resolver in `client.rs` shares the lookup path.
+pub(crate) fn live_block_slot(
+    cell: IVec3,
+    chunks: &Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: &ChunkMap,
+) -> Option<BlockSlot> {
+    let (coord, local) = world_to_chunk(cell);
+    let entity = chunk_map.0.get(&coord)?;
+    let (chunk, _) = chunks.get(*entity).ok()?;
+    let slot = chunk.get(local);
+    if slot.is_empty() { None } else { Some(slot) }
 }
 
 /// Voxel cells are unit cubes with `cell` as the integer min corner.

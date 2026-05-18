@@ -617,6 +617,7 @@ fn spawn_initial_npc_on_first_connect(
                     rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
                 },
                 crate::protocol::Carrying::default(),
+                crate::protocol::EquippedTool::default(),
             ),
             AvatarPose {
                 translation,
@@ -639,10 +640,14 @@ fn spawn_initial_npc_on_first_connect(
 /// Adapter that lets pathfinding query the live world. Treats unloaded
 /// chunks as solid so the search doesn't commit to a path through
 /// territory whose contents we don't know.
-struct WorldWalk<'q, 'w, 's> {
-    chunks: &'q Query<'w, 's, &'static Chunk>,
-    chunk_map: &'q ChunkMap,
-    registry: &'q BlockRegistry,
+///
+/// Exposed `pub(crate)` so other server systems (drop placement, etc.)
+/// can reuse the same standable check the brain uses — keeps "where
+/// does a body fit" logic in one place.
+pub(crate) struct WorldWalk<'q, 'w, 's> {
+    pub(crate) chunks: &'q Query<'w, 's, &'static Chunk>,
+    pub(crate) chunk_map: &'q ChunkMap,
+    pub(crate) registry: &'q BlockRegistry,
 }
 
 impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
