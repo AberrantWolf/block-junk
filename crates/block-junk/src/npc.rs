@@ -1330,15 +1330,17 @@ fn npc_brain_tick(
             // standalone scheduler in Update would never observe
             // Goal::Idle. Calling per-NPC at the Idle moment is the
             // only place where the scheduler can catch an unassigned
-            // NPC. The call is cheap (one O(items) index build + one
-            // O(plans) scan), and only NPCs without an existing
-            // assignment + empty carry get scored.
-            if !haul.assignments.contains(*npc_id) && carrying.is_empty() {
+            // NPC. Cheap: one O(items) index build + one O(plans)
+            // scan. Runs for *any* NPC without an existing
+            // assignment, including ones with non-empty carry — the
+            // matcher's deposit-only branch handles that case
+            // (save/load mid-haul, hand-offs from future systems).
+            if !haul.assignments.contains(*npc_id) {
                 crate::haul::try_schedule_haul_for_npc(
                     *npc_id,
                     &kind.0,
                     pose.translation,
-                    carrying.is_empty(),
+                    &carrying,
                     &haul.kind_registry,
                     &haul.plans,
                     &haul.world_items,

@@ -183,7 +183,7 @@ pub fn try_schedule_haul_for_npc(
     npc_id: NpcId,
     npc_kind: &str,
     pose: Vec3,
-    carrying_is_empty: bool,
+    carrying: &crate::protocol::Carrying,
     kind_registry: &crate::npc_registry::NpcKindRegistry,
     plans: &crate::plans::Plans,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
@@ -193,12 +193,6 @@ pub fn try_schedule_haul_for_npc(
     use crate::protocol::PlanKind;
 
     if assignments.contains(npc_id) {
-        return false;
-    }
-    if !carrying_is_empty {
-        // Non-empty carry from a previous assignment or a player
-        // hand-off — scheduler doesn't hijack. The brain's planner
-        // gets to dispose of it (wander, etc.).
         return false;
     }
     let cap = kind_registry
@@ -213,6 +207,64 @@ pub fn try_schedule_haul_for_npc(
         pose.y.floor() as i32,
         pose.z.floor() as i32,
     );
+
+    // Non-empty carry → deposit-only path. Find a Build plan that
+    // wants exactly this kind and create an assignment with an empty
+    // queue; `pick_next_haul_leg` then routes the NPC straight to the
+    // plan to deposit. Covers the save/load case (carry persists; the
+    // pre-save haul assignment doesn't) and any other "NPC was handed
+    // an item and now needs somewhere to put it" scenario. If no
+    // matching plan exists, the NPC falls through to the planner
+    // (wanders carrying the stack); the next time a matching plan
+    // appears, this branch picks them up.
+    if let (Some(carried_slot), c) = (carrying.item, carrying.count)
+        && c > 0
+    {
+        let mut best_plan: Option<(IVec3, i32)> = None;
+        for (cell, state) in plans.iter() {
+            if !matches!(state.kind, PlanKind::Build { .. }) {
+                continue;
+            }
+            if state.is_satisfied() {
+                continue;
+            }
+            let wants_it = state
+                .materials
+                .iter()
+                .any(|m| m.item == carried_slot && m.needed > m.present);
+            if !wants_it {
+                continue;
+            }
+            let dist = (cell.x - foot.x)
+                .abs()
+                .max((cell.y - foot.y).abs())
+                .max((cell.z - foot.z).abs());
+            if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
+                continue;
+            }
+            if best_plan.map(|(_, d)| dist < d).unwrap_or(true) {
+                best_plan = Some((*cell, dist));
+            }
+        }
+        let Some((plan_cell, _)) = best_plan else {
+            return false;
+        };
+        info!(
+            npc = npc_id.0,
+            plan = ?plan_cell.to_array(),
+            kind = carried_slot.0,
+            carry = c,
+            "haul assignment (deposit-only) committed",
+        );
+        assignments.insert(
+            npc_id,
+            HaulAssignment {
+                plan_cell,
+                queue: Vec::new(),
+            },
+        );
+        return true;
+    }
 
     // Index every loose item by ItemSlot once per call. The pool is
     // shared across this NPC's plan scan + final reservation pass;
