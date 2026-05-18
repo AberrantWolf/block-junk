@@ -4,6 +4,7 @@ mod camera;
 mod client;
 mod collision;
 mod debug;
+mod haul;
 mod inspect_panel;
 mod interactables;
 mod items;

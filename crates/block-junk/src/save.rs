@@ -42,7 +42,12 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v7 (2026-05-18): `plans` value evolves from bare `PlanKind` to
 ///                  `SavedPlanState` (kind + materials progress) for
 ///                  the Phase 3 plan-materials feature.
-pub const SAVE_VERSION: u32 = 7;
+/// v8 (2026-05-18): added `carrying` to `SavedNpc` so a save mid-haul
+///                  preserves each NPC's stack (Phase 4). HaulAssignments
+///                  + WorldItemReservations are deliberately *not* saved
+///                  — same pattern as PlanClaims; brain resets to Idle
+///                  on load and the scheduler re-pairs from scratch.
+pub const SAVE_VERSION: u32 = 8;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -198,6 +203,15 @@ pub struct SavedNpc {
     pub movement_mode: MovementMode,
     pub needs: HashMap<String, f32>,
     pub rng: u64,
+    /// Carry stack at save time. `None` for empty-handed NPCs and for
+    /// v7-and-earlier saves (serde-default fires there). Hauling NPCs
+    /// caught mid-cycle resume with their stack intact; the brain
+    /// itself resets to Idle on load, so the scheduler re-pairs the
+    /// NPC to a fresh assignment on the first post-load tick (the
+    /// carry is then deposited at whatever plan the scheduler picks,
+    /// or sits until a Q-drop / new haul disposes of it).
+    #[serde(default)]
+    pub carrying: Option<SavedCarry>,
 }
 
 pub fn save_root() -> PathBuf {
@@ -411,6 +425,10 @@ mod tests {
                 movement_mode: MovementMode::Walk,
                 needs: needs.clone(),
                 rng: 0xCAFE_BABE_DEAD_BEEF,
+                carrying: Some(SavedCarry {
+                    item_id: "vanilla:stone_chunk".to_owned(),
+                    count: 2,
+                }),
             }],
             world_clock: Some(WorldClock {
                 day: 3,
@@ -437,6 +455,9 @@ mod tests {
         assert_eq!(np.movement_mode, MovementMode::Walk);
         assert_eq!(np.needs.get("hunger"), Some(&0.42));
         assert_eq!(np.rng, 0xCAFE_BABE_DEAD_BEEF);
+        let npc_carry = np.carrying.as_ref().unwrap();
+        assert_eq!(npc_carry.item_id, "vanilla:stone_chunk");
+        assert_eq!(npc_carry.count, 2);
         let pose = decoded.last_player_pose.unwrap();
         assert_eq!(pose.translation, Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(pose.yaw, 0.5);

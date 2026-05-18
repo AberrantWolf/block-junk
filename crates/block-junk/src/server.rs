@@ -20,8 +20,8 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    DepositRequest, DropRequest, GameSet, MaterialEntry, MovementIntent, MovementMode,
-    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind, PlanState,
+    DepositRequest, DropRequest, GameSet, MovementIntent, MovementMode,
+    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind,
     RequestNpcDetails, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
@@ -49,6 +49,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::npc::NpcServerPlugin);
         app.add_plugins(crate::plans::PlansServerPlugin);
         app.add_plugins(crate::plan_claims::PlanClaimsPlugin);
+        app.add_plugins(crate::haul::HaulPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
@@ -329,7 +330,7 @@ fn load_from_save(
         info!("primed {dirty_marked} room-bounding cells for re-detection after load");
     }
     for npc in save.npcs {
-        spawn_loaded_npc(&mut commands, npc, &kind_registry);
+        spawn_loaded_npc(&mut commands, npc, &kind_registry, &item_registry);
     }
     // Loose items in the world. Resolve item ids → slots through the
     // current registry. An item id missing from the registry (mod
@@ -401,6 +402,7 @@ fn spawn_loaded_npc(
     commands: &mut Commands,
     npc: SavedNpc,
     kind_registry: &crate::npc_registry::NpcKindRegistry,
+    item_registry: &ItemRegistry,
 ) {
     let mut needs = npc.needs;
     if let Some(def) = kind_registry.get(&npc.kind) {
@@ -408,6 +410,30 @@ fn spawn_loaded_npc(
             needs.entry(need_id.clone()).or_insert(*default_value);
         }
     }
+    // Reconstruct the carry stack. Missing item ids (mod uninstalled
+    // between sessions) drop the carry silently — same degradation
+    // pattern `load_from_save` uses for world items.
+    let carry = npc
+        .carrying
+        .as_ref()
+        .and_then(|sc| {
+            let id = block_junk_mod_api::items::ItemId::new(sc.item_id.clone());
+            match item_registry.slot_of(&id) {
+                Some(slot) => Some(Carrying {
+                    item: Some(slot),
+                    count: sc.count,
+                }),
+                None => {
+                    warn!(
+                        npc = npc.id,
+                        item = %sc.item_id,
+                        "saved NPC carry references unknown item id; spawning empty-handed",
+                    );
+                    None
+                }
+            }
+        })
+        .unwrap_or_default();
     // Nested tuple: same 15-element Bundle workaround as the spawn-
     // cluster path. Identity/brain group + per-frame state + lightyear.
     commands.spawn((
@@ -421,6 +447,7 @@ fn spawn_loaded_npc(
                 goal: Goal::Idle,
                 rng: npc.rng,
             },
+            carry,
         ),
         npc.pose,
         AvatarVelocity::default(),
@@ -447,7 +474,7 @@ fn save_on_request(
     plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<(&AvatarPose, &Carrying), With<Avatar>>,
-    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
+    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain, &Carrying), With<Npc>>,
     world_items: Query<&WorldItem>,
     item_registry: Res<ItemRegistry>,
 ) {
@@ -471,7 +498,7 @@ fn save_on_request(
             entities: ce.clone(),
         })
         .collect();
-    let saved_npcs = collect_saved_npcs(&npcs);
+    let saved_npcs = collect_saved_npcs(&npcs, &item_registry);
     let chunk_count = edited.len();
     let npc_count = saved_npcs.len();
     let saved_plans = convert_saved_plans(&plans, &item_registry);
@@ -571,16 +598,27 @@ fn first_avatar_state(
 /// consistently broken planner will re-disable each NPC on its first
 /// tick after load (and log loudly each time).
 fn collect_saved_npcs(
-    npcs: &Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
+    npcs: &Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain, &Carrying), With<Npc>>,
+    item_registry: &ItemRegistry,
 ) -> Vec<SavedNpc> {
     npcs.iter()
-        .map(|(id, kind, pose, mode, needs, brain)| SavedNpc {
-            id: id.0,
-            kind: kind.0.clone(),
-            pose: *pose,
-            movement_mode: *mode,
-            needs: needs.0.clone(),
-            rng: brain.rng,
+        .map(|(id, kind, pose, mode, needs, brain, carry)| {
+            let carrying = match (carry.item, carry.count) {
+                (Some(slot), count) if count > 0 => Some(SavedCarry {
+                    item_id: item_registry.id_of(slot).to_string(),
+                    count,
+                }),
+                _ => None,
+            };
+            SavedNpc {
+                id: id.0,
+                kind: kind.0.clone(),
+                pose: *pose,
+                movement_mode: *mode,
+                needs: needs.0.clone(),
+                rng: brain.rng,
+                carrying,
+            }
         })
         .collect()
 }
@@ -602,7 +640,7 @@ fn save_then_shutdown(
     plans: Res<Plans>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<(&AvatarPose, &Carrying), With<Avatar>>,
-    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain), With<Npc>>,
+    npcs: Query<(&NpcId, &NpcKind, &AvatarPose, &MovementMode, &Needs, &Brain, &Carrying), With<Npc>>,
     world_items: Query<&WorldItem>,
     item_registry: Res<ItemRegistry>,
     mut exit: MessageWriter<AppExit>,
@@ -630,7 +668,7 @@ fn save_then_shutdown(
                         entities: ce.clone(),
                     })
                     .collect();
-                let saved_npcs = collect_saved_npcs(&npcs);
+                let saved_npcs = collect_saved_npcs(&npcs, &item_registry);
                 let saved_plans = convert_saved_plans(&plans, &item_registry);
                 let saved_items = collect_saved_world_items(&world_items, &item_registry);
                 let (saved_pose, saved_carry) = first_avatar_state(&avatars, &item_registry);

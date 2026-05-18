@@ -27,7 +27,8 @@
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::{Cardinal, Interactable, NeedRestore, UseSlot};
 use block_junk_mod_api::npcs::{
-    NearbyInteraction, NearbyPlan, NearbyRoom, NpcKindId, NpcSnapshot, PlanKindHint, PlannerGoal,
+    NearbyInteraction, NearbyPlan, NearbyRoom, NpcKindId, NpcSnapshot, PendingAssignment,
+    PlanKindHint, PlannerGoal,
 };
 use block_junk_mod_api::shared::BlockPos;
 use lightyear::prelude::*;
@@ -37,7 +38,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
+use crate::haul::{HaulAssignments, WorldItemReservations, release_haul_for};
 use crate::interactables::{InteractableIndex, InteractionClaims};
+use crate::items::ItemSlot;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
@@ -47,8 +50,8 @@ use crate::physics::{
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
-    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, KinematicLock, MovementIntent, MovementMode,
-    NpcAnimOverride, PlanKind, WorldClock,
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, KinematicLock, MovementIntent,
+    MovementMode, NpcAnimOverride, PlanEdit, PlanKind, WorldChannel, WorldClock, WorldItem,
 };
 use crate::scripting::ServerMods;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, world_to_chunk};
@@ -300,6 +303,42 @@ pub enum ArrivalAction {
         target_cell: IVec3,
         plan_kind: PlanKind,
         need_restore: Option<NeedRestore>,
+    },
+    /// One leg of a haul cycle: arrive at a `WorldItem`, pick it up,
+    /// then either keep collecting or walk to the plan to deposit.
+    /// `item_entity` is the specific loose item the scheduler reserved
+    /// for this NPC; `item_slot` is cached so the brain can validate
+    /// the item didn't change kinds between reservation and arrival
+    /// (e.g. it was picked up by a player and another loose item
+    /// drifted into the slot). `plan_cell` is the eventual delivery
+    /// target — needed at arrival time so the brain can plan the next
+    /// leg without consulting [`HaulAssignments`] (it consults it too,
+    /// but the cached plan cell lets us short-circuit when the
+    /// assignment is gone).
+    ///
+    /// If on arrival the item entity is missing, the WorldItem kind
+    /// no longer matches, or the NPC's carry can't accept it, the
+    /// haul is released and the NPC drops back to Idle for the
+    /// scheduler to reassign.
+    PickupForPlan {
+        item_entity: Entity,
+        item_slot: ItemSlot,
+        plan_cell: IVec3,
+    },
+    /// Final leg of a haul cycle: arrive at the plan and deposit the
+    /// NPC's full carry stack into the plan's materials. Reads the
+    /// NPC's [`Carrying`](crate::protocol::Carrying), calls
+    /// [`Plans::deposit`], broadcasts a [`PlanEdit`] so client
+    /// mirrors update, and clears the carry.
+    ///
+    /// If on arrival the plan is gone or no longer a Build plan, the
+    /// haul releases without depositing (carry stays on the NPC; the
+    /// scheduler will pick it up or, in degenerate cases, the carry
+    /// just sits there until something else does — there's no
+    /// auto-drop, since spilling a NPC's stack mid-air would be
+    /// surprising).
+    DepositAtPlan {
+        plan_cell: IVec3,
     },
 }
 
@@ -577,6 +616,7 @@ fn spawn_initial_npc_on_first_connect(
                     goal: Goal::Idle,
                     rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
                 },
+                crate::protocol::Carrying::default(),
             ),
             AvatarPose {
                 translation,
@@ -638,6 +678,24 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
 ///      errors disable just this one NPC's brain.
 ///   4. Steer the [`MovementIntent`] toward the current waypoint
 ///      (Wander only — Idle and Resting both clear intent).
+/// SystemParam bundle for plan + haul resources that the brain tick
+/// reaches for in phase 3. Folded into one slot because the brain tick
+/// is already at the Bevy 0.18 16-SystemParam ceiling — every loose
+/// `Res`/`Query` we'd otherwise add against this fn would trip the
+/// trait-impl limit. Group is "stuff the haul scheduler and arrival
+/// handlers share, plus the plan-claim state they coexist with."
+#[derive(bevy::ecs::system::SystemParam)]
+struct HaulCtx<'w, 's> {
+    plans: ResMut<'w, Plans>,
+    plan_claims: ResMut<'w, PlanClaims>,
+    assignments: ResMut<'w, HaulAssignments>,
+    reservations: ResMut<'w, WorldItemReservations>,
+    broadcast: ServerMultiMessageSender<'w, 's>,
+    servers: Query<'w, 's, &'static Server>,
+    world_items: Query<'w, 's, (Entity, &'static WorldItem)>,
+    kind_registry: Res<'w, NpcKindRegistry>,
+}
+
 #[allow(clippy::too_many_arguments, reason = "brain tick spans many subsystems")]
 fn npc_brain_tick(
     time: Res<Time>,
@@ -651,8 +709,7 @@ fn npc_brain_tick(
     room_map: Res<RoomMap>,
     interactable_index: Res<InteractableIndex>,
     mut interaction_claims: ResMut<InteractionClaims>,
-    plans: Res<Plans>,
-    mut plan_claims: ResMut<PlanClaims>,
+    mut haul: HaulCtx,
     world_clock: Res<WorldClock>,
     mut commands: Commands,
     mut npcs: Query<
@@ -664,6 +721,7 @@ fn npc_brain_tick(
             &mut Brain,
             &mut MovementIntent,
             &mut NpcPath,
+            &mut Carrying,
             &NpcKind,
             Has<KinematicLock>,
         ),
@@ -677,6 +735,8 @@ fn npc_brain_tick(
         registry: &block_registry,
     };
 
+    let server = haul.servers.single().ok();
+
     for (
         entity,
         npc_id,
@@ -685,6 +745,7 @@ fn npc_brain_tick(
         mut brain,
         mut intent,
         mut npc_path,
+        mut carrying,
         kind,
         is_locked,
     ) in npcs.iter_mut()
@@ -835,6 +896,219 @@ fn npc_brain_tick(
                         need_restore,
                     };
                 }
+                ArrivalAction::PickupForPlan {
+                    item_entity,
+                    item_slot,
+                    plan_cell,
+                } => {
+                    // Validate the reserved item is still where we
+                    // left it and still matches the slot the scheduler
+                    // queued. A despawned entity (player grabbed it,
+                    // or some future cleanup removed it) or a slot
+                    // mismatch (degenerate edge — items can't currently
+                    // change kinds, but defensive) both release the
+                    // haul.
+                    let item_ok = haul
+                        .world_items
+                        .get(item_entity)
+                        .map(|(_, wi)| wi.item == item_slot)
+                        .unwrap_or(false);
+                    let cap = haul
+                        .kind_registry
+                        .get(&kind.0)
+                        .map(|d| d.carry_capacity)
+                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+                    if !item_ok || !carrying.can_accept(item_slot, cap) {
+                        if !item_ok {
+                            info!(
+                                npc = npc_id.0,
+                                item = ?item_entity,
+                                "haul pickup: item gone or kind mismatch; releasing assignment",
+                            );
+                        } else {
+                            info!(
+                                npc = npc_id.0,
+                                "haul pickup: carry can't accept the reserved item; releasing assignment",
+                            );
+                        }
+                        release_haul_for(
+                            *npc_id,
+                            &mut haul.assignments,
+                            &mut haul.reservations,
+                        );
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    // Commit: increment carry, despawn the world item,
+                    // free the reservation, drop the entry from the
+                    // assignment queue. Carry::pickup_one returns false
+                    // only if can_accept was false; we just checked, so
+                    // the unwrap_or path is unreachable in practice.
+                    let added = carrying.pickup_one(item_slot, cap);
+                    debug_assert!(added, "pickup_one rejected after can_accept said yes");
+                    commands.entity(item_entity).despawn();
+                    haul.reservations.release(item_entity, *npc_id);
+                    if let Some(assignment) = haul.assignments.get_mut(*npc_id) {
+                        assignment.queue.retain(|r| r.entity != item_entity);
+                    }
+                    // Plan next leg from the (now updated) assignment.
+                    let next_goal = haul
+                        .assignments
+                        .get(*npc_id)
+                        .and_then(|a| {
+                            pick_next_haul_leg(
+                                &pose,
+                                a.plan_cell,
+                                &carrying,
+                                cap,
+                                &a.queue,
+                                &haul.plans,
+                                &world,
+                            )
+                            .map(Some)
+                            .unwrap_or(Some(None))
+                        })
+                        .flatten();
+                    match next_goal {
+                        Some(goal) => {
+                            if let Goal::MoveTo { path, .. } = &goal {
+                                npc_path.set_if_neq(NpcPath(path.clone()));
+                            }
+                            brain.goal = goal;
+                        }
+                        None => {
+                            // No more legs; release haul cleanly. May
+                            // also be the "path failed" branch (Err)
+                            // collapsed to Idle — both end the same
+                            // way.
+                            release_haul_for(
+                                *npc_id,
+                                &mut haul.assignments,
+                                &mut haul.reservations,
+                            );
+                            brain.goal = Goal::Idle;
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                        }
+                    }
+                    let _ = plan_cell; // captured for diagnostics; unused after pickup
+                }
+                ArrivalAction::DepositAtPlan { plan_cell } => {
+                    // Validate plan still exists + is a Build plan.
+                    // Remove plans don't accept materials; if the tag
+                    // was switched or cleared we release without
+                    // dropping carry — the NPC keeps the stack for the
+                    // next assignment (or a player Q-drop).
+                    let plan_kind = haul.plans.kind(plan_cell);
+                    let accepts = matches!(plan_kind, Some(PlanKind::Build { .. }));
+                    if !accepts {
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?plan_cell.to_array(),
+                            "haul deposit: plan gone or not a build plan; releasing assignment",
+                        );
+                        release_haul_for(
+                            *npc_id,
+                            &mut haul.assignments,
+                            &mut haul.reservations,
+                        );
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    // Deposit whatever we're carrying. Plans::deposit
+                    // returns 0 if the plan doesn't want this kind
+                    // (mismatched assignment — shouldn't happen but
+                    // doesn't deserve a panic).
+                    let (carry_item, carry_count) = match (carrying.item, carrying.count) {
+                        (Some(slot), c) if c > 0 => (slot, c),
+                        _ => {
+                            // Carry empty at deposit — degenerate but
+                            // recoverable. Release haul, idle, let the
+                            // scheduler try again.
+                            release_haul_for(
+                                *npc_id,
+                                &mut haul.assignments,
+                                &mut haul.reservations,
+                            );
+                            brain.goal = Goal::Idle;
+                            continue;
+                        }
+                    };
+                    let accepted = haul.plans.deposit(plan_cell, carry_item, carry_count);
+                    if accepted > 0 {
+                        carrying.count = carry_count - accepted;
+                        if carrying.count == 0 {
+                            carrying.item = None;
+                        }
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?plan_cell.to_array(),
+                            accepted,
+                            "haul deposit complete",
+                        );
+                        if let (Some(server), Some(state)) =
+                            (server, haul.plans.get(plan_cell).cloned())
+                        {
+                            let reply = PlanEdit {
+                                cell: plan_cell,
+                                kind: Some(state.kind),
+                                materials: state.materials,
+                            };
+                            if let Err(err) = haul.broadcast.send::<PlanEdit, WorldChannel>(
+                                &reply,
+                                server,
+                                &NetworkTarget::All,
+                            ) {
+                                warn!("haul deposit PlanEdit broadcast failed: {err}");
+                            }
+                        }
+                    }
+                    // Decide what's next. After a deposit the queue
+                    // may still have items (multi-trip haul); a
+                    // plan-satisfied state ends the assignment.
+                    let cap = haul
+                        .kind_registry
+                        .get(&kind.0)
+                        .map(|d| d.carry_capacity)
+                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+                    let next_goal = haul
+                        .assignments
+                        .get(*npc_id)
+                        .and_then(|a| {
+                            pick_next_haul_leg(
+                                &pose,
+                                a.plan_cell,
+                                &carrying,
+                                cap,
+                                &a.queue,
+                                &haul.plans,
+                                &world,
+                            )
+                            .map(Some)
+                            .unwrap_or(Some(None))
+                        })
+                        .flatten();
+                    match next_goal {
+                        Some(goal) => {
+                            if let Goal::MoveTo { path, .. } = &goal {
+                                npc_path.set_if_neq(NpcPath(path.clone()));
+                            }
+                            brain.goal = goal;
+                        }
+                        None => {
+                            release_haul_for(
+                                *npc_id,
+                                &mut haul.assignments,
+                                &mut haul.reservations,
+                            );
+                            brain.goal = Goal::Idle;
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                        }
+                    }
+                }
             }
         }
         // Abandonment of a MoveTo with an action that reserved a
@@ -852,7 +1126,18 @@ fn npc_brain_tick(
                         interaction_claims.release(*anchor_cell, *npc_id);
                     }
                     ArrivalAction::Work { target_cell, .. } => {
-                        plan_claims.release(*target_cell, *npc_id);
+                        haul.plan_claims.release(*target_cell, *npc_id);
+                    }
+                    ArrivalAction::PickupForPlan { .. }
+                    | ArrivalAction::DepositAtPlan { .. } => {
+                        // Stuck or timed out mid-haul: free the entire
+                        // assignment + every reservation it holds. The
+                        // scheduler will repick next tick.
+                        release_haul_for(
+                            *npc_id,
+                            &mut haul.assignments,
+                            &mut haul.reservations,
+                        );
                     }
                     _ => {}
                 }
@@ -960,7 +1245,7 @@ fn npc_brain_tick(
                     cell: *target_cell,
                     plan_kind: *plan_kind,
                 });
-                plan_claims.release(*target_cell, *npc_id);
+                haul.plan_claims.release(*target_cell, *npc_id);
                 interact_done = Some(*target_cell);
             }
         }
@@ -1039,6 +1324,80 @@ fn npc_brain_tick(
                     }
                 }
             }
+            // Per-NPC haul matchmaker runs here (NOT a standalone
+            // system) because the brain tick is monolithic — an NPC
+            // transitions Idle → next-goal in one iteration, so a
+            // standalone scheduler in Update would never observe
+            // Goal::Idle. Calling per-NPC at the Idle moment is the
+            // only place where the scheduler can catch an unassigned
+            // NPC. The call is cheap (one O(items) index build + one
+            // O(plans) scan), and only NPCs without an existing
+            // assignment + empty carry get scored.
+            if !haul.assignments.contains(*npc_id) && carrying.is_empty() {
+                crate::haul::try_schedule_haul_for_npc(
+                    *npc_id,
+                    &kind.0,
+                    pose.translation,
+                    carrying.is_empty(),
+                    &haul.kind_registry,
+                    &haul.plans,
+                    &haul.world_items,
+                    &mut haul.assignments,
+                    &mut haul.reservations,
+                );
+            }
+            // Engine-driven haul takes priority over the Lua planner.
+            // If the scheduler (above, or a previous tick) queued an
+            // assignment for this NPC, plan the first leg directly
+            // and skip the planner call. The planner sees
+            // `pending_assignments` in its snapshot when it is called
+            // for a *different* NPC, but never gets to overrule an
+            // active haul.
+            if haul.assignments.contains(*npc_id) {
+                let cap = haul
+                    .kind_registry
+                    .get(&kind.0)
+                    .map(|d| d.carry_capacity)
+                    .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+                let next_goal = haul
+                    .assignments
+                    .get(*npc_id)
+                    .and_then(|a| {
+                        pick_next_haul_leg(
+                            &pose,
+                            a.plan_cell,
+                            &carrying,
+                            cap,
+                            &a.queue,
+                            &haul.plans,
+                            &world,
+                        )
+                        .map(Some)
+                        .unwrap_or(Some(None))
+                    })
+                    .flatten();
+                match next_goal {
+                    Some(goal) => {
+                        if let Goal::MoveTo { path, .. } = &goal {
+                            npc_path.set_if_neq(NpcPath(path.clone()));
+                        }
+                        brain.goal = goal;
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                    None => {
+                        // Assignment was empty or pathfinding to the
+                        // first leg failed; release and fall through
+                        // to the planner so the NPC doesn't burn a
+                        // tick doing nothing.
+                        release_haul_for(
+                            *npc_id,
+                            &mut haul.assignments,
+                            &mut haul.reservations,
+                        );
+                    }
+                }
+            }
             let kind_id = NpcKindId(kind.0.clone());
             let snapshot = build_snapshot(
                 *npc_id,
@@ -1048,8 +1407,9 @@ fn npc_brain_tick(
                 &room_map,
                 &interactable_index,
                 &interaction_claims,
-                &plans,
-                &plan_claims,
+                &haul.plans,
+                &haul.plan_claims,
+                &haul.assignments,
                 &chunks,
                 &chunk_entities_q,
                 &chunk_map,
@@ -1086,7 +1446,12 @@ fn npc_brain_tick(
                     // the session. Drop the kinematic lock too so a
                     // disabled NPC isn't frozen mid-action.
                     interaction_claims.release_all_for(*npc_id);
-                    plan_claims.release_all_for(*npc_id);
+                    haul.plan_claims.release_all_for(*npc_id);
+                    release_haul_for(
+                        *npc_id,
+                        &mut haul.assignments,
+                        &mut haul.reservations,
+                    );
                     commands
                         .entity(entity)
                         .remove::<KinematicLock>()
@@ -1448,7 +1813,7 @@ fn npc_brain_tick(
                     // We need just the kind for the work pipeline; the
                     // materials gate is checked when collecting nearby
                     // plans for the snapshot (filtered out if pending).
-                    let Some(plan_kind) = plans.kind(target_cell) else {
+                    let Some(plan_kind) = haul.plans.kind(target_cell) else {
                         info!(
                             npc = npc_id.0,
                             target = ?target_cell.to_array(),
@@ -1461,7 +1826,7 @@ fn npc_brain_tick(
                         continue;
                     };
                     // Atomic claim. Lost-race → brief rest; planner re-picks.
-                    if !plan_claims.try_claim(target_cell, *npc_id) {
+                    if !haul.plan_claims.try_claim(target_cell, *npc_id) {
                         info!(
                             npc = npc_id.0,
                             target = ?target_cell.to_array(),
@@ -1498,7 +1863,7 @@ fn npc_brain_tick(
                             target = ?target_cell.to_array(),
                             "no standable neighbour of plan target; releasing claim and parking briefly",
                         );
-                        plan_claims.release(target_cell, *npc_id);
+                        haul.plan_claims.release(target_cell, *npc_id);
                         brain.goal = Goal::Resting {
                             remaining_secs: MIN_REST_SECS,
                         };
@@ -1561,7 +1926,7 @@ fn npc_brain_tick(
                                 reason,
                                 "work failed: no A* path to standable neighbour, releasing claim and parking briefly"
                             );
-                            plan_claims.release(target_cell, *npc_id);
+                            haul.plan_claims.release(target_cell, *npc_id);
                             if !npc_path.0.is_empty() {
                                 npc_path.0.clear();
                             }
@@ -1723,6 +2088,131 @@ fn native_fallback_goal() -> PlannerGoal {
     }
 }
 
+/// Max walk-deadline for a single haul leg (pickup or deposit). Same
+/// magnitude as the per-Goto/Work timeouts but a touch shorter — a
+/// haul cycle is many legs in series, so spending two minutes on each
+/// would let one wedged NPC tie up its assignment for the entire
+/// session. 60 s leaves headroom for a cross-chunk walk while still
+/// timing out promptly on a genuine wedge.
+const HAUL_LEG_TIMEOUT_SECS: f32 = 60.0;
+
+/// Default carry cap for any NPC kind that doesn't declare its own.
+/// Mirrors [`block_junk_mod_api::npcs::default_carry_capacity`] so the
+/// engine never reads a 0 cap when a kind is missing from the registry
+/// (which would deadlock the scheduler — every reservation gates on
+/// `Carrying::can_accept`).
+const DEFAULT_NPC_CARRY_CAPACITY: u32 = 3;
+
+/// Plan a Goal::MoveTo from `pose` to a standable neighbor of `target_cell`,
+/// with `on_arrive` firing on arrival. Returns `None` when no standable
+/// neighbor exists or no A* path reaches one — callers release the
+/// haul + idle in that case. When the NPC is already on a standable
+/// neighbor, returns a 1-cell path so the arrival check fires on the
+/// next tick (the brain's arrival path-projection helpers tolerate
+/// `path.len() == 1`).
+fn plan_haul_move<W: Walkability>(
+    pose: &AvatarPose,
+    target_cell: IVec3,
+    on_arrive: ArrivalAction,
+    deadline_secs: f32,
+    world: &W,
+) -> Option<Goal> {
+    let foot = pose_to_standable_foot(pose, world).unwrap_or_else(|| pose_to_foot_cell(pose));
+    let stand_cell = nearest_standable_neighbor(target_cell, foot, world)?;
+    let path = if stand_cell == foot {
+        vec![foot]
+    } else {
+        find_path(foot, stand_cell, world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
+            .map(|raw| smooth_path(raw, world))
+            .filter(|p| p.len() >= 2)?
+    };
+    Some(Goal::MoveTo {
+        path,
+        progress: 0.0,
+        deadline_secs,
+        last_pos: pose.translation,
+        stuck_secs: 0.0,
+        on_arrive,
+        snap: None,
+    })
+}
+
+/// Pick the next leg of a haul cycle after a pickup or deposit
+/// completes. Returns:
+/// - `Ok(Some(goal))` — next MoveTo is queued; assignment continues.
+/// - `Ok(None)` — assignment is naturally done (carry empty + queue
+///   empty, or plan satisfied with nothing left to fetch); caller
+///   releases the haul and drops to Idle. The scheduler picks again
+///   next tick if the plan still needs more.
+/// - `Err(())` — pathfinding failed for whichever destination was
+///   next; caller releases the haul and parks briefly. Same recovery
+///   as the existing WorkPlan path-failure branch.
+fn pick_next_haul_leg<W: Walkability>(
+    pose: &AvatarPose,
+    plan_cell: IVec3,
+    carrying: &Carrying,
+    carry_cap: u32,
+    assignment_queue: &[crate::haul::ReservedItem],
+    plans: &Plans,
+    world: &W,
+) -> Result<Option<Goal>, ()> {
+    let plan_remaining = matches!(plans.get(plan_cell), Some(s) if !s.is_satisfied());
+    let carry_full = !carrying.is_empty() && carrying.count >= carry_cap;
+    let queue_empty = assignment_queue.is_empty();
+    // Walk to deposit if: carry has stuff AND (queue empty OR carry full
+    // OR plan no longer needs more). The "plan no longer needs more"
+    // path drops the leftover via deposit too — Plans::deposit rounds
+    // accepted to remaining-need and the leftover stays on the NPC for
+    // the next assignment.
+    if !carrying.is_empty() && (queue_empty || carry_full || !plan_remaining) {
+        return plan_haul_move(
+            pose,
+            plan_cell,
+            ArrivalAction::DepositAtPlan { plan_cell },
+            HAUL_LEG_TIMEOUT_SECS,
+            world,
+        )
+        .map(Some)
+        .ok_or(());
+    }
+    // Walk to the next reserved item if: carry has room AND queue has
+    // items AND the plan still wants more. Pop happens at the *arrival*
+    // (pickup) handler, not here — `pick_next_haul_leg` only reads.
+    if !queue_empty && plan_remaining {
+        let next = assignment_queue[0];
+        return plan_haul_move(
+            pose,
+            pose_to_foot_cell_of(next.translation),
+            ArrivalAction::PickupForPlan {
+                item_entity: next.entity,
+                item_slot: next.item,
+                plan_cell,
+            },
+            HAUL_LEG_TIMEOUT_SECS,
+            world,
+        )
+        .map(Some)
+        .ok_or(());
+    }
+    // Carry empty + (queue empty or plan satisfied). The assignment has
+    // run its course; release and idle. If the plan still needs more,
+    // the scheduler will create a fresh assignment next tick.
+    Ok(None)
+}
+
+/// Convert a loose-item world translation into the foot cell directly
+/// under it — the cell the NPC pathfinds *to a neighbor of*. Items
+/// land at the surface, so their translation's floor `y` is the
+/// foot cell. Used in haul leg planning so callers don't have to
+/// invent a target IVec3 from a Vec3 themselves.
+fn pose_to_foot_cell_of(translation: Vec3) -> IVec3 {
+    IVec3::new(
+        translation.x.floor() as i32,
+        translation.y.floor() as i32,
+        translation.z.floor() as i32,
+    )
+}
+
 /// Build the snapshot handed to a planner this tick. Clones the need
 /// map (the planner's Lua state needs an independent copy to walk into
 /// a Lua table) and collects the K nearest matched rooms — that's the
@@ -1744,6 +2234,7 @@ fn build_snapshot(
     interaction_claims: &InteractionClaims,
     plans: &Plans,
     plan_claims: &PlanClaims,
+    haul_assignments: &HaulAssignments,
     chunks: &Query<&Chunk>,
     chunk_entities: &Query<&'static ChunkEntities>,
     chunk_map: &ChunkMap,
@@ -1776,6 +2267,26 @@ fn build_snapshot(
         block_registry,
         work_defaults,
     );
+    // Engine-assigned haul work for *this* NPC. Today the engine
+    // bypasses the planner whenever an assignment is live, so this
+    // field arrives empty in every snapshot a planner actually sees —
+    // populated only for the (currently unreachable) future where a
+    // planner gets to weigh in even mid-haul. Wire it through anyway
+    // so the surface is stable and the bypass becomes an enable/disable
+    // knob rather than a shape change.
+    let pending_assignments = haul_assignments
+        .get(id)
+        .map(|a| {
+            vec![PendingAssignment {
+                plan_cell: BlockPos {
+                    x: a.plan_cell.x,
+                    y: a.plan_cell.y,
+                    z: a.plan_cell.z,
+                },
+                items_remaining: a.queue.len() as u32,
+            }]
+        })
+        .unwrap_or_default();
     NpcSnapshot {
         id: id.0,
         kind: kind.clone(),
@@ -1789,6 +2300,7 @@ fn build_snapshot(
         nearby_interactions,
         nearby_plans,
         is_night: world_clock.is_night(),
+        pending_assignments,
     }
 }
 

@@ -206,6 +206,8 @@ impl Plugin for ClientPlugin {
                 (
                     attach_avatar_visuals,
                     attach_npc_visuals,
+                    attach_npc_carry_icons,
+                    update_npc_carry_icons,
                     start_npc_anim_idle,
                     drive_npc_animation,
                 )
@@ -2436,6 +2438,87 @@ fn attach_npc_visuals(
                 Transform::from_xyz(0.0, foot_offset, 0.0)
                     .with_rotation(Quat::from_rotation_y(core::f32::consts::PI)),
             ));
+    }
+}
+
+/// Marker on the NPC root entity once its carry icon has been
+/// spawned. Gates the per-frame attach loop so each NPC only gets
+/// one icon child even though the system runs every frame.
+#[derive(Component)]
+struct NpcCarryIconAttached;
+
+/// Marker on the child entity that *is* the floating carry icon —
+/// owns its own [`MeshMaterial3d`] handle so the per-NPC colour
+/// update doesn't bleed across NPCs (sharing a material handle would
+/// repaint every icon at once).
+#[derive(Component)]
+struct NpcCarryIcon;
+
+/// Spawn a hidden floating cube above each NPC's head, one per NPC.
+/// The cube is the MVP visual for "this NPC is carrying something" —
+/// hand-IK is deferred per the Phase 4 plan. Runs every frame but is
+/// idempotent against re-runs via the `NpcCarryIconAttached` marker.
+fn attach_npc_carry_icons(
+    npcs: Query<Entity, (With<Npc>, Without<NpcCarryIconAttached>)>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for entity in npcs.iter() {
+        let mesh = meshes.add(Cuboid::new(0.25, 0.25, 0.25));
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, 1.0),
+            unlit: true,
+            ..default()
+        });
+        // Anchor at +1.0 m above the NPC root (which itself is at eye
+        // height). Visible from above-the-head viewing angles, which
+        // covers most gameplay camera positions.
+        commands
+            .entity(entity)
+            .insert(NpcCarryIconAttached)
+            .with_child((
+                NpcCarryIcon,
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                Transform::from_xyz(0.0, 1.0, 0.0),
+                Visibility::Hidden,
+            ));
+    }
+}
+
+/// Mirror each NPC's `Carrying` state onto its floating icon child:
+/// hidden when empty, visible + tinted to the item def's color when
+/// holding a stack. Walks every NPC every frame — cheap (the per-NPC
+/// child lookup is one HashMap probe via the `Children` deref) and
+/// avoids the change-detection bookkeeping for sub-frame correctness.
+fn update_npc_carry_icons(
+    npcs: Query<(&Carrying, &Children), With<Npc>>,
+    mut icons: Query<
+        (&MeshMaterial3d<StandardMaterial>, &mut Visibility),
+        With<NpcCarryIcon>,
+    >,
+    items: Res<ItemRegistry>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (carry, children) in npcs.iter() {
+        for child in children.iter() {
+            let Ok((mat_handle, mut vis)) = icons.get_mut(child) else {
+                continue;
+            };
+            match (carry.item, carry.count) {
+                (Some(slot), c) if c > 0 => {
+                    *vis = Visibility::Inherited;
+                    if let Some(material) = materials.get_mut(&mat_handle.0) {
+                        let [r, g, b] = items.def(slot).color;
+                        material.base_color = Color::srgba(r, g, b, 1.0);
+                    }
+                }
+                _ => {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
     }
 }
 

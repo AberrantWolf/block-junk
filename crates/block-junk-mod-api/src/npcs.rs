@@ -240,6 +240,32 @@ pub struct NpcSnapshot {
     /// raw `time_of_day` and re-derive the threshold.
     #[serde(default)]
     pub is_night: bool,
+    /// Engine-assigned haul work this NPC is already committed to.
+    /// Populated by the haul scheduler before the planner runs;
+    /// planners see these for *visibility* only — they cannot
+    /// claim, alter, or hand back an assignment. When this field is
+    /// non-empty the engine bypasses the planner entirely for the
+    /// tick and drives the NPC through the haul cycle directly, so
+    /// any [`PlannerGoal`] a planner *does* return for an assigned
+    /// NPC is silently ignored. Future planner versions can use this
+    /// to score "should I do my own thing on top of hauling?" decisions
+    /// (today the answer is "you can't").
+    #[serde(default)]
+    pub pending_assignments: Vec<PendingAssignment>,
+}
+
+/// One entry in [`NpcSnapshot::pending_assignments`]. Coarse view of
+/// what the engine has assigned this NPC — enough for a planner to
+/// understand "you're hauling to that build over there" without
+/// leaking item-slot internals or reservation-table internals.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingAssignment {
+    /// The Build plan cell this haul is delivering to.
+    pub plan_cell: BlockPos,
+    /// How many items remain in the NPC's haul queue (not counting
+    /// anything already in carry). Drops to 0 on the final pickup
+    /// leg; the NPC then walks to `plan_cell` to deposit.
+    pub items_remaining: u32,
 }
 
 /// One entry in [`NpcSnapshot::nearby_plans`]. Carries the cell and a
