@@ -33,8 +33,8 @@ use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
-    EquippedTool, GameSet, MovementIntent, MovementMode, NpcAnimOverride, PickupRequest, PlanKind,
-    WorldChannel, WorldClock, WorldClockSync, WorldItem,
+    DropToolRequest, EquippedTool, GameSet, MovementIntent, MovementMode, NpcAnimOverride,
+    PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -100,6 +100,7 @@ impl Plugin for ClientPlugin {
                 (
                     normal_mode_action_input,
                     drop_carry_input,
+                    drop_tool_input,
                     cycle_selected_or_rotation,
                     reset_rotation_on_selection_change,
                 )
@@ -1409,6 +1410,29 @@ fn drop_carry_input(
     }
     if let Ok(mut s) = sender.single_mut() {
         s.send::<WorldChannel>(DropRequest);
+    }
+}
+
+/// T key → send a `DropToolRequest`. Symmetric counterpart to
+/// `drop_carry_input`, separate keybind because the tool slot is a
+/// separate stack. Server no-ops on empty tool slot.
+fn drop_tool_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    mut sender: Query<&mut MessageSender<DropToolRequest>>,
+) {
+    let locked = cursors
+        .single()
+        .map(|c| c.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+    if !locked {
+        return;
+    }
+    if !keys.just_pressed(KeyCode::KeyT) {
+        return;
+    }
+    if let Ok(mut s) = sender.single_mut() {
+        s.send::<WorldChannel>(DropToolRequest);
     }
 }
 

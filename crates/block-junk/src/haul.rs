@@ -92,10 +92,20 @@ pub struct ReservedItem {
 /// walks to the plan to deposit, and on deposit the assignment is
 /// released (the scheduler will hand out a fresh one next tick if the
 /// plan still has unmet materials).
+///
+/// `pending_tool` covers Phase 5b's "fetch the right tool first"
+/// branch — when the scheduler picks an NPC for a plan whose
+/// `work_action.required_tool` isn't satisfied by the NPC's
+/// `EquippedTool`, it also reserves a matching tool nearby and
+/// records it here. The brain walks to the tool first
+/// (`pick_next_haul_leg` checks this field before anything else),
+/// equips it via swap, clears the field, then continues with the
+/// material queue. `None` ⇒ no tool prereq.
 #[derive(Clone, Debug)]
 pub struct HaulAssignment {
     pub plan_cell: IVec3,
     pub queue: Vec<ReservedItem>,
+    pub pending_tool: Option<ReservedItem>,
 }
 
 /// Per-NPC assignment map. An NPC with an entry here is being driven
@@ -146,6 +156,9 @@ pub fn release_haul_for(
         for item in assignment.queue {
             reservations.release(item.entity, npc);
         }
+        if let Some(tool) = assignment.pending_tool {
+            reservations.release(tool.entity, npc);
+        }
     }
     // Belt-and-braces: even if the assignment is gone for some other
     // reason (manual mutation, future scheduler path), make sure no
@@ -179,13 +192,19 @@ const MAX_HAUL_ITEM_RADIUS_M: f32 = 64.0;
 ///
 /// Greedy. No global optimisation — the goal is "every NPC has
 /// something useful to do," not "minimise total haul distance."
+#[allow(clippy::too_many_arguments, reason = "scheduler reaches into many subsystems")]
 pub fn try_schedule_haul_for_npc(
     npc_id: NpcId,
     npc_kind: &str,
     pose: Vec3,
     carrying: &crate::protocol::Carrying,
+    equipped_tool: &crate::protocol::EquippedTool,
     kind_registry: &crate::npc_registry::NpcKindRegistry,
     plans: &crate::plans::Plans,
+    block_registry: &crate::blocks::BlockRegistry,
+    item_registry: &crate::items::ItemRegistry,
+    chunks: &Query<&crate::voxel::Chunk>,
+    chunk_map: &crate::voxel::ChunkMap,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
     assignments: &mut HaulAssignments,
     reservations: &mut WorldItemReservations,
@@ -261,6 +280,7 @@ pub fn try_schedule_haul_for_npc(
             HaulAssignment {
                 plan_cell,
                 queue: Vec::new(),
+                pending_tool: None,
             },
         );
         return true;
@@ -280,8 +300,13 @@ pub fn try_schedule_haul_for_npc(
             .push((entity, wi.translation));
     }
 
-    // Pick the nearest unsatisfied Build plan that has at least one
-    // reachable matching item.
+    // Pick the nearest unsatisfied Build plan that (a) has at least
+    // one reachable matching material item, AND (b) is workable by
+    // this NPC — either no tool required, the NPC already holds the
+    // right tool, or a matching tool exists nearby and can be
+    // reserved alongside the materials. Without (b) the haul would
+    // succeed but the plan would sit unworkable, defeating the
+    // point.
     let mut best_plan: Option<(IVec3, i32)> = None;
     for (cell, state) in plans.iter() {
         if !matches!(state.kind, PlanKind::Build { .. }) {
@@ -315,6 +340,33 @@ pub fn try_schedule_haul_for_npc(
         if !has_matchable {
             continue;
         }
+        // Tool gate: either no tool needed, NPC has it, or one is
+        // available to fetch. `required_tool_for_plan` reads the
+        // live block for Remove plans, the planned block for Build.
+        let required = required_tool_for_plan(
+            *cell,
+            &state.kind,
+            block_registry,
+            chunks,
+            chunk_map,
+        );
+        if let Some(tag) = &required {
+            let npc_satisfies = item_registry.tool_has_tag(equipped_tool.item, tag);
+            if !npc_satisfies
+                && find_nearest_unreserved_tool(
+                    tag,
+                    pose,
+                    npc_id,
+                    world_items,
+                    item_registry,
+                    reservations,
+                )
+                .is_none()
+            {
+                // Tool needed but unavailable — plan stays unworkable.
+                continue;
+            }
+        }
         if best_plan.map(|(_, d)| dist < d).unwrap_or(true) {
             best_plan = Some((*cell, dist));
         }
@@ -324,6 +376,45 @@ pub fn try_schedule_haul_for_npc(
     };
     let Some(state) = plans.get(plan_cell) else {
         return false;
+    };
+
+    // Reserve the tool first (if needed). If reservation fails (raced
+    // with another scheduler call for the same item), abandon this
+    // assignment — next tick we'll repick. Don't pre-mutate
+    // `reservations` for materials until the tool is locked, so a
+    // lost tool race releases zero items.
+    let required_tool_tag = required_tool_for_plan(
+        plan_cell,
+        &state.kind,
+        block_registry,
+        chunks,
+        chunk_map,
+    );
+    let pending_tool = if let Some(tag) = &required_tool_tag {
+        if item_registry.tool_has_tag(equipped_tool.item, tag) {
+            None
+        } else {
+            let Some((entity, item, translation)) = find_nearest_unreserved_tool(
+                tag,
+                pose,
+                npc_id,
+                world_items,
+                item_registry,
+                reservations,
+            ) else {
+                return false;
+            };
+            if !reservations.try_reserve(entity, npc_id) {
+                return false;
+            }
+            Some(ReservedItem {
+                entity,
+                item,
+                translation,
+            })
+        }
+    } else {
+        None
     };
 
     // Single-stack carry — every queue entry must be the same ItemSlot.
@@ -341,9 +432,15 @@ pub fn try_schedule_haul_for_npc(
         }
     }
     let Some(item_slot) = chosen_kind else {
+        if let Some(tool) = &pending_tool {
+            reservations.release(tool.entity, npc_id);
+        }
         return false;
     };
     let Some(pool) = items_by_slot.get(&item_slot) else {
+        if let Some(tool) = &pending_tool {
+            reservations.release(tool.entity, npc_id);
+        }
         return false;
     };
 
@@ -378,6 +475,9 @@ pub fn try_schedule_haul_for_npc(
         }
     }
     if queue.is_empty() {
+        if let Some(tool) = &pending_tool {
+            reservations.release(tool.entity, npc_id);
+        }
         return false;
     }
     info!(
@@ -385,6 +485,7 @@ pub fn try_schedule_haul_for_npc(
         plan = ?plan_cell.to_array(),
         kind = item_slot.0,
         queued = queue.len(),
+        tool = ?pending_tool.as_ref().map(|t| t.item.0),
         "haul assignment committed",
     );
     assignments.insert(
@@ -392,9 +493,77 @@ pub fn try_schedule_haul_for_npc(
         HaulAssignment {
             plan_cell,
             queue,
+            pending_tool,
         },
     );
     true
+}
+
+/// What tool tag (if any) the plan at `cell` requires its worker to
+/// hold. Build plans gate on the *block being placed*, Remove plans
+/// on the *live block being destroyed* — same convention the click
+/// resolver uses on the client. `None` ⇒ no tool required for this
+/// plan.
+fn required_tool_for_plan(
+    cell: IVec3,
+    kind: &crate::protocol::PlanKind,
+    block_registry: &crate::blocks::BlockRegistry,
+    chunks: &Query<&crate::voxel::Chunk>,
+    chunk_map: &crate::voxel::ChunkMap,
+) -> Option<block_junk_mod_api::blocks::TagId> {
+    use crate::protocol::PlanKind;
+    let slot = match kind {
+        PlanKind::Build { slot, .. } => *slot,
+        PlanKind::Remove => {
+            let (coord, local) = crate::voxel::world_to_chunk(cell);
+            let entity = chunk_map.0.get(&coord)?;
+            let chunk = chunks.get(*entity).ok()?;
+            let s = chunk.get(local);
+            if s.is_empty() {
+                return None;
+            }
+            s
+        }
+    };
+    block_registry
+        .def(slot)
+        .work_action
+        .as_ref()?
+        .required_tool
+        .clone()
+}
+
+/// Find the nearest unreserved [`WorldItem`] whose def carries
+/// `required_tag` in its `tool_tags`. Skips items reserved by
+/// another NPC and items beyond `MAX_HAUL_ITEM_RADIUS_M`. Returns
+/// (entity, slot, translation) for callers to plug into a
+/// `ReservedItem`. Linear scan; tool count is tiny.
+fn find_nearest_unreserved_tool(
+    required_tag: &block_junk_mod_api::blocks::TagId,
+    pose: Vec3,
+    npc_id: NpcId,
+    world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
+    item_registry: &crate::items::ItemRegistry,
+    reservations: &WorldItemReservations,
+) -> Option<(Entity, crate::items::ItemSlot, Vec3)> {
+    let mut best: Option<(Entity, crate::items::ItemSlot, Vec3, f32)> = None;
+    for (entity, wi) in world_items.iter() {
+        if reservations.is_taken_by_other(entity, npc_id) {
+            continue;
+        }
+        let def = item_registry.def(wi.item);
+        if !def.tool_tags.iter().any(|t| t == required_tag) {
+            continue;
+        }
+        let d = (wi.translation - pose).length();
+        if d > MAX_HAUL_ITEM_RADIUS_M {
+            continue;
+        }
+        if best.map(|(_, _, _, bd)| d < bd).unwrap_or(true) {
+            best = Some((entity, wi.item, wi.translation, d));
+        }
+    }
+    best.map(|(e, s, t, _)| (e, s, t))
 }
 
 pub struct HaulPlugin;
@@ -488,6 +657,7 @@ mod tests {
                         translation: Vec3::ZERO,
                     },
                 ],
+                pending_tool: None,
             },
         );
 
@@ -497,5 +667,29 @@ mod tests {
         // Both reservations are now free for anyone else.
         assert!(reservations.try_reserve(a, NPC_2));
         assert!(reservations.try_reserve(b, NPC_2));
+    }
+
+    #[test]
+    fn release_haul_for_also_drops_pending_tool() {
+        let mut assignments = HaulAssignments::default();
+        let mut reservations = WorldItemReservations::default();
+        let tool = entity(10);
+        reservations.try_reserve(tool, NPC_1);
+        assignments.insert(
+            NPC_1,
+            HaulAssignment {
+                plan_cell: IVec3::ZERO,
+                queue: vec![],
+                pending_tool: Some(ReservedItem {
+                    entity: tool,
+                    item: ItemSlot(0),
+                    translation: Vec3::ZERO,
+                }),
+            },
+        );
+        release_haul_for(NPC_1, &mut assignments, &mut reservations);
+        assert!(!assignments.contains(NPC_1));
+        // Tool reservation freed too — another NPC can claim it.
+        assert!(reservations.try_reserve(tool, NPC_2));
     }
 }

@@ -50,8 +50,9 @@ use crate::physics::{
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
-    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, KinematicLock, MovementIntent,
-    MovementMode, NpcAnimOverride, PlanEdit, PlanKind, WorldChannel, WorldClock, WorldItem,
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, EquippedTool, KinematicLock,
+    MovementIntent, MovementMode, NpcAnimOverride, PlanEdit, PlanKind, WorldChannel, WorldClock,
+    WorldItem,
 };
 use crate::scripting::ServerMods;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, world_to_chunk};
@@ -339,6 +340,19 @@ pub enum ArrivalAction {
     /// surprising).
     DepositAtPlan {
         plan_cell: IVec3,
+    },
+    /// Prereq leg of a haul cycle: arrive at a reserved tool item
+    /// and equip it. Phase 5b — created by the scheduler when an NPC
+    /// is assigned to a plan whose `work_action.required_tool`
+    /// doesn't match the NPC's current `EquippedTool`. On arrival:
+    /// validate the WorldItem still matches the expected slot,
+    /// swap into the tool slot with the displaced tool (if any)
+    /// dropping at the picked-up item's old position, clear the
+    /// assignment's `pending_tool`, then continue with the next
+    /// leg (material fetch).
+    PickupTool {
+        item_entity: Entity,
+        item_slot: ItemSlot,
     },
 }
 
@@ -699,6 +713,7 @@ struct HaulCtx<'w, 's> {
     servers: Query<'w, 's, &'static Server>,
     world_items: Query<'w, 's, (Entity, &'static WorldItem)>,
     kind_registry: Res<'w, NpcKindRegistry>,
+    item_registry: Res<'w, crate::items::ItemRegistry>,
 }
 
 #[allow(clippy::too_many_arguments, reason = "brain tick spans many subsystems")]
@@ -727,6 +742,7 @@ fn npc_brain_tick(
             &mut MovementIntent,
             &mut NpcPath,
             &mut Carrying,
+            &mut EquippedTool,
             &NpcKind,
             Has<KinematicLock>,
         ),
@@ -751,6 +767,7 @@ fn npc_brain_tick(
         mut intent,
         mut npc_path,
         mut carrying,
+        mut equipped_tool,
         kind,
         is_locked,
     ) in npcs.iter_mut()
@@ -966,6 +983,7 @@ fn npc_brain_tick(
                                 a.plan_cell,
                                 &carrying,
                                 cap,
+                                a.pending_tool.as_ref(),
                                 &a.queue,
                                 &haul.plans,
                                 &world,
@@ -1086,6 +1104,114 @@ fn npc_brain_tick(
                                 a.plan_cell,
                                 &carrying,
                                 cap,
+                                a.pending_tool.as_ref(),
+                                &a.queue,
+                                &haul.plans,
+                                &world,
+                            )
+                            .map(Some)
+                            .unwrap_or(Some(None))
+                        })
+                        .flatten();
+                    match next_goal {
+                        Some(goal) => {
+                            if let Goal::MoveTo { path, .. } = &goal {
+                                npc_path.set_if_neq(NpcPath(path.clone()));
+                            }
+                            brain.goal = goal;
+                        }
+                        None => {
+                            release_haul_for(
+                                *npc_id,
+                                &mut haul.assignments,
+                                &mut haul.reservations,
+                            );
+                            brain.goal = Goal::Idle;
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                        }
+                    }
+                }
+                ArrivalAction::PickupTool { item_entity, item_slot } => {
+                    // Validate the reserved tool item still exists +
+                    // matches the kind we reserved. A despawn between
+                    // reserve and arrival (player grabbed it, future
+                    // cleanup) collapses to "release haul, idle." The
+                    // scheduler will reassess next tick.
+                    let item_ok = haul
+                        .world_items
+                        .get(item_entity)
+                        .map(|(_, wi)| wi.item == item_slot)
+                        .unwrap_or(false);
+                    if !item_ok {
+                        info!(
+                            npc = npc_id.0,
+                            item = ?item_entity,
+                            "haul tool pickup: item gone or mismatch; releasing assignment",
+                        );
+                        release_haul_for(
+                            *npc_id,
+                            &mut haul.assignments,
+                            &mut haul.reservations,
+                        );
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    // Capture old translation BEFORE despawn — drop
+                    // the displaced tool there for an in-place swap.
+                    let pickup_pos = haul
+                        .world_items
+                        .get(item_entity)
+                        .map(|(_, wi)| wi.translation)
+                        .unwrap_or(pose.translation);
+                    // Swap into tool slot. Same logic as the player
+                    // pickup path.
+                    let displaced = equipped_tool.item.replace(item_slot);
+                    commands.entity(item_entity).despawn();
+                    info!(
+                        npc = npc_id.0,
+                        new_tool = item_slot.0,
+                        displaced = ?displaced.map(|s| s.0),
+                        "npc tool pickup swap",
+                    );
+                    if let Some(prev_slot) = displaced
+                        && prev_slot != item_slot
+                    {
+                        commands.spawn((
+                            WorldItem {
+                                item: prev_slot,
+                                translation: pickup_pos,
+                            },
+                            Transform::from_translation(pickup_pos),
+                            GlobalTransform::default(),
+                            Replicate::to_clients(NetworkTarget::All),
+                            Name::new(format!("WorldItem(npc_tool_swap:{})", prev_slot.0)),
+                        ));
+                    }
+                    haul.reservations.release(item_entity, *npc_id);
+                    if let Some(assignment) = haul.assignments.get_mut(*npc_id) {
+                        assignment.pending_tool = None;
+                    }
+                    // Continue with the next haul leg now that we're
+                    // tooled up. If the queue is empty (assignment
+                    // was tool-only) we naturally release + idle and
+                    // the scheduler will repick.
+                    let cap = haul
+                        .kind_registry
+                        .get(&kind.0)
+                        .map(|d| d.carry_capacity)
+                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+                    let next_goal = haul
+                        .assignments
+                        .get(*npc_id)
+                        .and_then(|a| {
+                            pick_next_haul_leg(
+                                &pose,
+                                a.plan_cell,
+                                &carrying,
+                                cap,
+                                a.pending_tool.as_ref(),
                                 &a.queue,
                                 &haul.plans,
                                 &world,
@@ -1134,7 +1260,8 @@ fn npc_brain_tick(
                         haul.plan_claims.release(*target_cell, *npc_id);
                     }
                     ArrivalAction::PickupForPlan { .. }
-                    | ArrivalAction::DepositAtPlan { .. } => {
+                    | ArrivalAction::DepositAtPlan { .. }
+                    | ArrivalAction::PickupTool { .. } => {
                         // Stuck or timed out mid-haul: free the entire
                         // assignment + every reservation it holds. The
                         // scheduler will repick next tick.
@@ -1346,8 +1473,13 @@ fn npc_brain_tick(
                     &kind.0,
                     pose.translation,
                     &carrying,
+                    &equipped_tool,
                     &haul.kind_registry,
                     &haul.plans,
+                    &block_registry,
+                    &haul.item_registry,
+                    &chunks,
+                    &chunk_map,
                     &haul.world_items,
                     &mut haul.assignments,
                     &mut haul.reservations,
@@ -1375,6 +1507,7 @@ fn npc_brain_tick(
                             a.plan_cell,
                             &carrying,
                             cap,
+                            a.pending_tool.as_ref(),
                             &a.queue,
                             &haul.plans,
                             &world,
@@ -1411,6 +1544,7 @@ fn npc_brain_tick(
                 &kind_id,
                 &pose,
                 &needs,
+                &equipped_tool,
                 &room_map,
                 &interactable_index,
                 &interaction_claims,
@@ -1421,6 +1555,7 @@ fn npc_brain_tick(
                 &chunk_entities_q,
                 &chunk_map,
                 &block_registry,
+                &haul.item_registry,
                 &work_defaults.0,
                 *world_clock,
             );
@@ -1845,6 +1980,54 @@ fn npc_brain_tick(
                         *intent = MovementIntent::default();
                         continue;
                     }
+                    // Phase-5b belt-and-braces: re-check the tool gate
+                    // at commit. The snapshot filter already hid plans
+                    // this NPC couldn't work, but the registry could
+                    // have mutated between snapshot and commit (hot
+                    // reload, future mod changes). Degrade silently
+                    // to a brief rest — same pattern as the no-tag
+                    // branch above.
+                    let commit_required_tool = match plan_kind {
+                        PlanKind::Build { slot, .. } => block_registry
+                            .def(slot)
+                            .work_action
+                            .as_ref()
+                            .and_then(|w| w.required_tool.clone()),
+                        PlanKind::Remove => {
+                            let (coord, local) = world_to_chunk(target_cell);
+                            chunk_map
+                                .0
+                                .get(&coord)
+                                .and_then(|&e| chunks.get(e).ok())
+                                .and_then(|chunk| {
+                                    let s = chunk.get(local);
+                                    if s.is_empty() { None } else { Some(s) }
+                                })
+                                .and_then(|s| {
+                                    block_registry
+                                        .def(s)
+                                        .work_action
+                                        .as_ref()
+                                        .and_then(|w| w.required_tool.clone())
+                                })
+                        }
+                    };
+                    if let Some(tag) = &commit_required_tool
+                        && !haul.item_registry.tool_has_tag(equipped_tool.item, tag)
+                    {
+                        warn!(
+                            npc = npc_id.0,
+                            target = ?target_cell.to_array(),
+                            required = %tag,
+                            "work commit: required tool no longer satisfied; releasing claim and resting",
+                        );
+                        haul.plan_claims.release(target_cell, *npc_id);
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
                     // Capture work-action knobs (need + magnitude + duration)
                     // *once* at goal commit. Build plans consult the block
                     // being placed (in the plan slot); Remove plans consult
@@ -2159,10 +2342,29 @@ fn pick_next_haul_leg<W: Walkability>(
     plan_cell: IVec3,
     carrying: &Carrying,
     carry_cap: u32,
+    pending_tool: Option<&crate::haul::ReservedItem>,
     assignment_queue: &[crate::haul::ReservedItem],
     plans: &Plans,
     world: &W,
 ) -> Result<Option<Goal>, ()> {
+    // Tool prereq comes first. Until the NPC has the right tool, no
+    // amount of material hauling helps — work would be gated at the
+    // plan. Scheduler reserved this tool atomically, so by the time
+    // we read pending_tool here it's earmarked for this NPC.
+    if let Some(tool) = pending_tool {
+        return plan_haul_move(
+            pose,
+            pose_to_foot_cell_of(tool.translation),
+            ArrivalAction::PickupTool {
+                item_entity: tool.entity,
+                item_slot: tool.item,
+            },
+            HAUL_LEG_TIMEOUT_SECS,
+            world,
+        )
+        .map(Some)
+        .ok_or(());
+    }
     let plan_remaining = matches!(plans.get(plan_cell), Some(s) if !s.is_satisfied());
     let carry_full = !carrying.is_empty() && carrying.count >= carry_cap;
     let queue_empty = assignment_queue.is_empty();
@@ -2236,6 +2438,7 @@ fn build_snapshot(
     kind: &NpcKindId,
     pose: &AvatarPose,
     needs: &Needs,
+    equipped_tool: &EquippedTool,
     rooms: &RoomMap,
     interactables: &InteractableIndex,
     interaction_claims: &InteractionClaims,
@@ -2246,6 +2449,7 @@ fn build_snapshot(
     chunk_entities: &Query<&'static ChunkEntities>,
     chunk_map: &ChunkMap,
     block_registry: &BlockRegistry,
+    item_registry: &crate::items::ItemRegistry,
     work_defaults: &block_junk_mod_api::npcs::WorkDefaults,
     world_clock: WorldClock,
 ) -> NpcSnapshot {
@@ -2266,12 +2470,14 @@ fn build_snapshot(
         plans,
         plan_claims,
         id,
+        equipped_tool,
         foot,
         SNAPSHOT_PLAN_RADIUS_CELLS,
         SNAPSHOT_PLAN_LIMIT,
         chunks,
         chunk_map,
         block_registry,
+        item_registry,
         work_defaults,
     );
     // Engine-assigned haul work for *this* NPC. Today the engine
@@ -2323,16 +2529,19 @@ fn build_snapshot(
 /// cell) with `WorkDefaults` as the fallback. Planners use these to
 /// pick the highest-payoff nearby plan when several are equidistant.
 #[allow(clippy::too_many_arguments, reason = "snapshot collector mirrors live brain lookups")]
+#[allow(clippy::too_many_arguments, reason = "snapshot collector mirrors live brain lookups")]
 fn collect_nearby_plans(
     plans: &Plans,
     plan_claims: &PlanClaims,
     self_id: NpcId,
+    equipped_tool: &EquippedTool,
     foot: IVec3,
     radius_cells: i32,
     limit: usize,
     chunks: &Query<&Chunk>,
     chunk_map: &ChunkMap,
     block_registry: &BlockRegistry,
+    item_registry: &crate::items::ItemRegistry,
     work_defaults: &block_junk_mod_api::npcs::WorkDefaults,
 ) -> Vec<NearbyPlan> {
     let mut out: Vec<NearbyPlan> = Vec::new();
@@ -2346,9 +2555,33 @@ fn collect_nearby_plans(
         }
         // Phase-3 gate: NPCs can only commit to plans whose materials
         // are fully delivered. Pending-materials Build plans wait for
-        // the player (or, post-Phase-4, the haul scheduler) to fill
-        // them — the planner shouldn't even see them.
+        // the player (or the haul scheduler) to fill them — the
+        // planner shouldn't even see them.
         if !state.is_satisfied() {
+            continue;
+        }
+        // Phase-5b gate: skip plans whose `work_action.required_tool`
+        // this NPC's `EquippedTool` doesn't satisfy. The planner only
+        // sees plans this NPC can actually drive — engine-haul
+        // tool-fetch is the route for tool-less NPCs, not the planner
+        // picking a plan and the engine silently failing.
+        let block_slot = match state.kind {
+            PlanKind::Build { slot, .. } => Some(slot),
+            PlanKind::Remove => {
+                let (coord, local) = world_to_chunk(*cell);
+                chunk_map.0.get(&coord).and_then(|&e| chunks.get(e).ok()).and_then(
+                    |chunk| {
+                        let s = chunk.get(local);
+                        if s.is_empty() { None } else { Some(s) }
+                    },
+                )
+            }
+        };
+        if let Some(slot) = block_slot
+            && let Some(work) = &block_registry.def(slot).work_action
+            && let Some(required) = &work.required_tool
+            && !item_registry.tool_has_tag(equipped_tool.item, required)
+        {
             continue;
         }
         let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;

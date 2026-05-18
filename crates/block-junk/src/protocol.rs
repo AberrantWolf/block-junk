@@ -646,6 +646,14 @@ pub struct DebugBumpNeed {
 #[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct DebugFillNearestPlan;
 
+/// Client → server: drop the player's currently-equipped tool back
+/// to the world as a `WorldItem`. Lands at the
+/// `drop_target_position` (one tile ahead of the player when that
+/// cell is standable, else at the player's feet) — same helper the
+/// carry-drop uses. No-op when the tool slot is empty.
+#[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct DropToolRequest;
+
 /// Client → server: spawn one of each vanilla tool item
 /// (axe / hammer / pickaxe) as `WorldItem`s near the requesting
 /// player's feet. Phase-5a testing prerequisite — until Phase 5b

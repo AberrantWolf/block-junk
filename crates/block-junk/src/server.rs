@@ -20,7 +20,8 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    DepositRequest, DropRequest, EquippedTool, GameSet, MovementIntent, MovementMode,
+    DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet, MovementIntent,
+    MovementMode,
     NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind,
     RequestNpcDetails, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
@@ -121,7 +122,12 @@ impl Plugin for ServerPlugin {
         );
         app.add_systems(
             Update,
-            (receive_pickup_requests, receive_drop_requests, receive_deposit_requests)
+            (
+                receive_pickup_requests,
+                receive_drop_requests,
+                receive_drop_tool_requests,
+                receive_deposit_requests,
+            )
                 .in_set(GameSet::Simulation),
         );
         app.add_systems(
@@ -1717,6 +1723,54 @@ fn receive_drop_requests(
                 Name::new(format!("WorldItem(dropped:{})", item.0)),
             ));
         }
+    }
+}
+
+/// Apply a client's tool-drop request. Takes the equipped tool out
+/// of the player's `EquippedTool` and spawns a `WorldItem` at the
+/// `drop_target_position` (in front of the player, fall back to
+/// feet). No-op when the tool slot is empty. Mirrors
+/// `receive_drop_requests` (carry) — the only differences are the
+/// component touched and the single-unit drop (tools never stack).
+fn receive_drop_tool_requests(
+    mut receivers: Query<(Entity, &mut MessageReceiver<DropToolRequest>)>,
+    avatars: Res<ClientAvatars>,
+    mut players: Query<(&AvatarPose, &mut EquippedTool), With<Avatar>>,
+    chunks: Query<&'static Chunk>,
+    chunk_map: Res<ChunkMap>,
+    block_registry: Res<BlockRegistry>,
+    mut commands: Commands,
+) {
+    let world = crate::npc::WorldWalk {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &block_registry,
+    };
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let request_count = receiver.receive().count();
+        if request_count == 0 {
+            continue;
+        }
+        let Some(&avatar) = avatars.0.get(&connection) else {
+            continue;
+        };
+        let Ok((pose, mut tool)) = players.get_mut(avatar) else {
+            continue;
+        };
+        let Some(slot) = tool.item.take() else {
+            continue;
+        };
+        let target = drop_target_position(pose, &world);
+        commands.spawn((
+            WorldItem {
+                item: slot,
+                translation: target,
+            },
+            Transform::from_translation(target),
+            GlobalTransform::default(),
+            Replicate::to_clients(NetworkTarget::All),
+            Name::new(format!("WorldItem(tool_dropped:{})", slot.0)),
+        ));
     }
 }
 

@@ -21,8 +21,8 @@ use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     Carrying, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
-    DebugFillNearestPlan, DebugSpawnTools, DepositRequest, DropRequest, EquippedTool,
-    MovementIntent, MovementMode,
+    DebugFillNearestPlan, DebugSpawnTools, DepositRequest, DropRequest, DropToolRequest,
+    EquippedTool, MovementIntent, MovementMode,
     NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync,
     RequestNpcDetails, WorldChannel, WorldClockSync, WorldItem,
 };
@@ -107,6 +107,8 @@ impl Plugin for ProtocolPlugin {
         app.register_message::<PickupRequest>()
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DropRequest>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<DropToolRequest>()
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DepositRequest>()
             .add_direction(NetworkDirection::ClientToServer);
