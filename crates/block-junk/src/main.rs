@@ -3,6 +3,8 @@ mod blocks;
 mod camera;
 mod client;
 mod collision;
+mod craft_stations;
+mod craft_ui;
 mod debug;
 mod haul;
 mod inspect_panel;

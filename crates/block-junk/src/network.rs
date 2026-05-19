@@ -17,10 +17,13 @@ use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
 use crate::menu::{AppState, JoinTarget};
+use crate::craft_stations::{
+    CancelOrder, DepositToStation, QueueOrder, StationUpdate, StationsFullSync, WorkStation,
+};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    Carrying, ChunkSnapshot, ChunkUnload, CraftRequest, DebugAdvanceTime, DebugBumpNeed,
+    Carrying, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
     DebugFillNearestPlan, DebugSpawnTools, DebugSpawnWorkbench, DepositRequest, DropRequest,
     DropToolRequest, EquippedTool, MovementIntent, MovementMode,
     NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync,
@@ -114,8 +117,20 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DepositRequest>()
             .add_direction(NetworkDirection::ClientToServer);
-        app.register_message::<CraftRequest>()
+        // Phase 6b craft-order messages. Retired the Phase 6a
+        // `CraftRequest` instant-craft path.
+        app.register_message::<QueueOrder>()
             .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<CancelOrder>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<DepositToStation>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<WorkStation>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<StationUpdate>()
+            .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<StationsFullSync>()
+            .add_direction(NetworkDirection::ServerToClient);
 
         // Player-avatar replication. Server owns the avatar entities; the
         // marker tells receivers "attach a mesh," and `AvatarPose` is the

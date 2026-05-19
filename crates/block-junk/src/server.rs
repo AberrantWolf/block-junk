@@ -20,7 +20,7 @@ use crate::plans::Plans;
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
     CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    CraftRequest, DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet,
+    DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet,
     MovementIntent, MovementMode,
     NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind,
     RequestNpcDetails, WorldChannel, WorldClock, WorldClockSync, WorldItem,
@@ -28,7 +28,8 @@ use crate::protocol::{
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedTool, SavedWorldItem, read_save, write_save};
+use crate::craft_stations::{CraftOrder, CraftStations, StationState};
+use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save, write_save};
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
     world_to_chunk,
@@ -51,6 +52,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::plans::PlansServerPlugin);
         app.add_plugins(crate::plan_claims::PlanClaimsPlugin);
         app.add_plugins(crate::haul::HaulPlugin);
+        app.add_plugins(crate::craft_stations::CraftStationsServerPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
@@ -127,7 +129,6 @@ impl Plugin for ServerPlugin {
                 receive_drop_requests,
                 receive_drop_tool_requests,
                 receive_deposit_requests,
-                receive_craft_requests,
             )
                 .in_set(GameSet::Simulation),
         );
@@ -222,6 +223,7 @@ fn load_from_save(
     mut dirty: ResMut<DetectionDirty>,
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
+    mut stations: ResMut<CraftStations>,
     config: Option<Res<ServerSaveConfig>>,
     block_registry: Res<BlockRegistry>,
     item_registry: Res<ItemRegistry>,
@@ -289,6 +291,45 @@ fn load_from_save(
             })
             .collect();
         plans.replace_all(restored);
+    }
+    // Restore craft-station state. Each station's inventory items
+    // resolve through the item registry; missing ids (mod removed)
+    // log + drop just that inventory entry rather than blocking the
+    // whole load. Orders with unknown recipe ids are kept (the
+    // craft modal renders "(unknown recipe)" + Cancel works) since
+    // the player may want to clear them by hand.
+    if !save.craft_stations.is_empty() {
+        let restored: Vec<(IVec3, StationState)> = save
+            .craft_stations
+            .into_iter()
+            .map(|(cell, saved)| {
+                let orders = saved
+                    .orders
+                    .into_iter()
+                    .map(|o| CraftOrder {
+                        recipe_id: o.recipe_id,
+                        total: o.total,
+                        completed: o.completed,
+                    })
+                    .collect();
+                let mut inventory = std::collections::HashMap::new();
+                for entry in saved.inventory {
+                    let id = block_junk_mod_api::items::ItemId::new(entry.item_id.clone());
+                    match item_registry.slot_of(&id) {
+                        Some(slot) => {
+                            *inventory.entry(slot).or_insert(0) += entry.count;
+                        }
+                        None => warn!(
+                            cell = ?cell.to_array(),
+                            item = %entry.item_id,
+                            "saved station inventory references unknown item id; dropping entry",
+                        ),
+                    }
+                }
+                (cell, StationState { orders, inventory })
+            })
+            .collect();
+        stations.replace_all(restored);
     }
     pending_pose.0 = save.last_player_pose;
     // Restore the world clock if the save carries one. Saves predating
@@ -547,6 +588,7 @@ fn save_on_request(
     config: Option<Res<ServerSaveConfig>>,
     clock: Res<WorldClock>,
     plans: Res<Plans>,
+    stations: Res<CraftStations>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
     npcs: Query<
@@ -592,6 +634,8 @@ fn save_on_request(
     let plan_count = saved_plans.len();
     let saved_items = collect_saved_world_items(&world_items, &item_registry);
     let item_count = saved_items.len();
+    let saved_stations = convert_saved_stations(&stations, &item_registry);
+    let station_count = saved_stations.len();
     let (saved_pose, saved_carry, saved_player_tool) =
         first_avatar_state(&avatars, &item_registry);
     let save = SaveFile {
@@ -604,13 +648,50 @@ fn save_on_request(
         world_items: saved_items,
         last_player_carry: saved_carry,
         last_player_tool: saved_player_tool,
+        craft_stations: saved_stations,
     };
     match write_save(name, &save) {
         Ok(()) => info!(
-            "save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items to {name:?}",
+            "save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items + {station_count} stations to {name:?}",
         ),
         Err(e) => error!("save-on-request to {name:?} failed: {e}"),
     }
+}
+
+/// Convert the engine-side `CraftStations` snapshot to the on-disk
+/// shape. Item slots are resolved back to their stable ids for the
+/// same reason `convert_saved_plans` does — slot ordering can shift
+/// between sessions if the mod set changes.
+fn convert_saved_stations(
+    stations: &CraftStations,
+    item_registry: &ItemRegistry,
+) -> Vec<(IVec3, SavedStationState)> {
+    stations
+        .iter()
+        .map(|(cell, state)| {
+            let orders = state
+                .orders
+                .iter()
+                .map(|o| SavedCraftOrder {
+                    recipe_id: o.recipe_id.clone(),
+                    total: o.total,
+                    completed: o.completed,
+                })
+                .collect();
+            let inventory = state
+                .inventory
+                .iter()
+                .map(|(slot, count)| SavedStationItem {
+                    item_id: item_registry.id_of(*slot).to_string(),
+                    count: *count,
+                })
+                .collect();
+            (
+                *cell,
+                SavedStationState { orders, inventory },
+            )
+        })
+        .collect()
 }
 
 /// Convert the engine-side `Plans` snapshot to the on-disk shape.
@@ -746,6 +827,7 @@ fn save_then_shutdown(
     config: Option<Res<ServerSaveConfig>>,
     clock: Res<WorldClock>,
     plans: Res<Plans>,
+    stations: Res<CraftStations>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
     npcs: Query<
@@ -791,12 +873,14 @@ fn save_then_shutdown(
                 let saved_npcs = collect_saved_npcs(&npcs, &item_registry);
                 let saved_plans = convert_saved_plans(&plans, &item_registry);
                 let saved_items = collect_saved_world_items(&world_items, &item_registry);
+                let saved_stations = convert_saved_stations(&stations, &item_registry);
                 let (saved_pose, saved_carry, saved_player_tool) =
-            first_avatar_state(&avatars, &item_registry);
+                    first_avatar_state(&avatars, &item_registry);
                 let chunk_count = edited.len();
                 let npc_count = saved_npcs.len();
                 let plan_count = saved_plans.len();
                 let item_count = saved_items.len();
+                let station_count = saved_stations.len();
                 let save = SaveFile {
                     version: SAVE_VERSION,
                     edited_chunks: edited,
@@ -806,11 +890,12 @@ fn save_then_shutdown(
                     plans: saved_plans,
                     world_items: saved_items,
                     last_player_carry: saved_carry,
-        last_player_tool: saved_player_tool,
+                    last_player_tool: saved_player_tool,
+                    craft_stations: saved_stations,
                 };
                 match write_save(name, &save) {
                     Ok(()) => info!(
-                        "saved {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items to {name:?}",
+                        "saved {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items + {station_count} stations to {name:?}",
                     ),
                     Err(e) => error!("save to {name:?} failed: {e}"),
                 }
@@ -1777,153 +1862,6 @@ fn receive_drop_tool_requests(
             Replicate::to_clients(NetworkTarget::All),
             Name::new(format!("WorldItem(tool_dropped:{})", slot.0)),
         ));
-    }
-}
-
-/// Apply a client's craft request. Re-validates everything the client
-/// claimed (station block still has the expected station_tag, recipe
-/// still exists in the registry, recipe.station still matches the
-/// block, player still in reach, carry still satisfies the recipe
-/// inputs, tool still satisfies the recipe's `required_tool`), then
-/// consumes inputs from carry + spawns the output as a WorldItem
-/// adjacent to the station. Silent no-op on any failure.
-///
-/// Output landing position: top of the station cell (cell origin +
-/// 1m in Y if the station is 1-tall, plus a small lateral jitter so
-/// repeated crafts don't z-fight). Phase 6a workbench is 1 cell tall;
-/// taller stations would need to look up the block's `entity_aabb`
-/// to find the top — defer until needed.
-#[allow(clippy::too_many_arguments, reason = "craft handler joins many subsystems")]
-fn receive_craft_requests(
-    mut receivers: Query<(Entity, &mut MessageReceiver<CraftRequest>)>,
-    avatars: Res<ClientAvatars>,
-    mut players: Query<(&AvatarPose, &mut Carrying, &EquippedTool), With<Avatar>>,
-    chunks: Query<(&Chunk, &ChunkEntities)>,
-    chunk_map: Res<ChunkMap>,
-    registry: Res<BlockRegistry>,
-    items_registry: Res<ItemRegistry>,
-    recipes: Res<crate::recipes::RecipeRegistry>,
-    mut commands: Commands,
-) {
-    use block_junk_mod_api::recipes::RecipeId;
-    /// Max distance from player to station for a craft to be legal.
-    /// Same magnitude as `PICKUP_PLAYER_REACH`; the gameplay
-    /// expectation is "you must be standing next to the workbench."
-    const CRAFT_PLAYER_REACH: f32 = 12.0;
-    for (connection, mut receiver) in receivers.iter_mut() {
-        let requests: Vec<CraftRequest> = receiver.receive().collect();
-        for req in requests {
-            let Some(&avatar) = avatars.0.get(&connection) else {
-                continue;
-            };
-            let Ok((pose, mut carry, _tool)) = players.get_mut(avatar) else {
-                continue;
-            };
-            // Reach check against the station cell centre.
-            let station_centre = req.station_cell.as_vec3() + Vec3::splat(0.5);
-            if (pose.translation - station_centre).length() > CRAFT_PLAYER_REACH {
-                continue;
-            }
-            // Look up the block at the station cell.
-            let (coord, local_idx) = crate::voxel::world_to_chunk(req.station_cell);
-            let Some(&chunk_entity) = chunk_map.0.get(&coord) else {
-                continue;
-            };
-            let Ok((chunk, _entities)) = chunks.get(chunk_entity) else {
-                continue;
-            };
-            let block_slot = chunk.get(local_idx);
-            if block_slot.is_empty() {
-                continue;
-            }
-            let block_def = registry.def(block_slot);
-            let Some(station_tag) = &block_def.station_tag else {
-                continue;
-            };
-            // Recipe lookup + station-tag agreement.
-            let recipe_id = RecipeId::new(req.recipe_id.clone());
-            let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
-                continue;
-            };
-            let recipe = recipes.def(recipe_slot);
-            if &recipe.station != station_tag {
-                continue;
-            }
-            // Tool gate re-check at commit time.
-            // (Tool already validated client-side; this is belt-and-
-            // braces against client/server registry drift.)
-            // Skipping the actual tool check here for brevity — the
-            // current vanilla recipes don't gate on tools, and the
-            // path is symmetric with the `required_tool` check in
-            // `pick_recipe_for_station`. Future expansion lands here.
-            // Inputs: carry must hold every required item kind in
-            // sufficient quantity. Single-stack carry means today this
-            // is at most one entry; the loop generalizes for free.
-            let inputs_satisfied = recipe.inputs.iter().all(|input| {
-                let Some(input_slot) = items_registry.slot_of(&input.item) else {
-                    return false;
-                };
-                carry.item == Some(input_slot) && carry.count >= input.count
-            });
-            if !inputs_satisfied {
-                continue;
-            }
-            // Consume inputs. Walks every input and decrements carry.
-            // Order matters when single-stack carry rolls over to
-            // None mid-loop; the per-entry slot match resolves to
-            // empty after the first decrement, which is fine because
-            // the inputs_satisfied check already guaranteed enough on
-            // entry.
-            for input in &recipe.inputs {
-                if carry.count >= input.count {
-                    carry.count -= input.count;
-                    if carry.count == 0 {
-                        carry.item = None;
-                    }
-                }
-            }
-            // Spawn outputs as WorldItems on top of the station cell.
-            // Resolve output slot via the item registry; missing id
-            // means the recipe references something the boot
-            // validator missed (shouldn't happen — recipe boot
-            // validator catches this — but defensive skip).
-            let Some(output_slot) = items_registry.slot_of(&recipe.output.item) else {
-                warn!(
-                    recipe = %recipe.id,
-                    output = %recipe.output.item,
-                    "craft commit: output item id missing from registry; skipping",
-                );
-                continue;
-            };
-            let top_of_station = Vec3::new(
-                req.station_cell.x as f32 + 0.5,
-                req.station_cell.y as f32 + 1.05,
-                req.station_cell.z as f32 + 0.5,
-            );
-            for unit in 0..recipe.output.count {
-                let angle = (unit as f32) * std::f32::consts::TAU
-                    / recipe.output.count.max(1) as f32;
-                let offset = Vec3::new(angle.cos() * 0.12, 0.0, angle.sin() * 0.12);
-                let translation = top_of_station + offset;
-                commands.spawn((
-                    WorldItem {
-                        item: output_slot,
-                        translation,
-                    },
-                    Transform::from_translation(translation),
-                    GlobalTransform::default(),
-                    Replicate::to_clients(NetworkTarget::All),
-                    Name::new(format!("WorldItem(crafted:{})", recipe.output.item)),
-                ));
-            }
-            info!(
-                recipe = %recipe.id,
-                cell = ?req.station_cell.to_array(),
-                output = %recipe.output.item,
-                count = recipe.output.count,
-                "craft commit",
-            );
-        }
     }
 }
 

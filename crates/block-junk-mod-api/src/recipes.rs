@@ -92,6 +92,14 @@ pub struct RecipeDef {
     /// with no matching station block is a typo, flagged loudly at
     /// load.
     pub station: TagId,
+    /// Minimum station tier required to craft this recipe. A
+    /// station with `station_tier >= recipe.tier` can perform it;
+    /// lower-tier stations don't see the recipe in their craft-order
+    /// modal. Default 0 (always-available basic recipe). Future
+    /// quality system: a higher-tier station performing a lower-tier
+    /// recipe yields better-quality output.
+    #[serde(default)]
+    pub tier: u8,
     /// Tool the crafter must hold to perform the recipe. Matches
     /// against [`crate::items::ItemDef::tool_tags`] the same way
     /// `WorkAction.required_tool` does. `None` ⇒ no tool required.

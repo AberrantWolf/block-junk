@@ -176,9 +176,24 @@ impl RecipeRegistry {
     /// Recipes available at a station with this tag, in registration
     /// order. Empty vec when no recipe targets the tag — same return
     /// shape as "tag is wrong"; the handler treats both the same way
-    /// (no craftable action).
+    /// (no craftable action). **Doesn't apply tier filtering** — use
+    /// [`Self::at_station_tier`] when you want recipes a specific
+    /// station instance can actually perform.
     pub fn at_station(&self, tag: &TagId) -> &[RecipeSlot] {
         self.by_station.get(tag).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Recipes available at a station with this tag whose `tier <=
+    /// max_tier`. Returns a fresh Vec; allocation is fine because
+    /// this is called at click time, not per-tick. Use this for the
+    /// craft-order modal's recipe list and any tier-gated server
+    /// validation.
+    pub fn at_station_tier(&self, tag: &TagId, max_tier: u8) -> Vec<RecipeSlot> {
+        self.at_station(tag)
+            .iter()
+            .copied()
+            .filter(|&slot| self.def(slot).tier <= max_tier)
+            .collect()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (RecipeSlot, &RecipeDef)> {

@@ -94,6 +94,7 @@ fn draw_target_outline(
     registry: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
+    stations: Res<crate::craft_stations::CraftStations>,
     plans: Res<Plans>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
@@ -123,8 +124,8 @@ fn draw_target_outline(
             let carry = local_carry.single().copied().unwrap_or_default();
             let tool = local_tool.single().copied().unwrap_or_default();
             draw_normal_target(
-                origin, dir, &chunks, &chunk_map, &registry, &items, &recipes, &plans,
-                &world_items, carry, tool, &mut gizmos,
+                origin, dir, &chunks, &chunk_map, &registry, &items, &recipes, &stations,
+                &plans, &world_items, carry, tool, &mut gizmos,
             );
         }
     }
@@ -183,6 +184,7 @@ fn draw_normal_target(
     registry: &BlockRegistry,
     items: &ItemRegistry,
     recipes: &crate::recipes::RecipeRegistry,
+    stations: &crate::craft_stations::CraftStations,
     plans: &Plans,
     world_items: &Query<&WorldItem>,
     carry: Carrying,
@@ -274,37 +276,44 @@ fn draw_normal_target(
     // No tag under the cursor; fall back to the world hit.
     if let Some(hit) = world_hit {
         let live_slot = live_block_slot(hit.cell, chunks, chunk_map);
-        // Station-block override: if the live block is a station, the
-        // L-click verb is "craft" rather than "direct-destroy."
-        // Purple when a recipe matches carry+tool (craftable now);
-        // soft-purple when the station is recognized but nothing the
-        // player holds can craft anything here. Direct-destroy (red)
-        // still applies on R-click, which the outline doesn't preview
-        // — same convention as the existing tagged-cell paths.
+        // Station-block override: the L-click verb is "open craft
+        // modal" (Phase 6b), not direct-destroy. Outline reads the
+        // *station's order state* — bright purple when at least one
+        // queued order has materials ready to work (so someone
+        // could hit the Work button right now), muted purple
+        // otherwise (no orders, or orders waiting on materials).
+        // Direct-destroy (red) still applies on R-click; outline
+        // doesn't preview R, same convention as the existing
+        // tagged-cell paths.
         if let Some(slot) = live_slot
-            && let Some(station_tag) = &registry.def(slot).station_tag
+            && registry.def(slot).station_tag.is_some()
         {
-            let craftable = recipes
-                .at_station(station_tag)
-                .iter()
-                .any(|&recipe_slot| {
-                    let def = recipes.def(recipe_slot);
-                    if let Some(required) = &def.required_tool
-                        && !items.tool_has_tag(tool.item, required)
-                    {
-                        return false;
-                    }
-                    def.inputs.iter().all(|input| {
-                        let Some(input_slot) = items.slot_of(&input.item) else {
+            let any_work_ready = stations
+                .get(hit.cell)
+                .map(|state| {
+                    state.orders.iter().any(|order| {
+                        let Some(recipe_slot) =
+                            recipes.slot_of(&block_junk_mod_api::recipes::RecipeId::new(
+                                order.recipe_id.clone(),
+                            ))
+                        else {
                             return false;
                         };
-                        carry.item == Some(input_slot) && carry.count >= input.count
+                        let def = recipes.def(recipe_slot);
+                        def.inputs.iter().all(|input| {
+                            let Some(input_slot) = items.slot_of(&input.item) else {
+                                return false;
+                            };
+                            state.inventory.get(&input_slot).copied().unwrap_or(0)
+                                >= input.count
+                        })
                     })
-                });
-            let colour = if craftable {
-                Color::srgb(0.78, 0.42, 0.95) // bright purple: craft ready
+                })
+                .unwrap_or(false);
+            let colour = if any_work_ready {
+                Color::srgb(0.78, 0.42, 0.95) // bright purple: order work-ready
             } else {
-                Color::srgb(0.50, 0.38, 0.58) // muted purple: station, but no recipe
+                Color::srgb(0.50, 0.38, 0.58) // muted purple: station, no work-ready
             };
             draw_cell(gizmos, hit.cell, colour);
             return;

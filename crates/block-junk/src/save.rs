@@ -51,7 +51,13 @@ use crate::voxel::{Chunk, ChunkEntities};
 ///                  to `SavedNpc` (Phase 5a). Single-slot tools live
 ///                  separately from carry stacks so the save shape is
 ///                  symmetric: each actor gets one optional tool id.
-pub const SAVE_VERSION: u32 = 9;
+/// v10 (2026-05-19): added `craft_stations` to `SaveFile` (Phase 6b).
+///                  Per-cell `SavedStationState` with queued orders +
+///                  deposited inventory so workbenches survive reload
+///                  mid-craft-cycle. Items stored as ids (strings)
+///                  for the same registry-stability reason world
+///                  items and carry use.
+pub const SAVE_VERSION: u32 = 10;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -144,6 +150,11 @@ pub struct SaveFile {
     /// `STARTER_TOOL_ID`).
     #[serde(default)]
     pub last_player_tool: Option<SavedTool>,
+    /// Craft-station state at save time — queued orders + deposited
+    /// inventory, per station cell. Empty vec for sessions with no
+    /// active stations OR for saves predating v10 (serde-default).
+    #[serde(default)]
+    pub craft_stations: Vec<(IVec3, SavedStationState)>,
 }
 
 /// On-disk shape of a [`WorldItem`](crate::protocol::WorldItem) entity.
@@ -175,6 +186,31 @@ pub struct SavedCarry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedTool {
     pub item_id: String,
+}
+
+/// On-disk shape of a
+/// [`StationState`](crate::craft_stations::StationState). Both fields
+/// store ids/strings (not registry slots) so the save survives a
+/// session where mods register in a different order. Recipe ids are
+/// stable strings already; inventory items go through the same
+/// id↔slot resolution carry + world items use.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedStationState {
+    pub orders: Vec<SavedCraftOrder>,
+    pub inventory: Vec<SavedStationItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedCraftOrder {
+    pub recipe_id: String,
+    pub total: u32,
+    pub completed: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedStationItem {
+    pub item_id: String,
+    pub count: u32,
 }
 
 /// On-disk shape of a [`PlanState`](crate::protocol::PlanState).
@@ -474,6 +510,20 @@ mod tests {
             last_player_tool: Some(SavedTool {
                 item_id: "vanilla:axe".to_owned(),
             }),
+            craft_stations: vec![(
+                IVec3::new(2, 32, 60),
+                SavedStationState {
+                    orders: vec![SavedCraftOrder {
+                        recipe_id: "vanilla:planks_from_log".to_owned(),
+                        total: 4,
+                        completed: 1,
+                    }],
+                    inventory: vec![SavedStationItem {
+                        item_id: "vanilla:wood_log".to_owned(),
+                        count: 2,
+                    }],
+                },
+            )],
         };
 
         let bytes =
@@ -513,5 +563,15 @@ mod tests {
         assert_eq!(tool.item_id, "vanilla:axe");
         let npc_tool = decoded.npcs[0].tool.as_ref().unwrap();
         assert_eq!(npc_tool.item_id, "vanilla:pickaxe");
+        assert_eq!(decoded.craft_stations.len(), 1);
+        let (station_cell, station_state) = &decoded.craft_stations[0];
+        assert_eq!(*station_cell, IVec3::new(2, 32, 60));
+        assert_eq!(station_state.orders.len(), 1);
+        assert_eq!(station_state.orders[0].recipe_id, "vanilla:planks_from_log");
+        assert_eq!(station_state.orders[0].total, 4);
+        assert_eq!(station_state.orders[0].completed, 1);
+        assert_eq!(station_state.inventory.len(), 1);
+        assert_eq!(station_state.inventory[0].item_id, "vanilla:wood_log");
+        assert_eq!(station_state.inventory[0].count, 2);
     }
 }

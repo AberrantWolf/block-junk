@@ -458,6 +458,7 @@ register {
     color = { 0.55, 0.42, 0.25 },
     pattern = "planks",
     station_tag = "vanilla:carpentry",
+    station_tier = 1,
     materials = {
         { item = "vanilla:wood_log", count = 2 },
     },
@@ -474,6 +475,7 @@ engine.recipes.register {
     output = { item = "vanilla:wood_planks", count = 1 },
     duration_secs = 4.0,
     station = "vanilla:carpentry",
+    tier = 1,
 }
 
 -- Needs the engine itself doesn't know about — it just decays whatever

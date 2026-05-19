@@ -646,22 +646,6 @@ pub struct DebugBumpNeed {
 #[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct DebugFillNearestPlan;
 
-/// Client → server: perform one crafting cycle of `recipe` at the
-/// station block at `station_cell`. Server re-validates the click is
-/// still legal (block at cell still has `station_tag == recipe.station`,
-/// player still adjacent + within reach, carry still satisfies the
-/// recipe's inputs, tool still satisfies `required_tool`), then
-/// consumes inputs from carry and spawns the output as a `WorldItem`
-/// adjacent to the station. Silent no-op on any validation failure
-/// — same degradation pattern as `DepositRequest`.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct CraftRequest {
-    pub station_cell: IVec3,
-    /// [`block_junk_mod_api::recipes::RecipeId`] string. Kept as plain
-    /// String here so `protocol.rs` doesn't drag in the recipe type.
-    pub recipe_id: String,
-}
-
 /// Client → server: drop the player's currently-equipped tool back
 /// to the world as a `WorldItem`. Lands at the
 /// `drop_target_position` (one tile ahead of the player when that

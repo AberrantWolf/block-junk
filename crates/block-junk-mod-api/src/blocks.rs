@@ -206,11 +206,12 @@ pub struct BlockDef {
     #[serde(default)]
     pub drops: Vec<ItemDrop>,
     /// Marks this block as a craft station. When `Some(tag)`, recipes
-    /// whose `station` matches `tag` can be performed at this block.
-    /// Players L-click on a station to craft when their carry matches
-    /// a recipe input (Phase 6a); NPCs route to stations via a
-    /// scheduler-driven goal in a future Phase 6b. `None` ⇒ the
-    /// block is not a station, the click resolver ignores it.
+    /// whose `station` matches `tag` AND `tier <= station_tier` can
+    /// be performed at this block. L-click on a station opens the
+    /// craft-order modal; orders queue up, materials get hauled in
+    /// (by player or NPC), and someone works the orders to produce
+    /// outputs. `None` ⇒ the block is not a station, the click
+    /// resolver falls through to direct-destroy.
     ///
     /// Tag matching is byte-exact (same convention as `TagId`
     /// elsewhere — no central station registry). One block can carry
@@ -219,6 +220,19 @@ pub struct BlockDef {
     /// `Vec<TagId>` later.
     #[serde(default)]
     pub station_tag: Option<TagId>,
+    /// Maximum recipe tier this station can perform. A recipe with
+    /// `tier <= station_tier` is available; higher-tier recipes are
+    /// hidden from the craft-order modal. Default 0 (only the most
+    /// basic recipes). Together with `station_tag`, this is the
+    /// engine's full gate on what each station can do. Meaningful
+    /// only when `station_tag` is also `Some`.
+    ///
+    /// Future quality system extends this: a higher-tier station
+    /// crafting a lower-tier recipe will yield higher-quality
+    /// outputs. For now, tier is a pure binary "can craft this or
+    /// not" gate.
+    #[serde(default)]
+    pub station_tier: u8,
     /// Items required to *build* this block via the Plan workflow. A
     /// player or NPC must deliver this many of each named item to the
     /// plan cell before the work-action can run. Same shape as
