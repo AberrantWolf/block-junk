@@ -58,6 +58,61 @@ impl Plugin for TargetOutlinePlugin {
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),
         );
+        app.add_systems(
+            Update,
+            draw_station_progress_bars
+                .in_set(GameSet::PostSimulation)
+                .run_if(in_state(AppState::InGame)),
+        );
+    }
+}
+
+/// Draw an in-world progress bar above every station with active
+/// crafting work. Visible to anyone, regardless of whether the
+/// craft-order modal is open — players hold L-click on the bench to
+/// progress the craft, and the modal can't be open while they do
+/// (L-click would conflict with UI), so the bar has to live in the
+/// world for them to see progress happen.
+///
+/// Position: just above the station block's top face. Two stacked
+/// gizmo lines fake a thick bar — Bevy gizmos are 1px lines, so a
+/// thin foreground stripe on top of a slightly wider background
+/// reads as a filled bar from gameplay distance.
+fn draw_station_progress_bars(
+    stations: Res<crate::craft_stations::CraftStations>,
+    mut gizmos: Gizmos,
+) {
+    use bevy::math::Vec3;
+    /// Bar width in metres. Sized to fit comfortably inside a 1-cell
+    /// station footprint with breathing room.
+    const BAR_WIDTH: f32 = 0.8;
+    /// Y offset above the station cell origin. The cell occupies
+    /// y..y+1; +1.3 sits just above the top face.
+    const BAR_Y_OFFSET: f32 = 1.3;
+    /// Vertical thickness — a small bundle of horizontal lines so
+    /// the bar reads from a few metres away.
+    const BAR_LINES: i32 = 6;
+    const BAR_LINE_SPACING: f32 = 0.012;
+    let bg = Color::srgba(0.20, 0.18, 0.22, 0.85);
+    let fg = Color::srgba(0.95, 0.55, 1.0, 1.0);
+    for (cell, state) in stations.iter() {
+        let Some(active) = state.active_work.as_ref() else {
+            continue;
+        };
+        let progress = (active.elapsed_secs / active.total_secs.max(0.001)).clamp(0.0, 1.0);
+        let centre_x = cell.x as f32 + 0.5;
+        let z = cell.z as f32 + 0.5;
+        let y0 = cell.y as f32 + BAR_Y_OFFSET;
+        let left = centre_x - BAR_WIDTH * 0.5;
+        let right = centre_x + BAR_WIDTH * 0.5;
+        let fill_right = left + BAR_WIDTH * progress;
+        for i in 0..BAR_LINES {
+            let y = y0 + (i as f32 - (BAR_LINES as f32 - 1.0) * 0.5) * BAR_LINE_SPACING;
+            gizmos.line(Vec3::new(left, y, z), Vec3::new(right, y, z), bg);
+            if progress > 0.0 {
+                gizmos.line(Vec3::new(left, y, z), Vec3::new(fill_right, y, z), fg);
+            }
+        }
     }
 }
 
