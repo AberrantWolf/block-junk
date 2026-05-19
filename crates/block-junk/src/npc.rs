@@ -716,6 +716,156 @@ struct HaulCtx<'w, 's> {
     item_registry: Res<'w, crate::items::ItemRegistry>,
 }
 
+/// Goals the preempt check considers abortable. Goals the Lua planner
+/// itself picks under critical need (Interact, Wander, Goto, Rest) are
+/// excluded — preempting Interact would yank the NPC off the action
+/// addressing the need, and preempting Wander/Goto/Rest would thrash
+/// the planner once per tick when no survival target is in range.
+///
+/// Pure for testability; the brain tick consults it and only then
+/// reaches for the side-effecting helpers below.
+pub(crate) fn preempt_eligible(goal: &Goal) -> bool {
+    match goal {
+        Goal::Working { .. } => true,
+        Goal::MoveTo { on_arrive, .. } => matches!(
+            on_arrive,
+            ArrivalAction::Work { .. }
+                | ArrivalAction::PickupForPlan { .. }
+                | ArrivalAction::DepositAtPlan { .. }
+                | ArrivalAction::PickupTool { .. }
+        ),
+        _ => false,
+    }
+}
+
+/// Release every claim, reservation, and assignment the NPC was
+/// holding for this goal. Pure side-effect on the four resource maps
+/// — no Bevy Commands, no world-state mutation — so it round-trips
+/// in unit tests without booting the full brain tick.
+///
+/// Coverage parallels [`preempt_current_goal`]:
+/// - `MoveTo { Interact { exclusive: true } }` / `Interacting { exclusive: true }` ⇒ release interaction claim
+/// - `MoveTo { Work }` / `Working` ⇒ release plan claim
+/// - `MoveTo { Pickup* / Deposit* }` ⇒ release haul assignment + all its reservations
+/// - Idle / Resting / non-exclusive interactions ⇒ no-op
+pub(crate) fn preempt_release_holds(
+    npc_id: NpcId,
+    goal: &Goal,
+    plan_claims: &mut PlanClaims,
+    interaction_claims: &mut InteractionClaims,
+    haul_assignments: &mut HaulAssignments,
+    haul_reservations: &mut WorldItemReservations,
+) {
+    match goal {
+        Goal::Idle | Goal::Resting { .. } => {}
+        Goal::MoveTo { on_arrive, .. } => match on_arrive {
+            ArrivalAction::Interact {
+                anchor_cell,
+                exclusive: true,
+                ..
+            } => {
+                interaction_claims.release(*anchor_cell, npc_id);
+            }
+            ArrivalAction::Work { target_cell, .. } => {
+                plan_claims.release(*target_cell, npc_id);
+            }
+            ArrivalAction::PickupForPlan { .. }
+            | ArrivalAction::DepositAtPlan { .. }
+            | ArrivalAction::PickupTool { .. } => {
+                release_haul_for(npc_id, haul_assignments, haul_reservations);
+            }
+            _ => {}
+        },
+        Goal::Interacting {
+            anchor_cell,
+            exclusive: true,
+            ..
+        } => {
+            interaction_claims.release(*anchor_cell, npc_id);
+        }
+        Goal::Interacting { .. } => {}
+        Goal::Working { target_cell, .. } => {
+            plan_claims.release(*target_cell, npc_id);
+        }
+    }
+}
+
+/// Cleanly abort whatever the NPC is doing right now and drop them to
+/// `Goal::Idle`. Used by the preempt check when a need crosses its
+/// `preempt_threshold` — the next planner call (same tick, since we're
+/// Idle) routes the NPC to Rest / Interact based on the high need
+/// value.
+///
+/// Delegates claim/reservation release to [`preempt_release_holds`],
+/// then handles the side-effects that need a Bevy context: ejecting
+/// a `KinematicLock`-ed `Interacting` body to a standable cell and
+/// dropping the lock so physics resumes from a sensible position.
+///
+/// No need-restore is applied — preempt is the "I gave up before
+/// finishing" path; only completion credits the need. Path is cleared
+/// so the next goal commits cleanly.
+///
+/// Phase 6c will add a `Goal::CraftingAtStation` arm that refunds
+/// consumed recipe inputs back to the station's inventory.
+#[allow(clippy::too_many_arguments, reason = "bundles cleanup-target refs from the brain tick's hot loop")]
+fn preempt_current_goal(
+    npc_id: NpcId,
+    entity: Entity,
+    is_locked: bool,
+    brain: &mut Brain,
+    npc_path: &mut NpcPath,
+    pose: &mut AvatarPose,
+    plan_claims: &mut PlanClaims,
+    interaction_claims: &mut InteractionClaims,
+    haul_assignments: &mut HaulAssignments,
+    haul_reservations: &mut WorldItemReservations,
+    commands: &mut Commands,
+    world: &WorldWalk,
+    chunks: &Query<&'static Chunk>,
+    chunk_entities_q: &Query<&'static ChunkEntities>,
+    chunk_map: &ChunkMap,
+    block_registry: &BlockRegistry,
+) {
+    if matches!(brain.goal, Goal::Idle) {
+        return;
+    }
+    preempt_release_holds(
+        npc_id,
+        &brain.goal,
+        plan_claims,
+        interaction_claims,
+        haul_assignments,
+        haul_reservations,
+    );
+    // Eject + unlock only applies when the body is currently snapped
+    // into a use-slot mid-interaction. Working / MoveTo / Resting
+    // never set KinematicLock, so this branch is effectively
+    // Interacting-only — but keying off `is_locked` rather than the
+    // Goal variant keeps the helper symmetric with the post-completion
+    // eject site below.
+    if is_locked {
+        if let Goal::Interacting { target_cell, .. } = &brain.goal {
+            let slot = slot_at_cell(*target_cell, chunks, chunk_map, block_registry);
+            let (anchor, orientation) =
+                resolve_anchor_with_orientation(*target_cell, chunk_entities_q, chunk_map);
+            if !try_eject_to_cells(
+                pose,
+                eject_candidates_for_slot(slot.as_ref(), anchor, orientation),
+                world,
+            ) {
+                warn!(
+                    npc = npc_id.0,
+                    anchor = ?anchor.to_array(),
+                    "preempt eject: no standable approach; NPC may be embedded",
+                );
+            }
+            commands.entity(entity).remove::<KinematicLock>();
+        }
+    }
+    npc_path.0.clear();
+    brain.goal = Goal::Idle;
+}
+
 #[allow(clippy::too_many_arguments, reason = "brain tick spans many subsystems")]
 fn npc_brain_tick(
     time: Res<Time>,
@@ -779,6 +929,57 @@ fn npc_brain_tick(
         for (id, value) in needs.0.iter_mut() {
             let decay = need_registry.decay_per_sec(id);
             *value = (*value + decay * dt).clamp(0.0, 1.0);
+        }
+
+        // Phase 1.5: preempt check. If any need crossed its data-defined
+        // `preempt_threshold` AND the NPC is doing something a survival-
+        // aware planner wouldn't pick under critical need (work / haul),
+        // abort to Idle so the planner re-routes them this same tick. We
+        // *don't* preempt goals the planner itself picks at urge (Rest,
+        // Interact, Wander, Goto) — preempting an Interact would yank
+        // the NPC off the very action that addresses the need, and
+        // preempting Wander/Goto would thrash 60 Hz when no survival
+        // interactable is in range. The mark-preempted flag suppresses
+        // the haul scheduler at the Idle entry below so a freshly-
+        // aborted hauler doesn't get instantly reassigned to another
+        // haul before the planner gets a turn.
+        let mut preempted_this_tick = false;
+        if preempt_eligible(&brain.goal) {
+            let crossed = needs.0.iter().find_map(|(id, value)| {
+                need_registry
+                    .preempt_threshold(id)
+                    .filter(|threshold| *value >= *threshold)
+                    .map(|threshold| (id.clone(), *value, threshold))
+            });
+            if let Some((need_id, value, threshold)) = crossed {
+                info!(
+                    npc = npc_id.0,
+                    need = %need_id,
+                    value = value,
+                    threshold = threshold,
+                    "preempt: aborting current goal for survival",
+                );
+                preempt_current_goal(
+                    *npc_id,
+                    entity,
+                    is_locked,
+                    &mut brain,
+                    &mut npc_path,
+                    &mut pose,
+                    &mut haul.plan_claims,
+                    &mut interaction_claims,
+                    &mut haul.assignments,
+                    &mut haul.reservations,
+                    &mut commands,
+                    &world,
+                    &chunks,
+                    &chunk_entities_q,
+                    &chunk_map,
+                    &block_registry,
+                );
+                preempted_this_tick = true;
+                *intent = MovementIntent::default();
+            }
         }
 
         // Phase 2: advance the active goal. MoveTo can finish in one
@@ -1467,7 +1668,12 @@ fn npc_brain_tick(
             // assignment, including ones with non-empty carry — the
             // matcher's deposit-only branch handles that case
             // (save/load mid-haul, hand-offs from future systems).
-            if !haul.assignments.contains(*npc_id) {
+            //
+            // Skipped on a tick where preempt fired: a hauler that just
+            // peeled off for survival would otherwise be instantly
+            // reassigned to another haul before the planner could
+            // route them to food/sleep.
+            if !preempted_this_tick && !haul.assignments.contains(*npc_id) {
                 crate::haul::try_schedule_haul_for_npc(
                     *npc_id,
                     &kind.0,
@@ -3377,4 +3583,212 @@ fn rand_unit(state: &mut u64) -> f32 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     let bits = (z ^ (z >> 31)) as u32;
     bits as f32 / (u32::MAX as f32 + 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-data tests for the preempt path. The full integration
+    //! ("preempted NPC ends up Resting / Interacting next tick") needs
+    //! a real brain-tick app and is covered by manual smoke. Here we
+    //! pin down the decision + cleanup logic so a future refactor
+    //! can't silently break it.
+
+    use super::*;
+    use crate::haul::{HaulAssignment, HaulAssignments, ReservedItem, WorldItemReservations};
+    use crate::interactables::InteractionClaims;
+    use crate::items::ItemSlot;
+    use crate::plan_claims::PlanClaims;
+    use bevy::prelude::{Entity, IVec3, Vec3};
+
+    fn dummy_work_goal(cell: IVec3) -> Goal {
+        Goal::Working {
+            remaining_secs: 4.0,
+            target_cell: cell,
+            plan_kind: PlanKind::Remove,
+            need_restore: None,
+        }
+    }
+
+    fn dummy_pickup_movetomove(item_entity: Entity, plan_cell: IVec3) -> Goal {
+        Goal::MoveTo {
+            path: vec![IVec3::ZERO, plan_cell],
+            progress: 0.0,
+            deadline_secs: 30.0,
+            last_pos: Vec3::ZERO,
+            stuck_secs: 0.0,
+            on_arrive: ArrivalAction::PickupForPlan {
+                item_entity,
+                item_slot: ItemSlot(0),
+                plan_cell,
+            },
+            snap: None,
+        }
+    }
+
+    #[test]
+    fn preempt_eligible_picks_work_and_haul_only() {
+        let cell = IVec3::new(1, 2, 3);
+        assert!(preempt_eligible(&dummy_work_goal(cell)));
+        assert!(preempt_eligible(&dummy_pickup_movetomove(
+            Entity::from_raw_u32(7).unwrap(),
+            cell
+        )));
+        assert!(preempt_eligible(&Goal::MoveTo {
+            path: vec![cell],
+            progress: 0.0,
+            deadline_secs: 30.0,
+            last_pos: Vec3::ZERO,
+            stuck_secs: 0.0,
+            on_arrive: ArrivalAction::Work {
+                duration_secs: 4.0,
+                target_cell: cell,
+                plan_kind: PlanKind::Remove,
+                need_restore: None,
+            },
+            snap: None,
+        }));
+
+        // Idle / Resting / Interacting are off-limits to preempt — the
+        // planner picks Rest/Interact when survival is critical, so
+        // preempting them would yank the NPC off the very action that
+        // addresses the need.
+        assert!(!preempt_eligible(&Goal::Idle));
+        assert!(!preempt_eligible(&Goal::Resting {
+            remaining_secs: 1.0
+        }));
+        assert!(!preempt_eligible(&Goal::Interacting {
+            remaining_secs: 1.0,
+            need_restore: None,
+            target_cell: cell,
+            anchor_cell: cell,
+            exclusive: true,
+            animation: None,
+        }));
+        // MoveTo with no follow-on (Wander/Goto) and MoveTo→Interact
+        // are both planner-picked under high need; neither should be
+        // preempted.
+        assert!(!preempt_eligible(&Goal::MoveTo {
+            path: vec![cell],
+            progress: 0.0,
+            deadline_secs: 30.0,
+            last_pos: Vec3::ZERO,
+            stuck_secs: 0.0,
+            on_arrive: ArrivalAction::None,
+            snap: None,
+        }));
+        assert!(!preempt_eligible(&Goal::MoveTo {
+            path: vec![cell],
+            progress: 0.0,
+            deadline_secs: 30.0,
+            last_pos: Vec3::ZERO,
+            stuck_secs: 0.0,
+            on_arrive: ArrivalAction::Interact {
+                need_restore: None,
+                duration_secs: 4.0,
+                target_cell: cell,
+                anchor_cell: cell,
+                exclusive: false,
+                animation: None,
+            },
+            snap: None,
+        }));
+    }
+
+    #[test]
+    fn preempt_release_holds_releases_plan_claim_on_working() {
+        let npc = NpcId(42);
+        let cell = IVec3::new(5, 6, 7);
+        let mut plan_claims = PlanClaims::default();
+        let mut interaction_claims = InteractionClaims::default();
+        let mut assignments = HaulAssignments::default();
+        let mut reservations = WorldItemReservations::default();
+        assert!(plan_claims.try_claim(cell, npc));
+
+        preempt_release_holds(
+            npc,
+            &dummy_work_goal(cell),
+            &mut plan_claims,
+            &mut interaction_claims,
+            &mut assignments,
+            &mut reservations,
+        );
+
+        // After release, another NPC can claim the same cell.
+        let other = NpcId(43);
+        assert!(plan_claims.try_claim(cell, other));
+    }
+
+    #[test]
+    fn preempt_release_holds_drops_haul_assignment_and_reservations() {
+        let npc = NpcId(7);
+        let item_entity = Entity::from_raw_u32(101).unwrap();
+        let plan_cell = IVec3::new(0, 0, 5);
+        let mut plan_claims = PlanClaims::default();
+        let mut interaction_claims = InteractionClaims::default();
+        let mut assignments = HaulAssignments::default();
+        let mut reservations = WorldItemReservations::default();
+
+        assert!(reservations.try_reserve(item_entity, npc));
+        assignments.insert(
+            npc,
+            HaulAssignment {
+                plan_cell,
+                queue: vec![ReservedItem {
+                    entity: item_entity,
+                    item: ItemSlot(0),
+                    translation: Vec3::ZERO,
+                }],
+                pending_tool: None,
+            },
+        );
+        assert!(assignments.contains(npc));
+
+        preempt_release_holds(
+            npc,
+            &dummy_pickup_movetomove(item_entity, plan_cell),
+            &mut plan_claims,
+            &mut interaction_claims,
+            &mut assignments,
+            &mut reservations,
+        );
+
+        assert!(!assignments.contains(npc));
+        let other = NpcId(8);
+        assert!(reservations.try_reserve(item_entity, other));
+    }
+
+    #[test]
+    fn preempt_release_holds_noop_on_idle_and_resting() {
+        let npc = NpcId(1);
+        let cell = IVec3::new(1, 1, 1);
+        let mut plan_claims = PlanClaims::default();
+        let mut interaction_claims = InteractionClaims::default();
+        let mut assignments = HaulAssignments::default();
+        let mut reservations = WorldItemReservations::default();
+        assert!(plan_claims.try_claim(cell, npc));
+
+        preempt_release_holds(
+            npc,
+            &Goal::Idle,
+            &mut plan_claims,
+            &mut interaction_claims,
+            &mut assignments,
+            &mut reservations,
+        );
+        preempt_release_holds(
+            npc,
+            &Goal::Resting {
+                remaining_secs: 2.0,
+            },
+            &mut plan_claims,
+            &mut interaction_claims,
+            &mut assignments,
+            &mut reservations,
+        );
+
+        // The unrelated plan claim survives — both no-ops left it
+        // alone, so another NPC still can't take it.
+        let other = NpcId(2);
+        assert!(!plan_claims.try_claim(cell, other));
+    }
 }

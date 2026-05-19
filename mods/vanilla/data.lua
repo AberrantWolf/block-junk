@@ -488,6 +488,15 @@ engine.needs.register {
     id = "hunger",
     display_name = "Hunger",
     decay_per_sec = 1.0 / 300.0,
+    -- "Starting to look for food" — planner pivots from idle rhythm
+    -- to the nearest food interactable at this level. Matches the
+    -- previous hardcoded HUNGER_THRESHOLD in events.lua.
+    urge_threshold = 0.3,
+    -- "Have to eat NOW" — engine yanks the NPC off whatever they're
+    -- doing (work, haul, craft) at this level. Well above the urge
+    -- so an NPC mid-task isn't ripped away the instant they get
+    -- peckish.
+    preempt_threshold = 0.6,
 }
 
 -- Sleep / tiredness. Decays slower than hunger because a day/night
@@ -502,6 +511,13 @@ engine.needs.register {
     id = "sleep",
     display_name = "Tiredness",
     decay_per_sec = 1.0 / 450.0,
+    urge_threshold = 0.25,
+    -- Critical exhaustion preempts current task. The planner still
+    -- gates the *sleep* action on it being night, so a preempted-at-
+    -- noon NPC will wander toward home rather than dropping into a
+    -- bed; the preempt just guarantees they aren't locked into a
+    -- 60s craft while sleep need spikes past 0.9.
+    preempt_threshold = 0.6,
 }
 
 -- Work / purpose. Drives NPCs to pick up player-tagged plans (build,
@@ -515,6 +531,9 @@ engine.needs.register {
     id = "work",
     display_name = "Purpose",
     decay_per_sec = 1.0 / 240.0,
+    urge_threshold = 0.3,
+    -- No preempt: wanting *more* work isn't an emergency. Leaving
+    -- this nil means the engine's preempt check ignores `work`.
 }
 
 -- Work-action balance defaults. Read by the engine at WorkPlan goal

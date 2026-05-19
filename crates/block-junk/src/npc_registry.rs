@@ -133,8 +133,26 @@ impl NeedRegistry {
         self.defs.get(id).map(|d| d.decay_per_sec).unwrap_or(0.0)
     }
 
+    /// "Starting to care" cutoff used by Lua planners at `Goal::Idle`
+    /// to decide whether the NPC should pivot from idle rhythm to the
+    /// matching interactable. `None` ⇒ no threshold registered;
+    /// callers fall back to their own default.
+    pub fn urge_threshold(&self, id: &str) -> Option<f32> {
+        self.defs.get(id).and_then(|d| d.urge_threshold)
+    }
+
+    /// "Drop everything" cutoff used by the engine's preempt check
+    /// every brain tick. `None` ⇒ this need never preempts.
+    pub fn preempt_threshold(&self, id: &str) -> Option<f32> {
+        self.defs.get(id).and_then(|d| d.preempt_threshold)
+    }
+
     pub fn need_count(&self) -> usize {
         self.defs.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &NeedDef)> {
+        self.defs.iter().map(|(k, v)| (k.as_str(), v))
     }
 }
 
@@ -217,5 +235,50 @@ impl AnimationRegistry {
 
     pub fn len(&self) -> usize {
         self.order.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use block_junk_mod_api::npcs::{NeedDef, NeedId};
+
+    fn need(id: &str, decay: f32, urge: Option<f32>, preempt: Option<f32>) -> NeedDef {
+        NeedDef {
+            id: NeedId::from(id),
+            display_name: id.to_string(),
+            decay_per_sec: decay,
+            urge_threshold: urge,
+            preempt_threshold: preempt,
+        }
+    }
+
+    #[test]
+    fn need_registry_returns_per_need_thresholds() {
+        let registry = NeedRegistry::build(vec![
+            need("hunger", 0.01, Some(0.3), Some(0.6)),
+            need("work", 0.02, Some(0.3), None),
+        ])
+        .unwrap();
+
+        assert_eq!(registry.urge_threshold("hunger"), Some(0.3));
+        assert_eq!(registry.preempt_threshold("hunger"), Some(0.6));
+        // `work` has urge but no preempt — wanting more work isn't an emergency.
+        assert_eq!(registry.urge_threshold("work"), Some(0.3));
+        assert_eq!(registry.preempt_threshold("work"), None);
+    }
+
+    #[test]
+    fn need_registry_returns_none_for_unknown_or_unset() {
+        let registry =
+            NeedRegistry::build(vec![need("hunger", 0.01, None, None)]).unwrap();
+
+        // Unset on a known need ⇒ None (callers fall back to a default).
+        assert_eq!(registry.urge_threshold("hunger"), None);
+        assert_eq!(registry.preempt_threshold("hunger"), None);
+        // Unknown need ⇒ None — tolerates stale references the same way
+        // `decay_per_sec` does.
+        assert_eq!(registry.urge_threshold("missing"), None);
+        assert_eq!(registry.preempt_threshold("missing"), None);
     }
 }

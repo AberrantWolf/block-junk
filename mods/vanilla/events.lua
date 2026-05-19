@@ -28,33 +28,24 @@
 -- and so a freshly-completed visit doesn't immediately re-trigger.
 local last_action = {}
 
--- Hunger threshold above which the NPC heads for food rather than
--- continuing its idle rhythm. With `restores = 0.4` per basket and the
--- threshold here at 0.3, an NPC that's just eaten won't head back for
--- more — the post-meal value (max(0, current - 0.4)) drops well below
--- the trigger. Picked low enough that visible "I'm hungry, going to
--- the basket" behaviour fires regularly in a session, high enough that
--- a freshly-spawned NPC with default deficit 0.2 doesn't pre-empt
--- everything else on tick zero.
-local HUNGER_THRESHOLD = 0.3
+-- "Starts caring" cutoffs are now data-driven — each need def in
+-- data.lua carries its own `urge_threshold`, the same value the engine
+-- uses to define the planner's pivot points. Cached here at load time
+-- so the planner's hot path is a plain table read, not an
+-- engine.needs.get() round-trip per tick. Falls back to 0.3 if a need
+-- forgot to set one (loud warning to surface mod-data drift).
+local function urge_threshold(need_id, fallback)
+    local def = engine.needs.get(need_id)
+    if def and def.urge_threshold then
+        return def.urge_threshold
+    end
+    print(string.format("warning: need '%s' missing urge_threshold; using %.2f", need_id, fallback))
+    return fallback
+end
 
--- Sleep threshold above which a tired NPC will *consider* heading for
--- a bed — actual sleep only fires when it's also night out (gated by
--- snapshot.is_night below). With `restores = 0.7` per bed and threshold
--- 0.25, an NPC that's slept will go well below the trigger, but an NPC
--- that hasn't slept in a day will be visibly tired by the time night
--- rolls around. The spawn default is 0.15, so a fresh NPC won't head
--- straight for a bed on session start.
-local SLEEP_THRESHOLD = 0.25
-
--- Work threshold above which an NPC will pick up the nearest player-
--- tagged plan. With `restores = 0.35` per completed action and threshold
--- 0.3, a villager who's just finished a tag won't immediately re-trigger
--- (post-completion deficit ~= 0), but a few minutes later they're back
--- in the queue. Ordered below sleep (rest is mandatory) and below
--- hunger (eating is more urgent), but above the idle wander/visit
--- rhythm — work is what a villager *chooses* to do over wandering.
-local WORK_THRESHOLD = 0.3
+local HUNGER_THRESHOLD = urge_threshold("hunger", 0.3)
+local SLEEP_THRESHOLD = urge_threshold("sleep", 0.25)
+local WORK_THRESHOLD = urge_threshold("work", 0.3)
 
 -- Probability of "go visit a room" after a rest, when at least one
 -- matched room is reachable in the snapshot. 0.5 makes the room

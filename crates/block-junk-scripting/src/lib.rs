@@ -479,6 +479,24 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
         Ok(())
     })?;
     needs_table.set("register", register_need)?;
+    // engine.needs.get(id) — read back a previously-registered need
+    // (including urge_threshold + preempt_threshold) so the planner can
+    // gate decisions on data-driven cutoffs instead of file-local
+    // constants. Returns nil if `id` wasn't registered. Scoped to this
+    // Lua state's accumulation buffer; cross-mod reads aren't supported
+    // (mods get the full registry on the engine side only).
+    let pending_needs_get = ctx.pending_needs.clone();
+    let get_need = lua.create_function(move |lua, id: String| -> mlua::Result<Value> {
+        let buf = pending_needs_get.lock().unwrap();
+        match buf.iter().find(|n| n.id.as_str() == id) {
+            Some(def) => Ok(lua.to_value_with(
+                def,
+                SerializeOptions::new().serialize_none_to_null(false),
+            )?),
+            None => Ok(Value::Nil),
+        }
+    })?;
+    needs_table.set("get", get_need)?;
     engine.set("needs", needs_table)?;
 
     // engine.animations.register(def) — both sides; the client loads

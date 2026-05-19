@@ -119,6 +119,19 @@ fn default_work_duration_secs() -> f32 {
 /// `decay_per_sec` every fixed tick and clamps to `[0, 1]`. Today every
 /// NPC carrying the matching need experiences the same decay rate;
 /// per-personality multipliers come later with the Personality system.
+///
+/// Two semantic thresholds drive behaviour:
+/// - `urge_threshold` ("I'm starting to want this"): the planner reads
+///   it at `Goal::Idle` entry to decide whether to pivot from idle
+///   rhythm to seeking the relevant interactable. `None` ⇒ planner
+///   falls back to its own constant (today 0.3-ish).
+/// - `preempt_threshold` ("I have to stop everything"): the engine
+///   reads it every brain tick. When any need crosses, the NPC's
+///   current non-Idle goal is aborted (work claim released, haul
+///   reservations released, partial craft refunded) and the brain
+///   returns to Idle so the planner can pick the survival goal next
+///   tick. `None` ⇒ the need never preempts (e.g. `work`: wanting
+///   *more* work isn't an emergency).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NeedDef {
     pub id: NeedId,
@@ -126,6 +139,14 @@ pub struct NeedDef {
     /// Decay applied each second (`Δ = decay_per_sec · dt`). 0 disables
     /// passive decay (the need only changes from explicit actions).
     pub decay_per_sec: f32,
+    /// "Starts caring" threshold consulted by the planner. See type
+    /// docs.
+    #[serde(default)]
+    pub urge_threshold: Option<f32>,
+    /// "Must drop everything" threshold consulted by the engine every
+    /// brain tick. See type docs.
+    #[serde(default)]
+    pub preempt_threshold: Option<f32>,
 }
 
 /// Registered NPC kind. Mods construct these and pass them to
