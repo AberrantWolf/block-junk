@@ -18,7 +18,8 @@ use lightyear::prelude::*;
 
 use crate::menu::{AppState, JoinTarget};
 use crate::craft_stations::{
-    CancelOrder, DepositToStation, QueueOrder, StationUpdate, StationsFullSync, WorkStation,
+    CancelOrder, DepositToStation, QueueOrder, StationUpdate, StationsFullSync, WorkStart,
+    WorkStop,
 };
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
@@ -125,7 +126,9 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DepositToStation>()
             .add_direction(NetworkDirection::ClientToServer);
-        app.register_message::<WorkStation>()
+        app.register_message::<WorkStart>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<WorkStop>()
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<StationUpdate>()
             .add_direction(NetworkDirection::ServerToClient);

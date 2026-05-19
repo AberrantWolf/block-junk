@@ -102,6 +102,7 @@ impl Plugin for ClientPlugin {
                 Update,
                 (
                     normal_mode_action_input,
+                    station_work_hold_input,
                     drop_carry_input,
                     drop_tool_input,
                     cycle_selected_or_rotation,
@@ -1169,6 +1170,8 @@ struct NormalActionIo<'w, 's> {
     edit: Query<'w, 's, &'static mut MessageSender<BlockEdit>>,
     pickup: Query<'w, 's, &'static mut MessageSender<PickupRequest>>,
     deposit: Query<'w, 's, &'static mut MessageSender<DepositRequest>>,
+    work_start: Query<'w, 's, &'static mut MessageSender<crate::craft_stations::WorkStart>>,
+    work_stop: Query<'w, 's, &'static mut MessageSender<crate::craft_stations::WorkStop>>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1177,6 +1180,7 @@ struct LocalPlayerState<'w, 's> {
     tool: Query<'w, 's, &'static EquippedTool, (With<Avatar>, With<Predicted>)>,
 }
 
+#[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
 fn normal_mode_action_input(
     mouse: Res<ButtonInput<MouseButton>>,
     cursors: Query<&CursorOptions, With<PrimaryWindow>>,
@@ -1193,11 +1197,14 @@ fn normal_mode_action_input(
     local: LocalPlayerState,
     mut action: ResMut<PlayerActionState>,
     mut io: NormalActionIo,
-    mut craft_ui: ResMut<crate::craft_stations::CraftStationUiState>,
+    craft_ui: Res<crate::craft_stations::CraftStationUiState>,
 ) {
     // Suppress in-world input while the craft-order modal is open.
     // Same mode-guard the F3 panel uses — cursor is unlocked, clicks
     // go to the modal, world input pauses until the modal closes.
+    // The station work-hold sub-system handles its own modal-open
+    // cancel (sends WorkStop), so this branch just gates the
+    // pickup/self-work/destroy paths.
     if craft_ui.is_open() {
         action.active = None;
         return;
@@ -1332,31 +1339,16 @@ fn normal_mode_action_input(
     } else {
         resolve_direct_destroy(world_hit.as_ref())
     };
-    // Station-open fast-path: L-click on a station block (no
-    // self-work tagged) opens the craft-order modal. The modal does
-    // its own UI for queueing orders, depositing carry, and starting
-    // work cycles — none of which use the in-world `PlayerActionState`
-    // timer. Phase 6a's instant-craft path (carry + click =
-    // immediately produce output) was retired here per the design
-    // rule "work shouldn't happen automatically."
-    if l_held
+    // Suppress fall-through to direct-destroy / self-work when the
+    // cursor is on a station block (L-click on stations belongs to
+    // the work-hold sub-system; we don't want a no-tag station to
+    // accidentally trigger an R-click destroy via the resolver).
+    if let Some(hit) = world_hit.as_ref()
         && resolved.is_none()
-        && mouse.just_pressed(MouseButton::Left)
-        && let Some(hit) = world_hit.as_ref()
+        && is_station_block(hit.cell, &chunks, &chunk_map, &registry)
     {
-        let (coord, local_idx) = crate::voxel::world_to_chunk(hit.cell);
-        if let Some(&entity) = chunk_map.0.get(&coord)
-            && let Ok((chunk, _)) = chunks.get(entity)
-        {
-            let slot = chunk.get(local_idx);
-            if !slot.is_empty()
-                && registry.def(slot).station_tag.is_some()
-            {
-                craft_ui.open_cell = Some(hit.cell);
-                action.active = None;
-                return;
-            }
-        }
+        action.active = None;
+        return;
     }
     let Some((target_cell, kind, edit, button)) = resolved else {
         action.active = None;
@@ -1449,6 +1441,110 @@ fn drop_carry_input(
     if let Ok(mut s) = sender.single_mut() {
         s.send::<WorldChannel>(DropRequest);
     }
+}
+
+/// Hold L-click on a station block to progress its active craft.
+/// Sends `WorkStart` on `just_pressed`, `WorkStop` on `just_released`
+/// or when the cursor leaves the working cell or the modal opens.
+/// Server only ticks the timer while a worker is registered, so this
+/// directly drives the "hold to progress" rule. F key opens the
+/// modal (separate system); L is reserved for the work action.
+///
+/// Kept as a dedicated system rather than folded into
+/// `normal_mode_action_input` to stay under Bevy 0.18's
+/// 16-SystemParam cap — the main action input fn is already at the
+/// ceiling.
+#[allow(clippy::too_many_arguments, reason = "work hold spans many subsystems")]
+fn station_work_hold_input(
+    mouse: Res<ButtonInput<MouseButton>>,
+    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    mode: Res<PlayerMode>,
+    cam: Query<&GlobalTransform, With<FlyCam>>,
+    chunks: Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    craft_ui: Res<crate::craft_stations::CraftStationUiState>,
+    mut work_start: Query<&mut MessageSender<crate::craft_stations::WorkStart>>,
+    mut work_stop: Query<&mut MessageSender<crate::craft_stations::WorkStop>>,
+    mut active_work_cell: Local<Option<IVec3>>,
+) {
+    // Same input-gates the main action input uses.
+    let locked = cursors
+        .single()
+        .map(|c| c.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+    let blocked = !locked || *mode != PlayerMode::Normal || craft_ui.is_open();
+    // Determine current target.
+    let target_cell: Option<IVec3> = if blocked {
+        None
+    } else {
+        cam.single().ok().and_then(|cam_t| {
+            let origin = cam_t.translation();
+            let dir = *cam_t.forward();
+            let hit = entity_aware_raycast(
+                origin,
+                dir,
+                RAYCAST_REACH,
+                &chunks,
+                &chunk_map,
+                &registry,
+                None,
+            )?;
+            if is_station_block(hit.cell, &chunks, &chunk_map, &registry) {
+                Some(hit.cell)
+            } else {
+                None
+            }
+        })
+    };
+    let l_held = !blocked && mouse.pressed(MouseButton::Left);
+    // Stop when the holding condition stops.
+    let should_stop = active_work_cell.is_some()
+        && match (l_held, target_cell) {
+            (true, Some(c)) => Some(c) != *active_work_cell,
+            _ => true,
+        };
+    if should_stop
+        && let Some(cell) = active_work_cell.take()
+        && let Ok(mut s) = work_stop.single_mut()
+    {
+        s.send::<WorldChannel>(crate::craft_stations::WorkStop {
+            station_cell: cell,
+        });
+    }
+    // Start on the just_pressed edge against a station target.
+    if l_held
+        && mouse.just_pressed(MouseButton::Left)
+        && let Some(cell) = target_cell
+        && *active_work_cell != Some(cell)
+    {
+        if let Ok(mut s) = work_start.single_mut() {
+            s.send::<WorldChannel>(crate::craft_stations::WorkStart {
+                station_cell: cell,
+            });
+        }
+        *active_work_cell = Some(cell);
+    }
+}
+
+/// Helper shared by `normal_mode_action_input` and
+/// `station_work_hold_input`: does the cell hold a block with a
+/// `station_tag`?
+fn is_station_block(
+    cell: IVec3,
+    chunks: &Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: &ChunkMap,
+    registry: &BlockRegistry,
+) -> bool {
+    let (coord, local) = crate::voxel::world_to_chunk(cell);
+    let Some(&entity) = chunk_map.0.get(&coord) else {
+        return false;
+    };
+    let Ok((chunk, _)) = chunks.get(entity) else {
+        return false;
+    };
+    let slot = chunk.get(local);
+    !slot.is_empty() && registry.def(slot).station_tag.is_some()
 }
 
 /// T key → send a `DropToolRequest`. Symmetric counterpart to

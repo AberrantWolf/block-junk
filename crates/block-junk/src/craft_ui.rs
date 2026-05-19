@@ -23,7 +23,7 @@ use lightyear::prelude::*;
 
 use crate::blocks::BlockRegistry;
 use crate::craft_stations::{
-    CancelOrder, CraftStationUiState, CraftStations, DepositToStation, QueueOrder, WorkStation,
+    CancelOrder, CraftStationUiState, CraftStations, DepositToStation, QueueOrder,
     craft_modal_cursor_lock,
 };
 use crate::items::ItemRegistry;
@@ -36,11 +36,16 @@ pub struct CraftUiPlugin;
 
 impl Plugin for CraftUiPlugin {
     fn build(&self, app: &mut App) {
-        // Lifecycle systems (block-gone, Esc, cursor lock) run in
-        // the regular Update schedule.
+        // Lifecycle systems (block-gone, Esc, F-toggle, cursor lock)
+        // run in the regular Update schedule.
         app.add_systems(
             Update,
-            (close_on_block_gone, close_on_escape, craft_modal_cursor_lock)
+            (
+                close_on_block_gone,
+                close_on_escape,
+                toggle_modal_with_f_key,
+                craft_modal_cursor_lock,
+            )
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),
         );
@@ -98,6 +103,68 @@ fn close_on_escape(
     }
 }
 
+/// F key toggles the craft-order modal:
+/// - Modal closed + cursor on a station block → open for that cell.
+/// - Modal open → close.
+/// L-click is reserved for the hold-to-work action, so the modal
+/// needs its own entry key. Same just_pressed-edge convention as
+/// the F3 panel toggle.
+#[allow(clippy::too_many_arguments, reason = "modal toggle pulls from many subsystems")]
+fn toggle_modal_with_f_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    cursors: Query<&bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
+    cam: Query<&GlobalTransform, With<crate::camera::FlyCam>>,
+    chunks: Query<(&Chunk, &crate::voxel::ChunkEntities)>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut ui_state: ResMut<CraftStationUiState>,
+) {
+    if !keys.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+    if ui_state.is_open() {
+        ui_state.open_cell = None;
+        ui_state.pending_quantities.clear();
+        return;
+    }
+    // Require cursor lock so F-in-pause-menu doesn't pop the modal.
+    let locked = cursors
+        .single()
+        .map(|c| c.grab_mode != bevy::window::CursorGrabMode::None)
+        .unwrap_or(false);
+    if !locked {
+        return;
+    }
+    let Ok(cam_t) = cam.single() else {
+        return;
+    };
+    let origin = cam_t.translation();
+    let dir = *cam_t.forward();
+    let Some(hit) = crate::client::entity_aware_raycast(
+        origin,
+        dir,
+        crate::client::RAYCAST_REACH,
+        &chunks,
+        &chunk_map,
+        &registry,
+        None,
+    ) else {
+        return;
+    };
+    let (coord, local) = crate::voxel::world_to_chunk(hit.cell);
+    let Some(&entity) = chunk_map.0.get(&coord) else {
+        return;
+    };
+    let Ok((chunk, _)) = chunks.get(entity) else {
+        return;
+    };
+    let slot = chunk.get(local);
+    if slot.is_empty() || registry.def(slot).station_tag.is_none() {
+        return;
+    }
+    ui_state.open_cell = Some(hit.cell);
+}
+
 #[allow(clippy::too_many_arguments, reason = "modal pulls from many subsystems")]
 fn draw_craft_modal(
     mut contexts: EguiContexts,
@@ -112,7 +179,6 @@ fn draw_craft_modal(
     mut queue_sender: Query<&mut MessageSender<QueueOrder>>,
     mut cancel_sender: Query<&mut MessageSender<CancelOrder>>,
     mut deposit_sender: Query<&mut MessageSender<DepositToStation>>,
-    mut work_sender: Query<&mut MessageSender<WorkStation>>,
 ) {
     let Some(cell) = ui_state.open_cell else {
         return;
@@ -150,7 +216,7 @@ fn draw_craft_modal(
     let mut to_queue: Option<(String, u32)> = None;
     let mut to_cancel: Option<String> = None;
     let mut to_deposit = false;
-    let mut to_work: Option<String> = None;
+    let mut to_close = false;
 
     let station_state = stations.get(cell).cloned().unwrap_or_default();
     let carry_state = carry.iter().next().copied().unwrap_or_default();
@@ -197,17 +263,20 @@ fn draw_craft_modal(
             }
             ui.separator();
 
-            // Active orders.
+            // Active orders. No Work button — work happens via
+            // hold-L-click on the bench in-world (Phase 6b.2). The
+            // modal shows status + lets the player cancel.
             ui.label(egui::RichText::new("Active orders").strong());
+            ui.label(
+                egui::RichText::new("Close the modal and HOLD L-click on the bench to work.")
+                    .small()
+                    .weak(),
+            );
             if station_state.orders.is_empty() {
                 ui.label("  (none queued)");
             } else {
                 let work_in_progress = station_state.active_work.as_ref();
                 for order in &station_state.orders {
-                    // Look up the recipe def — orders persist the
-                    // string id, so the registry resolve might miss
-                    // if a mod was uninstalled mid-session. Fall
-                    // back to the raw id text.
                     let recipe = recipes
                         .slot_of(&block_junk_mod_api::recipes::RecipeId::new(
                             order.recipe_id.clone(),
@@ -220,46 +289,64 @@ fn draw_craft_modal(
                     let is_active = work_in_progress
                         .map(|aw| aw.recipe_id == order.recipe_id)
                         .unwrap_or(false);
-                    // Work button: enabled when inventory satisfies
-                    // every input AND no other craft is in progress
-                    // at this station (one workspace, one craft).
-                    let other_active = work_in_progress.is_some() && !is_active;
-                    let can_work = !other_active
-                        && match recipe {
-                            Some(def) => def.inputs.iter().all(|input| {
-                                let Some(slot) = items.slot_of(&input.item) else {
-                                    return false;
-                                };
-                                station_state
+                    // Status line: ready / waiting on Nx Item / paused at NN%.
+                    let status = if is_active
+                        && let Some(aw) = work_in_progress
+                    {
+                        let pct = (aw.elapsed_secs / aw.total_secs.max(0.001))
+                            .clamp(0.0, 1.0);
+                        Some((pct, format!("{:.0}%", pct * 100.0)))
+                    } else {
+                        None
+                    };
+                    let missing: Vec<String> = match recipe {
+                        Some(def) => def
+                            .inputs
+                            .iter()
+                            .filter_map(|input| {
+                                let slot = items.slot_of(&input.item)?;
+                                let have = station_state
                                     .inventory
                                     .get(&slot)
                                     .copied()
-                                    .unwrap_or(0)
-                                    >= input.count
-                            }),
-                            None => false,
-                        };
+                                    .unwrap_or(0);
+                                if have >= input.count {
+                                    None
+                                } else {
+                                    let need = input.count - have;
+                                    Some(format!(
+                                        "{}× {}",
+                                        need,
+                                        items.def(slot).display_name
+                                    ))
+                                }
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    };
                     ui.horizontal(|ui| {
                         ui.label(format!(
-                            "  {label} — {}/{}",
+                            "{label} — {}/{}",
                             order.completed, order.total
                         ));
-                        if is_active
-                            && let Some(aw) = work_in_progress
-                        {
-                            let pct = (aw.elapsed_secs / aw.total_secs.max(0.001))
-                                .clamp(0.0, 1.0);
-                            ui.label(format!("Working… {:.0}%", pct * 100.0));
-                        } else if ui
-                            .add_enabled(can_work, egui::Button::new("Work"))
-                            .clicked()
-                        {
-                            to_work = Some(order.recipe_id.clone());
-                        }
                         if ui.button("Cancel").clicked() {
                             to_cancel = Some(order.recipe_id.clone());
                         }
                     });
+                    if let Some((pct, text)) = status {
+                        ui.add(
+                            egui::ProgressBar::new(pct)
+                                .text(text)
+                                .desired_width(380.0),
+                        );
+                    } else if !missing.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("  needs: {}", missing.join(", ")))
+                                .weak(),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("  ready to work").weak());
+                    }
                 }
             }
             ui.separator();
@@ -309,12 +396,14 @@ fn draw_craft_modal(
             }
             ui.separator();
             if ui.button("Close").clicked() {
-                // Close on next frame via the open=false path below.
-                // egui's window manages the "X" → false signal too;
-                // unifying via show_open lets either trigger close.
+                // Pull the close signal out via `to_close` so the
+                // dismissal happens after `show()` returns —
+                // mutating `ui_state.open_cell` inside the closure
+                // would conflict with the `show_open` borrow.
+                to_close = true;
             }
         });
-    if !show_open {
+    if !show_open || to_close {
         ui_state.open_cell = None;
         ui_state.pending_quantities.clear();
         return;
@@ -331,14 +420,6 @@ fn draw_craft_modal(
         && let Ok(mut s) = cancel_sender.single_mut()
     {
         s.send::<WorldChannel>(CancelOrder {
-            station_cell: cell,
-            recipe_id,
-        });
-    }
-    if let Some(recipe_id) = to_work
-        && let Ok(mut s) = work_sender.single_mut()
-    {
-        s.send::<WorldChannel>(WorkStation {
             station_cell: cell,
             recipe_id,
         });

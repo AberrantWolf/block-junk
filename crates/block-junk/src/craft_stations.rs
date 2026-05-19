@@ -130,6 +130,51 @@ impl StationState {
     }
 }
 
+/// Server-only: which connection (player) or future NPC entity is
+/// currently "powering" each station's `active_work`. The server
+/// tick only increments elapsed when this map has an entry for the
+/// cell. Cleared on `WorkStop`, on player disconnect, and on
+/// active_work auto-clear (completion or cancel).
+///
+/// Doesn't replicate — clients only see the elapsed/total progress
+/// via the broadcast StationState; they don't need to know which
+/// specific entity is doing the work.
+#[derive(Resource, Default, Debug)]
+pub struct ActiveWorkers {
+    by_cell: HashMap<IVec3, Entity>,
+}
+
+impl ActiveWorkers {
+    pub fn register(&mut self, cell: IVec3, worker: Entity) {
+        self.by_cell.insert(cell, worker);
+    }
+
+    /// Clear the registration at `cell` only if the current worker
+    /// matches `worker`. Lets a disconnected player's cleanup not
+    /// nuke a fresh worker who replaced them mid-tick.
+    pub fn release(&mut self, cell: IVec3, worker: Entity) {
+        if let Some(existing) = self.by_cell.get(&cell)
+            && *existing == worker
+        {
+            self.by_cell.remove(&cell);
+        }
+    }
+
+    pub fn force_clear(&mut self, cell: IVec3) {
+        self.by_cell.remove(&cell);
+    }
+
+    /// Drop every registration held by `worker`. Mirrors
+    /// PlanClaims::release_all_for; used on player disconnect.
+    pub fn release_all_for(&mut self, worker: Entity) {
+        self.by_cell.retain(|_, w| *w != worker);
+    }
+
+    pub fn has_worker(&self, cell: IVec3) -> bool {
+        self.by_cell.contains_key(&cell)
+    }
+}
+
 /// Server-authoritative + client-mirrored craft-order map. Same
 /// shape on both sides; the server mutates + broadcasts, the client
 /// applies broadcasts.
@@ -229,19 +274,36 @@ pub struct DepositToStation {
     pub station_cell: IVec3,
 }
 
-/// Client → server: perform one craft cycle for `recipe_id` at the
-/// station. Server validates the order exists + station inventory
-/// satisfies inputs + reach. Consumes inputs from inventory, spawns
-/// the output as a `WorldItem` on top of the station, and increments
-/// the order's `completed`.
+/// Client → server: start (or resume) being the active worker at
+/// `station_cell`. Server registers this connection as the worker;
+/// while registered, the server's tick advances the station's
+/// `active_work.elapsed_secs`. If there's no `active_work` yet but
+/// a queued order has its inputs satisfied, the server creates a
+/// new `active_work` (consuming the inputs) for the first such
+/// order and registers the worker.
 ///
-/// Replaces Phase 6a's `CraftRequest`, which crafted directly from
-/// carry without an order. Phase 6b's "no auto-craft" rule means
-/// crafting only happens via an explicit `WorkStation` invocation.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct WorkStation {
+/// Phase 6b.2 "hold to progress" rule: clients send WorkStart on
+/// L-click `just_pressed` against a station and WorkStop on
+/// `just_released`. Without an active worker the timer doesn't
+/// tick, so a half-finished craft pauses cleanly when the player
+/// walks away and resumes when they hold again.
+///
+/// Replaces the single-shot `WorkStation` message that finished a
+/// craft cycle in one click — that path violated the
+/// no-instant-crafting rule.
+#[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct WorkStart {
     pub station_cell: IVec3,
-    pub recipe_id: String,
+}
+
+/// Client → server: stop being the active worker at `station_cell`.
+/// Server clears the worker registration; the timer pauses but
+/// `active_work` (and its accumulated `elapsed_secs`) persists for
+/// resume. Quiet no-op when this connection wasn't the current
+/// worker.
+#[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct WorkStop {
+    pub station_cell: IVec3,
 }
 
 pub struct CraftStationsServerPlugin;
@@ -250,14 +312,17 @@ pub struct CraftStationsClientPlugin;
 impl Plugin for CraftStationsServerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CraftStations>();
+        app.init_resource::<ActiveWorkers>();
         app.add_observer(send_stations_full_sync_on_connect);
+        app.add_observer(release_workers_on_disconnect);
         app.add_systems(
             Update,
             (
                 receive_queue_orders,
                 receive_cancel_orders,
                 receive_deposit_to_station,
-                receive_work_station,
+                receive_work_start,
+                receive_work_stop,
             )
                 .in_set(GameSet::Simulation),
         );
@@ -573,9 +638,23 @@ fn receive_deposit_to_station(
     }
 }
 
+/// Handle `WorkStart`: register the connection as the active worker
+/// at the station + start a new craft cycle if needed.
+///
+/// Two cases:
+/// 1. Station already has `active_work` (paused or being worked by
+///    someone who walked away). Re-register this connection as the
+///    worker; don't touch elapsed/total/recipe. Lets a player who
+///    pauses-resumes pick up where they left off, and lets a
+///    different player (or future NPC) take over a paused craft
+///    cleanly.
+/// 2. Station has no `active_work` yet. Find the first queued order
+///    whose inputs the inventory satisfies; consume inputs, set
+///    active_work, register the worker. Silent skip if no such
+///    order exists.
 #[allow(clippy::too_many_arguments, reason = "wire handler joins many subsystems")]
-fn receive_work_station(
-    mut receivers: Query<(Entity, &mut MessageReceiver<WorkStation>)>,
+fn receive_work_start(
+    mut receivers: Query<(Entity, &mut MessageReceiver<WorkStart>)>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     chunks: Query<&crate::voxel::Chunk>,
@@ -584,6 +663,7 @@ fn receive_work_station(
     item_registry: Res<crate::items::ItemRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
+    mut workers: ResMut<ActiveWorkers>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
@@ -611,71 +691,106 @@ fn receive_work_station(
             ) else {
                 continue;
             };
-            let recipe_id = RecipeId::new(req.recipe_id.clone());
-            let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
-                continue;
-            };
-            let recipe = recipes.def(recipe_slot);
-            if recipe.station != station_def.tag || recipe.tier > station_def.tier {
-                continue;
-            }
-            let Some(state) = stations.get_mut(req.station_cell) else {
-                continue;
-            };
-            // Reject if another craft is already running at this
-            // station — one workspace, one active craft at a time.
-            // Player has to wait or cancel the in-flight one.
-            if state.active_work.is_some() {
-                continue;
-            }
-            // Order must exist + have remaining quantity.
-            if !state
-                .orders
-                .iter()
-                .any(|o| o.recipe_id == req.recipe_id && !o.is_done())
+            // Case 1: existing active_work — just re-register the
+            // worker. The recipe + station agreement was validated
+            // when active_work was first created; trust that here.
+            // A different player taking over a paused craft is also
+            // fine — they just pick up where the previous one left.
+            if let Some(state) = stations.get(req.station_cell)
+                && state.active_work.is_some()
             {
+                workers.register(req.station_cell, connection);
                 continue;
             }
-            // Inputs must resolve + station inventory must satisfy
-            // every entry. Pre-check before any consume so a
-            // multi-input recipe doesn't partially deplete on
-            // failure.
-            let inputs_ok = recipe.inputs.iter().all(|input| {
-                let Some(slot) = item_registry.slot_of(&input.item) else {
-                    return false;
+            // Case 2: no active_work. Find the first queued order
+            // whose recipe is valid at this station + inputs are
+            // available, then start it.
+            let state = stations.get_or_insert(req.station_cell);
+            let mut started = false;
+            for order_idx in 0..state.orders.len() {
+                let order = &state.orders[order_idx];
+                if order.is_done() {
+                    continue;
+                }
+                let recipe_id = RecipeId::new(order.recipe_id.clone());
+                let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
+                    continue;
                 };
-                state.inventory.get(&slot).copied().unwrap_or(0) >= input.count
-            });
-            if !inputs_ok {
-                continue;
+                let recipe = recipes.def(recipe_slot);
+                if recipe.station != station_def.tag || recipe.tier > station_def.tier {
+                    continue;
+                }
+                let inputs_ok = recipe.inputs.iter().all(|input| {
+                    let Some(slot) = item_registry.slot_of(&input.item) else {
+                        return false;
+                    };
+                    state.inventory.get(&slot).copied().unwrap_or(0) >= input.count
+                });
+                if !inputs_ok {
+                    continue;
+                }
+                let recipe_id_str = order.recipe_id.clone();
+                let total_secs = recipe.duration_secs;
+                // Lock inputs in by consuming up front. Cancel
+                // refunds; completion produces the output.
+                for input in &recipe.inputs {
+                    let slot = item_registry.slot_of(&input.item).expect("checked");
+                    state.try_consume(slot, input.count);
+                }
+                state.active_work = Some(ActiveWork {
+                    recipe_id: recipe_id_str.clone(),
+                    total_secs,
+                    elapsed_secs: 0.0,
+                });
+                started = true;
+                info!(
+                    cell = ?req.station_cell.to_array(),
+                    recipe = %recipe_id_str,
+                    duration = total_secs,
+                    "station work started",
+                );
+                break;
             }
-            // Lock inputs in by consuming up front. If the craft is
-            // cancelled the inputs are refunded in
-            // `receive_cancel_orders`; if it completes the inputs
-            // are already paid for and the output spawns.
-            for input in &recipe.inputs {
-                let slot = item_registry.slot_of(&input.item).expect("checked above");
-                state.try_consume(slot, input.count);
+            if started {
+                workers.register(req.station_cell, connection);
+                let snapshot = stations.get(req.station_cell).cloned();
+                broadcast_station(
+                    &mut broadcast,
+                    server,
+                    req.station_cell,
+                    snapshot,
+                );
+            } else {
+                // Nothing to start. The empty get_or_insert above
+                // may have left an empty state behind — clean up.
+                stations.remove_if_empty(req.station_cell);
             }
-            state.active_work = Some(ActiveWork {
-                recipe_id: req.recipe_id.clone(),
-                total_secs: recipe.duration_secs,
-                elapsed_secs: 0.0,
-            });
-            info!(
-                cell = ?req.station_cell.to_array(),
-                recipe = %recipe.id,
-                duration = recipe.duration_secs,
-                "station work started",
-            );
-            broadcast_station(
-                &mut broadcast,
-                server,
-                req.station_cell,
-                Some(state.clone()),
-            );
         }
     }
+}
+
+/// Handle `WorkStop`: clear the worker registration. `active_work`
+/// itself persists so a resume picks up where this paused.
+fn receive_work_stop(
+    mut receivers: Query<(Entity, &mut MessageReceiver<WorkStop>)>,
+    mut workers: ResMut<ActiveWorkers>,
+) {
+    for (connection, mut receiver) in receivers.iter_mut() {
+        for req in receiver.receive() {
+            workers.release(req.station_cell, connection);
+        }
+    }
+}
+
+/// Observer: a player disconnect clears every work registration
+/// they held, so a half-finished craft pauses cleanly. The
+/// `active_work` itself (consumed inputs + elapsed_secs) persists;
+/// another player or NPC can resume by sending `WorkStart`.
+fn release_workers_on_disconnect(
+    trigger: On<Remove, Connected>,
+    mut workers: ResMut<ActiveWorkers>,
+) {
+    workers.release_all_for(trigger.entity);
 }
 
 /// Minimum interval between mid-work broadcasts. Trades a couple
@@ -694,11 +809,13 @@ const WORK_PROGRESS_BROADCAST_INTERVAL_SECS: f32 = 0.25;
 /// Mid-work broadcasts fire at most every
 /// `WORK_PROGRESS_BROADCAST_INTERVAL_SECS` so the modal's progress
 /// label can advance. The completion broadcast happens regardless.
+#[allow(clippy::too_many_arguments, reason = "tick joins many subsystems")]
 fn tick_station_work(
     time: Res<Time>,
     item_registry: Res<crate::items::ItemRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
+    mut workers: ResMut<ActiveWorkers>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut commands: Commands,
@@ -717,11 +834,16 @@ fn tick_station_work(
     if do_progress_broadcast {
         *next_broadcast_in = WORK_PROGRESS_BROADCAST_INTERVAL_SECS;
     }
-    // Collect cells that need an update to avoid mutating + iterating
-    // the map simultaneously. Two-pass: gather, then mutate.
+    // Collect cells with active_work AND an active worker — only
+    // those tick. Stations with active_work but no worker are paused
+    // (player walked away mid-craft); the elapsed_secs sits intact
+    // until someone resumes via WorkStart.
     let active_cells: Vec<IVec3> = stations
         .iter()
-        .filter_map(|(cell, state)| state.active_work.as_ref().map(|_| *cell))
+        .filter(|(cell, state)| {
+            state.active_work.is_some() && workers.has_worker(**cell)
+        })
+        .map(|(cell, _)| *cell)
         .collect();
     for cell in active_cells {
         let Some(state) = stations.get_mut(cell) else {
@@ -818,6 +940,12 @@ fn tick_station_work(
             order_done,
             "station work complete",
         );
+        // Completion clears the worker — the player would send
+        // WorkStop next frame anyway, but tidying server-side
+        // means a player who holds through completion doesn't
+        // accidentally start a brand-new craft on the same hold
+        // (they'd need to release + re-press).
+        workers.force_clear(cell);
         let snapshot = state.clone();
         let now_empty = snapshot.is_empty();
         stations.remove_if_empty(cell);
