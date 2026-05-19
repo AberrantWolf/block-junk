@@ -50,6 +50,25 @@ impl CraftOrder {
     }
 }
 
+/// An in-progress craft cycle at a station. Materials were consumed
+/// from `inventory` at start (locked in) so the work can't be raced
+/// — its inputs are already committed. On completion the output
+/// spawns + `active_work` clears + the matching order's `completed`
+/// bumps. A Cancel before completion refunds the consumed inputs
+/// back into the inventory.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActiveWork {
+    pub recipe_id: String,
+    /// Total seconds the recipe takes (snapshot of
+    /// `recipe.duration_secs` at start, so a future modifier system
+    /// can scale on per-craft start rather than per-tick lookup).
+    pub total_secs: f32,
+    /// Wall-time elapsed so far. Incremented by `tick_station_work`
+    /// each FixedUpdate; when `elapsed_secs >= total_secs` the work
+    /// completes.
+    pub elapsed_secs: f32,
+}
+
 /// Full server-side state of one station cell. Replicated to clients
 /// via [`StationUpdate`] / [`StationsFullSync`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,6 +78,11 @@ pub struct StationState {
     /// orders. Counts of 0 are scrubbed so iteration only ever sees
     /// real entries.
     pub inventory: HashMap<ItemSlot, u32>,
+    /// In-progress craft cycle, if any. At most one active work per
+    /// station — players + NPCs share the single workspace. Other
+    /// orders' Work buttons disable while this is `Some`.
+    #[serde(default)]
+    pub active_work: Option<ActiveWork>,
 }
 
 impl Default for StationState {
@@ -66,15 +90,18 @@ impl Default for StationState {
         Self {
             orders: Vec::new(),
             inventory: HashMap::new(),
+            active_work: None,
         }
     }
 }
 
 impl StationState {
     /// True when nothing references this station — caller drops it
-    /// from the by-cell map.
+    /// from the by-cell map. Active work counts as "non-empty"
+    /// even when orders and inventory are both empty (mid-cancel
+    /// transitions briefly land here).
     pub fn is_empty(&self) -> bool {
-        self.orders.is_empty() && self.inventory.is_empty()
+        self.orders.is_empty() && self.inventory.is_empty() && self.active_work.is_none()
     }
 
     /// Add `count` of `item` to the inventory. 0 is a no-op.
@@ -234,6 +261,11 @@ impl Plugin for CraftStationsServerPlugin {
             )
                 .in_set(GameSet::Simulation),
         );
+        // Work timer ticks in FixedUpdate so duration_secs reads as
+        // wall-clock seconds independent of frame rate. Output spawn
+        // + state mutation happen on the tick that crosses the
+        // threshold; broadcast follows.
+        app.add_systems(FixedUpdate, tick_station_work);
     }
 }
 
@@ -420,12 +452,16 @@ fn receive_queue_orders(
     }
 }
 
+#[allow(clippy::too_many_arguments, reason = "cancel refunds need item registry + recipes")]
 fn receive_cancel_orders(
     mut receivers: Query<(Entity, &mut MessageReceiver<CancelOrder>)>,
+    recipes: Res<crate::recipes::RecipeRegistry>,
+    item_registry: Res<crate::items::ItemRegistry>,
     mut stations: ResMut<CraftStations>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
+    use block_junk_mod_api::recipes::RecipeId;
     let Ok(server) = servers.single() else {
         return;
     };
@@ -443,7 +479,28 @@ fn receive_cancel_orders(
             {
                 state.orders.remove(idx);
             }
-            if state.orders.len() == before {
+            let order_removed = state.orders.len() < before;
+            // If the active work matches the cancelled order, refund
+            // its consumed inputs to the inventory and clear it.
+            // Otherwise active work for a *different* order keeps
+            // running.
+            let mut refunded = false;
+            if let Some(active) = &state.active_work
+                && active.recipe_id == req.recipe_id
+            {
+                let recipe_id = RecipeId::new(active.recipe_id.clone());
+                if let Some(recipe_slot) = recipes.slot_of(&recipe_id) {
+                    let recipe = recipes.def(recipe_slot);
+                    for input in &recipe.inputs {
+                        if let Some(slot) = item_registry.slot_of(&input.item) {
+                            state.deposit(slot, input.count);
+                        }
+                    }
+                }
+                state.active_work = None;
+                refunded = true;
+            }
+            if !order_removed && !refunded {
                 continue;
             }
             let snapshot = state.clone();
@@ -458,6 +515,7 @@ fn receive_cancel_orders(
             info!(
                 cell = ?req.station_cell.to_array(),
                 recipe = %req.recipe_id,
+                refunded,
                 "craft order cancelled",
             );
         }
@@ -528,7 +586,6 @@ fn receive_work_station(
     mut stations: ResMut<CraftStations>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
-    mut commands: Commands,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
     let Ok(server) = servers.single() else {
@@ -565,14 +622,20 @@ fn receive_work_station(
             let Some(state) = stations.get_mut(req.station_cell) else {
                 continue;
             };
+            // Reject if another craft is already running at this
+            // station — one workspace, one active craft at a time.
+            // Player has to wait or cancel the in-flight one.
+            if state.active_work.is_some() {
+                continue;
+            }
             // Order must exist + have remaining quantity.
-            let Some(order_idx) = state
+            if !state
                 .orders
                 .iter()
-                .position(|o| o.recipe_id == req.recipe_id && !o.is_done())
-            else {
+                .any(|o| o.recipe_id == req.recipe_id && !o.is_done())
+            {
                 continue;
-            };
+            }
             // Inputs must resolve + station inventory must satisfy
             // every entry. Pre-check before any consume so a
             // multi-input recipe doesn't partially deplete on
@@ -586,67 +649,184 @@ fn receive_work_station(
             if !inputs_ok {
                 continue;
             }
-            // Output slot resolves (boot validator guarantees, but
-            // defensive).
-            let Some(output_slot) = item_registry.slot_of(&recipe.output.item) else {
-                warn!(
-                    recipe = %recipe.id,
-                    output = %recipe.output.item,
-                    "work commit: output item missing from registry; skipping",
-                );
-                continue;
-            };
-            // Commit: consume inputs, bump completed, maybe drop the
-            // order if it just finished.
+            // Lock inputs in by consuming up front. If the craft is
+            // cancelled the inputs are refunded in
+            // `receive_cancel_orders`; if it completes the inputs
+            // are already paid for and the output spawns.
             for input in &recipe.inputs {
                 let slot = item_registry.slot_of(&input.item).expect("checked above");
                 state.try_consume(slot, input.count);
             }
-            state.orders[order_idx].completed += 1;
-            let order_done = state.orders[order_idx].is_done();
-            if order_done {
-                state.orders.remove(order_idx);
-            }
-            // Spawn output on top of the station.
-            let top_of_station = Vec3::new(
-                req.station_cell.x as f32 + 0.5,
-                req.station_cell.y as f32 + 1.05,
-                req.station_cell.z as f32 + 0.5,
-            );
-            for unit in 0..recipe.output.count {
-                let angle = (unit as f32) * std::f32::consts::TAU
-                    / recipe.output.count.max(1) as f32;
-                let offset = Vec3::new(angle.cos() * 0.12, 0.0, angle.sin() * 0.12);
-                let translation = top_of_station + offset;
-                commands.spawn((
-                    crate::protocol::WorldItem {
-                        item: output_slot,
-                        translation,
-                    },
-                    Transform::from_translation(translation),
-                    GlobalTransform::default(),
-                    Replicate::to_clients(NetworkTarget::All),
-                    Name::new(format!("WorldItem(crafted:{})", recipe.output.item)),
-                ));
-            }
+            state.active_work = Some(ActiveWork {
+                recipe_id: req.recipe_id.clone(),
+                total_secs: recipe.duration_secs,
+                elapsed_secs: 0.0,
+            });
             info!(
                 cell = ?req.station_cell.to_array(),
                 recipe = %recipe.id,
-                output = %recipe.output.item,
-                count = recipe.output.count,
-                done = order_done,
-                "station work cycle",
+                duration = recipe.duration_secs,
+                "station work started",
             );
-            let snapshot = state.clone();
-            let now_empty = snapshot.is_empty();
-            stations.remove_if_empty(req.station_cell);
             broadcast_station(
                 &mut broadcast,
                 server,
                 req.station_cell,
-                if now_empty { None } else { Some(snapshot) },
+                Some(state.clone()),
             );
         }
+    }
+}
+
+/// Minimum interval between mid-work broadcasts. Trades a couple
+/// updates per craft cycle for a visible progress bar without
+/// per-tick wire traffic. With one active station and a 4-second
+/// recipe this is ~16 broadcasts total — invisible cost. Tighten if
+/// the bar feels choppy; loosen if mass-craft scenes push bandwidth.
+const WORK_PROGRESS_BROADCAST_INTERVAL_SECS: f32 = 0.25;
+
+/// Tick every station's active work toward completion. On completion:
+/// spawn the recipe's output as a `WorldItem` on top of the station,
+/// bump the matching order's `completed`, remove the order if it just
+/// finished, clear `active_work`, broadcast. Inputs were already
+/// consumed at start, so completion just produces the output.
+///
+/// Mid-work broadcasts fire at most every
+/// `WORK_PROGRESS_BROADCAST_INTERVAL_SECS` so the modal's progress
+/// label can advance. The completion broadcast happens regardless.
+fn tick_station_work(
+    time: Res<Time>,
+    item_registry: Res<crate::items::ItemRegistry>,
+    recipes: Res<crate::recipes::RecipeRegistry>,
+    mut stations: ResMut<CraftStations>,
+    mut broadcast: ServerMultiMessageSender,
+    servers: Query<&Server>,
+    mut commands: Commands,
+    mut next_broadcast_in: Local<f32>,
+) {
+    use block_junk_mod_api::recipes::RecipeId;
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    *next_broadcast_in -= dt;
+    let do_progress_broadcast = *next_broadcast_in <= 0.0;
+    if do_progress_broadcast {
+        *next_broadcast_in = WORK_PROGRESS_BROADCAST_INTERVAL_SECS;
+    }
+    // Collect cells that need an update to avoid mutating + iterating
+    // the map simultaneously. Two-pass: gather, then mutate.
+    let active_cells: Vec<IVec3> = stations
+        .iter()
+        .filter_map(|(cell, state)| state.active_work.as_ref().map(|_| *cell))
+        .collect();
+    for cell in active_cells {
+        let Some(state) = stations.get_mut(cell) else {
+            continue;
+        };
+        let Some(active) = state.active_work.as_mut() else {
+            continue;
+        };
+        active.elapsed_secs += dt;
+        if active.elapsed_secs < active.total_secs {
+            // Still working — broadcast at the heartbeat interval so
+            // the modal's progress label advances without per-tick
+            // wire chatter.
+            if do_progress_broadcast {
+                broadcast_station(&mut broadcast, server, cell, Some(state.clone()));
+            }
+            continue;
+        }
+        // Completion path. Clone the recipe id out of the active
+        // entry before taking it.
+        let recipe_id_str = active.recipe_id.clone();
+        state.active_work = None;
+        let recipe_id = RecipeId::new(recipe_id_str.clone());
+        let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
+            warn!(
+                cell = ?cell.to_array(),
+                recipe = %recipe_id_str,
+                "work complete: recipe id missing from registry; skipping output",
+            );
+            broadcast_station(&mut broadcast, server, cell, Some(state.clone()));
+            continue;
+        };
+        let recipe = recipes.def(recipe_slot);
+        let Some(output_slot) = item_registry.slot_of(&recipe.output.item) else {
+            warn!(
+                recipe = %recipe.id,
+                output = %recipe.output.item,
+                "work complete: output item missing from registry; skipping",
+            );
+            broadcast_station(&mut broadcast, server, cell, Some(state.clone()));
+            continue;
+        };
+        // Spawn output(s) on top of the station.
+        let top_of_station = Vec3::new(
+            cell.x as f32 + 0.5,
+            cell.y as f32 + 1.05,
+            cell.z as f32 + 0.5,
+        );
+        for unit in 0..recipe.output.count {
+            let angle = (unit as f32) * std::f32::consts::TAU
+                / recipe.output.count.max(1) as f32;
+            let offset = Vec3::new(angle.cos() * 0.12, 0.0, angle.sin() * 0.12);
+            let translation = top_of_station + offset;
+            commands.spawn((
+                crate::protocol::WorldItem {
+                    item: output_slot,
+                    translation,
+                },
+                Transform::from_translation(translation),
+                GlobalTransform::default(),
+                Replicate::to_clients(NetworkTarget::All),
+                Name::new(format!("WorldItem(crafted:{})", recipe.output.item)),
+            ));
+        }
+        // Bump the matching order's completed counter; remove the
+        // order if it just finished.
+        let order_done = if let Some(idx) = state
+            .orders
+            .iter()
+            .position(|o| o.recipe_id == recipe_id_str && !o.is_done())
+        {
+            state.orders[idx].completed += 1;
+            let done = state.orders[idx].is_done();
+            if done {
+                state.orders.remove(idx);
+            }
+            done
+        } else {
+            // Order was cancelled mid-work but active_work somehow
+            // outlived it — shouldn't happen because cancel-with-
+            // matching-active refunds + clears, but defensive.
+            warn!(
+                cell = ?cell.to_array(),
+                recipe = %recipe_id_str,
+                "work complete: matching order gone; output produced anyway",
+            );
+            false
+        };
+        info!(
+            cell = ?cell.to_array(),
+            recipe = %recipe.id,
+            output = %recipe.output.item,
+            count = recipe.output.count,
+            order_done,
+            "station work complete",
+        );
+        let snapshot = state.clone();
+        let now_empty = snapshot.is_empty();
+        stations.remove_if_empty(cell);
+        broadcast_station(
+            &mut broadcast,
+            server,
+            cell,
+            if now_empty { None } else { Some(snapshot) },
+        );
     }
 }
 

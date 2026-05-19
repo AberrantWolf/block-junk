@@ -57,7 +57,11 @@ use crate::voxel::{Chunk, ChunkEntities};
 ///                  mid-craft-cycle. Items stored as ids (strings)
 ///                  for the same registry-stability reason world
 ///                  items and carry use.
-pub const SAVE_VERSION: u32 = 10;
+/// v11 (2026-05-19): added `active_work` to `SavedStationState`
+///                  (serde-defaulted) so a save mid-craft-timer
+///                  resumes with the work intact. Required by the
+///                  "no instant crafting" rule landing alongside.
+pub const SAVE_VERSION: u32 = 11;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -198,6 +202,19 @@ pub struct SavedTool {
 pub struct SavedStationState {
     pub orders: Vec<SavedCraftOrder>,
     pub inventory: Vec<SavedStationItem>,
+    /// In-progress craft snapshot. `None` for stations sitting
+    /// idle, AND for saves predating v11 (the serde default lets
+    /// v10 saves still load by treating "no field" as "no work").
+    #[serde(default)]
+    pub active_work: Option<SavedActiveWork>,
+}
+
+/// On-disk shape of an in-progress craft cycle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedActiveWork {
+    pub recipe_id: String,
+    pub total_secs: f32,
+    pub elapsed_secs: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -522,6 +539,11 @@ mod tests {
                         item_id: "vanilla:wood_log".to_owned(),
                         count: 2,
                     }],
+                    active_work: Some(SavedActiveWork {
+                        recipe_id: "vanilla:planks_from_log".to_owned(),
+                        total_secs: 4.0,
+                        elapsed_secs: 1.25,
+                    }),
                 },
             )],
         };
@@ -573,5 +595,9 @@ mod tests {
         assert_eq!(station_state.inventory.len(), 1);
         assert_eq!(station_state.inventory[0].item_id, "vanilla:wood_log");
         assert_eq!(station_state.inventory[0].count, 2);
+        let active = station_state.active_work.as_ref().unwrap();
+        assert_eq!(active.recipe_id, "vanilla:planks_from_log");
+        assert_eq!(active.total_secs, 4.0);
+        assert_eq!(active.elapsed_secs, 1.25);
     }
 }

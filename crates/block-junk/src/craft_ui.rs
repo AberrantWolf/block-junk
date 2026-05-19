@@ -36,17 +36,23 @@ pub struct CraftUiPlugin;
 
 impl Plugin for CraftUiPlugin {
     fn build(&self, app: &mut App) {
+        // Lifecycle systems (block-gone, Esc, cursor lock) run in
+        // the regular Update schedule.
         app.add_systems(
             Update,
-            (
-                close_on_block_gone,
-                close_on_escape,
-                draw_craft_modal,
-                craft_modal_cursor_lock,
-            )
-                .chain()
+            (close_on_block_gone, close_on_escape, craft_modal_cursor_lock)
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),
+        );
+        // The modal itself MUST live in `EguiPrimaryContextPass` —
+        // egui only collects pointer/click events during that
+        // schedule, so running the window in `Update` renders fine
+        // but every button-click silently falls through. The debug
+        // panel + pause menu use the same schedule for the same
+        // reason. (Hit this exact trap on first wire-up.)
+        app.add_systems(
+            bevy_egui::EguiPrimaryContextPass,
+            draw_craft_modal.run_if(in_state(AppState::InGame)),
         );
     }
 }
@@ -196,6 +202,7 @@ fn draw_craft_modal(
             if station_state.orders.is_empty() {
                 ui.label("  (none queued)");
             } else {
+                let work_in_progress = station_state.active_work.as_ref();
                 for order in &station_state.orders {
                     // Look up the recipe def — orders persist the
                     // string id, so the registry resolve might miss
@@ -210,28 +217,40 @@ fn draw_craft_modal(
                         Some(def) => def.display_name.clone(),
                         None => format!("{} (unknown recipe)", order.recipe_id),
                     };
+                    let is_active = work_in_progress
+                        .map(|aw| aw.recipe_id == order.recipe_id)
+                        .unwrap_or(false);
                     // Work button: enabled when inventory satisfies
-                    // every input.
-                    let can_work = match recipe {
-                        Some(def) => def.inputs.iter().all(|input| {
-                            let Some(slot) = items.slot_of(&input.item) else {
-                                return false;
-                            };
-                            station_state
-                                .inventory
-                                .get(&slot)
-                                .copied()
-                                .unwrap_or(0)
-                                >= input.count
-                        }),
-                        None => false,
-                    };
+                    // every input AND no other craft is in progress
+                    // at this station (one workspace, one craft).
+                    let other_active = work_in_progress.is_some() && !is_active;
+                    let can_work = !other_active
+                        && match recipe {
+                            Some(def) => def.inputs.iter().all(|input| {
+                                let Some(slot) = items.slot_of(&input.item) else {
+                                    return false;
+                                };
+                                station_state
+                                    .inventory
+                                    .get(&slot)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    >= input.count
+                            }),
+                            None => false,
+                        };
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "  {label} — {}/{}",
                             order.completed, order.total
                         ));
-                        if ui
+                        if is_active
+                            && let Some(aw) = work_in_progress
+                        {
+                            let pct = (aw.elapsed_secs / aw.total_secs.max(0.001))
+                                .clamp(0.0, 1.0);
+                            ui.label(format!("Working… {:.0}%", pct * 100.0));
+                        } else if ui
                             .add_enabled(can_work, egui::Button::new("Work"))
                             .clicked()
                         {

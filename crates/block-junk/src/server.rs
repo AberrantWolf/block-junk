@@ -28,8 +28,8 @@ use crate::protocol::{
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::craft_stations::{CraftOrder, CraftStations, StationState};
-use crate::save::{SAVE_VERSION, SaveFile, SavedCarry, SavedChunk, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save, write_save};
+use crate::craft_stations::{ActiveWork, CraftOrder, CraftStations, StationState};
+use crate::save::{SAVE_VERSION, SaveFile, SavedActiveWork, SavedCarry, SavedChunk, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save, write_save};
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
     world_to_chunk,
@@ -326,7 +326,19 @@ fn load_from_save(
                         ),
                     }
                 }
-                (cell, StationState { orders, inventory })
+                let active_work = saved.active_work.map(|aw| ActiveWork {
+                    recipe_id: aw.recipe_id,
+                    total_secs: aw.total_secs,
+                    elapsed_secs: aw.elapsed_secs,
+                });
+                (
+                    cell,
+                    StationState {
+                        orders,
+                        inventory,
+                        active_work,
+                    },
+                )
             })
             .collect();
         stations.replace_all(restored);
@@ -686,9 +698,18 @@ fn convert_saved_stations(
                     count: *count,
                 })
                 .collect();
+            let active_work = state.active_work.as_ref().map(|aw| SavedActiveWork {
+                recipe_id: aw.recipe_id.clone(),
+                total_secs: aw.total_secs,
+                elapsed_secs: aw.elapsed_secs,
+            });
             (
                 *cell,
-                SavedStationState { orders, inventory },
+                SavedStationState {
+                    orders,
+                    inventory,
+                    active_work,
+                },
             )
         })
         .collect()
