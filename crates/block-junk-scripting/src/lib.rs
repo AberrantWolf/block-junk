@@ -16,6 +16,7 @@ use block_junk_mod_api::{
     blocks::BlockDef,
     items::ItemDef,
     npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal, WorkDefaults},
+    recipes::RecipeDef,
     rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
     textures::{MaskDef, RampDef},
@@ -80,6 +81,7 @@ pub struct LoadContext {
     pub pending_masks: Arc<Mutex<Vec<MaskDef>>>,
     pub pending_ramps: Arc<Mutex<Vec<RampDef>>>,
     pub pending_animations: Arc<Mutex<Vec<AnimationDef>>>,
+    pub pending_recipes: Arc<Mutex<Vec<RecipeDef>>>,
     /// At most one set of work-action defaults across all mods. Loud
     /// failure on second call so two mods can't silently overwrite each
     /// other's balance — matches the "never silently degrade" rule.
@@ -130,6 +132,11 @@ impl LoadContext {
     /// Drain the accumulated animation defs.
     pub fn take_animations(&self) -> Vec<AnimationDef> {
         std::mem::take(&mut *self.pending_animations.lock().unwrap())
+    }
+
+    /// Drain the accumulated recipe defs.
+    pub fn take_recipes(&self) -> Vec<RecipeDef> {
+        std::mem::take(&mut *self.pending_recipes.lock().unwrap())
     }
 
     /// Take the optional work-action defaults. `None` ⇒ no mod called
@@ -494,6 +501,28 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     })?;
     animations_table.set("register", register_animation)?;
     engine.set("animations", animations_table)?;
+
+    // engine.recipes.register(def) — both sides accumulate. Recipes
+    // are display data on the client (crafting UI, station inspect
+    // panel) and execution data on the server (crafting handler).
+    // Slot ordering matches across sides so a future wire-friendly
+    // RecipeSlot type drops in cleanly.
+    let recipes_table = lua.create_table()?;
+    let pending_recipes = ctx.pending_recipes.clone();
+    let register_recipe = lua.create_function(move |lua, value: Value| {
+        let def: RecipeDef = lua.from_value(value)?;
+        let mut buf = pending_recipes.lock().unwrap();
+        if buf.iter().any(|r| r.id == def.id) {
+            return Err(mlua::Error::external(format!(
+                "duplicate recipe id {}",
+                def.id
+            )));
+        }
+        buf.push(def);
+        Ok(())
+    })?;
+    recipes_table.set("register", register_recipe)?;
+    engine.set("recipes", recipes_table)?;
 
     // engine.npcs.register(def) — both sides accumulate. set_planner is
     // server-only because planners run against authoritative state.

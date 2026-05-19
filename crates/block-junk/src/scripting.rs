@@ -17,6 +17,7 @@ use crate::blocks::{BlockRegistry, WorldSlots};
 use crate::items::ItemRegistry;
 use crate::npc_registry::{AnimationRegistry, NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::protocol::{CellEdit, GameSet};
+use crate::recipes::RecipeRegistry;
 use crate::rooms::{RoomEventMsg, RoomPatternRegistry};
 
 const MODS_DIR: &str = "./mods";
@@ -39,6 +40,7 @@ impl Plugin for ServerScriptingPlugin {
             blocks,
             slots,
             items,
+            recipes,
             rooms,
             needs,
             npc_kinds,
@@ -51,6 +53,7 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(blocks);
         app.insert_resource(slots);
         app.insert_resource(items);
+        app.insert_resource(recipes);
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
@@ -74,6 +77,7 @@ impl Plugin for ClientScriptingPlugin {
             blocks,
             slots,
             items,
+            recipes,
             rooms,
             needs,
             npc_kinds,
@@ -86,6 +90,7 @@ impl Plugin for ClientScriptingPlugin {
         app.insert_resource(blocks);
         app.insert_resource(slots);
         app.insert_resource(items);
+        app.insert_resource(recipes);
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
@@ -103,6 +108,7 @@ struct LoadResult {
     blocks: BlockRegistry,
     slots: WorldSlots,
     items: ItemRegistry,
+    recipes: RecipeRegistry,
     rooms: RoomPatternRegistry,
     needs: NeedRegistry,
     npc_kinds: NpcKindRegistry,
@@ -146,6 +152,22 @@ fn load_side(side: Side) -> LoadResult {
     // would silently spawn nothing at runtime — fail loud at boot.
     if let Err(e) = items.validate_block_drops(&pending_blocks) {
         panic!("{} block drops validation failed: {e}", side.as_str());
+    }
+    // Recipes reference item ids (inputs + output) so the item
+    // registry has to exist first. Validates duration bounds + id
+    // resolution inside `build`; station-tag reachability is
+    // checked against the block list below.
+    let recipes = match RecipeRegistry::build(ctx.take_recipes(), &items) {
+        Ok(r) => r,
+        Err(e) => panic!("{} recipe registry build failed: {e}", side.as_str()),
+    };
+    info!(
+        "[{}] recipe registry: {} recipe(s)",
+        side.as_str(),
+        recipes.slot_count()
+    );
+    if let Err(e) = recipes.validate_against_blocks(&pending_blocks) {
+        panic!("{} recipe station validation failed: {e}", side.as_str());
     }
     let rooms = match RoomPatternRegistry::build(ctx.take_rooms()) {
         Ok(r) => r,
@@ -239,6 +261,7 @@ fn load_side(side: Side) -> LoadResult {
         blocks,
         slots,
         items,
+        recipes,
         rooms,
         needs,
         npc_kinds,

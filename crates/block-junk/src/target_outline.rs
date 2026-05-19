@@ -93,6 +93,7 @@ fn draw_target_outline(
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
+    recipes: Res<crate::recipes::RecipeRegistry>,
     plans: Res<Plans>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
@@ -122,8 +123,8 @@ fn draw_target_outline(
             let carry = local_carry.single().copied().unwrap_or_default();
             let tool = local_tool.single().copied().unwrap_or_default();
             draw_normal_target(
-                origin, dir, &chunks, &chunk_map, &registry, &items, &plans, &world_items,
-                carry, tool, &mut gizmos,
+                origin, dir, &chunks, &chunk_map, &registry, &items, &recipes, &plans,
+                &world_items, carry, tool, &mut gizmos,
             );
         }
     }
@@ -181,6 +182,7 @@ fn draw_normal_target(
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
     items: &ItemRegistry,
+    recipes: &crate::recipes::RecipeRegistry,
     plans: &Plans,
     world_items: &Query<&WorldItem>,
     carry: Carrying,
@@ -269,11 +271,46 @@ fn draw_normal_target(
         draw_cell(gizmos, cell, colour);
         return;
     }
-    // No tag under the cursor; fall back to the world hit. R-click
-    // direct-destroy is red, OR grey if the live block needs a tool
-    // the player isn't holding.
+    // No tag under the cursor; fall back to the world hit.
     if let Some(hit) = world_hit {
         let live_slot = live_block_slot(hit.cell, chunks, chunk_map);
+        // Station-block override: if the live block is a station, the
+        // L-click verb is "craft" rather than "direct-destroy."
+        // Purple when a recipe matches carry+tool (craftable now);
+        // soft-purple when the station is recognized but nothing the
+        // player holds can craft anything here. Direct-destroy (red)
+        // still applies on R-click, which the outline doesn't preview
+        // — same convention as the existing tagged-cell paths.
+        if let Some(slot) = live_slot
+            && let Some(station_tag) = &registry.def(slot).station_tag
+        {
+            let craftable = recipes
+                .at_station(station_tag)
+                .iter()
+                .any(|&recipe_slot| {
+                    let def = recipes.def(recipe_slot);
+                    if let Some(required) = &def.required_tool
+                        && !items.tool_has_tag(tool.item, required)
+                    {
+                        return false;
+                    }
+                    def.inputs.iter().all(|input| {
+                        let Some(input_slot) = items.slot_of(&input.item) else {
+                            return false;
+                        };
+                        carry.item == Some(input_slot) && carry.count >= input.count
+                    })
+                });
+            let colour = if craftable {
+                Color::srgb(0.78, 0.42, 0.95) // bright purple: craft ready
+            } else {
+                Color::srgb(0.50, 0.38, 0.58) // muted purple: station, but no recipe
+            };
+            draw_cell(gizmos, hit.cell, colour);
+            return;
+        }
+        // Non-station: direct-destroy red, OR grey if the live block
+        // needs a tool the player isn't holding.
         let colour = if player_can_work_slot(live_slot, registry, items, tool) {
             Color::srgb(1.0, 0.35, 0.3)
         } else {

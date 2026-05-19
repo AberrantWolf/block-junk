@@ -205,6 +205,20 @@ pub struct BlockDef {
     /// fail loudly rather than silently spawn nothing.
     #[serde(default)]
     pub drops: Vec<ItemDrop>,
+    /// Marks this block as a craft station. When `Some(tag)`, recipes
+    /// whose `station` matches `tag` can be performed at this block.
+    /// Players L-click on a station to craft when their carry matches
+    /// a recipe input (Phase 6a); NPCs route to stations via a
+    /// scheduler-driven goal in a future Phase 6b. `None` ⇒ the
+    /// block is not a station, the click resolver ignores it.
+    ///
+    /// Tag matching is byte-exact (same convention as `TagId`
+    /// elsewhere — no central station registry). One block can carry
+    /// exactly one station tag today; multi-station blocks (a
+    /// workbench-anvil hybrid) would require lifting this to
+    /// `Vec<TagId>` later.
+    #[serde(default)]
+    pub station_tag: Option<TagId>,
     /// Items required to *build* this block via the Plan workflow. A
     /// player or NPC must deliver this many of each named item to the
     /// plan cell before the work-action can run. Same shape as

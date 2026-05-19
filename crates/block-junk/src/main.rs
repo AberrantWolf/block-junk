@@ -19,6 +19,7 @@ mod plans;
 mod player_mode;
 mod preview;
 mod protocol;
+mod recipes;
 mod rooms;
 mod save;
 mod scripting;

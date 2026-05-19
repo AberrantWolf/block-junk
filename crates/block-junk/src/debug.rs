@@ -30,7 +30,7 @@ use crate::npc::{Needs, Npc};
 use crate::npc_registry::NeedRegistry;
 use crate::protocol::{
     DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools,
-    GameSet,
+    DebugSpawnWorkbench, GameSet,
     WorldChannel, WorldClock,
 };
 
@@ -70,6 +70,7 @@ impl Plugin for DebugServerPlugin {
                 receive_debug_bump_need,
                 receive_debug_fill_nearest_plan,
                 receive_debug_spawn_tools,
+                receive_debug_spawn_workbench,
             )
                 .in_set(GameSet::Simulation),
         );
@@ -148,6 +149,7 @@ fn debug_panel_ui(
     mut need_sender: Query<&mut MessageSender<DebugBumpNeed>>,
     mut fill_plan_sender: Query<&mut MessageSender<DebugFillNearestPlan>>,
     mut spawn_tools_sender: Query<&mut MessageSender<DebugSpawnTools>>,
+    mut spawn_workbench_sender: Query<&mut MessageSender<DebugSpawnWorkbench>>,
     mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
 ) {
     if !open.0 {
@@ -163,6 +165,7 @@ fn debug_panel_ui(
     let mut need_bump: Option<(String, f32)> = None;
     let mut fill_nearest_plan = false;
     let mut spawn_tools = false;
+    let mut spawn_workbench = false;
 
     let time_label = match clock.as_deref() {
         Some(c) => format!(
@@ -205,6 +208,9 @@ fn debug_panel_ui(
             }
             if ui.button("Spawn vanilla tools").clicked() {
                 spawn_tools = true;
+            }
+            if ui.button("Spawn workbench").clicked() {
+                spawn_workbench = true;
             }
             ui.separator();
             ui.label(egui::RichText::new("Advance time").strong());
@@ -289,6 +295,11 @@ fn debug_panel_ui(
     if spawn_tools {
         if let Ok(mut sender) = spawn_tools_sender.single_mut() {
             sender.send::<WorldChannel>(DebugSpawnTools);
+        }
+    }
+    if spawn_workbench {
+        if let Ok(mut sender) = spawn_workbench_sender.single_mut() {
+            sender.send::<WorldChannel>(DebugSpawnWorkbench);
         }
     }
 }
@@ -482,6 +493,103 @@ fn receive_debug_spawn_tools(
         info!(
             count = spawned,
             "debug: spawned vanilla tools near player",
+        );
+    }
+}
+
+/// Apply [`DebugSpawnWorkbench`]: drop a `vanilla:workbench` block one
+/// tile ahead of the player so the Phase 6a crafting loop is testable
+/// without going through tag-plan + materials delivery. Silent skip
+/// when the target cell is already occupied (the place validator
+/// rejects + logs) or the workbench id isn't registered (mod removed
+/// / typo).
+///
+/// Routes through `apply_block_edit` directly — the server can't
+/// deliver a wire BlockEdit to its own receiver, so we call the
+/// place pipeline in-process. Gets the broadcast + sidecar +
+/// auto-clear-plan behaviour for free.
+#[allow(clippy::too_many_arguments, reason = "place pipeline reaches many subsystems")]
+fn receive_debug_spawn_workbench(
+    mut receivers: Query<(Entity, &mut MessageReceiver<crate::protocol::DebugSpawnWorkbench>)>,
+    avatars: Res<crate::server::ClientAvatars>,
+    poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
+    block_registry: Res<crate::blocks::BlockRegistry>,
+    mut chunks: Query<(
+        &mut crate::voxel::Chunk,
+        &mut crate::voxel::ChunkEntities,
+    )>,
+    chunk_map: Res<crate::voxel::ChunkMap>,
+    mut commands: Commands,
+    mut broadcast: ServerMultiMessageSender,
+    servers: Query<&Server>,
+    mut cell_bus: MessageWriter<crate::protocol::CellEdit>,
+) {
+    use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS};
+    use block_junk_mod_api::blocks::{BlockId, Cardinal};
+
+    const WORKBENCH_ID: &str = "vanilla:workbench";
+
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for (connection, mut receiver) in receivers.iter_mut() {
+        let count = receiver.receive().count();
+        if count == 0 {
+            continue;
+        }
+        let Some(&avatar) = avatars.0.get(&connection) else {
+            continue;
+        };
+        let Ok(pose) = poses.get(avatar) else {
+            continue;
+        };
+        let Some(slot) = block_registry.slot_of(&BlockId::new(WORKBENCH_ID)) else {
+            warn!(
+                id = WORKBENCH_ID,
+                "debug spawn workbench: id missing from block registry; skipping",
+            );
+            continue;
+        };
+        // Foot cell + one tile ahead in the dominant cardinal — same
+        // forward-snap pattern `drop_target_position` uses.
+        let foot_pos = pose.translation
+            - bevy::math::Vec3::new(
+                0.0,
+                EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
+                0.0,
+            );
+        let foot_cell = bevy::math::IVec3::new(
+            foot_pos.x.floor() as i32,
+            foot_pos.y.floor() as i32,
+            foot_pos.z.floor() as i32,
+        );
+        let forward =
+            bevy::math::Vec3::new(-pose.yaw.sin(), 0.0, -pose.yaw.cos());
+        let cardinal = if forward.x.abs() > forward.z.abs() {
+            bevy::math::IVec3::new(forward.x.signum() as i32, 0, 0)
+        } else {
+            bevy::math::IVec3::new(0, 0, forward.z.signum() as i32)
+        };
+        let target_cell = foot_cell + cardinal;
+        let edit = crate::protocol::BlockEdit {
+            anchor: target_cell,
+            slot,
+            orientation: Cardinal::default(),
+        };
+        crate::server::apply_block_edit(
+            edit,
+            &mut commands,
+            &mut chunks,
+            &chunk_map,
+            &block_registry,
+            server,
+            &mut broadcast,
+            &mut cell_bus,
+        );
+        info!(
+            cell = ?target_cell.to_array(),
+            id = WORKBENCH_ID,
+            "debug: placed workbench",
         );
     }
 }

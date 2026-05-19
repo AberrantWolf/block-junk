@@ -68,6 +68,15 @@ engine.items.register {
     tool_tags = { "vanilla:pickaxe" },
 }
 
+-- Crafting outputs (Phase 6a). Wood planks are the first recipe
+-- product; mesh + color stand in for a future planks asset.
+engine.items.register {
+    id = "vanilla:wood_planks",
+    display_name = "Wood Planks",
+    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    color = { 0.72, 0.55, 0.32 },
+}
+
 -- Masks + ramps composited per-block by the chunk fragment shader.
 -- Slot order is registration order; refs from `layers` below resolve
 -- against these by id at boot. Mods can register their own with
@@ -432,6 +441,39 @@ register {
         duration_secs = 2.0,
         exclusive = false,
     },
+}
+
+-- Phase 6a: first craft station. Solid cube placeholder mesh; the
+-- station_tag pairs with the `vanilla:planks_from_log` recipe below.
+-- materials cost = 2 wood_log so plan-build pricing makes sense even
+-- for the simple block.
+register {
+    id = "vanilla:workbench",
+    display_name = "Workbench",
+    flags = {
+        solid = true,
+        room_boundary = true,
+        support_below = true,
+    },
+    color = { 0.55, 0.42, 0.25 },
+    pattern = "planks",
+    station_tag = "vanilla:carpentry",
+    materials = {
+        { item = "vanilla:wood_log", count = 2 },
+    },
+}
+
+-- Recipes (Phase 6a). One per station for the MVP; multi-recipe
+-- selection UI lands when a station gains its second recipe.
+engine.recipes.register {
+    id = "vanilla:planks_from_log",
+    display_name = "Wood planks (from log)",
+    inputs = {
+        { item = "vanilla:wood_log", count = 1 },
+    },
+    output = { item = "vanilla:wood_planks", count = 1 },
+    duration_secs = 4.0,
+    station = "vanilla:carpentry",
 }
 
 -- Needs the engine itself doesn't know about — it just decays whatever

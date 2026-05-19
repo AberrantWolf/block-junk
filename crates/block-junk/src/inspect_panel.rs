@@ -309,6 +309,7 @@ fn refresh_inspect_panel(
     target: Res<InspectTarget>,
     registry: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
+    recipes: Res<crate::recipes::RecipeRegistry>,
     plans: Res<Plans>,
     mut roots: Query<&mut Visibility, With<InspectPanelRoot>>,
     mut texts: Query<&mut Text, With<InspectPanelText>>,
@@ -320,7 +321,7 @@ fn refresh_inspect_panel(
     if !target.is_changed() && !plans.is_changed() {
         return;
     }
-    let body = render_body(&target.state, &registry, &items, &plans);
+    let body = render_body(&target.state, &registry, &items, &recipes, &plans);
     let visibility = match body {
         Some(_) => Visibility::Inherited,
         None => Visibility::Hidden,
@@ -338,6 +339,7 @@ fn render_body(
     state: &InspectState,
     registry: &BlockRegistry,
     items: &ItemRegistry,
+    recipes: &crate::recipes::RecipeRegistry,
     plans: &Plans,
 ) -> Option<String> {
     match state {
@@ -349,6 +351,13 @@ fn render_body(
         InspectState::Npc(details) => Some(format_npc(details, false)),
         InspectState::Block { cell, slot } => {
             let mut out = format_block(*cell, *slot, registry);
+            // Station info appends when the inspected block is a
+            // station — lists every recipe registered at the station
+            // tag so the player knows what they could craft.
+            if let Some(station_tag) = &registry.def(*slot).station_tag {
+                out.push('\n');
+                out.push_str(&format_station_inner(station_tag, recipes, items));
+            }
             // Append plan info when the inspected block is tagged
             // (Remove plans live on solid cells, so the block raycast
             // resolves them).
@@ -385,6 +394,51 @@ fn format_item(slot: ItemSlot, items: &ItemRegistry) -> String {
         for tag in &def.tool_tags {
             out.push_str(&format!("  {tag}\n"));
         }
+    }
+    out
+}
+
+/// Render the station-tag + recipes list when the inspected block is
+/// a station. Recipes show input → output so the player sees what
+/// kind of work this station does without trial-and-error.
+fn format_station_inner(
+    tag: &block_junk_mod_api::blocks::TagId,
+    recipes: &crate::recipes::RecipeRegistry,
+    items: &ItemRegistry,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("station: {tag}\n"));
+    let slots = recipes.at_station(tag);
+    if slots.is_empty() {
+        out.push_str("recipes: (none registered)\n");
+        return out;
+    }
+    out.push_str("recipes:\n");
+    for &slot in slots {
+        let def = recipes.def(slot);
+        let inputs_str = if def.inputs.is_empty() {
+            "(free)".to_owned()
+        } else {
+            def.inputs
+                .iter()
+                .map(|i| {
+                    let name = items
+                        .slot_of(&i.item)
+                        .map(|s| items.def(s).display_name.clone())
+                        .unwrap_or_else(|| i.item.to_string());
+                    format!("{}x {}", i.count, name)
+                })
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        let out_name = items
+            .slot_of(&def.output.item)
+            .map(|s| items.def(s).display_name.clone())
+            .unwrap_or_else(|| def.output.item.to_string());
+        out.push_str(&format!(
+            "  {} → {}x {} ({:.1}s)\n",
+            inputs_str, def.output.count, out_name, def.duration_secs
+        ));
     }
     out
 }

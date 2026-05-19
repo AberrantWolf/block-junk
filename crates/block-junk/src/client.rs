@@ -32,9 +32,10 @@ use crate::target_outline::TargetOutlinePlugin;
 use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
-    DropToolRequest, EquippedTool, GameSet, MovementIntent, MovementMode, NpcAnimOverride,
-    PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync, WorldItem,
+    Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, CraftRequest, DepositRequest,
+    DropRequest, DropToolRequest, EquippedTool, GameSet, MovementIntent, MovementMode,
+    NpcAnimOverride, PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync,
+    WorldItem,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -348,6 +349,7 @@ pub struct ActiveAction {
 pub enum ActionKind {
     Place,
     Break,
+    Craft,
 }
 
 /// Real seconds to complete one Build-mode action (place or break) with
@@ -1166,6 +1168,7 @@ struct NormalActionIo<'w, 's> {
     edit: Query<'w, 's, &'static mut MessageSender<BlockEdit>>,
     pickup: Query<'w, 's, &'static mut MessageSender<PickupRequest>>,
     deposit: Query<'w, 's, &'static mut MessageSender<DepositRequest>>,
+    craft: Query<'w, 's, &'static mut MessageSender<CraftRequest>>,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1186,6 +1189,7 @@ fn normal_mode_action_input(
     plans: Res<Plans>,
     registry: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
+    recipes: Res<crate::recipes::RecipeRegistry>,
     world_items: Query<&WorldItem>,
     local: LocalPlayerState,
     mut action: ResMut<PlayerActionState>,
@@ -1312,14 +1316,82 @@ fn normal_mode_action_input(
     );
 
     // Resolve the verb for this frame. L wins over R when both held.
-    // For L we also need the plan-only raycast — Build tags float in
-    // empty space and the world raycast can't see them.
+    // For L: try self-work on a tag first (the player tagged this for
+    // a reason — honour it), then craft on a station block if no
+    // self-work resolved. R is direct-destroy.
     let resolved = if l_held {
         let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, RAYCAST_REACH, &plans);
         resolve_self_work(cam_pos, &plans, world_hit.as_ref(), plan_hit)
     } else {
         resolve_direct_destroy(world_hit.as_ref())
     };
+    // Craft fast-path: L-click on a station block, no self-work
+    // tagged. Lookup station_tag → first matching recipe given carry.
+    // Same `PlayerActionState` timer machinery, just sends a
+    // `CraftRequest` instead of a `BlockEdit` on completion. Recipe
+    // duration drives the timer step (vs. the `PLAYER_ACTION_
+    // DURATION_SECS` constant the edit path uses) so heavy recipes
+    // visibly take longer.
+    if l_held
+        && resolved.is_none()
+        && let Some(hit) = world_hit.as_ref()
+    {
+        let (coord, local_idx) = crate::voxel::world_to_chunk(hit.cell);
+        if let Some(&entity) = chunk_map.0.get(&coord)
+            && let Ok((chunk, _)) = chunks.get(entity)
+        {
+            let slot = chunk.get(local_idx);
+            if !slot.is_empty()
+                && let Some(station_tag) = &registry.def(slot).station_tag
+            {
+                let carry = local.carry.single().copied().unwrap_or_default();
+                let tool = local.tool.single().copied().unwrap_or_default();
+                if let Some((recipe_slot, duration_secs)) =
+                    pick_recipe_for_station(station_tag, &recipes, &items, &carry, tool)
+                {
+                    let target_cell = hit.cell;
+                    let kind = ActionKind::Craft;
+                    // Instant path mirrors the edit branch.
+                    if instant_builds.0 {
+                        if mouse.just_pressed(MouseButton::Left)
+                            && let Ok(mut s) = io.craft.single_mut()
+                        {
+                            s.send::<WorldChannel>(CraftRequest {
+                                station_cell: target_cell,
+                                recipe_id: recipes.def(recipe_slot).id.0.clone(),
+                            });
+                            action.active = None;
+                        }
+                        return;
+                    }
+                    let step = time.delta_secs() / duration_secs;
+                    let progress = match action.active {
+                        Some(a) if a.target_cell == target_cell && a.kind == kind => {
+                            a.progress + step
+                        }
+                        _ => step,
+                    };
+                    if progress >= 1.0 {
+                        let recipe_id = recipes.def(recipe_slot).id.0.clone();
+                        if let Ok(mut s) = io.craft.single_mut() {
+                            s.send::<WorldChannel>(CraftRequest {
+                                station_cell: target_cell,
+                                recipe_id,
+                            });
+                        }
+                        action.active = None;
+                    } else {
+                        action.active = Some(ActiveAction {
+                            target_cell,
+                            kind,
+                            progress,
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+    }
     let Some((target_cell, kind, edit, button)) = resolved else {
         action.active = None;
         return;
@@ -1484,6 +1556,50 @@ fn resolve_self_work(
         PlanKind::Build { .. } => ActionKind::Place,
     };
     Some((cell, action_kind, edit, MouseButton::Left))
+}
+
+/// Pick the first recipe at `station_tag` whose inputs the player's
+/// `Carrying` satisfies AND whose `required_tool` (if any) the
+/// player's equipped tool satisfies. Returns `(slot, duration_secs)`
+/// for the timer; `None` means "this station has nothing the player
+/// can craft right now." First-match wins (registration order),
+/// matching the recipe scheduler convention.
+///
+/// Phase 6a only handles single-input recipes; multi-input still
+/// returns Some when the carry covers all listed inputs (single-stack
+/// carry currently forbids that combinatorially, so multi-input
+/// recipes register but can't be crafted by hand until inventory
+/// expands). Worth a future revisit when that constraint loosens.
+fn pick_recipe_for_station(
+    station_tag: &block_junk_mod_api::blocks::TagId,
+    recipes: &crate::recipes::RecipeRegistry,
+    items: &ItemRegistry,
+    carry: &Carrying,
+    tool: EquippedTool,
+) -> Option<(crate::recipes::RecipeSlot, f32)> {
+    for &recipe_slot in recipes.at_station(station_tag) {
+        let def = recipes.def(recipe_slot);
+        // Tool gate: skip if recipe needs a tool the player isn't
+        // holding. `tool_has_tag(None, _)` is false.
+        if let Some(tag) = &def.required_tool
+            && !items.tool_has_tag(tool.item, tag)
+        {
+            continue;
+        }
+        // Inputs: every entry must resolve to an item slot the carry
+        // holds in sufficient quantity. Single-stack carry means this
+        // can only succeed for recipes with one input kind today.
+        let inputs_ok = def.inputs.iter().all(|input| {
+            let Some(input_slot) = items.slot_of(&input.item) else {
+                return false;
+            };
+            carry.item == Some(input_slot) && carry.count >= input.count
+        });
+        if inputs_ok {
+            return Some((recipe_slot, def.duration_secs));
+        }
+    }
+    None
 }
 
 /// Pick the cell the player's R-click would direct-destroy this frame.

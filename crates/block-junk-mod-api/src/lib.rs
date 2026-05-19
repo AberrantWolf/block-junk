@@ -34,6 +34,7 @@ pub mod animations;
 pub mod blocks;
 pub mod items;
 pub mod npcs;
+pub mod recipes;
 pub mod rooms;
 pub mod textures;
 
