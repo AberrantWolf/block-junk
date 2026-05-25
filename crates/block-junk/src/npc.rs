@@ -2226,16 +2226,25 @@ fn npc_brain_tick(
             );
             // One-line per-NPC trace at every planner call so a
             // session log shows what each NPC saw on each decision.
-            // `?need_hunger` / `?need_sleep` use Option formatting so
-            // a missing need shows up explicitly as None.
+            // Includes every need-id the snapshot carries (vanilla:
+            // hunger/sleep/work; mods may add more) plus the counts of
+            // every option pool the planner can pick from. The pairing
+            // with the "planner committed" log below tells you *what*
+            // the planner saw vs *what* it picked, which is enough to
+            // diagnose "why didn't this NPC work that nearby plan?"
+            // without instrumenting the Lua planner itself.
             let need_hunger = snapshot.needs.get("hunger").copied();
             let need_sleep = snapshot.needs.get("sleep").copied();
+            let need_work = snapshot.needs.get("work").copied();
             info!(
                 npc = npc_id.0,
                 is_night = snapshot.is_night,
                 hunger = ?need_hunger,
                 sleep = ?need_sleep,
+                work = ?need_work,
+                nearby_plans = snapshot.nearby_plans.len(),
                 nearby_interactions = snapshot.nearby_interactions.len(),
+                nearby_rooms = snapshot.nearby_rooms.len(),
                 "planner snapshot",
             );
             let planner_goal = match mods.0.call_planner(&kind_id, &snapshot) {
@@ -2269,6 +2278,33 @@ fn npc_brain_tick(
                     continue;
                 }
             };
+            // Single-line summary of what the planner *chose*, paired
+            // with the "planner snapshot" log just above. Distinguishes
+            // between the planner's primitive kinds (Idle/Rest/Wander/
+            // Goto/Interact/WorkPlan) and includes the target cell where
+            // applicable. With the snapshot's `nearby_plans` count, this
+            // is enough to spot "NPC saw 2 plans but chose Interact" —
+            // a clue that a survival branch (hunger/sleep) fired first.
+            let chosen_summary: &'static str = match &planner_goal {
+                PlannerGoal::Idle => "Idle",
+                PlannerGoal::Rest { .. } => "Rest",
+                PlannerGoal::Wander { .. } => "Wander",
+                PlannerGoal::Goto { .. } => "Goto",
+                PlannerGoal::Interact { .. } => "Interact",
+                PlannerGoal::WorkPlan { .. } => "WorkPlan",
+            };
+            let chosen_target: Option<BlockPos> = match &planner_goal {
+                PlannerGoal::Goto { cell, .. }
+                | PlannerGoal::Interact { cell, .. }
+                | PlannerGoal::WorkPlan { cell, .. } => Some(*cell),
+                _ => None,
+            };
+            info!(
+                npc = npc_id.0,
+                kind = chosen_summary,
+                target = ?chosen_target,
+                "planner committed",
+            );
             // Convert the planner's surface form into a live engine
             // Goal. Wander triggers an A* pick here; Rest/Idle just
             // arm a timer. Clamps protect against a misbehaving
@@ -3253,12 +3289,32 @@ fn collect_nearby_plans(
     work_defaults: &block_junk_mod_api::npcs::WorkDefaults,
 ) -> Vec<NearbyPlan> {
     let mut out: Vec<NearbyPlan> = Vec::new();
+    // Trace-level filter reasons: a plan that gets filtered before
+    // reaching the planner is invisible at the info level (we only
+    // log the surviving count). Run with
+    // `RUST_LOG=block_junk::npc=trace` to see exactly which plans got
+    // excluded and why ("too far", "claimed by someone else", "needs
+    // materials", "wrong tool"). Tagged with both the NPC and the
+    // plan cell so a grep tells you the whole picture.
     for (cell, state) in plans.iter() {
         let d = *cell - foot;
-        if d.x.abs() > radius_cells || d.y.abs() > radius_cells || d.z.abs() > radius_cells {
+        let chebyshev = d.x.abs().max(d.y.abs()).max(d.z.abs());
+        if chebyshev > radius_cells {
+            trace!(
+                npc = self_id.0,
+                cell = ?cell.to_array(),
+                chebyshev,
+                radius_cells,
+                "nearby plan filter: too far",
+            );
             continue;
         }
         if plan_claims.is_taken_by_other(*cell, self_id) {
+            trace!(
+                npc = self_id.0,
+                cell = ?cell.to_array(),
+                "nearby plan filter: claimed by another npc",
+            );
             continue;
         }
         // Phase-3 gate: NPCs can only commit to plans whose materials
@@ -3266,6 +3322,11 @@ fn collect_nearby_plans(
         // the player (or the haul scheduler) to fill them — the
         // planner shouldn't even see them.
         if !state.is_satisfied() {
+            trace!(
+                npc = self_id.0,
+                cell = ?cell.to_array(),
+                "nearby plan filter: materials not yet delivered",
+            );
             continue;
         }
         // Phase-5b gate: skip plans whose `work_action.required_tool`
@@ -3290,6 +3351,13 @@ fn collect_nearby_plans(
             && let Some(required) = &work.required_tool
             && !item_registry.tool_has_tag(equipped_tool.item, required)
         {
+            trace!(
+                npc = self_id.0,
+                cell = ?cell.to_array(),
+                required = %required,
+                equipped = ?equipped_tool.item.map(|s| s.0),
+                "nearby plan filter: tool gate",
+            );
             continue;
         }
         let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
