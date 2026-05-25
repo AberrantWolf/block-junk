@@ -370,7 +370,7 @@ struct HotbarSlot(usize);
 struct HotbarRoot;
 
 /// Which kind of icon a hotbar slot renders. Voxel blocks have a
-/// meaningful 16x16 pattern texture; mesh blocks (workbench, forge,
+/// meaningful 16x16 pattern texture; mesh blocks (workbench, anvil,
 /// bed) don't — their look is the gltf, and using the pattern
 /// texture would make the hotbar entry look like terrain. For those
 /// we fall back to a white-bg slot with a 3-letter text label
@@ -673,7 +673,7 @@ fn setup_scene(
                 for (i, entry) in palette.0.iter().enumerate() {
                     // Three icon paths:
                     //   - Destroy slot → bundled pickaxe sprite.
-                    //   - Block with mesh (workbench, forge, bed, etc.) →
+                    //   - Block with mesh (workbench, anvil, bed, etc.) →
                     //     white-bg text label. The pattern-derived texture
                     //     would look like terrain and gets confused with
                     //     real grass/stone/wood blocks.

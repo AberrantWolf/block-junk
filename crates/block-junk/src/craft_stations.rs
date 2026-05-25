@@ -305,7 +305,7 @@ impl CraftStations {
 /// Max Chebyshev distance (cells) from an NPC's foot to a craft
 /// station the scheduler will commit to. Same magnitude as the haul
 /// scheduler's plan radius so an NPC doesn't cross-map for one
-/// distant forge while a closer workbench sits with orders.
+/// distant anvil while a closer workbench sits with orders.
 pub(crate) const MAX_CRAFT_STATION_RADIUS_CELLS: i32 = 48;
 
 /// Per-NPC craft scheduler. Called from the brain-tick Idle entry

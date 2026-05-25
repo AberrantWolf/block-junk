@@ -496,20 +496,24 @@ register {
 }
 
 -- Phase 6c: second craft station. KayKit RPG Tools Bits "anvil" mesh
--- — natural bounds 1.617×0.8×0.75 m, so the gltf node bakes a uniform
--- 0.6 scale (one float across all three axes — no skew) shrinking it
--- to 0.97×0.48×0.45 m: fits inside a single 1 m cell with a small X
--- buffer, sits roughly knee-high. Single-cell footprint (default).
--- Reuses tools_bits_texture.png already in this directory.
+-- — natural bounds 1.617×0.8×0.75 m. The gltf node bakes the same
+-- uniform 2/3 scale the workbench uses, so the two stations read at
+-- consistent visual scale when set next to each other. Post-transform
+-- extents 1.078×0.533×0.5 m: the X axis overflows the cell by ~0.10 m
+-- on the -X side (the source mesh is offset toward -X; one float
+-- applied to all three axes can't recenter it without a translation,
+-- and asymmetric translation isn't a uniform-scale concern). Voxel
+-- mesher skips faces of the footprint cell, so the overhang reads as
+-- "the anvil sticks out a bit" rather than clipping geometry.
 --
--- station_tag = "vanilla:smithing" — the first non-carpentry tag, so
--- the recipe registry exercises >1 station/tag pair. materials = 4
--- stone_chunk so the player has a clear reason to gather stone first
--- (the forge costs more than the workbench in raw materials, matching
--- the "smithing requires more setup than carpentry" stereotype).
+-- Single-cell footprint. station_tag = "vanilla:smithing" — the first
+-- non-carpentry tag, so the recipe registry exercises >1 station/tag
+-- pair. materials = 4 stone_chunk so the player has a clear reason to
+-- gather stone first (the anvil costs more than the workbench, the
+-- "smithing setup is heavier than carpentry" stereotype).
 register {
-    id = "vanilla:forge",
-    display_name = "Forge",
+    id = "vanilla:anvil",
+    display_name = "Anvil",
     flags = {
         solid = true,
         room_boundary = true,
@@ -518,8 +522,8 @@ register {
     color = { 0.38, 0.36, 0.40 },
     mesh = "mods://vanilla/models/anvil.gltf",
     entity_aabb = {
-        min = { -0.543, 0.0, -0.225 },
-        max = {  0.427, 0.48, 0.225 },
+        min = { -0.603, 0.0, -0.25 },
+        max = {  0.475, 0.533, 0.25 },
     },
     station_tag = "vanilla:smithing",
     station_tier = 1,
