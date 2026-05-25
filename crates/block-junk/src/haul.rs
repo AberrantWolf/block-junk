@@ -85,13 +85,39 @@ pub struct ReservedItem {
     pub translation: Vec3,
 }
 
-/// What one NPC is currently hauling. `plan_cell` is the Build plan
-/// being filled; `queue` is the remaining items the scheduler has
-/// reserved for this run, in pickup order (front first). After every
-/// pickup the brain pops the front; when the queue empties the brain
-/// walks to the plan to deposit, and on deposit the assignment is
-/// released (the scheduler will hand out a fresh one next tick if the
-/// plan still has unmet materials).
+/// Where the next deposit leg of a haul cycle delivers materials.
+/// Build plans and craft stations are both single-cell deposit
+/// targets the scheduler can route to; the brain picks the right
+/// arrival action ([`crate::npc::ArrivalAction::DepositAtPlan`] vs
+/// [`crate::npc::ArrivalAction::DepositAtStation`]) from this.
+///
+/// Tool prereqs only apply to Plan targets (the *work* needs a tool;
+/// delivery doesn't). Station haul never carries a `pending_tool`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HaulTarget {
+    Plan(IVec3),
+    Station(IVec3),
+}
+
+impl HaulTarget {
+    /// The world cell of the deposit target — useful when the caller
+    /// only needs the location (distance check, path target), not the
+    /// kind.
+    pub fn cell(&self) -> IVec3 {
+        match self {
+            HaulTarget::Plan(c) | HaulTarget::Station(c) => *c,
+        }
+    }
+}
+
+/// What one NPC is currently hauling. `target` is the deposit
+/// destination (Build plan or craft station); `queue` is the
+/// remaining items the scheduler has reserved for this run, in
+/// pickup order (front first). After every pickup the brain pops the
+/// front; when the queue empties the brain walks to the target to
+/// deposit, and on deposit the assignment is released (the scheduler
+/// will hand out a fresh one next tick if the target still has unmet
+/// demand).
 ///
 /// `pending_tool` covers Phase 5b's "fetch the right tool first"
 /// branch — when the scheduler picks an NPC for a plan whose
@@ -100,10 +126,12 @@ pub struct ReservedItem {
 /// records it here. The brain walks to the tool first
 /// (`pick_next_haul_leg` checks this field before anything else),
 /// equips it via swap, clears the field, then continues with the
-/// material queue. `None` ⇒ no tool prereq.
+/// material queue. `None` ⇒ no tool prereq. Station targets always
+/// carry `None` here — recipe tool gates are enforced when the
+/// engine schedules the *work*, not the haul.
 #[derive(Clone, Debug)]
 pub struct HaulAssignment {
-    pub plan_cell: IVec3,
+    pub target: HaulTarget,
     pub queue: Vec<ReservedItem>,
     pub pending_tool: Option<ReservedItem>,
 }
@@ -201,8 +229,10 @@ pub fn try_schedule_haul_for_npc(
     equipped_tool: &crate::protocol::EquippedTool,
     kind_registry: &crate::npc_registry::NpcKindRegistry,
     plans: &crate::plans::Plans,
+    stations: &crate::craft_stations::CraftStations,
     block_registry: &crate::blocks::BlockRegistry,
     item_registry: &crate::items::ItemRegistry,
+    recipes: &crate::recipes::RecipeRegistry,
     chunks: &Query<&crate::voxel::Chunk>,
     chunk_map: &crate::voxel::ChunkMap,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
@@ -227,19 +257,20 @@ pub fn try_schedule_haul_for_npc(
         pose.z.floor() as i32,
     );
 
-    // Non-empty carry → deposit-only path. Find a Build plan that
-    // wants exactly this kind and create an assignment with an empty
-    // queue; `pick_next_haul_leg` then routes the NPC straight to the
-    // plan to deposit. Covers the save/load case (carry persists; the
-    // pre-save haul assignment doesn't) and any other "NPC was handed
-    // an item and now needs somewhere to put it" scenario. If no
-    // matching plan exists, the NPC falls through to the planner
-    // (wanders carrying the stack); the next time a matching plan
-    // appears, this branch picks them up.
+    // Non-empty carry → deposit-only path. Find the nearest target
+    // (Build plan or craft station) that wants exactly this kind and
+    // create an assignment with an empty queue; `pick_next_haul_leg`
+    // then routes the NPC straight to deposit. Covers the save/load
+    // case (carry persists; the pre-save haul assignment doesn't),
+    // post-craft "I came home holding the output" scenarios, and any
+    // other "NPC was handed an item and now needs somewhere to put it"
+    // situation. If no matching target exists, the NPC falls through
+    // to the planner (wanders carrying the stack); the next time a
+    // matching target appears, this branch picks them up.
     if let (Some(carried_slot), c) = (carrying.item, carrying.count)
         && c > 0
     {
-        let mut best_plan: Option<(IVec3, i32)> = None;
+        let mut best: Option<(HaulTarget, i32)> = None;
         for (cell, state) in plans.iter() {
             if !matches!(state.kind, PlanKind::Build { .. }) {
                 continue;
@@ -254,23 +285,33 @@ pub fn try_schedule_haul_for_npc(
             if !wants_it {
                 continue;
             }
-            let dist = (cell.x - foot.x)
-                .abs()
-                .max((cell.y - foot.y).abs())
-                .max((cell.z - foot.z).abs());
+            let dist = chebyshev(*cell, foot);
             if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
                 continue;
             }
-            if best_plan.map(|(_, d)| dist < d).unwrap_or(true) {
-                best_plan = Some((*cell, dist));
+            if best.map(|(_, d)| dist < d).unwrap_or(true) {
+                best = Some((HaulTarget::Plan(*cell), dist));
             }
         }
-        let Some((plan_cell, _)) = best_plan else {
+        for (cell, state) in stations.iter() {
+            let demand = compute_station_demand(state, recipes, item_registry);
+            if demand.get(&carried_slot).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let dist = chebyshev(*cell, foot);
+            if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
+                continue;
+            }
+            if best.map(|(_, d)| dist < d).unwrap_or(true) {
+                best = Some((HaulTarget::Station(*cell), dist));
+            }
+        }
+        let Some((target, _)) = best else {
             return false;
         };
         info!(
             npc = npc_id.0,
-            plan = ?plan_cell.to_array(),
+            target = ?target,
             kind = carried_slot.0,
             carry = c,
             "haul assignment (deposit-only) committed",
@@ -278,7 +319,7 @@ pub fn try_schedule_haul_for_npc(
         assignments.insert(
             npc_id,
             HaulAssignment {
-                plan_cell,
+                target,
                 queue: Vec::new(),
                 pending_tool: None,
             },
@@ -300,14 +341,20 @@ pub fn try_schedule_haul_for_npc(
             .push((entity, wi.translation));
     }
 
-    // Pick the nearest unsatisfied Build plan that (a) has at least
-    // one reachable matching material item, AND (b) is workable by
-    // this NPC — either no tool required, the NPC already holds the
-    // right tool, or a matching tool exists nearby and can be
-    // reserved alongside the materials. Without (b) the haul would
-    // succeed but the plan would sit unworkable, defeating the
-    // point.
-    let mut best_plan: Option<(IVec3, i32)> = None;
+    // Pick the nearest viable target — Build plan or craft station.
+    // A target is viable when (a) it has unmet demand for at least one
+    // item slot AND there's a reachable matching item nearby, AND (b)
+    // for Plan targets only, the plan is workable by this NPC (the
+    // NPC has the required tool or a matching one is reachable).
+    // Stations have no tool gate at the haul layer — recipe tool
+    // requirements are enforced when the *work* is scheduled.
+    //
+    // For each candidate, also pick the input slot we'd actually fetch
+    // (single-stack carry forces one kind per assignment). Picking the
+    // slot at target-selection time means the "matchable items" check
+    // and the later reservation pass agree on the same kind.
+    let mut best: Option<(HaulTarget, crate::items::ItemSlot, u32, i32)> = None;
+    // best = (target, kind to fetch, remaining count needed, chebyshev distance)
     for (cell, state) in plans.iter() {
         if !matches!(state.kind, PlanKind::Build { .. }) {
             continue;
@@ -315,31 +362,20 @@ pub fn try_schedule_haul_for_npc(
         if state.is_satisfied() {
             continue;
         }
-        let dist = (cell.x - foot.x)
-            .abs()
-            .max((cell.y - foot.y).abs())
-            .max((cell.z - foot.z).abs());
+        let dist = chebyshev(*cell, foot);
         if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
             continue;
         }
-        let has_matchable = state.materials.iter().any(|m| {
-            if m.needed <= m.present {
-                return false;
-            }
-            let Some(pool) = items_by_slot.get(&m.item) else {
-                return false;
-            };
-            pool.iter().any(|(entity, translation)| {
-                if reservations.is_taken_by_other(*entity, npc_id) {
-                    return false;
-                }
-                let d = (*translation - pose).length();
-                d <= MAX_HAUL_ITEM_RADIUS_M
-            })
-        });
-        if !has_matchable {
+        let chosen = pick_haul_kind(
+            state.materials.iter().map(|m| (m.item, m.needed.saturating_sub(m.present))),
+            &items_by_slot,
+            pose,
+            npc_id,
+            reservations,
+        );
+        let Some((slot, remaining)) = chosen else {
             continue;
-        }
+        };
         // Tool gate: either no tool needed, NPC has it, or one is
         // available to fetch. `required_tool_for_plan` reads the
         // live block for Remove plans, the planned block for Build.
@@ -367,76 +403,84 @@ pub fn try_schedule_haul_for_npc(
                 continue;
             }
         }
-        if best_plan.map(|(_, d)| dist < d).unwrap_or(true) {
-            best_plan = Some((*cell, dist));
+        if best.map(|(_, _, _, d)| dist < d).unwrap_or(true) {
+            best = Some((HaulTarget::Plan(*cell), slot, remaining, dist));
         }
     }
-    let Some((plan_cell, _)) = best_plan else {
-        return false;
-    };
-    let Some(state) = plans.get(plan_cell) else {
+    for (cell, state) in stations.iter() {
+        let dist = chebyshev(*cell, foot);
+        if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
+            continue;
+        }
+        let demand = compute_station_demand(state, recipes, item_registry);
+        if demand.is_empty() {
+            continue;
+        }
+        let chosen = pick_haul_kind(
+            demand.iter().map(|(s, c)| (*s, *c)),
+            &items_by_slot,
+            pose,
+            npc_id,
+            reservations,
+        );
+        let Some((slot, remaining)) = chosen else {
+            continue;
+        };
+        if best.map(|(_, _, _, d)| dist < d).unwrap_or(true) {
+            best = Some((HaulTarget::Station(*cell), slot, remaining, dist));
+        }
+    }
+    let Some((target, item_slot, remaining_for_kind, _)) = best else {
         return false;
     };
 
-    // Reserve the tool first (if needed). If reservation fails (raced
-    // with another scheduler call for the same item), abandon this
-    // assignment — next tick we'll repick. Don't pre-mutate
-    // `reservations` for materials until the tool is locked, so a
-    // lost tool race releases zero items.
-    let required_tool_tag = required_tool_for_plan(
-        plan_cell,
-        &state.kind,
-        block_registry,
-        chunks,
-        chunk_map,
-    );
-    let pending_tool = if let Some(tag) = &required_tool_tag {
-        if item_registry.tool_has_tag(equipped_tool.item, tag) {
-            None
-        } else {
-            let Some((entity, item, translation)) = find_nearest_unreserved_tool(
-                tag,
-                pose,
-                npc_id,
-                world_items,
-                item_registry,
-                reservations,
-            ) else {
-                return false;
-            };
-            if !reservations.try_reserve(entity, npc_id) {
-                return false;
+    // Reserve the tool first (if any). Stations never carry a tool
+    // prereq at the haul layer, so this branch only fires for Plans.
+    // If reservation fails (raced with another scheduler call), abort
+    // this assignment — next tick we repick. Don't pre-reserve any
+    // materials until the tool is locked, so a lost race releases
+    // zero items.
+    let pending_tool = if let HaulTarget::Plan(plan_cell) = target {
+        let Some(state) = plans.get(plan_cell) else {
+            return false;
+        };
+        let required_tool_tag = required_tool_for_plan(
+            plan_cell,
+            &state.kind,
+            block_registry,
+            chunks,
+            chunk_map,
+        );
+        if let Some(tag) = &required_tool_tag {
+            if item_registry.tool_has_tag(equipped_tool.item, tag) {
+                None
+            } else {
+                let Some((entity, item, translation)) = find_nearest_unreserved_tool(
+                    tag,
+                    pose,
+                    npc_id,
+                    world_items,
+                    item_registry,
+                    reservations,
+                ) else {
+                    return false;
+                };
+                if !reservations.try_reserve(entity, npc_id) {
+                    return false;
+                }
+                Some(ReservedItem {
+                    entity,
+                    item,
+                    translation,
+                })
             }
-            Some(ReservedItem {
-                entity,
-                item,
-                translation,
-            })
+        } else {
+            None
         }
     } else {
         None
     };
 
-    // Single-stack carry — every queue entry must be the same ItemSlot.
-    // Pick the most-needed remaining kind; ties to iteration order.
-    let mut chosen_kind: Option<crate::items::ItemSlot> = None;
-    let mut remaining_for_kind: u32 = 0;
-    for m in &state.materials {
-        let remaining = m.needed.saturating_sub(m.present);
-        if remaining == 0 {
-            continue;
-        }
-        if remaining > remaining_for_kind {
-            chosen_kind = Some(m.item);
-            remaining_for_kind = remaining;
-        }
-    }
-    let Some(item_slot) = chosen_kind else {
-        if let Some(tool) = &pending_tool {
-            reservations.release(tool.entity, npc_id);
-        }
-        return false;
-    };
     let Some(pool) = items_by_slot.get(&item_slot) else {
         if let Some(tool) = &pending_tool {
             reservations.release(tool.entity, npc_id);
@@ -482,7 +526,7 @@ pub fn try_schedule_haul_for_npc(
     }
     info!(
         npc = npc_id.0,
-        plan = ?plan_cell.to_array(),
+        target = ?target,
         kind = item_slot.0,
         queued = queue.len(),
         tool = ?pending_tool.as_ref().map(|t| t.item.0),
@@ -491,12 +535,130 @@ pub fn try_schedule_haul_for_npc(
     assignments.insert(
         npc_id,
         HaulAssignment {
-            plan_cell,
+            target,
             queue,
             pending_tool,
         },
     );
     true
+}
+
+/// Chebyshev (chessboard) distance between two cells. Same metric
+/// used everywhere else in the scheduler for "is this within radius."
+fn chebyshev(a: IVec3, b: IVec3) -> i32 {
+    (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs())
+}
+
+/// Pick which kind to fetch for a haul target with multiple unmet
+/// demands. Single-stack carry means every queue entry is the same
+/// ItemSlot, so picking once at target-selection time keeps the
+/// "matchable items" check and the later reservation pass agreed on
+/// the same kind.
+///
+/// Strategy: greatest remaining count wins (ties to iteration order).
+/// Skips kinds with no reachable, unreserved items in the pool — a
+/// kind with 10 needed but no items nearby would route the NPC to a
+/// dead-end pickup leg.
+fn pick_haul_kind(
+    demands: impl IntoIterator<Item = (crate::items::ItemSlot, u32)>,
+    items_by_slot: &std::collections::HashMap<
+        crate::items::ItemSlot,
+        Vec<(Entity, Vec3)>,
+    >,
+    pose: Vec3,
+    npc_id: NpcId,
+    reservations: &WorldItemReservations,
+) -> Option<(crate::items::ItemSlot, u32)> {
+    let mut chosen: Option<(crate::items::ItemSlot, u32)> = None;
+    for (slot, remaining) in demands {
+        if remaining == 0 {
+            continue;
+        }
+        let Some(pool) = items_by_slot.get(&slot) else {
+            continue;
+        };
+        let reachable = pool.iter().any(|(entity, translation)| {
+            if reservations.is_taken_by_other(*entity, npc_id) {
+                return false;
+            }
+            (*translation - pose).length() <= MAX_HAUL_ITEM_RADIUS_M
+        });
+        if !reachable {
+            continue;
+        }
+        if chosen.map(|(_, c)| remaining > c).unwrap_or(true) {
+            chosen = Some((slot, remaining));
+        }
+    }
+    chosen
+}
+
+/// Per-item-slot deficit for a craft station: how much input is
+/// short across the station's not-yet-done queued orders, after
+/// accounting for current inventory and any active_work that has
+/// already drained its inputs.
+///
+/// Implementation: for each non-done order, multiply each recipe
+/// input by the order's `remaining`. If `active_work` is currently
+/// running and matches the order's recipe, one unit's inputs are
+/// already mid-craft (drained at WorkStation receive), so that unit
+/// doesn't add demand. The result is summed across orders, then
+/// the station's current inventory is subtracted.
+///
+/// Caller uses this to (a) tell whether a station needs hauling at
+/// all (empty result ⇒ no), and (b) which item slot to fetch.
+pub fn compute_station_demand(
+    state: &crate::craft_stations::StationState,
+    recipes: &crate::recipes::RecipeRegistry,
+    item_registry: &crate::items::ItemRegistry,
+) -> std::collections::HashMap<crate::items::ItemSlot, u32> {
+    use block_junk_mod_api::recipes::RecipeId;
+    let mut required: std::collections::HashMap<crate::items::ItemSlot, u32> =
+        std::collections::HashMap::new();
+    for order in &state.orders {
+        if order.is_done() {
+            continue;
+        }
+        let remaining = order.remaining();
+        // If this order is the one in active_work, one of its units
+        // has already had its inputs consumed (locked in at WorkStation
+        // receive). Skip the inputs for that one unit.
+        let in_flight = state
+            .active_work
+            .as_ref()
+            .is_some_and(|aw| aw.recipe_id == order.recipe_id);
+        let units_needing_inputs = if in_flight {
+            remaining.saturating_sub(1)
+        } else {
+            remaining
+        };
+        if units_needing_inputs == 0 {
+            continue;
+        }
+        let recipe_id = RecipeId::new(order.recipe_id.clone());
+        let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
+            continue;
+        };
+        let recipe = recipes.def(recipe_slot);
+        for input in &recipe.inputs {
+            let Some(input_slot) = item_registry.slot_of(&input.item) else {
+                continue;
+            };
+            *required.entry(input_slot).or_insert(0) += input.count * units_needing_inputs;
+        }
+    }
+    // Subtract inventory; drop entries with zero deficit so callers
+    // can treat `is_empty()` as "station has everything it needs."
+    let mut deficit: std::collections::HashMap<crate::items::ItemSlot, u32> =
+        std::collections::HashMap::new();
+    for (slot, qty) in required {
+        let have = state.inventory.get(&slot).copied().unwrap_or(0);
+        let need = qty.saturating_sub(have);
+        if need > 0 {
+            deficit.insert(slot, need);
+        }
+    }
+    deficit
 }
 
 /// What tool tag (if any) the plan at `cell` requires its worker to
@@ -644,7 +806,7 @@ mod tests {
         assignments.insert(
             NPC_1,
             HaulAssignment {
-                plan_cell: IVec3::ZERO,
+                target: HaulTarget::Plan(IVec3::ZERO),
                 queue: vec![
                     ReservedItem {
                         entity: a,
@@ -678,7 +840,7 @@ mod tests {
         assignments.insert(
             NPC_1,
             HaulAssignment {
-                plan_cell: IVec3::ZERO,
+                target: HaulTarget::Plan(IVec3::ZERO),
                 queue: vec![],
                 pending_tool: Some(ReservedItem {
                     entity: tool,

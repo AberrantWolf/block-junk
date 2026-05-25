@@ -384,6 +384,19 @@ pub enum ArrivalAction {
     /// another worker stole the inputs), release the
     /// `CraftAssignment` and return to Idle silently.
     WorkStation { station_cell: IVec3 },
+    /// Final leg of a station-haul cycle: arrive at a craft station
+    /// and drain the NPC's full carry stack into the station's
+    /// `inventory`. Phase 6c (station haul) — issued by the haul
+    /// scheduler when a station's queued orders have unmet inputs and
+    /// the NPC is carrying a matching item. Mirrors `DepositAtPlan`
+    /// in shape; the only difference is the deposit target
+    /// (CraftStations vs Plans) and the broadcast (StationUpdate vs
+    /// PlanEdit).
+    ///
+    /// If by arrival the station is gone (block destroyed) or no
+    /// longer wants the carry's item kind, the haul releases without
+    /// depositing — same convention as DepositAtPlan.
+    DepositAtStation { station_cell: IVec3 },
 }
 
 /// Native-side brain state. Holds the current goal + a tiny PRNG seed
@@ -776,6 +789,7 @@ pub(crate) fn preempt_eligible(goal: &Goal) -> bool {
             ArrivalAction::Work { .. }
                 | ArrivalAction::PickupForPlan { .. }
                 | ArrivalAction::DepositAtPlan { .. }
+                | ArrivalAction::DepositAtStation { .. }
                 | ArrivalAction::PickupTool { .. }
                 | ArrivalAction::WorkStation { .. }
         ),
@@ -816,6 +830,7 @@ pub(crate) fn preempt_release_holds(
             }
             ArrivalAction::PickupForPlan { .. }
             | ArrivalAction::DepositAtPlan { .. }
+            | ArrivalAction::DepositAtStation { .. }
             | ArrivalAction::PickupTool { .. } => {
                 release_haul_for(npc_id, haul_assignments, haul_reservations);
             }
@@ -1289,12 +1304,15 @@ fn npc_brain_tick(
                         .and_then(|a| {
                             pick_next_haul_leg(
                                 &pose,
-                                a.plan_cell,
+                                a.target,
                                 &carrying,
                                 cap,
                                 a.pending_tool.as_ref(),
                                 &a.queue,
                                 &haul.plans,
+                                &craft.stations,
+                                &craft.recipes,
+                                &haul.item_registry,
                                 &world,
                             )
                             .map(Some)
@@ -1410,12 +1428,164 @@ fn npc_brain_tick(
                         .and_then(|a| {
                             pick_next_haul_leg(
                                 &pose,
-                                a.plan_cell,
+                                a.target,
                                 &carrying,
                                 cap,
                                 a.pending_tool.as_ref(),
                                 &a.queue,
                                 &haul.plans,
+                                &craft.stations,
+                                &craft.recipes,
+                                &haul.item_registry,
+                                &world,
+                            )
+                            .map(Some)
+                            .unwrap_or(Some(None))
+                        })
+                        .flatten();
+                    match next_goal {
+                        Some(goal) => {
+                            if let Goal::MoveTo { path, .. } = &goal {
+                                npc_path.set_if_neq(NpcPath(path.clone()));
+                            }
+                            brain.goal = goal;
+                        }
+                        None => {
+                            release_haul_for(
+                                *npc_id,
+                                &mut haul.assignments,
+                                &mut haul.reservations,
+                            );
+                            brain.goal = Goal::Idle;
+                            if !npc_path.0.is_empty() {
+                                npc_path.0.clear();
+                            }
+                        }
+                    }
+                }
+                ArrivalAction::DepositAtStation { station_cell } => {
+                    // Validate the cell is still a station block. A
+                    // destroyed workbench between haul start and
+                    // arrival collapses to "release haul, idle." The
+                    // NPC keeps any leftover carry; the scheduler
+                    // finds a different target (plan or station) on
+                    // the next Idle entry.
+                    let station_ok = crate::craft_stations::lookup_station_def(
+                        station_cell,
+                        &chunks,
+                        &chunk_map,
+                        &block_registry,
+                    )
+                    .is_some();
+                    if !station_ok {
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?station_cell.to_array(),
+                            "haul deposit: station gone; releasing assignment",
+                        );
+                        release_haul_for(
+                            *npc_id,
+                            &mut haul.assignments,
+                            &mut haul.reservations,
+                        );
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    let (carry_item, carry_count) = match (carrying.item, carrying.count) {
+                        (Some(slot), c) if c > 0 => (slot, c),
+                        _ => {
+                            release_haul_for(
+                                *npc_id,
+                                &mut haul.assignments,
+                                &mut haul.reservations,
+                            );
+                            brain.goal = Goal::Idle;
+                            continue;
+                        }
+                    };
+                    // Cap deposit at the station's current demand for
+                    // this kind, so an NPC arriving with a partial
+                    // stack but a small unmet need doesn't over-supply
+                    // and orphan the leftover. Unlike Plans::deposit
+                    // (which caps internally), CraftStations::deposit
+                    // is unbounded — players intentionally dump whole
+                    // stacks via the modal — so the cap lives here at
+                    // the NPC-haul layer.
+                    let want = craft
+                        .stations
+                        .get(station_cell)
+                        .map(|s| {
+                            crate::haul::compute_station_demand(
+                                s,
+                                &craft.recipes,
+                                &haul.item_registry,
+                            )
+                            .get(&carry_item)
+                            .copied()
+                            .unwrap_or(0)
+                        })
+                        .unwrap_or(0);
+                    if want == 0 {
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?station_cell.to_array(),
+                            kind = carry_item.0,
+                            "haul deposit: station has no demand for carry; releasing",
+                        );
+                        release_haul_for(
+                            *npc_id,
+                            &mut haul.assignments,
+                            &mut haul.reservations,
+                        );
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    let accepted = want.min(carry_count);
+                    let state_after = {
+                        let state = craft.stations.get_or_insert(station_cell);
+                        state.deposit(carry_item, accepted);
+                        state.clone()
+                    };
+                    carrying.count = carry_count - accepted;
+                    if carrying.count == 0 {
+                        carrying.item = None;
+                    }
+                    info!(
+                        npc = npc_id.0,
+                        cell = ?station_cell.to_array(),
+                        accepted,
+                        "haul deposit (station) complete",
+                    );
+                    if let Some(server) = server {
+                        crate::craft_stations::broadcast_station(
+                            &mut haul.broadcast,
+                            server,
+                            station_cell,
+                            Some(state_after),
+                        );
+                    }
+                    // Pick next leg from the (possibly still active)
+                    // assignment. Same pattern as DepositAtPlan.
+                    let cap = haul
+                        .kind_registry
+                        .get(&kind.0)
+                        .map(|d| d.carry_capacity)
+                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+                    let next_goal = haul
+                        .assignments
+                        .get(*npc_id)
+                        .and_then(|a| {
+                            pick_next_haul_leg(
+                                &pose,
+                                a.target,
+                                &carrying,
+                                cap,
+                                a.pending_tool.as_ref(),
+                                &a.queue,
+                                &haul.plans,
+                                &craft.stations,
+                                &craft.recipes,
+                                &haul.item_registry,
                                 &world,
                             )
                             .map(Some)
@@ -1517,12 +1687,15 @@ fn npc_brain_tick(
                         .and_then(|a| {
                             pick_next_haul_leg(
                                 &pose,
-                                a.plan_cell,
+                                a.target,
                                 &carrying,
                                 cap,
                                 a.pending_tool.as_ref(),
                                 &a.queue,
                                 &haul.plans,
+                                &craft.stations,
+                                &craft.recipes,
+                                &haul.item_registry,
                                 &world,
                             )
                             .map(Some)
@@ -1620,6 +1793,7 @@ fn npc_brain_tick(
                     }
                     ArrivalAction::PickupForPlan { .. }
                     | ArrivalAction::DepositAtPlan { .. }
+                    | ArrivalAction::DepositAtStation { .. }
                     | ArrivalAction::PickupTool { .. } => {
                         // Stuck or timed out mid-haul: free the entire
                         // assignment + every reservation it holds. The
@@ -1962,8 +2136,10 @@ fn npc_brain_tick(
                     &equipped_tool,
                     &haul.kind_registry,
                     &haul.plans,
+                    &craft.stations,
                     &block_registry,
                     &haul.item_registry,
+                    &craft.recipes,
                     &chunks,
                     &chunk_map,
                     &haul.world_items,
@@ -1990,12 +2166,15 @@ fn npc_brain_tick(
                     .and_then(|a| {
                         pick_next_haul_leg(
                             &pose,
-                            a.plan_cell,
+                            a.target,
                             &carrying,
                             cap,
                             a.pending_tool.as_ref(),
                             &a.queue,
                             &haul.plans,
+                            &craft.stations,
+                            &craft.recipes,
+                            &haul.item_registry,
                             &world,
                         )
                         .map(Some)
@@ -2840,20 +3019,27 @@ fn plan_haul_move<W: Walkability>(
 /// - `Err(())` — pathfinding failed for whichever destination was
 ///   next; caller releases the haul and parks briefly. Same recovery
 ///   as the existing WorkPlan path-failure branch.
+#[allow(clippy::too_many_arguments, reason = "haul leg picker spans plan + station ctx")]
 fn pick_next_haul_leg<W: Walkability>(
     pose: &AvatarPose,
-    plan_cell: IVec3,
+    target: crate::haul::HaulTarget,
     carrying: &Carrying,
     carry_cap: u32,
     pending_tool: Option<&crate::haul::ReservedItem>,
     assignment_queue: &[crate::haul::ReservedItem],
     plans: &Plans,
+    stations: &crate::craft_stations::CraftStations,
+    recipes: &crate::recipes::RecipeRegistry,
+    item_registry: &crate::items::ItemRegistry,
     world: &W,
 ) -> Result<Option<Goal>, ()> {
+    use crate::haul::HaulTarget;
     // Tool prereq comes first. Until the NPC has the right tool, no
     // amount of material hauling helps — work would be gated at the
     // plan. Scheduler reserved this tool atomically, so by the time
-    // we read pending_tool here it's earmarked for this NPC.
+    // we read pending_tool here it's earmarked for this NPC. Station
+    // targets never set pending_tool (recipe tool gates are enforced
+    // by the *craft* scheduler, not the haul one).
     if let Some(tool) = pending_tool {
         return plan_haul_move(
             pose,
@@ -2868,19 +3054,32 @@ fn pick_next_haul_leg<W: Walkability>(
         .map(Some)
         .ok_or(());
     }
-    let plan_remaining = matches!(plans.get(plan_cell), Some(s) if !s.is_satisfied());
+    // "Target still wants more" check — plans use `is_satisfied`,
+    // stations use `compute_station_demand`. Both: missing entry ⇒
+    // target gone ⇒ no demand.
+    let target_remaining = match target {
+        HaulTarget::Plan(cell) => matches!(plans.get(cell), Some(s) if !s.is_satisfied()),
+        HaulTarget::Station(cell) => stations
+            .get(cell)
+            .map(|s| !crate::haul::compute_station_demand(s, recipes, item_registry).is_empty())
+            .unwrap_or(false),
+    };
     let carry_full = !carrying.is_empty() && carrying.count >= carry_cap;
     let queue_empty = assignment_queue.is_empty();
+    let deposit_arrival = match target {
+        HaulTarget::Plan(cell) => ArrivalAction::DepositAtPlan { plan_cell: cell },
+        HaulTarget::Station(cell) => ArrivalAction::DepositAtStation { station_cell: cell },
+    };
     // Walk to deposit if: carry has stuff AND (queue empty OR carry full
-    // OR plan no longer needs more). The "plan no longer needs more"
-    // path drops the leftover via deposit too — Plans::deposit rounds
-    // accepted to remaining-need and the leftover stays on the NPC for
-    // the next assignment.
-    if !carrying.is_empty() && (queue_empty || carry_full || !plan_remaining) {
+    // OR target no longer needs more). The "no longer needs more"
+    // path drops the leftover via deposit too — Plans::deposit /
+    // CraftStations::deposit round to remaining-need; any leftover
+    // stays on the NPC for the next assignment.
+    if !carrying.is_empty() && (queue_empty || carry_full || !target_remaining) {
         return plan_haul_move(
             pose,
-            plan_cell,
-            ArrivalAction::DepositAtPlan { plan_cell },
+            target.cell(),
+            deposit_arrival,
             HAUL_LEG_TIMEOUT_SECS,
             world,
         )
@@ -2888,17 +3087,22 @@ fn pick_next_haul_leg<W: Walkability>(
         .ok_or(());
     }
     // Walk to the next reserved item if: carry has room AND queue has
-    // items AND the plan still wants more. Pop happens at the *arrival*
-    // (pickup) handler, not here — `pick_next_haul_leg` only reads.
-    if !queue_empty && plan_remaining {
+    // items AND the target still wants more. Pop happens at the
+    // *arrival* (pickup) handler, not here — this fn only reads.
+    if !queue_empty && target_remaining {
         let next = assignment_queue[0];
+        // PickupForPlan's `plan_cell` field is the original target's
+        // cell — for station targets it carries the station_cell, used
+        // by the pickup arrival only for "where am I delivering this"
+        // diagnostics. The actual deposit destination is re-derived
+        // from `assignment.target` on the next leg.
         return plan_haul_move(
             pose,
             pose_to_foot_cell_of(next.translation),
             ArrivalAction::PickupForPlan {
                 item_entity: next.entity,
                 item_slot: next.item,
-                plan_cell,
+                plan_cell: target.cell(),
             },
             HAUL_LEG_TIMEOUT_SECS,
             world,
@@ -2906,9 +3110,9 @@ fn pick_next_haul_leg<W: Walkability>(
         .map(Some)
         .ok_or(());
     }
-    // Carry empty + (queue empty or plan satisfied). The assignment has
-    // run its course; release and idle. If the plan still needs more,
-    // the scheduler will create a fresh assignment next tick.
+    // Carry empty + (queue empty or target satisfied). The assignment
+    // has run its course; release and idle. If the target still needs
+    // more, the scheduler will create a fresh assignment next tick.
     Ok(None)
 }
 
@@ -2993,11 +3197,12 @@ fn build_snapshot(
     let pending_assignments = haul_assignments
         .get(id)
         .map(|a| {
+            let cell = a.target.cell();
             vec![PendingAssignment {
                 plan_cell: BlockPos {
-                    x: a.plan_cell.x,
-                    y: a.plan_cell.y,
-                    z: a.plan_cell.z,
+                    x: cell.x,
+                    y: cell.y,
+                    z: cell.z,
                 },
                 items_remaining: a.queue.len() as u32,
             }]
@@ -4046,7 +4251,7 @@ mod tests {
         assignments.insert(
             npc,
             HaulAssignment {
-                plan_cell,
+                target: crate::haul::HaulTarget::Plan(plan_cell),
                 queue: vec![ReservedItem {
                     entity: item_entity,
                     item: ItemSlot(0),
