@@ -130,6 +130,73 @@ impl StationState {
     }
 }
 
+/// Server-only: NPC ↔ station booking, used by the craft scheduler
+/// (Phase 6c-A) to prevent two NPCs walking to the same workstation.
+/// Bidirectional so the scheduler can ask "is this station taken?"
+/// in O(1) without scanning every NPC's assignment.
+///
+/// Distinct from [`ActiveWorkers`]: this records *intent to work*
+/// (NPC en route or working), keyed by `NpcId`; ActiveWorkers
+/// records *currently powering active_work*, keyed by `Entity`.
+/// Both can exist for the same cell simultaneously (NPC has arrived
+/// + registered as ActiveWorker) or only one (NPC is mid-walk: in
+/// CraftAssignments but not yet ActiveWorkers).
+///
+/// Doesn't persist across save/load — NPCs reset to Idle and the
+/// scheduler re-pairs from scratch, same pattern as HaulAssignments.
+#[derive(Resource, Default, Debug)]
+pub struct CraftAssignments {
+    by_npc: HashMap<crate::npc::NpcId, IVec3>,
+    by_station: HashMap<IVec3, crate::npc::NpcId>,
+}
+
+impl CraftAssignments {
+    /// Atomically book `npc` for `station`. Succeeds only if both
+    /// sides are free (or already point at each other — re-reserve
+    /// is idempotent). Returns true on success. Either-or-neither so
+    /// a half-failed reserve never leaves a dangling reverse entry.
+    pub fn try_reserve(&mut self, npc: crate::npc::NpcId, station: IVec3) -> bool {
+        match (self.by_npc.get(&npc), self.by_station.get(&station)) {
+            (Some(existing_cell), Some(existing_npc))
+                if *existing_cell == station && existing_npc.0 == npc.0 =>
+            {
+                true
+            }
+            (None, None) => {
+                self.by_npc.insert(npc, station);
+                self.by_station.insert(station, npc);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop the booking held by `npc`, if any. Removes both
+    /// directions in lockstep.
+    pub fn release_for_npc(&mut self, npc: crate::npc::NpcId) {
+        if let Some(station) = self.by_npc.remove(&npc) {
+            self.by_station.remove(&station);
+        }
+    }
+
+    /// True when `station` is booked by some NPC other than `npc`.
+    /// Scheduler uses this to skip targets already taken.
+    pub fn station_taken_by_other(&self, station: IVec3, npc: crate::npc::NpcId) -> bool {
+        match self.by_station.get(&station) {
+            Some(holder) => holder.0 != npc.0,
+            None => false,
+        }
+    }
+
+    pub fn station_of(&self, npc: crate::npc::NpcId) -> Option<IVec3> {
+        self.by_npc.get(&npc).copied()
+    }
+
+    pub fn contains_npc(&self, npc: crate::npc::NpcId) -> bool {
+        self.by_npc.contains_key(&npc)
+    }
+}
+
 /// Server-only: which connection (player) or future NPC entity is
 /// currently "powering" each station's `active_work`. The server
 /// tick only increments elapsed when this map has an entry for the
@@ -172,6 +239,10 @@ impl ActiveWorkers {
 
     pub fn has_worker(&self, cell: IVec3) -> bool {
         self.by_cell.contains_key(&cell)
+    }
+
+    pub fn worker_at(&self, cell: IVec3) -> Option<Entity> {
+        self.by_cell.get(&cell).copied()
     }
 }
 
@@ -229,6 +300,149 @@ impl CraftStations {
     pub fn snapshot(&self) -> Vec<(IVec3, StationState)> {
         self.by_cell.iter().map(|(c, s)| (*c, s.clone())).collect()
     }
+}
+
+/// Max Chebyshev distance (cells) from an NPC's foot to a craft
+/// station the scheduler will commit to. Same magnitude as the haul
+/// scheduler's plan radius so an NPC doesn't cross-map for one
+/// distant forge while a closer workbench sits with orders.
+pub(crate) const MAX_CRAFT_STATION_RADIUS_CELLS: i32 = 48;
+
+/// Per-NPC craft scheduler. Called from the brain-tick Idle entry
+/// BEFORE the haul scheduler. Returns `Some(station_cell)` when it
+/// books an assignment; the caller dispatches a `MoveTo` with
+/// [`ArrivalAction::WorkStation`](crate::npc::ArrivalAction::WorkStation).
+///
+/// Pick rule: nearest station (Chebyshev cells, within
+/// `MAX_CRAFT_STATION_RADIUS_CELLS`) where every gate clears:
+///   1. Station's block def declares a `station_tag` (it is a station).
+///   2. No active worker registered AND no in-progress `active_work`
+///      (resume of abandoned work is a future feature; for now only
+///      start-fresh orders qualify).
+///   3. At least one queued order whose recipe `station == station_tag`,
+///      `tier <= station_tier`, `required_tool` (if any) matches the
+///      NPC's `EquippedTool`, and whose inputs the station inventory
+///      currently satisfies.
+///   4. Not already booked in `CraftAssignments` by another NPC.
+///
+/// Atomic: the final `try_reserve` is the only mutation. A scheduler
+/// call that picks a target but loses the reservation race returns
+/// `None` and the next tick retries.
+#[allow(clippy::too_many_arguments, reason = "scheduler reaches into many subsystems")]
+pub fn try_schedule_craft_for_npc(
+    npc_id: crate::npc::NpcId,
+    pose: Vec3,
+    equipped_tool: &crate::protocol::EquippedTool,
+    stations: &CraftStations,
+    workers: &ActiveWorkers,
+    assignments: &mut CraftAssignments,
+    block_registry: &crate::blocks::BlockRegistry,
+    recipes: &crate::recipes::RecipeRegistry,
+    item_registry: &crate::items::ItemRegistry,
+    chunks: &Query<&crate::voxel::Chunk>,
+    chunk_map: &crate::voxel::ChunkMap,
+) -> Option<IVec3> {
+    use block_junk_mod_api::recipes::RecipeId;
+
+    if assignments.contains_npc(npc_id) {
+        return None;
+    }
+    let foot = IVec3::new(
+        pose.x.floor() as i32,
+        pose.y.floor() as i32,
+        pose.z.floor() as i32,
+    );
+
+    let mut best: Option<(IVec3, i32)> = None;
+    for (cell, state) in stations.iter() {
+        if assignments.station_taken_by_other(*cell, npc_id) {
+            continue;
+        }
+        if workers.has_worker(*cell) {
+            continue;
+        }
+        if state.active_work.is_some() {
+            // 6c-A skips abandoned in-progress crafts. A future patch
+            // can add a "resume if my tool matches" branch.
+            continue;
+        }
+        if state.orders.is_empty() {
+            continue;
+        }
+
+        let dist = (cell.x - foot.x)
+            .abs()
+            .max((cell.y - foot.y).abs())
+            .max((cell.z - foot.z).abs());
+        if dist > MAX_CRAFT_STATION_RADIUS_CELLS {
+            continue;
+        }
+        if let Some((_, best_dist)) = best {
+            if dist >= best_dist {
+                continue;
+            }
+        }
+
+        // Read the block at the station cell to get its tag + tier.
+        let (coord, local) = crate::voxel::world_to_chunk(*cell);
+        let Some(&chunk_entity) = chunk_map.0.get(&coord) else {
+            continue;
+        };
+        let Ok(chunk) = chunks.get(chunk_entity) else {
+            continue;
+        };
+        let block_slot = chunk.get(local);
+        if block_slot.is_empty() {
+            continue;
+        }
+        let block_def = block_registry.def(block_slot);
+        let Some(station_tag) = block_def.station_tag.as_ref() else {
+            continue;
+        };
+        let max_tier = block_def.station_tier;
+
+        // At least one order workable right now (recipe matches the
+        // station's tag/tier, inputs satisfied, tool gate met).
+        let any_workable = state.orders.iter().any(|order| {
+            if order.is_done() {
+                return false;
+            }
+            let recipe_id = RecipeId::new(order.recipe_id.clone());
+            let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
+                return false;
+            };
+            let recipe = recipes.def(recipe_slot);
+            if recipe.station != *station_tag || recipe.tier > max_tier {
+                return false;
+            }
+            if let Some(tag) = &recipe.required_tool
+                && !item_registry.tool_has_tag(equipped_tool.item, tag)
+            {
+                return false;
+            }
+            recipe.inputs.iter().all(|input| {
+                let Some(slot) = item_registry.slot_of(&input.item) else {
+                    return false;
+                };
+                state.inventory.get(&slot).copied().unwrap_or(0) >= input.count
+            })
+        });
+        if !any_workable {
+            continue;
+        }
+        best = Some((*cell, dist));
+    }
+
+    let (cell, _) = best?;
+    if !assignments.try_reserve(npc_id, cell) {
+        return None;
+    }
+    info!(
+        npc = npc_id.0,
+        cell = ?cell.to_array(),
+        "craft assignment booked",
+    );
+    Some(cell)
 }
 
 /// Server → client: per-cell broadcast. `state: None` is the "remove
@@ -313,6 +527,7 @@ impl Plugin for CraftStationsServerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CraftStations>();
         app.init_resource::<ActiveWorkers>();
+        app.init_resource::<CraftAssignments>();
         app.add_observer(send_stations_full_sync_on_connect);
         app.add_observer(release_workers_on_disconnect);
         app.add_systems(
@@ -667,7 +882,6 @@ fn receive_work_start(
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
-    use block_junk_mod_api::recipes::RecipeId;
     let Ok(server) = servers.single() else {
         return;
     };
@@ -704,65 +918,27 @@ fn receive_work_start(
             }
             // Case 2: no active_work. Find the first queued order
             // whose recipe is valid at this station + inputs are
-            // available, then start it.
-            let state = stations.get_or_insert(req.station_cell);
-            let mut started = false;
-            for order_idx in 0..state.orders.len() {
-                let order = &state.orders[order_idx];
-                if order.is_done() {
-                    continue;
-                }
-                let recipe_id = RecipeId::new(order.recipe_id.clone());
-                let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
-                    continue;
-                };
-                let recipe = recipes.def(recipe_slot);
-                if recipe.station != station_def.tag || recipe.tier > station_def.tier {
-                    continue;
-                }
-                let inputs_ok = recipe.inputs.iter().all(|input| {
-                    let Some(slot) = item_registry.slot_of(&input.item) else {
-                        return false;
-                    };
-                    state.inventory.get(&slot).copied().unwrap_or(0) >= input.count
-                });
-                if !inputs_ok {
-                    continue;
-                }
-                let recipe_id_str = order.recipe_id.clone();
-                let total_secs = recipe.duration_secs;
-                // Lock inputs in by consuming up front. Cancel
-                // refunds; completion produces the output.
-                for input in &recipe.inputs {
-                    let slot = item_registry.slot_of(&input.item).expect("checked");
-                    state.try_consume(slot, input.count);
-                }
-                state.active_work = Some(ActiveWork {
-                    recipe_id: recipe_id_str.clone(),
-                    total_secs,
-                    elapsed_secs: 0.0,
-                });
-                started = true;
-                info!(
-                    cell = ?req.station_cell.to_array(),
-                    recipe = %recipe_id_str,
-                    duration = total_secs,
-                    "station work started",
-                );
-                break;
-            }
+            // available, then start it. Shared with the NPC arrival
+            // path — single source of truth for "start the first
+            // satisfiable order."
+            let _ = stations.get_or_insert(req.station_cell);
+            let started = try_start_first_satisfiable_order(
+                req.station_cell,
+                connection,
+                &station_def,
+                &item_registry,
+                &recipes,
+                &mut stations,
+                &mut workers,
+            )
+            .is_some();
             if started {
-                workers.register(req.station_cell, connection);
                 let snapshot = stations.get(req.station_cell).cloned();
-                broadcast_station(
-                    &mut broadcast,
-                    server,
-                    req.station_cell,
-                    snapshot,
-                );
+                broadcast_station(&mut broadcast, server, req.station_cell, snapshot);
             } else {
-                // Nothing to start. The empty get_or_insert above
-                // may have left an empty state behind — clean up.
+                // The get_or_insert above may have left an empty
+                // state behind — clean up so the by-cell map stays
+                // sparse.
                 stations.remove_if_empty(req.station_cell);
             }
         }
@@ -810,6 +986,7 @@ const WORK_PROGRESS_BROADCAST_INTERVAL_SECS: f32 = 0.25;
 /// `WORK_PROGRESS_BROADCAST_INTERVAL_SECS` so the modal's progress
 /// label can advance. The completion broadcast happens regardless.
 #[allow(clippy::too_many_arguments, reason = "tick joins many subsystems")]
+#[allow(clippy::too_many_arguments, reason = "completion path joins many subsystems")]
 fn tick_station_work(
     time: Res<Time>,
     item_registry: Res<crate::items::ItemRegistry>,
@@ -819,6 +996,10 @@ fn tick_station_work(
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut commands: Commands,
+    chunks: Query<&crate::voxel::Chunk>,
+    chunk_map: Res<crate::voxel::ChunkMap>,
+    block_registry: Res<crate::blocks::BlockRegistry>,
+    npc_q: Query<(), With<crate::npc::Npc>>,
     mut next_broadcast_in: Local<f32>,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
@@ -940,20 +1121,55 @@ fn tick_station_work(
             order_done,
             "station work complete",
         );
-        // Completion clears the worker — the player would send
-        // WorkStop next frame anyway, but tidying server-side
-        // means a player who holds through completion doesn't
-        // accidentally start a brand-new craft on the same hold
-        // (they'd need to release + re-press).
-        workers.force_clear(cell);
-        let snapshot = state.clone();
-        let now_empty = snapshot.is_empty();
+        // NPC workers auto-continue with the next satisfiable order
+        // so they don't have to round-trip through Idle to keep
+        // crafting (Phase 6c-A "park until done"). Players clear on
+        // completion — their hold-L-click UX requires a re-press
+        // before the next craft starts. Determining "is this an
+        // NPC?" is a single ECS lookup on the worker entity.
+        let worker_entity = workers.worker_at(cell);
+        let worker_is_npc = worker_entity
+            .map(|e| npc_q.get(e).is_ok())
+            .unwrap_or(false);
+        let mut auto_continued = false;
+        if worker_is_npc && let Some(worker) = worker_entity {
+            // Look up the station def fresh in case the block was
+            // replaced mid-craft (degenerate but defensive).
+            if let Some(station_def) = lookup_station_def(
+                cell,
+                &chunks,
+                &chunk_map,
+                &block_registry,
+            ) && try_start_first_satisfiable_order(
+                cell,
+                worker,
+                &station_def,
+                &item_registry,
+                &recipes,
+                &mut stations,
+                &mut workers,
+            )
+            .is_some()
+            {
+                auto_continued = true;
+            }
+        }
+        if !auto_continued {
+            // Either a player worker (release + re-press to continue)
+            // or no next satisfiable order — clear the registration
+            // so the station goes paused (paused-with-active_work
+            // never happens here since we already set it to None
+            // above; this just frees the slot for the next worker).
+            workers.force_clear(cell);
+        }
+        let snapshot = stations.get(cell).cloned();
+        let now_empty = snapshot.as_ref().map(|s| s.is_empty()).unwrap_or(true);
         stations.remove_if_empty(cell);
         broadcast_station(
             &mut broadcast,
             server,
             cell,
-            if now_empty { None } else { Some(snapshot) },
+            if now_empty { None } else { snapshot },
         );
     }
 }
@@ -962,12 +1178,12 @@ fn tick_station_work(
 /// tier) pair. `None` ⇒ cell is empty, unloaded, or holds a
 /// non-station block. Skips having to thread an Option<&BlockDef>
 /// through every handler.
-struct StationDefView {
-    tag: block_junk_mod_api::blocks::TagId,
-    tier: u8,
+pub(crate) struct StationDefView {
+    pub(crate) tag: block_junk_mod_api::blocks::TagId,
+    pub(crate) tier: u8,
 }
 
-fn lookup_station_def(
+pub(crate) fn lookup_station_def(
     cell: IVec3,
     chunks: &Query<&crate::voxel::Chunk>,
     chunk_map: &crate::voxel::ChunkMap,
@@ -988,10 +1204,91 @@ fn lookup_station_def(
     })
 }
 
+/// Shared "start the first satisfiable order at this station for
+/// this worker" path. Used by the player [`receive_work_start`]
+/// (Case 2), the NPC arrival handler in `npc_brain_tick`
+/// (`ArrivalAction::WorkStation`), and the auto-continue branch of
+/// [`tick_station_work`] (start the next order when an NPC's current
+/// craft completes).
+///
+/// Returns `Some(recipe_id)` of the order that was started, or `None`
+/// when no order matches (queue empty, no inputs available, tier/tag
+/// mismatch). On success: inputs are consumed up front (locked in;
+/// Cancel refunds, completion produces output), `active_work` is set,
+/// `worker_entity` is registered in [`ActiveWorkers`] for the cell
+/// (idempotent — re-registering the same worker is a no-op). Does NOT
+/// broadcast — callers handle the [`StationUpdate`] since
+/// `tick_station_work` already broadcasts at the bottom of its
+/// completion path and double-broadcasting on the same tick would
+/// be wasted bandwidth.
+///
+/// Caller is responsible for `stations.remove_if_empty(cell)` on the
+/// `None` path — this helper doesn't probe emptiness because the
+/// player path's `get_or_insert` already created the entry and the
+/// NPC path always has an existing entry to act on.
+pub(crate) fn try_start_first_satisfiable_order(
+    station_cell: IVec3,
+    worker_entity: Entity,
+    station_def: &StationDefView,
+    item_registry: &crate::items::ItemRegistry,
+    recipes: &crate::recipes::RecipeRegistry,
+    stations: &mut CraftStations,
+    workers: &mut ActiveWorkers,
+) -> Option<String> {
+    use block_junk_mod_api::recipes::RecipeId;
+    let state = stations.get_mut(station_cell)?;
+    let mut started_recipe_id: Option<String> = None;
+    for order_idx in 0..state.orders.len() {
+        let order = &state.orders[order_idx];
+        if order.is_done() {
+            continue;
+        }
+        let recipe_id = RecipeId::new(order.recipe_id.clone());
+        let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
+            continue;
+        };
+        let recipe = recipes.def(recipe_slot);
+        if recipe.station != station_def.tag || recipe.tier > station_def.tier {
+            continue;
+        }
+        let inputs_ok = recipe.inputs.iter().all(|input| {
+            let Some(slot) = item_registry.slot_of(&input.item) else {
+                return false;
+            };
+            state.inventory.get(&slot).copied().unwrap_or(0) >= input.count
+        });
+        if !inputs_ok {
+            continue;
+        }
+        let recipe_id_str = order.recipe_id.clone();
+        let total_secs = recipe.duration_secs;
+        for input in &recipe.inputs {
+            let slot = item_registry.slot_of(&input.item).expect("checked");
+            state.try_consume(slot, input.count);
+        }
+        state.active_work = Some(ActiveWork {
+            recipe_id: recipe_id_str.clone(),
+            total_secs,
+            elapsed_secs: 0.0,
+        });
+        started_recipe_id = Some(recipe_id_str);
+        break;
+    }
+    if let Some(recipe_id_str) = &started_recipe_id {
+        workers.register(station_cell, worker_entity);
+        info!(
+            cell = ?station_cell.to_array(),
+            recipe = %recipe_id_str,
+            "station work started",
+        );
+    }
+    started_recipe_id
+}
+
 /// Helper: send one `StationUpdate` to every client. `state = None`
 /// signals "remove this cell from the mirror" — used when an order
 /// completes and the station has nothing left.
-fn broadcast_station(
+pub(crate) fn broadcast_station(
     broadcast: &mut ServerMultiMessageSender,
     server: &Server,
     cell: IVec3,
@@ -1004,5 +1301,67 @@ fn broadcast_station(
         &NetworkTarget::All,
     ) {
         warn!("station update broadcast failed: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::npc::NpcId;
+
+    #[test]
+    fn craft_assignments_try_reserve_atomic_both_or_neither() {
+        let mut a = CraftAssignments::default();
+        let npc = NpcId(1);
+        let cell = IVec3::new(5, 6, 7);
+
+        // First reserve: succeeds, both sides populated.
+        assert!(a.try_reserve(npc, cell));
+        assert_eq!(a.station_of(npc), Some(cell));
+        assert!(a.contains_npc(npc));
+
+        // Re-reserve same pairing: idempotent.
+        assert!(a.try_reserve(npc, cell));
+
+        // Conflict — same NPC, different station: refuses (NPC already
+        // booked elsewhere). Reverse map untouched.
+        let other_cell = IVec3::new(10, 6, 7);
+        assert!(!a.try_reserve(npc, other_cell));
+        assert_eq!(a.station_of(npc), Some(cell));
+
+        // Conflict — different NPC, same station: refuses.
+        let other_npc = NpcId(2);
+        assert!(!a.try_reserve(other_npc, cell));
+        assert!(!a.contains_npc(other_npc));
+    }
+
+    #[test]
+    fn craft_assignments_release_clears_both_directions() {
+        let mut a = CraftAssignments::default();
+        let npc = NpcId(7);
+        let cell = IVec3::new(0, 0, 0);
+        assert!(a.try_reserve(npc, cell));
+        a.release_for_npc(npc);
+        assert!(!a.contains_npc(npc));
+        // Reverse map is clean — another NPC can now claim the same
+        // station.
+        let other = NpcId(8);
+        assert!(a.try_reserve(other, cell));
+    }
+
+    #[test]
+    fn craft_assignments_station_taken_by_other_distinguishes_self() {
+        let mut a = CraftAssignments::default();
+        let me = NpcId(1);
+        let other = NpcId(2);
+        let cell = IVec3::new(3, 4, 5);
+        assert!(a.try_reserve(me, cell));
+        // I don't see my own booking as "taken by other"...
+        assert!(!a.station_taken_by_other(cell, me));
+        // ...but another NPC does.
+        assert!(a.station_taken_by_other(cell, other));
+        // Empty cell is taken by no one.
+        let empty = IVec3::new(99, 99, 99);
+        assert!(!a.station_taken_by_other(empty, me));
     }
 }

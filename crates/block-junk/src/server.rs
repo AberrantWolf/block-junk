@@ -2029,6 +2029,9 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
                 Some(*target_cell),
             )
         }
+        Goal::CraftingAtStation { station_cell } => {
+            ("crafting".into(), Some(*station_cell))
+        }
     }
 }
 

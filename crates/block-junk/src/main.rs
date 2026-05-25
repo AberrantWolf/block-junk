@@ -3,6 +3,7 @@ mod blocks;
 mod camera;
 mod client;
 mod collision;
+mod craft_progress_hud;
 mod craft_stations;
 mod craft_ui;
 mod debug;

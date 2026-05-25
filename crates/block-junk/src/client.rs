@@ -50,6 +50,7 @@ impl Plugin for ClientPlugin {
             .add_plugins(PlansClientPlugin)
             .add_plugins(crate::craft_stations::CraftStationsClientPlugin)
             .add_plugins(crate::craft_ui::CraftUiPlugin)
+            .add_plugins(crate::craft_progress_hud::CraftProgressHudPlugin)
             .add_plugins(InspectPanelPlugin)
             // Frame interpolation smooths AvatarPose between FixedUpdate
             // ticks during PostUpdate render. Without it, on a high-refresh

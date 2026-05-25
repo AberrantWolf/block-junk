@@ -234,6 +234,24 @@ pub enum Goal {
         plan_kind: PlanKind,
         need_restore: Option<NeedRestore>,
     },
+    /// Parked at a craft station, registered as the active worker
+    /// while the server's `tick_station_work` drives the order to
+    /// completion. Phase 6c-A. Entered only via a successful arrival
+    /// on [`ArrivalAction::WorkStation`].
+    ///
+    /// Unlike [`Goal::Working`] there's no NPC-side timer — the
+    /// progress lives on the station's `active_work` field. The brain
+    /// holds position with zero `MovementIntent` and checks each tick
+    /// whether work remains (active_work present OR a queued order
+    /// the inventory satisfies). When neither is true the brain
+    /// returns to Idle, unregisters from `ActiveWorkers`, and releases
+    /// its `CraftAssignment` for the next NPC to take.
+    ///
+    /// Order-to-order continuation happens server-side: when
+    /// `tick_station_work` completes one order and the next queued
+    /// order's inputs are still satisfied, it auto-starts the next
+    /// `active_work` so the NPC keeps crafting without re-routing.
+    CraftingAtStation { station_cell: IVec3 },
 }
 
 /// Pre-computed pose-snap for a
@@ -354,6 +372,18 @@ pub enum ArrivalAction {
         item_entity: Entity,
         item_slot: ItemSlot,
     },
+    /// Arrive at a craft station and begin work. Phase 6c-A — created
+    /// by the craft scheduler when an NPC has the right tool (if
+    /// any) and the station has a queued order whose inputs the
+    /// inventory satisfies. On arrival: find the first satisfiable
+    /// order, consume its inputs, create `active_work`, register the
+    /// NPC entity in `ActiveWorkers`, transition the brain to
+    /// [`Goal::CraftingAtStation`].
+    ///
+    /// If by arrival no order is still satisfiable (player Cancel,
+    /// another worker stole the inputs), release the
+    /// `CraftAssignment` and return to Idle silently.
+    WorkStation { station_cell: IVec3 },
 }
 
 /// Native-side brain state. Holds the current goal + a tiny PRNG seed
@@ -697,6 +727,19 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
 ///      errors disable just this one NPC's brain.
 ///   4. Steer the [`MovementIntent`] toward the current waypoint
 ///      (Wander only — Idle and Resting both clear intent).
+/// SystemParam bundle for the craft-station scheduler + arrival
+/// handlers (Phase 6c-A). Folded into one slot to keep the brain tick
+/// under Bevy 0.18's 16-SystemParam ceiling — same reason
+/// [`HaulCtx`] is bundled. Group is "everything the craft scheduler
+/// and the WorkStation arrival need to mutate or read."
+#[derive(bevy::ecs::system::SystemParam)]
+struct CraftCtx<'w> {
+    stations: ResMut<'w, crate::craft_stations::CraftStations>,
+    workers: ResMut<'w, crate::craft_stations::ActiveWorkers>,
+    assignments: ResMut<'w, crate::craft_stations::CraftAssignments>,
+    recipes: Res<'w, crate::recipes::RecipeRegistry>,
+}
+
 /// SystemParam bundle for plan + haul resources that the brain tick
 /// reaches for in phase 3. Folded into one slot because the brain tick
 /// is already at the Bevy 0.18 16-SystemParam ceiling — every loose
@@ -727,12 +770,14 @@ struct HaulCtx<'w, 's> {
 pub(crate) fn preempt_eligible(goal: &Goal) -> bool {
     match goal {
         Goal::Working { .. } => true,
+        Goal::CraftingAtStation { .. } => true,
         Goal::MoveTo { on_arrive, .. } => matches!(
             on_arrive,
             ArrivalAction::Work { .. }
                 | ArrivalAction::PickupForPlan { .. }
                 | ArrivalAction::DepositAtPlan { .. }
                 | ArrivalAction::PickupTool { .. }
+                | ArrivalAction::WorkStation { .. }
         ),
         _ => false,
     }
@@ -774,6 +819,12 @@ pub(crate) fn preempt_release_holds(
             | ArrivalAction::PickupTool { .. } => {
                 release_haul_for(npc_id, haul_assignments, haul_reservations);
             }
+            ArrivalAction::WorkStation { .. } => {
+                // CraftAssignment release handled by the calling
+                // brain-tick site (it has access to CraftAssignments
+                // + ActiveWorkers, neither of which lives in this
+                // pure helper's signature). See preempt-craft task.
+            }
             _ => {}
         },
         Goal::Interacting {
@@ -786,6 +837,11 @@ pub(crate) fn preempt_release_holds(
         Goal::Interacting { .. } => {}
         Goal::Working { target_cell, .. } => {
             plan_claims.release(*target_cell, npc_id);
+        }
+        Goal::CraftingAtStation { .. } => {
+            // CraftAssignment + ActiveWorkers release handled by the
+            // brain-tick caller. Same reason as ArrivalAction::WorkStation
+            // above — those resources aren't in this helper's scope.
         }
     }
 }
@@ -880,6 +936,7 @@ fn npc_brain_tick(
     interactable_index: Res<InteractableIndex>,
     mut interaction_claims: ResMut<InteractionClaims>,
     mut haul: HaulCtx,
+    mut craft: CraftCtx,
     world_clock: Res<WorldClock>,
     mut commands: Commands,
     mut npcs: Query<
@@ -959,6 +1016,20 @@ fn npc_brain_tick(
                     threshold = threshold,
                     "preempt: aborting current goal for survival",
                 );
+                // Craft-specific release happens BEFORE the generic
+                // preempt path mutates brain.goal — once goal is
+                // overwritten to Idle, we can't read the
+                // station_cell back out. The Active worker slot is
+                // freed too so paused active_work doesn't trap the
+                // station behind a no-longer-present worker.
+                let craft_station_cell = match &brain.goal {
+                    Goal::CraftingAtStation { station_cell } => Some(*station_cell),
+                    Goal::MoveTo {
+                        on_arrive: ArrivalAction::WorkStation { station_cell },
+                        ..
+                    } => Some(*station_cell),
+                    _ => None,
+                };
                 preempt_current_goal(
                     *npc_id,
                     entity,
@@ -977,6 +1048,14 @@ fn npc_brain_tick(
                     &chunk_map,
                     &block_registry,
                 );
+                if let Some(cell) = craft_station_cell {
+                    craft.assignments.release_for_npc(*npc_id);
+                    craft.workers.release(cell, entity);
+                    // Don't refund consumed inputs — active_work
+                    // persists so any future worker (player or
+                    // another NPC) can resume the in-progress craft.
+                    // Preempt is a pause, not a cancel.
+                }
                 preempted_this_tick = true;
                 *intent = MovementIntent::default();
             }
@@ -996,6 +1075,11 @@ fn npc_brain_tick(
         let mut rest_done = false;
         let mut interact_completed = false;
         let mut work_done = false;
+        // Set by the CraftingAtStation arm when the brain detects
+        // end-conditions (station out of work, lost worker slot, or
+        // assignment cleared). Consumed below to release the
+        // CraftAssignment + ActiveWorker entry and drop back to Idle.
+        let mut crafting_done_at: Option<IVec3> = None;
         match &mut brain.goal {
             Goal::Idle => {}
             Goal::Resting { remaining_secs } => {
@@ -1014,6 +1098,30 @@ fn npc_brain_tick(
                 *remaining_secs -= dt;
                 if *remaining_secs <= 0.0 {
                     work_done = true;
+                }
+            }
+            Goal::CraftingAtStation { station_cell } => {
+                // No NPC-side timer — the station's `active_work`
+                // ticks server-side. End-condition: leave when I'm no
+                // longer the registered worker (someone else took the
+                // station, or I got unregistered via Cancel) OR the
+                // station has nothing left to work on (`active_work`
+                // is None AND no satisfiable queued order). Task #14's
+                // auto-continue handles "active_work completes →
+                // start next order" so a transient None state during
+                // one tick is fine; a None state with nothing to
+                // start is the real end.
+                let station_cell_local = *station_cell;
+                let still_me = craft.workers.worker_at(station_cell_local) == Some(entity);
+                let still_assigned =
+                    craft.assignments.station_of(*npc_id) == Some(station_cell_local);
+                let work_in_progress = craft
+                    .stations
+                    .get(station_cell_local)
+                    .and_then(|s| s.active_work.as_ref())
+                    .is_some();
+                if !still_me || !still_assigned || !work_in_progress {
+                    crafting_done_at = Some(station_cell_local);
                 }
             }
             Goal::MoveTo {
@@ -1441,6 +1549,56 @@ fn npc_brain_tick(
                         }
                     }
                 }
+                ArrivalAction::WorkStation { station_cell } => {
+                    // Resolve the station def + try to start the first
+                    // queued order whose inputs the inventory still
+                    // satisfies. If no order qualifies (player Cancel
+                    // mid-walk, inventory drained by another worker),
+                    // release the CraftAssignment and drop to Idle —
+                    // the scheduler may re-pair us next tick or fall
+                    // through to haul.
+                    let station_def = crate::craft_stations::lookup_station_def(
+                        station_cell,
+                        &chunks,
+                        &chunk_map,
+                        &block_registry,
+                    );
+                    let started = if let Some(station_def) = station_def {
+                        crate::craft_stations::try_start_first_satisfiable_order(
+                            station_cell,
+                            entity,
+                            &station_def,
+                            &haul.item_registry,
+                            &craft.recipes,
+                            &mut craft.stations,
+                            &mut craft.workers,
+                        )
+                        .is_some()
+                    } else {
+                        false
+                    };
+                    if started {
+                        if let Some(server) = server {
+                            let snapshot =
+                                craft.stations.get(station_cell).cloned();
+                            crate::craft_stations::broadcast_station(
+                                &mut haul.broadcast,
+                                server,
+                                station_cell,
+                                snapshot,
+                            );
+                        }
+                        brain.goal = Goal::CraftingAtStation { station_cell };
+                    } else {
+                        info!(
+                            npc = npc_id.0,
+                            station = ?station_cell.to_array(),
+                            "craft arrival: no satisfiable order; releasing booking",
+                        );
+                        craft.assignments.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                    }
+                }
             }
         }
         // Abandonment of a MoveTo with an action that reserved a
@@ -1471,6 +1629,13 @@ fn npc_brain_tick(
                             &mut haul.assignments,
                             &mut haul.reservations,
                         );
+                    }
+                    ArrivalAction::WorkStation { .. } => {
+                        // Stuck mid-walk-to-station: release the
+                        // booking so another NPC (or this one next
+                        // tick) can take it. No worker registration
+                        // exists yet — arrival is what registers.
+                        craft.assignments.release_for_npc(*npc_id);
                     }
                     _ => {}
                 }
@@ -1616,6 +1781,21 @@ fn npc_brain_tick(
             }
             brain.goal = Goal::Idle;
         }
+        // Crafting end-condition cleanup: release the booking + the
+        // ActiveWorker slot, then drop to Idle. Triggered by the
+        // CraftingAtStation arm when the station ran out of work or
+        // the NPC's worker registration was cleared. Done here (not
+        // inline in the match) so we don't double-borrow `craft`.
+        if let Some(station_cell) = crafting_done_at {
+            craft.workers.release(station_cell, entity);
+            craft.assignments.release_for_npc(*npc_id);
+            info!(
+                npc = npc_id.0,
+                station = ?station_cell.to_array(),
+                "crafting complete or interrupted; releasing station",
+            );
+            brain.goal = Goal::Idle;
+        }
         if matches!(brain.goal, Goal::Idle) {
             // Self-rescue: if the NPC's pose isn't standable, A* will
             // bail on every goal the planner picks and we'll loop
@@ -1649,6 +1829,106 @@ fn npc_brain_tick(
                         if !npc_path.0.is_empty() {
                             npc_path.0.clear();
                         }
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                }
+            }
+            // Phase 6c-A: craft scheduler runs BEFORE haul. "Skills
+            // first, hauling fallback" — an NPC who can do useful work
+            // at a nearby station (inventory satisfies an order, tool
+            // matches) takes that work in preference to hauling
+            // materials around. This delivers the user's natural-
+            // fallout requirement: free NPCs do skilled work when
+            // workable; only idle-skilled-NPCs fall back to hauling.
+            if !preempted_this_tick
+                && !craft.assignments.contains_npc(*npc_id)
+                && !haul.assignments.contains(*npc_id)
+                && let Some(station_cell) =
+                    crate::craft_stations::try_schedule_craft_for_npc(
+                        *npc_id,
+                        pose.translation,
+                        &equipped_tool,
+                        &craft.stations,
+                        &craft.workers,
+                        &mut craft.assignments,
+                        &block_registry,
+                        &craft.recipes,
+                        &haul.item_registry,
+                        &chunks,
+                        &chunk_map,
+                    )
+            {
+                // Walk to a standable neighbour of the station block.
+                // Station cells are solid (the workbench itself), so
+                // the path target is one of the surrounding floor
+                // cells. Same pattern as the WorkPlan dispatch below.
+                let foot = pose_to_standable_foot(&pose, &world)
+                    .unwrap_or_else(|| pose_to_foot_cell(&pose));
+                let stand_cell = nearest_standable_neighbor(station_cell, foot, &world);
+                let path = stand_cell.and_then(|stand| {
+                    if stand == foot {
+                        Some(vec![foot])
+                    } else {
+                        find_path(
+                            foot,
+                            stand,
+                            &world,
+                            ASTAR_NODE_BUDGET,
+                            ASTAR_PATH_BUDGET,
+                        )
+                        .map(|raw| smooth_path(raw, &world))
+                        .filter(|p| p.len() >= 1)
+                    }
+                });
+                match path {
+                    Some(path) if path.len() >= 2 => {
+                        npc_path.set_if_neq(NpcPath(path.clone()));
+                        brain.goal = Goal::MoveTo {
+                            path,
+                            progress: 0.0,
+                            deadline_secs: 60.0,
+                            last_pos: pose.translation,
+                            stuck_secs: 0.0,
+                            on_arrive: ArrivalAction::WorkStation { station_cell },
+                            snap: None,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                    Some(_) => {
+                        // Already adjacent to the station — skip the
+                        // walk, jump straight to the arrival handler
+                        // by synthesising a one-cell path. Same trick
+                        // the WorkPlan path uses when foot == stand.
+                        if !npc_path.0.is_empty() {
+                            npc_path.0.clear();
+                        }
+                        brain.goal = Goal::MoveTo {
+                            path: vec![foot],
+                            progress: 0.0,
+                            deadline_secs: 1.0,
+                            last_pos: pose.translation,
+                            stuck_secs: 0.0,
+                            on_arrive: ArrivalAction::WorkStation { station_cell },
+                            snap: None,
+                        };
+                        *intent = MovementIntent::default();
+                        continue;
+                    }
+                    None => {
+                        // No standable neighbour or A* failed.
+                        // Release the booking; next tick may find a
+                        // different station or fall through to haul.
+                        info!(
+                            npc = npc_id.0,
+                            station = ?station_cell.to_array(),
+                            "craft commit: no path to station; releasing booking",
+                        );
+                        craft.assignments.release_for_npc(*npc_id);
                         brain.goal = Goal::Resting {
                             remaining_secs: MIN_REST_SECS,
                         };
@@ -2405,6 +2685,23 @@ fn npc_brain_tick(
                         dyaw,
                     };
                 }
+            }
+            Goal::CraftingAtStation { station_cell } => {
+                // Face the station while crafting. No forward motion —
+                // the body is parked. Yaw aim keeps the NPC visually
+                // engaged with the workbench.
+                let aim = waypoint_xz(*station_cell);
+                let Some(dyaw) = aim_yaw_step(pose_xz, pose.yaw, aim, dt) else {
+                    *intent = MovementIntent::default();
+                    continue;
+                };
+                *intent = MovementIntent {
+                    wishdir: [0, 0, 0],
+                    jump: false,
+                    toggle_mode: false,
+                    interact: false,
+                    dyaw,
+                };
             }
             Goal::Idle | Goal::Resting { .. } => {
                 *intent = MovementIntent::default();
@@ -3645,6 +3942,23 @@ mod tests {
                 plan_kind: PlanKind::Remove,
                 need_restore: None,
             },
+            snap: None,
+        }));
+        // Phase 6c-A: crafting at a station is preemptable (a tired
+        // NPC mid-craft should drop the workbench and head for bed).
+        // MoveTo with WorkStation arrival is too — we'd rather pivot
+        // to survival than walk to the workbench just to be preempted
+        // on arrival.
+        assert!(preempt_eligible(&Goal::CraftingAtStation {
+            station_cell: cell,
+        }));
+        assert!(preempt_eligible(&Goal::MoveTo {
+            path: vec![cell],
+            progress: 0.0,
+            deadline_secs: 30.0,
+            last_pos: Vec3::ZERO,
+            stuck_secs: 0.0,
+            on_arrive: ArrivalAction::WorkStation { station_cell: cell },
             snap: None,
         }));
 
