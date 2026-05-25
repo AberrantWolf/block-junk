@@ -68,12 +68,15 @@ engine.items.register {
     tool_tags = { "vanilla:pickaxe" },
 }
 
--- Crafting outputs (Phase 6a). Wood planks are the first recipe
--- product; mesh + color stand in for a future planks asset.
+-- Crafting outputs (Phase 6a). KayKit Resource Bits
+-- "Wood_Planks_Stack_Small": short stack of milled boards, shares
+-- `resource_bits_texture.png` with the log/stone-chunk items.
+-- Visually distinct from the cylindrical Wood_Log_B so a dropped
+-- planks pile reads differently from a dropped log.
 engine.items.register {
     id = "vanilla:wood_planks",
     display_name = "Wood Planks",
-    mesh = "mods://vanilla/models/Wood_Log_B.gltf",
+    mesh = "mods://vanilla/models/Wood_Planks_Stack_Small.gltf",
     color = { 0.72, 0.55, 0.32 },
 }
 
@@ -443,7 +446,21 @@ register {
     },
 }
 
--- Phase 6a: first craft station. Solid cube placeholder mesh; the
+-- Phase 6a: first craft station. KayKit Mystery Monthly "Toy_Workbench"
+-- mesh — a proper workbench shape, distinct from the planks-textured
+-- wood block. Natural bounds 3×1.5×2.06 m. The gltf node bakes in
+-- a uniform scale of 2/3 (one float across all three axes — no skew)
+-- and a +0.5 m X translation. Post-transform extents:
+--   X: -0.5 → 1.5  (exactly two cells wide along the +X extends axis)
+--   Y:  0.0 → 1.0  (fits one cell tall)
+--   Z: -0.505 → 0.871  (asymmetric in mesh-local; mounted tools and
+--                       a saw arm extend forward into +Z, slightly
+--                       past the cell footprint — intentional, the
+--                       voxel mesher skips the footprint cells'
+--                       faces so adjacent airspace renders normally)
+-- footprint = anchor + one cell to the east, same pattern as the bed.
+-- entity_aabb is tight to the scaled mesh so the place/break raycast
+-- can't catch clicks behind the workbench or above its 1 m tabletop.
 -- station_tag pairs with the `vanilla:planks_from_log` recipe below.
 -- materials cost = 2 wood_log so plan-build pricing makes sense even
 -- for the simple block.
@@ -456,7 +473,12 @@ register {
         support_below = true,
     },
     color = { 0.55, 0.42, 0.25 },
-    pattern = "planks",
+    mesh = "mods://vanilla/models/Toy_Workbench.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.505 },
+        max = {  1.5, 1.0,  0.871 },
+    },
     station_tag = "vanilla:carpentry",
     station_tier = 1,
     materials = {
