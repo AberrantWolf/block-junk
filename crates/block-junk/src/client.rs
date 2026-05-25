@@ -369,6 +369,40 @@ struct HotbarSlot(usize);
 #[derive(Component)]
 struct HotbarRoot;
 
+/// Which kind of icon a hotbar slot renders. Voxel blocks have a
+/// meaningful 16x16 pattern texture; mesh blocks (workbench, forge,
+/// bed) don't — their look is the gltf, and using the pattern
+/// texture would make the hotbar entry look like terrain. For those
+/// we fall back to a white-bg slot with a 3-letter text label
+/// derived from the block's display name.
+enum HotbarIconKind {
+    Image(Handle<Image>),
+    Label(String),
+}
+
+/// Derive the short text shown in the hotbar slot for a mesh block:
+/// first three characters of the first word of the display name,
+/// title-cased ("Berry basket" → "Ber", "Workbench" → "Wor", "Forge"
+/// → "For", "Bed" → "Bed"). Ascii-only — non-ascii names fall through
+/// to whatever `take(3)` yields on the byte-stream, acceptable for
+/// the placeholder labels we use today.
+fn short_label(display_name: &str) -> String {
+    let first_word = display_name.split_whitespace().next().unwrap_or("");
+    let mut out = String::with_capacity(3);
+    for (i, ch) in first_word.chars().take(3).enumerate() {
+        if i == 0 {
+            for up in ch.to_uppercase() {
+                out.push(up);
+            }
+        } else {
+            for lo in ch.to_lowercase() {
+                out.push(lo);
+            }
+        }
+    }
+    out
+}
+
 #[derive(Component)]
 struct ActionProgressBar;
 
@@ -428,6 +462,7 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     palette: Res<PlaceablePalette>,
     textures: Res<BlockTextures>,
+    block_registry: Res<crate::blocks::BlockRegistry>,
     animations: Res<crate::npc_registry::AnimationRegistry>,
     existing: Option<Res<AvatarAssets>>,
 ) {
@@ -636,15 +671,33 @@ fn setup_scene(
                         ));
                     });
                 for (i, entry) in palette.0.iter().enumerate() {
-                    let (icon, bg) = match entry {
+                    // Three icon paths:
+                    //   - Destroy slot → bundled pickaxe sprite.
+                    //   - Block with mesh (workbench, forge, bed, etc.) →
+                    //     white-bg text label. The pattern-derived texture
+                    //     would look like terrain and gets confused with
+                    //     real grass/stone/wood blocks.
+                    //   - Voxel block → its baked 16x16 pattern texture.
+                    let slot_bg = Color::srgba(0.1, 0.1, 0.1, 0.6);
+                    let (icon_kind, bg) = match entry {
                         PaletteSlot::Destroy => (
-                            destroy_icon.clone(),
+                            HotbarIconKind::Image(destroy_icon.clone()),
                             Color::srgba(0.35, 0.10, 0.10, 0.7),
                         ),
-                        PaletteSlot::Block(slot) => (
-                            textures.icons[slot.0 as usize].clone(),
-                            Color::srgba(0.1, 0.1, 0.1, 0.6),
-                        ),
+                        PaletteSlot::Block(slot) => {
+                            let def = block_registry.def(*slot);
+                            if def.mesh.is_some() {
+                                (
+                                    HotbarIconKind::Label(short_label(&def.display_name)),
+                                    slot_bg,
+                                )
+                            } else {
+                                (
+                                    HotbarIconKind::Image(textures.icons[slot.0 as usize].clone()),
+                                    slot_bg,
+                                )
+                            }
+                        }
                     };
                     column
                         .spawn((
@@ -660,15 +713,40 @@ fn setup_scene(
                             BackgroundColor(bg),
                             HotbarSlot(i),
                         ))
-                        .with_children(|slot_parent| {
-                            slot_parent.spawn((
-                                ImageNode::new(icon),
-                                Node {
-                                    width: Val::Px(32.0),
-                                    height: Val::Px(32.0),
-                                    ..default()
-                                },
-                            ));
+                        .with_children(|slot_parent| match icon_kind {
+                            HotbarIconKind::Image(handle) => {
+                                slot_parent.spawn((
+                                    ImageNode::new(handle),
+                                    Node {
+                                        width: Val::Px(32.0),
+                                        height: Val::Px(32.0),
+                                        ..default()
+                                    },
+                                ));
+                            }
+                            HotbarIconKind::Label(text) => {
+                                slot_parent
+                                    .spawn((
+                                        Node {
+                                            width: Val::Px(32.0),
+                                            height: Val::Px(32.0),
+                                            justify_content: JustifyContent::Center,
+                                            align_items: AlignItems::Center,
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::WHITE),
+                                    ))
+                                    .with_children(|inner| {
+                                        inner.spawn((
+                                            Text::new(text),
+                                            TextFont {
+                                                font_size: 14.0,
+                                                ..default()
+                                            },
+                                            TextColor(Color::srgb(0.12, 0.12, 0.12)),
+                                        ));
+                                    });
+                            }
                         });
                 }
             });

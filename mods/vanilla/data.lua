@@ -80,6 +80,15 @@ engine.items.register {
     color = { 0.72, 0.55, 0.32 },
 }
 
+-- Second crafted output: stone bricks from the forge (Phase 6c). Same
+-- "small stack" convention as planks. Reuses resource_bits_texture.png.
+engine.items.register {
+    id = "vanilla:stone_brick",
+    display_name = "Stone Brick",
+    mesh = "mods://vanilla/models/Stone_Bricks_Stack_Small.gltf",
+    color = { 0.60, 0.58, 0.55 },
+}
+
 -- Masks + ramps composited per-block by the chunk fragment shader.
 -- Slot order is registration order; refs from `layers` below resolve
 -- against these by id at boot. Mods can register their own with
@@ -486,8 +495,41 @@ register {
     },
 }
 
--- Recipes (Phase 6a). One per station for the MVP; multi-recipe
--- selection UI lands when a station gains its second recipe.
+-- Phase 6c: second craft station. KayKit RPG Tools Bits "anvil" mesh
+-- — natural bounds 1.617×0.8×0.75 m, so the gltf node bakes a uniform
+-- 0.6 scale (one float across all three axes — no skew) shrinking it
+-- to 0.97×0.48×0.45 m: fits inside a single 1 m cell with a small X
+-- buffer, sits roughly knee-high. Single-cell footprint (default).
+-- Reuses tools_bits_texture.png already in this directory.
+--
+-- station_tag = "vanilla:smithing" — the first non-carpentry tag, so
+-- the recipe registry exercises >1 station/tag pair. materials = 4
+-- stone_chunk so the player has a clear reason to gather stone first
+-- (the forge costs more than the workbench in raw materials, matching
+-- the "smithing requires more setup than carpentry" stereotype).
+register {
+    id = "vanilla:forge",
+    display_name = "Forge",
+    flags = {
+        solid = true,
+        room_boundary = true,
+        support_below = true,
+    },
+    color = { 0.38, 0.36, 0.40 },
+    mesh = "mods://vanilla/models/anvil.gltf",
+    entity_aabb = {
+        min = { -0.543, 0.0, -0.225 },
+        max = {  0.427, 0.48, 0.225 },
+    },
+    station_tag = "vanilla:smithing",
+    station_tier = 1,
+    materials = {
+        { item = "vanilla:stone_chunk", count = 4 },
+    },
+}
+
+-- Recipes. One per station for the MVP; multi-recipe selection UI
+-- lands when a station gains its second recipe.
 engine.recipes.register {
     id = "vanilla:planks_from_log",
     display_name = "Wood planks (from log)",
@@ -497,6 +539,18 @@ engine.recipes.register {
     output = { item = "vanilla:wood_planks", count = 1 },
     duration_secs = 4.0,
     station = "vanilla:carpentry",
+    tier = 1,
+}
+
+engine.recipes.register {
+    id = "vanilla:bricks_from_chunk",
+    display_name = "Stone brick (from chunk)",
+    inputs = {
+        { item = "vanilla:stone_chunk", count = 1 },
+    },
+    output = { item = "vanilla:stone_brick", count = 1 },
+    duration_secs = 4.0,
+    station = "vanilla:smithing",
     tier = 1,
 }
 
