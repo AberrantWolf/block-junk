@@ -21,7 +21,6 @@
 //! send these messages. Gate on an auth/role flag once we have one.
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, Window};
 use bevy_egui::{EguiContexts, egui};
 use lightyear::prelude::*;
 
@@ -98,33 +97,25 @@ impl Default for InstantPlayerBuilds {
     }
 }
 
-/// Toggle the debug panel on F3 and also un/relock the cursor so the
-/// panel's buttons are actually clickable. The cursor-lock toggle
-/// mirrors `camera::capture`/`release_cursor` rather than calling them
-/// — the camera plugin owns its own discard-next-motion bookkeeping
-/// and going through there from a non-state-transition system would
-/// risk a phantom mouse delta on re-capture. The minor duplication
-/// is the right trade for a dev-only panel.
+/// Toggle the debug panel on F3. Cursor lock is NOT handled here —
+/// `UiCaptures` is the SSOT; acquiring `UiCapture::DebugPanel` is
+/// enough, the `apply_cursor_mode` system in [`crate::ui_capture`]
+/// handles the window. See that module's docs for why direct cursor
+/// toggling here would re-introduce the cursor/input-state desync
+/// bug class.
 fn toggle_debug_panel(
     keys: Res<ButtonInput<KeyCode>>,
     mut open: ResMut<DebugPanelOpen>,
-    mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
+    mut captures: ResMut<crate::ui_capture::UiCaptures>,
 ) {
     if !keys.just_pressed(KeyCode::F3) {
         return;
     }
     open.0 = !open.0;
-    let Ok((mut window, mut cursor)) = windows.single_mut() else {
-        return;
-    };
     if open.0 {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
+        captures.acquire(crate::ui_capture::UiCapture::DebugPanel);
     } else {
-        let centre = Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
-        window.set_cursor_position(Some(centre));
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
+        captures.release(crate::ui_capture::UiCapture::DebugPanel);
     }
 }
 
@@ -150,7 +141,7 @@ fn debug_panel_ui(
     mut fill_plan_sender: Query<&mut MessageSender<DebugFillNearestPlan>>,
     mut spawn_tools_sender: Query<&mut MessageSender<DebugSpawnTools>>,
     mut spawn_workbench_sender: Query<&mut MessageSender<DebugSpawnWorkbench>>,
-    mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
+    mut captures: ResMut<crate::ui_capture::UiCaptures>,
 ) {
     if !open.0 {
         return;
@@ -261,16 +252,12 @@ fn debug_panel_ui(
             }
         });
     // If egui's title-bar X just closed the window, mirror the F3
-    // path: relock the cursor so the player can keep playing without
-    // having to press F3 to re-grab focus.
+    // path: release the DebugPanel capture so apply_cursor_mode
+    // relocks the cursor automatically. Direct cursor toggling here
+    // would re-introduce the bug class UiCaptures was built to
+    // eliminate.
     if open.0 && !show_open {
-        if let Ok((mut window, mut cursor)) = windows.single_mut() {
-            let centre =
-                Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
-            window.set_cursor_position(Some(centre));
-            cursor.grab_mode = CursorGrabMode::Locked;
-            cursor.visible = false;
-        }
+        captures.release(crate::ui_capture::UiCapture::DebugPanel);
     }
     open.0 = show_open;
 

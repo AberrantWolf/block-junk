@@ -13,7 +13,6 @@
 
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::*;
 
@@ -216,7 +215,7 @@ impl DragVerb {
 fn plan_mode_input(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mode: Res<PlayerMode>,
     cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
@@ -229,17 +228,13 @@ fn plan_mode_input(
     mut drag: ResMut<PlanDragState>,
     mut sender: Query<&mut MessageSender<PlanEditBatch>>,
 ) {
-    // Mode switch or losing cursor lock mid-drag — drop the in-flight
+    // Mode switch or any overlay open mid-drag — drop the in-flight
     // rectangle so we don't accidentally commit one on the next click.
     if *mode != PlayerMode::Plan {
         drag.active = None;
         return;
     }
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
+    if captures.is_captured() {
         drag.active = None;
         return;
     }

@@ -19,7 +19,6 @@
 //! for debug (F3) so in-game UI reads as a distinct visual layer.
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use lightyear::prelude::*;
 
 use crate::blocks::{BlockRegistry, BlockSlot};
@@ -132,7 +131,7 @@ fn spawn_inspect_panel(mut commands: Commands, existing: Query<(), With<InspectP
 
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
 fn refresh_inspect_target(
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     drag: Res<PlanDragState>,
     cam: Query<&GlobalTransform, With<FlyCam>>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
@@ -144,13 +143,9 @@ fn refresh_inspect_target(
     mut target: ResMut<InspectTarget>,
     mut sender: Query<&mut MessageSender<RequestNpcDetails>>,
 ) {
-    // Cursor unlocked (menu / alt-tab) or mid-drag: hide the panel.
+    // Overlay open (menu / modal) or mid-drag: hide the panel.
     // Plan-mode drag preview owns the visual layer until release.
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked || drag.active.is_some() {
+    if captures.is_captured() || drag.active.is_some() {
         if !matches!(target.state, InspectState::None) {
             target.state = InspectState::None;
         }

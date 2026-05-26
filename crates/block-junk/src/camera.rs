@@ -4,6 +4,7 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::menu::AppState;
 use crate::protocol::AvatarPose;
+use crate::ui_capture::{DiscardNextMotion, UiCaptures};
 
 /// Per-camera mouse-look state. The avatar's `AvatarPose.yaw` is the
 /// authoritative running yaw; this component holds local-only pitch and
@@ -33,26 +34,17 @@ pub struct FlyCamPlugin;
 
 impl Plugin for FlyCamPlugin {
     fn build(&self, app: &mut App) {
-        // Cursor capture is bound to the InGame state. Entering InGame
-        // locks the cursor; leaving it (to MainMenu or Paused) releases.
-        // The pause menu shortcut (Esc) lives in MenuPlugin, not here.
-        app.init_resource::<DiscardNextMotion>()
-            .add_systems(OnEnter(AppState::InGame), lock_cursor)
+        // Cursor capture is bound to AppState transitions: entering
+        // InGame locks the cursor, leaving releases. During gameplay
+        // the [`UiCaptures`] SSOT owns the cursor — overlays
+        // acquire/release captures and the apply_cursor_mode system
+        // handles the window. lock_cursor / release_cursor here only
+        // bridge the state-transition boundary.
+        app.add_systems(OnEnter(AppState::InGame), lock_cursor)
             .add_systems(OnExit(AppState::InGame), release_cursor)
             .add_systems(Update, fly_cam_input.run_if(in_state(AppState::InGame)));
     }
 }
-
-/// Set on every cursor capture/recentre, cleared by the first nonzero
-/// motion that arrives afterwards. macOS's `CGWarpMouseCursorPosition`
-/// accumulates the warp distance into the *next user-generated* motion
-/// event — which can land many frames later, not the next tick — so a
-/// fixed-frame discard isn't enough. Discarding the first nonzero motion
-/// after capture catches the synthetic delta whenever it actually shows up.
-/// Cost: occasionally drops one legitimate motion frame (~16ms) on
-/// platforms that don't add a warp delta. Imperceptible.
-#[derive(Resource, Default)]
-struct DiscardNextMotion(bool);
 
 fn lock_cursor(
     mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
@@ -83,22 +75,22 @@ fn capture(window: &mut Window, cursor: &mut CursorOptions, discard: &mut Discar
 
 fn fly_cam_input(
     motion: Res<AccumulatedMouseMotion>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<UiCaptures>,
     mut cam: Query<(&mut FlyCam, &mut Transform, &AvatarPose)>,
     mut discard: ResMut<DiscardNextMotion>,
 ) {
     let Ok((mut cam, mut transform, pose)) = cam.single_mut() else {
         return;
     };
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
+    // Single SSOT check: mouse-look fires when no overlay is holding
+    // the cursor. The cursor's actual `grab_mode` is downstream of
+    // this state and should not be queried as the source of truth.
+    let active = !captures.is_captured();
 
     // Mouse-look only — translation goes through MovementIntent → the shared
     // controller now, so WASD / Space / Shift drive the avatar in both
     // walk and fly modes via the input pipeline.
-    if locked && motion.delta != Vec2::ZERO {
+    if active && motion.delta != Vec2::ZERO {
         if discard.0 {
             // First nonzero motion since capture is the warp's phantom delta;
             // skip it once and resume normal processing.

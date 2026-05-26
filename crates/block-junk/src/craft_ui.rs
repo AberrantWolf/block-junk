@@ -12,7 +12,10 @@
 //! Modal lifecycle:
 //! 1. Player L-clicks a station block → `normal_mode_action_input`
 //!    sets `CraftStationUiState.open_cell = Some(cell)`.
-//! 2. Cursor unlocks via `craft_modal_cursor_lock` (Changed-detected).
+//! 2. `sync_craft_modal_capture` mirrors `open_cell` into `UiCaptures`
+//!    (acquire when open, release when closed). The single
+//!    `apply_cursor_mode` system reads UiCaptures and toggles the
+//!    window's grab_mode — this module never touches it directly.
 //! 3. This module's `draw_craft_modal` renders an egui window each
 //!    frame the state is open.
 //! 4. Close button / Esc / station-block-gone clears `open_cell`.
@@ -24,7 +27,7 @@ use lightyear::prelude::*;
 use crate::blocks::BlockRegistry;
 use crate::craft_stations::{
     CancelOrder, CraftStationUiState, CraftStations, DepositToStation, QueueOrder,
-    craft_modal_cursor_lock,
+    sync_craft_modal_capture,
 };
 use crate::items::ItemRegistry;
 use crate::menu::AppState;
@@ -44,7 +47,7 @@ impl Plugin for CraftUiPlugin {
                 close_on_block_gone,
                 close_on_escape,
                 toggle_modal_with_f_key,
-                craft_modal_cursor_lock,
+                sync_craft_modal_capture,
             )
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),
@@ -116,7 +119,7 @@ pub(crate) fn close_on_escape(
 #[allow(clippy::too_many_arguments, reason = "modal toggle pulls from many subsystems")]
 fn toggle_modal_with_f_key(
     keys: Res<ButtonInput<KeyCode>>,
-    cursors: Query<&bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     cam: Query<&GlobalTransform, With<crate::camera::FlyCam>>,
     chunks: Query<(&Chunk, &crate::voxel::ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
@@ -131,12 +134,9 @@ fn toggle_modal_with_f_key(
         ui_state.pending_quantities.clear();
         return;
     }
-    // Require cursor lock so F-in-pause-menu doesn't pop the modal.
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != bevy::window::CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
+    // SSOT: any overlay captured ⇒ ignore the F press. Prevents
+    // F-in-pause-menu / F-in-debug-panel from popping the craft modal.
+    if captures.is_captured() {
         return;
     }
     let Ok(cam_t) = cam.single() else {

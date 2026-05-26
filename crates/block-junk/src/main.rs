@@ -28,6 +28,7 @@ mod save;
 mod scripting;
 mod server;
 mod target_outline;
+mod ui_capture;
 mod voxel;
 
 use core::sync::atomic::AtomicBool;
@@ -195,6 +196,7 @@ fn run_client(preset: Option<LaunchMode>) {
             .chain()
             .run_if(in_state(AppState::InGame)),
     );
+    app.add_plugins(ui_capture::UiCapturesPlugin);
     app.add_plugins(MenuPlugin);
     app.add_plugins(NetworkPlugin {
         mode: NetMode::Client,

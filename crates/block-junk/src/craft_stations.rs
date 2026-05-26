@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -630,28 +629,24 @@ fn receive_station_update_broadcasts(
     }
 }
 
-/// Suppress the camera mouse-look + relock when the craft-order
-/// modal is open. Mirrors the F3 panel's cursor handling — opens
-/// the cursor so the modal is interactive; closes when the modal
-/// dismisses.
-pub fn craft_modal_cursor_lock(
+/// Reflect [`CraftStationUiState::open_cell`] into the [`UiCaptures`]
+/// SSOT. Lets the modal stay in charge of its own open state (set
+/// from many call sites — Esc handler, F-key toggle, block-gone
+/// auto-close, etc.) while the cursor lock lives in one place. The
+/// previous direct cursor toggling created a bug class where modal
+/// open/close paths got out of sync with cursor lock; this routes
+/// everything through the capture set.
+pub fn sync_craft_modal_capture(
     ui_state: Res<CraftStationUiState>,
-    mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
+    mut captures: ResMut<crate::ui_capture::UiCaptures>,
 ) {
     if !ui_state.is_changed() {
         return;
     }
-    let Ok((mut window, mut cursor)) = windows.single_mut() else {
-        return;
-    };
     if ui_state.is_open() {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
+        captures.acquire(crate::ui_capture::UiCapture::CraftModal);
     } else {
-        let centre = Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
-        window.set_cursor_position(Some(centre));
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
+        captures.release(crate::ui_capture::UiCapture::CraftModal);
     }
 }
 

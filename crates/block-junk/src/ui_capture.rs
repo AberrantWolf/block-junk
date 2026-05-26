@@ -1,0 +1,196 @@
+//! Single source of truth for "is a UI overlay holding the cursor?"
+//!
+//! The principle, learned the hard way from a real bug: cursor lock
+//! state and in-world input enable state MUST come from the same
+//! piece of state. The previous design had each overlay manually
+//! toggling `cursor.grab_mode` and each in-world input system
+//! independently checking `is_open()` flags. The two went out of
+//! sync when a single Esc press fired both the modal's close-handler
+//! AND the pause-menu toggle, leaving the cursor unlocked while the
+//! visible modal was gone. Hover-outlines (which don't gate on cursor
+//! lock) kept working; in-world clicks (which do) didn't. The bug
+//! looked like "L-click pickup is broken" instead of the truer
+//! statement "the cursor is unlocked when it shouldn't be."
+//!
+//! [`UiCaptures`] is the SSOT. Every overlay that wants the cursor
+//! [`acquire`](UiCaptures::acquire)s its [`UiCapture`] variant when it
+//! opens and [`release`](UiCaptures::release)s when it closes. The
+//! single [`apply_cursor_mode`] system reads the resource and applies
+//! the window's grab_mode + visibility — no other code touches them.
+//! Every in-world input system gates on
+//! [`is_captured`](UiCaptures::is_captured) — no `!locked` checks, no
+//! per-overlay `is_open()` checks. The cursor is locked ⇔ no captures
+//! held ⇔ in-world input is active. One fact, three uses.
+//!
+//! Adding a new overlay = one new [`UiCapture`] variant and an
+//! acquire/release call pair in the overlay's open/close logic.
+//! Adding a new in-world input system = one `if captures.is_captured()
+//! { return; }` line. There is no third option.
+
+use bevy::prelude::*;
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use std::collections::HashSet;
+
+/// One distinct UI overlay that currently wants the cursor. Add a
+/// variant when you build a new modal/dialog/in-flight cursor-takeover
+/// flow. Variants are compared by equality only — no payload — so
+/// "the craft modal is open" doesn't differ from "the craft modal
+/// is open for cell (1,2,3)." Per-overlay state lives in that
+/// overlay's resource; this enum is just the capture identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UiCapture {
+    /// Game pause overlay (Esc).
+    PauseMenu,
+    /// Craft-order modal (F-key on a station).
+    CraftModal,
+    /// F3 dev panel.
+    DebugPanel,
+}
+
+/// The set of overlays currently holding the cursor. Non-empty ⇒
+/// cursor is unlocked, in-world input suppressed. Empty ⇒ mouse-look
+/// mode, in-world input flowing.
+#[derive(Resource, Default, Debug)]
+pub struct UiCaptures {
+    active: HashSet<UiCapture>,
+}
+
+impl UiCaptures {
+    /// Mark `capture` as active. Idempotent — re-acquiring an already-
+    /// held capture is a no-op (no extra cursor toggling).
+    pub fn acquire(&mut self, capture: UiCapture) {
+        self.active.insert(capture);
+    }
+
+    /// Mark `capture` as no longer active. Idempotent — releasing
+    /// something that wasn't held is a no-op.
+    pub fn release(&mut self, capture: UiCapture) {
+        self.active.remove(&capture);
+    }
+
+    /// True when at least one overlay is capturing the cursor. Every
+    /// in-world input system gates on `!is_captured()` (or
+    /// equivalently early-returns on `is_captured()`).
+    pub fn is_captured(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    /// True when *some other* overlay than `me` is capturing. Used by
+    /// Esc handlers so a key press routes to the topmost overlay
+    /// rather than firing two close-handlers in the same tick. Self
+    /// is excluded so an overlay can ask "should I respond to this
+    /// Esc, or is something else going to consume it?"
+    pub fn has_other_than(&self, me: UiCapture) -> bool {
+        self.active.iter().any(|c| *c != me)
+    }
+}
+
+/// Set on every cursor recentre. The camera's mouse-look reader
+/// (`fly_cam_input`) consumes it on the first nonzero motion that
+/// arrives afterwards, dropping that one synthetic-warp delta. macOS's
+/// `CGWarpMouseCursorPosition` accumulates the warp distance into the
+/// *next user-generated* motion event — which can land many frames
+/// later — so a fixed-frame discard isn't enough. Owned by this
+/// module rather than the camera plugin because the SSOT principle
+/// extends here too: the warp happens whenever apply_cursor_mode
+/// recentres, which is whenever captures transitions to empty.
+#[derive(Resource, Default)]
+pub(crate) struct DiscardNextMotion(pub(crate) bool);
+
+/// Apply [`UiCaptures`] to the primary window. The single system that
+/// touches `cursor.grab_mode` / `cursor.visible` — every other system
+/// goes through `UiCaptures`. Runs every frame to keep the window in
+/// sync; `is_changed` short-circuit keeps the cost to one HashSet read
+/// plus a comparison on the common path.
+fn apply_cursor_mode(
+    captures: Res<UiCaptures>,
+    mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
+    mut discard: ResMut<DiscardNextMotion>,
+) {
+    if !captures.is_changed() {
+        return;
+    }
+    let Ok((mut window, mut cursor)) = windows.single_mut() else {
+        return;
+    };
+    if captures.is_captured() {
+        cursor.grab_mode = CursorGrabMode::None;
+        cursor.visible = true;
+    } else {
+        // Re-centre the cursor on relock so the next mouse delta reads
+        // from the middle of the screen, not wherever the player let
+        // it drift to while clicking through UI. Set the discard flag
+        // so the synthetic warp delta gets dropped by fly_cam_input.
+        let centre = Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
+        window.set_cursor_position(Some(centre));
+        cursor.grab_mode = CursorGrabMode::Locked;
+        cursor.visible = false;
+        discard.0 = true;
+    }
+}
+
+pub struct UiCapturesPlugin;
+
+impl Plugin for UiCapturesPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<UiCaptures>();
+        app.init_resource::<DiscardNextMotion>();
+        app.add_systems(Update, apply_cursor_mode);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_is_not_captured() {
+        let c = UiCaptures::default();
+        assert!(!c.is_captured());
+        assert!(!c.has_other_than(UiCapture::PauseMenu));
+    }
+
+    #[test]
+    fn acquire_release_round_trips() {
+        let mut c = UiCaptures::default();
+        c.acquire(UiCapture::CraftModal);
+        assert!(c.is_captured());
+        c.release(UiCapture::CraftModal);
+        assert!(!c.is_captured());
+    }
+
+    #[test]
+    fn acquire_is_idempotent() {
+        let mut c = UiCaptures::default();
+        c.acquire(UiCapture::CraftModal);
+        c.acquire(UiCapture::CraftModal);
+        c.release(UiCapture::CraftModal);
+        assert!(!c.is_captured());
+    }
+
+    #[test]
+    fn release_without_acquire_is_noop() {
+        let mut c = UiCaptures::default();
+        c.release(UiCapture::CraftModal);
+        assert!(!c.is_captured());
+    }
+
+    #[test]
+    fn has_other_than_excludes_self() {
+        let mut c = UiCaptures::default();
+        c.acquire(UiCapture::CraftModal);
+        assert!(!c.has_other_than(UiCapture::CraftModal));
+        assert!(c.has_other_than(UiCapture::PauseMenu));
+    }
+
+    #[test]
+    fn has_other_than_with_multiple_captures() {
+        let mut c = UiCaptures::default();
+        c.acquire(UiCapture::CraftModal);
+        c.acquire(UiCapture::DebugPanel);
+        // Both captures are active; each one still "has another."
+        assert!(c.has_other_than(UiCapture::CraftModal));
+        assert!(c.has_other_than(UiCapture::DebugPanel));
+        assert!(c.has_other_than(UiCapture::PauseMenu));
+    }
+}

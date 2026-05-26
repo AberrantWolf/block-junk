@@ -4,7 +4,6 @@ use bevy::animation::{AnimatedBy, AnimationTargetId};
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::*;
 
@@ -764,18 +763,15 @@ fn setup_scene(
 fn cycle_selected_or_rotation(
     scroll: Res<AccumulatedMouseScroll>,
     keys: Res<ButtonInput<KeyCode>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mode: Res<PlayerMode>,
     mut selected: ResMut<SelectedBlock>,
     mut rotation: ResMut<PlacementRotation>,
     palette: Res<PlaceablePalette>,
 ) {
-    // Don't steal scrolls from menus / unlocked cursor states.
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
+    // SSOT input gate: scroll only acts when no overlay holds the
+    // cursor. See [`crate::ui_capture`] for the design rationale.
+    if captures.is_captured() {
         return;
     }
     // Wheel only cycles blocks in Plan mode (where the selection picks
@@ -1262,7 +1258,7 @@ struct LocalPlayerState<'w, 's> {
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
 fn normal_mode_action_input(
     mouse: Res<ButtonInput<MouseButton>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mode: Res<PlayerMode>,
     time: Res<Time>,
     instant_builds: Res<crate::debug::InstantPlayerBuilds>,
@@ -1276,30 +1272,20 @@ fn normal_mode_action_input(
     local: LocalPlayerState,
     mut action: ResMut<PlayerActionState>,
     mut io: NormalActionIo,
-    craft_ui: Res<crate::craft_stations::CraftStationUiState>,
 ) {
-    // Suppress in-world input while the craft-order modal is open.
-    // Same mode-guard the F3 panel uses — cursor is unlocked, clicks
-    // go to the modal, world input pauses until the modal closes.
-    // The station work-hold sub-system handles its own modal-open
-    // cancel (sends WorkStop), so this branch just gates the
-    // pickup/self-work/destroy paths.
-    if craft_ui.is_open() {
+    // SSOT input gate: any open overlay (pause / craft modal / debug
+    // panel) suppresses in-world input. Single check replaces the
+    // earlier `craft_ui.is_open()` + `!locked` pair, which were
+    // independent flags that desynced (the bug class
+    // [`crate::ui_capture`] was built to eliminate).
+    if captures.is_captured() {
         action.active = None;
         return;
     }
-    // Only Normal uses the action timer. Switching modes or losing
-    // cursor lock mid-action cancels the in-flight progress so
-    // re-entering doesn't pick up a stale timer state.
+    // Only Normal uses the action timer. Switching modes mid-action
+    // cancels the in-flight progress so re-entering doesn't pick up
+    // a stale timer state.
     if *mode != PlayerMode::Normal {
-        action.active = None;
-        return;
-    }
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
         action.active = None;
         return;
     }
@@ -1504,14 +1490,10 @@ fn normal_mode_action_input(
 /// no-op when the player is empty-handed.
 fn drop_carry_input(
     keys: Res<ButtonInput<KeyCode>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mut sender: Query<&mut MessageSender<DropRequest>>,
 ) {
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
+    if captures.is_captured() {
         return;
     }
     if !keys.just_pressed(KeyCode::KeyQ) {
@@ -1536,23 +1518,21 @@ fn drop_carry_input(
 #[allow(clippy::too_many_arguments, reason = "work hold spans many subsystems")]
 fn station_work_hold_input(
     mouse: Res<ButtonInput<MouseButton>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mode: Res<PlayerMode>,
     cam: Query<&GlobalTransform, With<FlyCam>>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    craft_ui: Res<crate::craft_stations::CraftStationUiState>,
     mut work_start: Query<&mut MessageSender<crate::craft_stations::WorkStart>>,
     mut work_stop: Query<&mut MessageSender<crate::craft_stations::WorkStop>>,
     mut active_work_cell: Local<Option<IVec3>>,
 ) {
-    // Same input-gates the main action input uses.
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    let blocked = !locked || *mode != PlayerMode::Normal || craft_ui.is_open();
+    // Single SSOT gate. `captures.is_captured()` covers the previous
+    // `!locked` AND `craft_ui.is_open()` checks in one shot: when the
+    // modal is open it's captured, when alt-tabbed the WindowBlur
+    // capture (future) would be set, etc.
+    let blocked = captures.is_captured() || *mode != PlayerMode::Normal;
     // Determine current target.
     let target_cell: Option<IVec3> = if blocked {
         None
@@ -1631,14 +1611,10 @@ fn is_station_block(
 /// separate stack. Server no-ops on empty tool slot.
 fn drop_tool_input(
     keys: Res<ButtonInput<KeyCode>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mut sender: Query<&mut MessageSender<DropToolRequest>>,
 ) {
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
+    if captures.is_captured() {
         return;
     }
     if !keys.just_pressed(KeyCode::KeyT) {
@@ -2121,7 +2097,7 @@ fn update_placement_preview(
     cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
     chunks: Query<(&Chunk, &ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
     rotation: Res<PlacementRotation>,
@@ -2138,7 +2114,7 @@ fn update_placement_preview(
     // `Res<PlayerMode>` would push this past the 16-param `SystemParam`
     // cap in Bevy 0.18. Mode gating lives in a `run_if` on the system
     // registration plus `hide_preview_on_mode_change` for the leave-Build
-    // transition. Cursor-lock gating still happens here.
+    // transition. SSOT input gating still happens here.
     let hide = |entity: Option<Entity>, q: &mut Query<(&mut Visibility, &mut Transform)>| {
         if let Some(e) = entity {
             if let Ok((mut v, _)) = q.get_mut(e) {
@@ -2147,11 +2123,7 @@ fn update_placement_preview(
         }
     };
 
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
+    if captures.is_captured() {
         hide(state.cube_root, &mut roots);
         hide(state.scene_root, &mut roots);
         return;
@@ -2394,7 +2366,7 @@ fn receive_snapshots(
 /// keypress.
 fn buffer_input(
     keys: Res<ButtonInput<KeyCode>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mut flycam: Query<&mut FlyCam>,
     mut q: Query<&mut ActionState<MovementIntent>, With<InputMarker<MovementIntent>>>,
     mut prev_toggle: Local<bool>,
@@ -2403,13 +2375,10 @@ fn buffer_input(
         return;
     };
 
-    // Skip input while the cursor is free (alt-tabbed, settings menu).
-    // A default ActionState is what the controller treats as "no keys
-    // held, no rotation" — so we still tick through cleanly.
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
+    // Skip input while a UI overlay holds the cursor. A default
+    // ActionState is what the controller treats as "no keys held, no
+    // rotation" — so we still tick through cleanly.
+    let active = !captures.is_captured();
     // Drain mouse-motion accumulator into this tick's dyaw. fly_cam_input
     // refills it at render rate; the next FixedUpdate's controller folds
     // the drained value into pose.yaw on both client (predicted) and
@@ -2423,7 +2392,7 @@ fn buffer_input(
         dyaw,
         ..Default::default()
     };
-    if locked {
+    if active {
         let mut wd = [0i8; 3];
         // Convention: forward = -Z (matches Bevy yaw=0), right = +X, up = +Y.
         if keys.pressed(KeyCode::KeyW) { wd[2] -= 1; }
