@@ -700,4 +700,11 @@ engine.npcs.register {
         walk = "vanilla:walk",
         work = "vanilla:work",
     },
+    -- Per-tick velocity preservation (0..1). 0 = snap horizontal
+    -- velocity to wishdir target every FixedUpdate tick; 1 = keep
+    -- previous velocity (controller is horizontally inert, only
+    -- gravity + collisions move the NPC). Vanilla wanderers
+    -- path-follow precisely, so we want no momentum. Dial up if a
+    -- future heavy creature should feel slidey / hard to turn.
+    npc_momentum = 0.0,
 }

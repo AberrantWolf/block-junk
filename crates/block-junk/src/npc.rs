@@ -2,7 +2,8 @@
 //!
 //! **Layer 1 (this file, native Rust)** runs every fixed tick: decay
 //! needs, advance the current goal, write a [`MovementIntent`], step
-//! physics through the same `apply_walk_step` players use.
+//! physics through `npc_walk_step` (a momentum-tunable variant of
+//! the player's `apply_walk_step`; see `physics.rs`).
 //!
 //! **Layer 2 (Lua planner)** runs only when the engine asks: when an
 //! NPC's goal completes (the brain enters [`Goal::Idle`]). The planner
@@ -45,7 +46,7 @@ use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
 use crate::rooms::RoomMap;
 use crate::physics::{
-    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, standing_pose_translation,
+    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, standing_pose_translation,
 };
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
@@ -4045,24 +4046,30 @@ fn lookahead_point(path: &[IVec3], start_progress: f32, distance: f32) -> Vec2 {
     waypoint_xz(*path.last().expect("non-empty path"))
 }
 
-/// Run the same physics controller players use, against the brain-
-/// written `MovementIntent`. Mirrors `server_player_step` in server.rs
-/// modulo the source of the intent — NPC brain vs replicated player
-/// input. Actor-vs-actor contact is handled post-physics by
-/// `soft_separate_actors`, not in the sweep, so two actors can briefly
-/// overlap then get pushed apart gently rather than hard-stopping at
-/// contact.
+/// Run the NPC walk controller against the brain-written
+/// `MovementIntent`. Uses `npc_walk_step` (not the player's
+/// Quake-style `apply_walk_step`) so the per-kind `npc_momentum`
+/// from Lua can replace friction + acceleration with a simple
+/// lerp toward the wishdir target — NPCs path-follow precisely
+/// instead of sliding past waypoints. The kind's momentum is
+/// looked up by `NpcKind` each tick; a missing kind def falls back
+/// to 0.0 (snap-instant), same default as the kind-def field.
+///
+/// Actor-vs-actor contact stays in `soft_separate_actors`
+/// post-physics, so two NPCs can briefly overlap then get pushed
+/// apart gently rather than hard-stopping at contact.
 pub(crate) fn npc_physics_step(
     time: Res<Time>,
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
+    kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
     mut npcs: Query<
         (
             &mut AvatarPose,
             &mut AvatarVelocity,
             &mut AvatarOnGround,
-            &mut MovementMode,
+            &NpcKind,
             &MovementIntent,
         ),
         (With<Npc>, Without<KinematicLock>),
@@ -4074,8 +4081,20 @@ pub(crate) fn npc_physics_step(
         chunk_map: &chunk_map,
         registry: &registry,
     };
-    for (mut pose, mut vel, mut on_ground, mut mode, intent) in npcs.iter_mut() {
-        apply_walk_step(&mut pose, &mut vel, &mut on_ground, &mut mode, intent, dt, &world);
+    for (mut pose, mut vel, mut on_ground, kind, intent) in npcs.iter_mut() {
+        let momentum = kind_registry
+            .get(&kind.0)
+            .map(|def| def.npc_momentum)
+            .unwrap_or(0.0);
+        crate::physics::npc_walk_step(
+            &mut pose,
+            &mut vel,
+            &mut on_ground,
+            intent,
+            momentum,
+            dt,
+            &world,
+        );
     }
 }
 

@@ -182,6 +182,29 @@ pub struct NpcKindDef {
     /// Use-slot interactions override these by setting
     /// [`UseSlot.animation`](crate::blocks::UseSlot::animation).
     pub animations: NpcKindAnimations,
+    /// Per-tick velocity preservation in the NPC walk controller,
+    /// 0.0..=1.0. Each FixedUpdate tick the horizontal velocity is
+    /// lerped toward `wishdir * walk_speed`:
+    /// ```text
+    /// v.xz = v.xz * npc_momentum + target.xz * (1.0 - npc_momentum)
+    /// ```
+    /// So:
+    /// - `0.0` (default) → no momentum at all; the NPC's horizontal
+    ///   velocity snaps to its wishdir-derived target every tick.
+    ///   Stops on a dime when the brain stops asking for movement,
+    ///   turns instantly at waypoints.
+    /// - `1.0` → velocity is fully preserved; the controller never
+    ///   changes XZ velocity (gravity and collisions still apply, so
+    ///   the NPC will eventually grind to a halt against geometry).
+    /// - Values in between trade off responsiveness for sliding feel
+    ///   (e.g. `0.9` ≈ heavy momentum, drift past corners).
+    ///
+    /// Players use a separate Quake-style controller with friction +
+    /// acceleration; this field only affects NPCs, who path-follow
+    /// and benefit from precise waypoint pursuit over juicy
+    /// player-feel inertia.
+    #[serde(default = "default_npc_momentum")]
+    pub npc_momentum: f32,
 }
 
 /// Per-kind default animation set. All three slots are mandatory —
@@ -493,6 +516,16 @@ fn default_wander_radius() -> i32 {
 
 fn default_carry_capacity() -> u32 {
     3
+}
+
+fn default_npc_momentum() -> f32 {
+    // 0 = snap velocity to wishdir target every tick. Picked as the
+    // default per the 2026-05-26 movement re-tune: NPCs path-follow
+    // and the Quake friction/accel pair made them overshoot
+    // waypoints, get stuck slipping past corners, and look generally
+    // confused. Mods can dial momentum up per-kind if a slidey feel
+    // is wanted for a specific kind (e.g. a heavy creature).
+    0.0
 }
 
 fn default_wander_timeout() -> f32 {
