@@ -2,23 +2,32 @@
 //!
 //! Independent of mode in *behaviour* (always drawn when there's an
 //! actionable target) but tinted to read what the next click would do.
-//! See [[player-input-scheme-l-click-primary]] for the canonical
-//! verb-by-target table — this module is the visible half of that
-//! contract.
+//! Under the L=destroy / R=interact scheme outlines advertise the L
+//! verb primarily, with Plan mode drawing both L and R outlines at
+//! once because both verbs have meaningful targets simultaneously
+//! (L on cell vs R on outward neighbour).
 //!
-//! Phase-0 palette (more colours land as Phase 1/3 features add their
-//! verbs):
+//! Palette:
 //!
-//! - **Plan mode**:
-//!   - Destroy slot → red (tag-for-remove)
-//!   - Block slot   → green (tag-for-build, on the outward-face cell)
+//! - **Plan mode** (both verbs may draw):
+//!   - Red on cursor cell → L would Remove (untagged solid) or un-tag
+//!     (any tagged cell).
+//!   - Green on the outward-face neighbour → R would Build with the
+//!     selected hotbar block. Suppressed if palette empty or cursor
+//!     is on an empty cell (no face to build off).
 //!
-//! - **Normal mode**:
-//!   - Cursor on a tagged plan cell (Remove or Build) → orange
-//!     (L-click holds to self-work)
-//!   - Cursor on any other solid block → red
-//!     (R-click holds to direct-destroy)
-//!   - Otherwise: no outline
+//! - **Normal mode** (single outline, advertises L):
+//!   - Gold on a `WorldItem` (compatible) / cyan (inspect-only).
+//!   - Green on a Build plan that the carry deposits into.
+//!   - Orange on a satisfied plan tag (self-work hold) / grey when
+//!     tool-gated.
+//!   - Cyan on a pending plan the carry can't help with (inspect).
+//!   - Green on a station whose queued order needs the carry
+//!     (L deposits) — overrides the purple work-state for this frame.
+//!   - Bright purple on a station with a work-ready order (L holds
+//!     to progress) / muted purple on a station with no work-ready.
+//!   - Red on any other solid block (L holds to mine) / grey when
+//!     tool-gated.
 //!
 //! Drawn with Bevy gizmos rather than a spawned wireframe entity. Cheap
 //! enough to redo every frame; saves us a Transform-sync pass and the
@@ -147,36 +156,38 @@ fn draw_plan_target(
     palette: &PlaceablePalette,
     gizmos: &mut Gizmos,
 ) {
-    // Plan-mode Remove sees through already-tagged cells so the cursor
-    // can preview a Remove behind another Remove tag — same trick
-    // `plan_mode_input` uses on the actual press.
-    let destroy_selected = selected.current_block(palette).is_none();
-    let skip_plan_remove = if destroy_selected { Some(plans) } else { None };
-    let Some(hit) = entity_aware_raycast(
-        origin,
-        dir,
-        RAYCAST_REACH,
-        chunks,
-        chunk_map,
-        registry,
-        skip_plan_remove,
-    ) else {
+    // L can land on a Build tag floating in empty space; check the
+    // plan raycast and prefer whichever target is closer.
+    let world_hit =
+        entity_aware_raycast(origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None);
+    let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, plans);
+    let world_dist = world_hit
+        .as_ref()
+        .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - origin).length());
+    let plan_dist = plan_hit.as_ref().map(|(d, _)| *d);
+
+    let red = Color::srgb(1.0, 0.35, 0.3);
+    let green = Color::srgb(0.3, 1.0, 0.4);
+
+    let prefer_plan = match (plan_dist, world_dist) {
+        (Some(p), Some(w)) => p < w,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if prefer_plan {
+        // L would single-cell un-tag a floating Build plan. No face
+        // to project R against — only the L outline draws.
+        let (_, cell) = plan_hit.unwrap();
+        draw_cell(gizmos, cell, red);
         return;
-    };
-    // Outline cell = where the tag would land. Build (block slot)
-    // lands on the outward-face neighbour; Remove (Destroy slot)
-    // tags the cell under the cursor.
-    let target = if destroy_selected {
-        hit.cell
-    } else {
-        hit.cell + hit.face_normal
-    };
-    let colour = if destroy_selected {
-        Color::srgb(1.0, 0.35, 0.3)
-    } else {
-        Color::srgb(0.3, 1.0, 0.4)
-    };
-    draw_cell(gizmos, target, colour);
+    }
+    let Some(hit) = world_hit else { return };
+    // L outline: cursor cell. R outline: outward-face neighbour, only
+    // if the palette has something selectable.
+    draw_cell(gizmos, hit.cell, red);
+    if selected.current_block(palette).is_some() {
+        draw_cell(gizmos, hit.cell + hit.face_normal, green);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -280,41 +291,28 @@ fn draw_normal_target(
     // No tag under the cursor; fall back to the world hit.
     if let Some(hit) = world_hit {
         let live_slot = live_block_slot(hit.cell, chunks, chunk_map);
-        // Station-block override: the L-click verb is "open craft
-        // modal" (Phase 6b), not direct-destroy. Outline reads the
-        // *station's order state* — bright purple when at least one
-        // queued order has materials ready to work (so someone
-        // could hit the Work button right now), muted purple
-        // otherwise (no orders, or orders waiting on materials).
-        // Direct-destroy (red) still applies on R-click; outline
-        // doesn't preview R, same convention as the existing
-        // tagged-cell paths.
+        // Station-block override: L-click does (deposit → start-work
+        // → "no work to do" toast) and R-click opens the modal.
+        //   - Carry matches a queued recipe's missing input → green
+        //     (deposit-ready, mirrors the Build-plan deposit colour).
+        //   - At least one queued order is work-ready → bright purple.
+        //   - Otherwise muted purple (toast-on-click; modal-on-R).
         if let Some(slot) = live_slot
             && registry.def(slot).station_tag.is_some()
         {
-            let any_work_ready = stations
-                .get(hit.cell)
-                .map(|state| {
-                    state.orders.iter().any(|order| {
-                        let Some(recipe_slot) =
-                            recipes.slot_of(&block_junk_mod_api::recipes::RecipeId::new(
-                                order.recipe_id.clone(),
-                            ))
-                        else {
-                            return false;
-                        };
-                        let def = recipes.def(recipe_slot);
-                        def.inputs.iter().all(|input| {
-                            let Some(input_slot) = items.slot_of(&input.item) else {
-                                return false;
-                            };
-                            state.inventory.get(&input_slot).copied().unwrap_or(0)
-                                >= input.count
-                        })
-                    })
-                })
+            let state = stations.get(hit.cell);
+            let needs_carry = match (state, carry.item) {
+                (Some(s), Some(carry_item)) => {
+                    crate::craft_stations::station_needs_carry(s, recipes, items, carry_item)
+                }
+                _ => false,
+            };
+            let any_work_ready = state
+                .map(|s| crate::craft_stations::station_has_work_ready(s, recipes, items))
                 .unwrap_or(false);
-            let colour = if any_work_ready {
+            let colour = if needs_carry {
+                Color::srgb(0.3, 1.0, 0.4) // deposit-ready green
+            } else if any_work_ready {
                 Color::srgb(0.78, 0.42, 0.95) // bright purple: order work-ready
             } else {
                 Color::srgb(0.50, 0.38, 0.58) // muted purple: station, no work-ready
@@ -322,7 +320,7 @@ fn draw_normal_target(
             draw_cell(gizmos, hit.cell, colour);
             return;
         }
-        // Non-station: direct-destroy red, OR grey if the live block
+        // Non-station: direct-mine red, OR grey if the live block
         // needs a tool the player isn't holding.
         let colour = if player_can_work_slot(live_slot, registry, items, tool) {
             Color::srgb(1.0, 0.35, 0.3)

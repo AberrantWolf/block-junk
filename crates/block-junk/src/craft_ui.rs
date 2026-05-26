@@ -10,8 +10,10 @@
 //! gameplay surfaces.
 //!
 //! Modal lifecycle:
-//! 1. Player L-clicks a station block → `normal_mode_action_input`
-//!    sets `CraftStationUiState.open_cell = Some(cell)`.
+//! 1. Player R-clicks a station block → `open_modal_on_right_click`
+//!    sets `CraftStationUiState.open_cell = Some(cell)`. R-click is
+//!    the universal "interact with this thing" verb in Normal mode;
+//!    L-click is reserved for working the station in-world.
 //! 2. `sync_craft_modal_capture` mirrors `open_cell` into `UiCaptures`
 //!    (acquire when open, release when closed). The single
 //!    `apply_cursor_mode` system reads UiCaptures and toggles the
@@ -39,13 +41,13 @@ pub struct CraftUiPlugin;
 
 impl Plugin for CraftUiPlugin {
     fn build(&self, app: &mut App) {
-        // Lifecycle systems (block-gone, Esc, F-toggle, cursor lock)
+        // Lifecycle systems (block-gone, R-click open, cursor lock)
         // run in the regular Update schedule.
         app.add_systems(
             Update,
             (
                 close_on_block_gone,
-                toggle_modal_with_f_key,
+                open_modal_on_right_click,
                 sync_craft_modal_capture,
             )
                 .in_set(GameSet::PostSimulation)
@@ -92,32 +94,30 @@ fn close_on_block_gone(
     }
 }
 
-/// F key toggles the craft-order modal:
-/// - Modal closed + cursor on a station block → open for that cell.
-/// - Modal open → close.
-/// L-click is reserved for the hold-to-work action, so the modal
-/// needs its own entry key. Same just_pressed-edge convention as
-/// the F3 panel toggle.
-#[allow(clippy::too_many_arguments, reason = "modal toggle pulls from many subsystems")]
-fn toggle_modal_with_f_key(
-    keys: Res<ButtonInput<KeyCode>>,
+/// R-click on a station block opens the craft-order modal. Esc and
+/// the modal's Close button drive close; this system never closes.
+/// Only `just_pressed` — held R doesn't re-open per frame.
+#[allow(clippy::too_many_arguments, reason = "modal open pulls from many subsystems")]
+fn open_modal_on_right_click(
+    mouse: Res<ButtonInput<MouseButton>>,
     captures: Res<crate::ui_capture::UiCaptures>,
+    mode: Res<crate::player_mode::PlayerMode>,
     cam: Query<&GlobalTransform, With<crate::camera::FlyCam>>,
     chunks: Query<(&Chunk, &crate::voxel::ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
     mut ui_state: ResMut<CraftStationUiState>,
 ) {
-    if !keys.just_pressed(KeyCode::KeyF) {
+    if !mouse.just_pressed(MouseButton::Right) {
         return;
     }
-    if ui_state.is_open() {
-        ui_state.open_cell = None;
-        ui_state.pending_quantities.clear();
+    // R-click is a Normal-mode verb; in Plan mode R drives Build
+    // placement (handled in `plans.rs`) so we ignore it here.
+    if *mode != crate::player_mode::PlayerMode::Normal {
         return;
     }
-    // SSOT: any overlay captured ⇒ ignore the F press. Prevents
-    // F-in-pause-menu / F-in-debug-panel from popping the craft modal.
+    // SSOT: any overlay captured ⇒ ignore the click. Prevents
+    // R-in-pause-menu / R-in-debug-panel from popping the craft modal.
     if captures.is_captured() {
         return;
     }
@@ -254,7 +254,9 @@ fn draw_craft_modal(
             // modal shows status + lets the player cancel.
             ui.label(egui::RichText::new("Active orders").strong());
             ui.label(
-                egui::RichText::new("Close the modal and HOLD L-click on the bench to work.")
+                egui::RichText::new(
+                    "Close the modal and HOLD L-click on the bench to work. L-click also deposits carry when materials are missing.",
+                )
                     .small()
                     .weak(),
             );

@@ -50,6 +50,7 @@ impl Plugin for ClientPlugin {
             .add_plugins(crate::craft_stations::CraftStationsClientPlugin)
             .add_plugins(crate::craft_ui::CraftUiPlugin)
             .add_plugins(crate::craft_progress_hud::CraftProgressHudPlugin)
+            .add_plugins(crate::worldspace_toast::WorldspaceToastPlugin)
             .add_plugins(InspectPanelPlugin)
             // Frame interpolation smooths AvatarPose between FixedUpdate
             // ticks during PostUpdate render. Without it, on a high-refresh
@@ -66,11 +67,9 @@ impl Plugin for ClientPlugin {
         // resources from it.
         let palette = {
             let reg = app.world().resource::<BlockRegistry>();
-            // Destroy lives at index 0 so 1-key intuition (`top of the
-            // bar = break`) matches the visual ordering.
-            let mut entries: Vec<PaletteSlot> = vec![PaletteSlot::Destroy];
-            entries.extend(reg.iter_placeable().map(PaletteSlot::Block));
-            PlaceablePalette(entries)
+            // L=destroy moved off the hotbar — the bar holds only the
+            // R-click Build options now.
+            PlaceablePalette(reg.iter_placeable().collect())
         };
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
         app.insert_resource(palette);
@@ -98,11 +97,17 @@ impl Plugin for ClientPlugin {
                 OnEnter(AppState::InGame),
                 (setup_scene, setup_placement_preview),
             )
+            // Split across two `add_systems` calls — `normal_mode_action_input`
+            // has so many params that bundling it with four others overflows
+            // Bevy's trait-resolution chain for system tuples (cap 3 in
+            // bevy-018 skill).
+            .add_systems(
+                Update,
+                normal_mode_action_input.in_set(GameSet::Input),
+            )
             .add_systems(
                 Update,
                 (
-                    normal_mode_action_input,
-                    station_work_hold_input,
                     drop_carry_input,
                     drop_tool_input,
                     cycle_selected_or_rotation,
@@ -276,48 +281,27 @@ pub struct BlockEntities {
     by_chunk: HashMap<ChunkCoord, HashSet<IVec3>>,
 }
 
-/// One hotbar entry. `Destroy` is the synthetic top slot whose L-click
-/// tags the cursor cell for removal in Plan mode. `Block` is a regular
-/// placeable. (Pre-2026-05-18, Build mode used the same slot to break
-/// blocks directly; Normal-mode direct-destroy is now R-click and
-/// bypasses the hotbar entirely.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaletteSlot {
-    Destroy,
-    Block(BlockSlot),
-}
-
-impl PaletteSlot {
-    pub fn block(self) -> Option<BlockSlot> {
-        match self {
-            PaletteSlot::Destroy => None,
-            PaletteSlot::Block(slot) => Some(slot),
-        }
-    }
-}
-
-/// Hotbar entries shown to the player. Always begins with a synthetic
-/// [`PaletteSlot::Destroy`] slot at index 0; the remaining entries are
-/// pulled from [`BlockRegistry::iter_placeable`]. Built once at startup;
-/// if/when mods can add blocks at runtime this will need invalidation.
+/// Hotbar entries shown to the player. Each entry is a placeable
+/// [`BlockSlot`] from [`BlockRegistry::iter_placeable`]. Built once at
+/// startup; if/when mods can add blocks at runtime this will need
+/// invalidation. Under the L=destroy / R=build scheme the hotbar only
+/// drives R-click Build in Plan mode — L-Remove reads the world cell
+/// directly, no slot needed.
 #[derive(Resource)]
-pub struct PlaceablePalette(pub Vec<PaletteSlot>);
+pub struct PlaceablePalette(pub Vec<BlockSlot>);
 
 /// Index into [`PlaceablePalette`] of the currently selected entry.
-/// Mouse wheel cycles. Read only by Plan-mode tagging — Normal mode
-/// drives its verb from cursor context, not the hotbar.
+/// Mouse wheel cycles. Read only by Plan-mode R-click Build — Normal
+/// mode drives its verb from cursor context, not the hotbar.
 #[derive(Resource, Default)]
 pub struct SelectedBlock(pub usize);
 
 impl SelectedBlock {
-    pub fn current(&self, palette: &PlaceablePalette) -> PaletteSlot {
-        palette.0[self.0]
-    }
-
-    /// Convenience: the selected entry as a placeable block, or `None`
-    /// if the synthetic [`PaletteSlot::Destroy`] slot is selected.
+    /// The selected block, or `None` if the palette is empty (no
+    /// placeable blocks registered — shouldn't happen in practice,
+    /// vanilla mods register at least a few).
     pub fn current_block(&self, palette: &PlaceablePalette) -> Option<BlockSlot> {
-        self.current(palette).block()
+        palette.0.get(self.0).copied()
     }
 }
 
@@ -619,9 +603,6 @@ fn setup_scene(
     // is the block's procedural 16×16 texture rendered at 32×32 with
     // nearest-neighbour sampling (configured on the source `Image` in
     // BlockTexturesPlugin) so the pattern reads as crisp pixel art.
-    // The synthetic Destroy slot at index 0 carries the pickaxe icon
-    // and a subtle red tint instead.
-    let destroy_icon: Handle<Image> = asset_server.load("ui/mode_icons/tool_pickaxe.png");
     commands
         .spawn((
             HotbarRoot,
@@ -669,35 +650,21 @@ fn setup_scene(
                             TextColor(Color::srgba(0.9, 0.9, 0.9, 1.0)),
                         ));
                     });
-                for (i, entry) in palette.0.iter().enumerate() {
-                    // Three icon paths:
-                    //   - Destroy slot → bundled pickaxe sprite.
+                for (i, slot) in palette.0.iter().enumerate() {
+                    // Two icon paths:
                     //   - Block with mesh (workbench, anvil, bed, etc.) →
                     //     white-bg text label. The pattern-derived texture
                     //     would look like terrain and gets confused with
                     //     real grass/stone/wood blocks.
                     //   - Voxel block → its baked 16x16 pattern texture.
                     let slot_bg = Color::srgba(0.1, 0.1, 0.1, 0.6);
-                    let (icon_kind, bg) = match entry {
-                        PaletteSlot::Destroy => (
-                            HotbarIconKind::Image(destroy_icon.clone()),
-                            Color::srgba(0.35, 0.10, 0.10, 0.7),
-                        ),
-                        PaletteSlot::Block(slot) => {
-                            let def = block_registry.def(*slot);
-                            if def.mesh.is_some() {
-                                (
-                                    HotbarIconKind::Label(short_label(&def.display_name)),
-                                    slot_bg,
-                                )
-                            } else {
-                                (
-                                    HotbarIconKind::Image(textures.icons[slot.0 as usize].clone()),
-                                    slot_bg,
-                                )
-                            }
-                        }
+                    let def = block_registry.def(*slot);
+                    let icon_kind = if def.mesh.is_some() {
+                        HotbarIconKind::Label(short_label(&def.display_name))
+                    } else {
+                        HotbarIconKind::Image(textures.icons[slot.0 as usize].clone())
                     };
+                    let bg = slot_bg;
                     column
                         .spawn((
                             Node {
@@ -785,8 +752,7 @@ fn cycle_selected_or_rotation(
     }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     if ctrl {
-        // No orientation to rotate when the Destroy slot is selected;
-        // swallow the wheel rather than spinning a meaningless angle.
+        // Empty palette ⇒ no orientation to rotate; swallow the wheel.
         if selected.current_block(&palette).is_none() {
             return;
         }
@@ -1245,6 +1211,8 @@ struct NormalActionIo<'w, 's> {
     edit: Query<'w, 's, &'static mut MessageSender<BlockEdit>>,
     pickup: Query<'w, 's, &'static mut MessageSender<PickupRequest>>,
     deposit: Query<'w, 's, &'static mut MessageSender<DepositRequest>>,
+    deposit_station:
+        Query<'w, 's, &'static mut MessageSender<crate::craft_stations::DepositToStation>>,
     work_start: Query<'w, 's, &'static mut MessageSender<crate::craft_stations::WorkStart>>,
     work_stop: Query<'w, 's, &'static mut MessageSender<crate::craft_stations::WorkStop>>,
 }
@@ -1255,6 +1223,45 @@ struct LocalPlayerState<'w, 's> {
     tool: Query<'w, 's, &'static EquippedTool, (With<Avatar>, With<Predicted>)>,
 }
 
+/// Read-only world + registries bundle for `normal_mode_action_input`.
+/// Eight resources/queries collapsed into one `SystemParam` slot —
+/// without this the system overflows Bevy 0.18's 16-param cap on
+/// `IntoSystem` resolution (cap 1 in the bevy-018 skill).
+#[derive(bevy::ecs::system::SystemParam)]
+struct InputContext<'w, 's> {
+    blocks: Res<'w, BlockRegistry>,
+    items: Res<'w, ItemRegistry>,
+    recipes: Res<'w, crate::recipes::RecipeRegistry>,
+    plans: Res<'w, Plans>,
+    stations: Res<'w, crate::craft_stations::CraftStations>,
+    chunk_map: Res<'w, ChunkMap>,
+    chunks: Query<'w, 's, (&'static Chunk, &'static ChunkEntities)>,
+    world_items: Query<'w, 's, &'static WorldItem>,
+}
+
+/// Normal-mode L-click handler under the L=world-verb / R=UI scheme.
+///
+/// Priorities on L `just_pressed`, evaluated in order — first match
+/// commits and consumes the press:
+///   1. Pickup a `WorldItem` if it's the closest target.
+///   2. Deposit carry into a station whose queued orders need it
+///      (`station_needs_carry`).
+///   3. Deposit carry into a Build plan that still needs it.
+///
+/// After the instant paths, the hold path picks one of:
+///   - **Station with work-ready order** → `WorkStart` on edge, the
+///     server ticks while the worker stays registered. `WorkStop` on
+///     release, cursor-leave, mode-change, or overlay-capture.
+///   - **Station without work-ready and without a useful deposit** →
+///     fire a "No work to do" toast on the press edge (single-shot).
+///   - **Satisfied plan tag (Build or Remove)** → hold-self-work
+///     timer.
+///   - **Plain solid block** → hold-mine timer (was R-click in the
+///     old scheme).
+///
+/// R-click is owned by `craft_ui::open_modal_on_right_click` (open
+/// craft modal) and reserved for future door / NPC interactables. It
+/// passes through this system without doing anything here.
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
 fn normal_mode_action_input(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -1263,35 +1270,42 @@ fn normal_mode_action_input(
     time: Res<Time>,
     instant_builds: Res<crate::debug::InstantPlayerBuilds>,
     cam: Query<&GlobalTransform, With<FlyCam>>,
-    chunks: Query<(&Chunk, &ChunkEntities)>,
-    chunk_map: Res<ChunkMap>,
-    plans: Res<Plans>,
-    registry: Res<BlockRegistry>,
-    items: Res<ItemRegistry>,
-    world_items: Query<&WorldItem>,
+    ctx: InputContext,
     local: LocalPlayerState,
     mut action: ResMut<PlayerActionState>,
     mut io: NormalActionIo,
+    mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
+    mut work_cell: Local<Option<IVec3>>,
 ) {
-    // SSOT input gate: any open overlay (pause / craft modal / debug
-    // panel) suppresses in-world input. Single check replaces the
-    // earlier `craft_ui.is_open()` + `!locked` pair, which were
-    // independent flags that desynced (the bug class
-    // [`crate::ui_capture`] was built to eliminate).
-    if captures.is_captured() {
+    // Inline-expanded "stop the active work-hold if any" — Rust's
+    // nested-fn signatures don't compose well with `Local` + `Query`
+    // lifetimes, so a macro keeps the call sites readable without
+    // wrestling the borrow checker on every branch.
+    macro_rules! stop_work {
+        () => {
+            if let Some(cell) = work_cell.take()
+                && let Ok(mut s) = io.work_stop.single_mut()
+            {
+                s.send::<WorldChannel>(crate::craft_stations::WorkStop {
+                    station_cell: cell,
+                });
+            }
+        };
+    }
+
+    // SSOT input gate. Captured overlay or non-Normal mode drops every
+    // in-flight bit of state.
+    if captures.is_captured() || *mode != PlayerMode::Normal {
+        stop_work!();
         action.active = None;
         return;
     }
-    // Only Normal uses the action timer. Switching modes mid-action
-    // cancels the in-flight progress so re-entering doesn't pick up
-    // a stale timer state.
-    if *mode != PlayerMode::Normal {
-        action.active = None;
-        return;
-    }
+
     let l_held = mouse.pressed(MouseButton::Left);
-    let r_held = mouse.pressed(MouseButton::Right);
-    if !l_held && !r_held {
+    let l_just_pressed = mouse.just_pressed(MouseButton::Left);
+
+    if !l_held {
+        stop_work!();
         action.active = None;
         return;
     }
@@ -1299,182 +1313,208 @@ fn normal_mode_action_input(
     let Ok(cam_t) = cam.single() else {
         return;
     };
-    let Ok(mut sender) = io.edit.single_mut() else {
-        return;
-    };
     let cam_pos = cam_t.translation();
     let cam_dir = *cam_t.forward();
 
-    // Two instant L-click fast-paths, in priority order:
-    //   1. Pickup a WorldItem closer than any solid block.
-    //   2. Deposit a carry unit into a Build plan that needs it.
-    // Both consume the click before the self-work timer can latch.
-    if mouse.just_pressed(MouseButton::Left) {
-        let item_hit = raycast_world_items(cam_pos, cam_dir, RAYCAST_REACH, &world_items);
-        let world_hit_for_compare = entity_aware_raycast(
-            cam_pos,
-            cam_dir,
-            RAYCAST_REACH,
-            &chunks,
-            &chunk_map,
-            &registry,
-            None,
-        );
-        let world_hit_dist = world_hit_for_compare
-            .as_ref()
-            .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
-        let carry = local.carry.single().copied().unwrap_or_default();
+    let world_hit = entity_aware_raycast(
+        cam_pos,
+        cam_dir,
+        RAYCAST_REACH,
+        &ctx.chunks,
+        &ctx.chunk_map,
+        &ctx.blocks,
+        None,
+    );
+    let item_hit = raycast_world_items(cam_pos, cam_dir, RAYCAST_REACH, &ctx.world_items);
+    let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, RAYCAST_REACH, &ctx.plans);
 
-        // (1) Pickup.
-        if let Some((item_translation, item_dist, item_slot)) = item_hit
-            && world_hit_dist.map(|wd| item_dist < wd).unwrap_or(true)
-        {
-            // Tools route to the EquippedTool slot (server-side); the
-            // client just sends the pickup unconditionally and lets
-            // the server's swap-semantics handle slot occupancy.
-            // Resources still gate on Carrying compatibility.
-            let is_tool = !items.def(item_slot).tool_tags.is_empty();
-            if is_tool || carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY) {
-                if let Ok(mut sender) = io.pickup.single_mut() {
-                    sender.send::<WorldChannel>(PickupRequest {
+    let world_dist = world_hit
+        .as_ref()
+        .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
+
+    let carry = local.carry.single().copied().unwrap_or_default();
+    let tool = local.tool.single().copied().unwrap_or_default();
+
+    // Instant L-press paths — at most one fires per `just_pressed`.
+    if l_just_pressed {
+        // (1) Pickup beats both world + plan when it's closest. Tools
+        // route to the EquippedTool slot server-side; the client just
+        // sends the pickup unconditionally and lets swap-semantics
+        // handle slot occupancy. Resources still gate on Carrying.
+        if let Some((item_translation, item_dist, item_slot)) = item_hit {
+            let beats_world = world_dist.map(|wd| item_dist < wd).unwrap_or(true);
+            let beats_plan = plan_hit.map(|(pd, _)| item_dist < pd).unwrap_or(true);
+            if beats_world && beats_plan {
+                let is_tool = !ctx.items.def(item_slot).tool_tags.is_empty();
+                if (is_tool || carry.can_accept(item_slot, PLAYER_CARRY_CAPACITY))
+                    && let Ok(mut s) = io.pickup.single_mut()
+                {
+                    s.send::<WorldChannel>(PickupRequest {
                         target: item_translation,
                     });
                 }
+                stop_work!();
+                action.active = None;
+                return;
             }
+        }
+
+        // (2) Station deposit — cursor on a station whose queued
+        // orders are missing this carry item.
+        if let Some(carry_item) = carry.item
+            && carry.count > 0
+            && let Some(hit) = world_hit.as_ref()
+            && is_station_block(hit.cell, &ctx.chunks, &ctx.chunk_map, &ctx.blocks)
+            && let Some(state) = ctx.stations.get(hit.cell)
+            && crate::craft_stations::station_needs_carry(
+                state,
+                &ctx.recipes,
+                &ctx.items,
+                carry_item,
+            )
+        {
+            if let Ok(mut s) = io.deposit_station.single_mut() {
+                s.send::<WorldChannel>(crate::craft_stations::DepositToStation {
+                    station_cell: hit.cell,
+                });
+            }
+            stop_work!();
             action.active = None;
             return;
         }
 
-        // (2) Deposit. Resolve the targeted plan cell via the same
-        // world-or-plan-raycast comparison `resolve_self_work` uses,
-        // but only fire when (a) carry has matching item and (b) the
-        // plan still needs more of it. Lets a player drop wood into
-        // a wood-build plan without first walking onto it.
+        // (3) Build plan deposit — same plan-or-world resolver the
+        // outline uses to pick the deposit-ready cell. Lets a player
+        // drop wood into a wood-build plan without first walking onto
+        // it.
         if let Some(carry_item) = carry.item
             && carry.count > 0
         {
-            let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, RAYCAST_REACH, &plans);
-            let world_tagged_dist = world_hit_for_compare
-                .as_ref()
-                .filter(|h| plans.get(h.cell).is_some())
-                .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos, h.cell))
-                .map(|(d, c)| (d.length(), c));
-            let plan_target = match (world_tagged_dist, plan_hit) {
-                (Some(a), Some(b)) if a.0 <= b.0 => Some(a.1),
-                (Some(_), Some((_, c))) => Some(c),
-                (Some(a), None) => Some(a.1),
-                (None, Some((_, c))) => Some(c),
-                (None, None) => None,
-            };
+            let plan_target =
+                pick_deposit_target(cam_pos, &ctx.plans, world_hit.as_ref(), plan_hit);
             if let Some(cell) = plan_target
-                && let Some(state) = plans.get(cell)
+                && let Some(state) = ctx.plans.get(cell)
                 && state.remaining_for(carry_item) > 0
             {
-                if let Ok(mut sender) = io.deposit.single_mut() {
-                    sender.send::<WorldChannel>(DepositRequest { cell });
+                if let Ok(mut s) = io.deposit.single_mut() {
+                    s.send::<WorldChannel>(DepositRequest { cell });
                 }
+                stop_work!();
                 action.active = None;
                 return;
             }
         }
     }
 
-    // World raycast hits whatever solid block (or block-entity) is
-    // first along the ray. `skip_plan_remove = None`: in Normal mode
-    // we *want* the cursor to land on a tagged-Remove cell so L-click
-    // can self-work it; seeing through tagged cells is a Plan-mode
-    // affordance for stacking Remove tags through walls.
-    let world_hit = entity_aware_raycast(
-        cam_pos,
-        cam_dir,
-        RAYCAST_REACH,
-        &chunks,
-        &chunk_map,
-        &registry,
-        None,
-    );
-
-    // Resolve the verb for this frame. L wins over R when both held.
-    // For L: try self-work on a tag first (the player tagged this for
-    // a reason — honour it), then craft on a station block if no
-    // self-work resolved. R is direct-destroy.
-    let resolved = if l_held {
-        let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, RAYCAST_REACH, &plans);
-        resolve_self_work(cam_pos, &plans, world_hit.as_ref(), plan_hit)
-    } else {
-        resolve_direct_destroy(world_hit.as_ref())
-    };
-    // Suppress fall-through to direct-destroy / self-work when the
-    // cursor is on a station block (L-click on stations belongs to
-    // the work-hold sub-system; we don't want a no-tag station to
-    // accidentally trigger an R-click destroy via the resolver).
+    // Hold-on-station path: WorkStart on edge, fire toast otherwise.
     if let Some(hit) = world_hit.as_ref()
-        && resolved.is_none()
-        && is_station_block(hit.cell, &chunks, &chunk_map, &registry)
+        && is_station_block(hit.cell, &ctx.chunks, &ctx.chunk_map, &ctx.blocks)
     {
-        action.active = None;
-        return;
-    }
-    let Some((target_cell, kind, edit, button)) = resolved else {
-        action.active = None;
-        return;
-    };
-
-    // Tool gate: if the targeted block's work_action requires a tool
-    // tag the player isn't holding, the click is inert. Same logic
-    // the outline uses to render grey, kept in sync via the shared
-    // `live_block_slot` / `player_can_work_slot` helpers in
-    // target_outline.rs. Symmetric with the outline so what the
-    // player sees and what the click does always agree.
-    let work_slot = match button {
-        MouseButton::Right => {
-            // direct-destroy: live block at cell
-            crate::target_outline::live_block_slot(target_cell, &chunks, &chunk_map)
-        }
-        _ => {
-            // L-click self-work: Build → block being placed;
-            // Remove → live block being destroyed.
-            match edit.slot.is_empty() {
-                true => crate::target_outline::live_block_slot(target_cell, &chunks, &chunk_map),
-                false => Some(edit.slot),
+        let work_ready = ctx.stations
+            .get(hit.cell)
+            .map(|s| {
+                crate::craft_stations::station_has_work_ready(s, &ctx.recipes, &ctx.items)
+            })
+            .unwrap_or(false);
+        if work_ready {
+            // If cursor moved between work-ready stations, send Stop
+            // for the previous before Start on the new.
+            if let Some(active) = *work_cell
+                && active != hit.cell
+            {
+                if let Ok(mut s) = io.work_stop.single_mut() {
+                    s.send::<WorldChannel>(crate::craft_stations::WorkStop {
+                        station_cell: active,
+                    });
+                }
+                *work_cell = None;
             }
+            if *work_cell != Some(hit.cell)
+                && (l_just_pressed || work_cell.is_none())
+            {
+                // `work_cell.is_none()` covers the case where the
+                // player started a hold over a non-station cell and
+                // swept onto a station mid-hold — we don't have a
+                // just_pressed edge but should still register as
+                // worker. Press-edge required only for the disjoint
+                // "new press onto a station" case.
+                if l_just_pressed
+                    && let Ok(mut s) = io.work_start.single_mut()
+                {
+                    s.send::<WorldChannel>(crate::craft_stations::WorkStart {
+                        station_cell: hit.cell,
+                    });
+                    *work_cell = Some(hit.cell);
+                }
+            }
+            action.active = None;
+            return;
         }
-    };
-    let tool = local.tool.single().copied().unwrap_or_default();
-    if !crate::target_outline::player_can_work_slot(work_slot, &registry, &items, tool) {
-        // Click inert. Don't tick the action timer — the player
-        // will see the outline stay grey and try a different tool.
+        // Station with no work-ready order. Single toast on the press
+        // edge so a held L doesn't spam.
+        if l_just_pressed {
+            toasts.push(crate::worldspace_toast::SpawnToast {
+                cell: hit.cell,
+                text: "No work to do".to_owned(),
+            });
+        }
+        stop_work!();
         action.active = None;
         return;
     }
 
-    // Instant path: F3 toggle skips the timer. Single send on the
-    // first frame of the chosen button; no state machine, no
-    // progress bar.
+    // Past the station branch — if we still have a work-hold latched,
+    // the cursor has moved off the station, so stop.
+    stop_work!();
+
+    // Resolve the remaining L-hold verb: self-work on a satisfied
+    // plan tag, or direct-mine on a plain solid block.
+    let resolved = resolve_left_hold(cam_pos, &ctx.plans, world_hit.as_ref(), plan_hit);
+    let Some((target_cell, kind, edit)) = resolved else {
+        action.active = None;
+        return;
+    };
+
+    // Tool gate. Build: gate on the block being placed; Break: gate
+    // on the live block being destroyed. Same predicate the outline
+    // uses to render grey, kept in sync.
+    let work_slot = if edit.slot.is_empty() {
+        crate::target_outline::live_block_slot(target_cell, &ctx.chunks, &ctx.chunk_map)
+    } else {
+        Some(edit.slot)
+    };
+    if !crate::target_outline::player_can_work_slot(
+        work_slot,
+        &ctx.blocks,
+        &ctx.items,
+        tool,
+    ) {
+        action.active = None;
+        return;
+    }
+
+    // Instant-builds debug toggle: single send on the press edge.
     if instant_builds.0 {
-        if mouse.just_pressed(button) {
-            sender.send::<WorldChannel>(edit);
-            action.active = None;
+        if l_just_pressed
+            && let Ok(mut s) = io.edit.single_mut()
+        {
+            s.send::<WorldChannel>(edit);
         }
+        action.active = None;
         return;
     }
 
     // Timed path: accumulate progress against the same target across
-    // frames, restart from zero if the target or verb changed (player
-    // swept the cursor or swapped buttons).
+    // frames; restart on target or verb change.
     let step = time.delta_secs() / PLAYER_ACTION_DURATION_SECS;
     let progress = match action.active {
         Some(a) if a.target_cell == target_cell && a.kind == kind => a.progress + step,
         _ => step,
     };
-
     if progress >= 1.0 {
-        sender.send::<WorldChannel>(edit);
-        // Drop state. If the button is still held the next frame's
-        // raycast will see the updated world (or, for ~1 tick before
-        // the broadcast lands, the stale cell — server rejects the
-        // duplicate). Held-sweep harvesting falls out naturally once
-        // the world updates and the target cell changes.
+        if let Ok(mut s) = io.edit.single_mut() {
+            s.send::<WorldChannel>(edit);
+        }
         action.active = None;
     } else {
         action.active = Some(ActiveAction {
@@ -1504,91 +1544,7 @@ fn drop_carry_input(
     }
 }
 
-/// Hold L-click on a station block to progress its active craft.
-/// Sends `WorkStart` on `just_pressed`, `WorkStop` on `just_released`
-/// or when the cursor leaves the working cell or the modal opens.
-/// Server only ticks the timer while a worker is registered, so this
-/// directly drives the "hold to progress" rule. F key opens the
-/// modal (separate system); L is reserved for the work action.
-///
-/// Kept as a dedicated system rather than folded into
-/// `normal_mode_action_input` to stay under Bevy 0.18's
-/// 16-SystemParam cap — the main action input fn is already at the
-/// ceiling.
-#[allow(clippy::too_many_arguments, reason = "work hold spans many subsystems")]
-fn station_work_hold_input(
-    mouse: Res<ButtonInput<MouseButton>>,
-    captures: Res<crate::ui_capture::UiCaptures>,
-    mode: Res<PlayerMode>,
-    cam: Query<&GlobalTransform, With<FlyCam>>,
-    chunks: Query<(&Chunk, &ChunkEntities)>,
-    chunk_map: Res<ChunkMap>,
-    registry: Res<BlockRegistry>,
-    mut work_start: Query<&mut MessageSender<crate::craft_stations::WorkStart>>,
-    mut work_stop: Query<&mut MessageSender<crate::craft_stations::WorkStop>>,
-    mut active_work_cell: Local<Option<IVec3>>,
-) {
-    // Single SSOT gate. `captures.is_captured()` covers the previous
-    // `!locked` AND `craft_ui.is_open()` checks in one shot: when the
-    // modal is open it's captured, when alt-tabbed the WindowBlur
-    // capture (future) would be set, etc.
-    let blocked = captures.is_captured() || *mode != PlayerMode::Normal;
-    // Determine current target.
-    let target_cell: Option<IVec3> = if blocked {
-        None
-    } else {
-        cam.single().ok().and_then(|cam_t| {
-            let origin = cam_t.translation();
-            let dir = *cam_t.forward();
-            let hit = entity_aware_raycast(
-                origin,
-                dir,
-                RAYCAST_REACH,
-                &chunks,
-                &chunk_map,
-                &registry,
-                None,
-            )?;
-            if is_station_block(hit.cell, &chunks, &chunk_map, &registry) {
-                Some(hit.cell)
-            } else {
-                None
-            }
-        })
-    };
-    let l_held = !blocked && mouse.pressed(MouseButton::Left);
-    // Stop when the holding condition stops.
-    let should_stop = active_work_cell.is_some()
-        && match (l_held, target_cell) {
-            (true, Some(c)) => Some(c) != *active_work_cell,
-            _ => true,
-        };
-    if should_stop
-        && let Some(cell) = active_work_cell.take()
-        && let Ok(mut s) = work_stop.single_mut()
-    {
-        s.send::<WorldChannel>(crate::craft_stations::WorkStop {
-            station_cell: cell,
-        });
-    }
-    // Start on the just_pressed edge against a station target.
-    if l_held
-        && mouse.just_pressed(MouseButton::Left)
-        && let Some(cell) = target_cell
-        && *active_work_cell != Some(cell)
-    {
-        if let Ok(mut s) = work_start.single_mut() {
-            s.send::<WorldChannel>(crate::craft_stations::WorkStart {
-                station_cell: cell,
-            });
-        }
-        *active_work_cell = Some(cell);
-    }
-}
-
-/// Helper shared by `normal_mode_action_input` and
-/// `station_work_hold_input`: does the cell hold a block with a
-/// `station_tag`?
+/// Helper: does the cell hold a block with a `station_tag`?
 fn is_station_block(
     cell: IVec3,
     chunks: &Query<(&Chunk, &ChunkEntities)>,
@@ -1625,29 +1581,19 @@ fn drop_tool_input(
     }
 }
 
-/// Pick the cell the player's L-click would self-work this frame.
-/// Prefers whichever tagged cell is *closer* to the camera between:
-///   - the world-raycast hit cell if it itself carries a plan tag
-///     (typically a Remove tag on a solid wall); or
-///   - the nearest tagged-cell hit from a Plans-only raycast (typically
-///     a Build tag floating in empty space, which the world raycast
-///     misses because the cell is empty).
+/// Pick the cell the player's L-click hold should act on. Tagged-plan
+/// self-work wins over direct-mine when a satisfied tag lies under the
+/// cursor (world or plan-aware raycast, closer wins). Otherwise the
+/// world-raycast hit drives direct-mine. `None` ⇒ no actionable target.
 ///
-/// On a tie, the world-raycast hit wins — a tagged-solid right under
-/// the cursor is the intuitive choice over a Build tag hovering at the
-/// same distance.
-///
-/// Returns `(target_cell, ActionKind, BlockEdit, MouseButton::Left)` or
-/// `None` if no tagged cell lies under the cursor.
-fn resolve_self_work(
+/// Returns `(target_cell, ActionKind, BlockEdit)`.
+fn resolve_left_hold(
     cam_pos: Vec3,
     plans: &Plans,
     world_hit: Option<&EntityAwareHit>,
     plan_hit: Option<(f32, IVec3)>,
-) -> Option<(IVec3, ActionKind, BlockEdit, MouseButton)> {
-    // Helper: build a candidate tuple if the cell has a tag *and* its
-    // materials are satisfied. Unsatisfied Build plans are inert to
-    // L-click self-work (the player needs to deposit first).
+) -> Option<(IVec3, ActionKind, BlockEdit)> {
+    // Tagged self-work first.
     let materialize = |cell: IVec3, dist: f32| -> Option<(f32, IVec3, PlanKind)> {
         let state = plans.get(cell)?;
         if !state.is_satisfied() {
@@ -1660,33 +1606,56 @@ fn resolve_self_work(
         materialize(h.cell, dist)
     });
     let plan_candidate = plan_hit.and_then(|(dist, cell)| materialize(cell, dist));
-    let (_, cell, kind) = match (world_candidate, plan_candidate) {
-        (Some(a), Some(b)) if a.0 <= b.0 => a,
-        (Some(_), Some(b)) => b,
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => return None,
-    };
-    let edit = plan_to_edit(cell, kind);
-    let action_kind = match kind {
-        PlanKind::Remove => ActionKind::Break,
-        PlanKind::Build { .. } => ActionKind::Place,
-    };
-    Some((cell, action_kind, edit, MouseButton::Left))
-}
-
-/// Pick the cell the player's R-click would direct-destroy this frame.
-/// Reads the world raycast's hit cell; if there's no hit, no action.
-fn resolve_direct_destroy(
-    world_hit: Option<&EntityAwareHit>,
-) -> Option<(IVec3, ActionKind, BlockEdit, MouseButton)> {
+    if let Some((_, cell, kind)) = match (world_candidate, plan_candidate) {
+        (Some(a), Some(b)) if a.0 <= b.0 => Some(a),
+        (Some(_), Some(b)) => Some(b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    } {
+        let edit = plan_to_edit(cell, kind);
+        let action_kind = match kind {
+            PlanKind::Remove => ActionKind::Break,
+            PlanKind::Build { .. } => ActionKind::Place,
+        };
+        return Some((cell, action_kind, edit));
+    }
+    // Direct-mine on a plain solid block.
     let hit = world_hit?;
     let edit = BlockEdit {
         anchor: hit.cell,
         slot: BlockSlot::EMPTY,
         orientation: Cardinal::default(),
     };
-    Some((hit.cell, ActionKind::Break, edit, MouseButton::Right))
+    Some((hit.cell, ActionKind::Break, edit))
+}
+
+/// Pick the Build-plan cell a player's L-click deposit would target.
+/// Prefers whichever cell is closer between (a) the world-raycast hit
+/// if it itself carries a plan tag, or (b) the nearest plan-raycast
+/// hit (typically a Build tag floating in empty space the world ray
+/// misses).
+fn pick_deposit_target(
+    cam_pos: Vec3,
+    plans: &Plans,
+    world_hit: Option<&EntityAwareHit>,
+    plan_hit: Option<(f32, IVec3)>,
+) -> Option<IVec3> {
+    let world_tagged = world_hit
+        .filter(|h| plans.get(h.cell).is_some())
+        .map(|h| {
+            (
+                (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length(),
+                h.cell,
+            )
+        });
+    match (world_tagged, plan_hit) {
+        (Some(a), Some(b)) if a.0 <= b.0 => Some(a.1),
+        (Some(_), Some((_, c))) => Some(c),
+        (Some(a), None) => Some(a.1),
+        (None, Some((_, c))) => Some(c),
+        (None, None) => None,
+    }
 }
 
 /// Translate a `PlanKind` into the `BlockEdit` that would satisfy it.
@@ -2040,10 +2009,9 @@ fn setup_placement_preview(
 }
 
 /// Run-condition: only show the placement preview ghost in Plan mode
-/// with a real block in the hotbar. The Destroy slot has no place
-/// preview — the cursor outline already indicates the target cell.
-/// Plan-mode preview reads as "this is what the tag would build" while
-/// the drag is paused on a single cell.
+/// with a real block in the hotbar (the empty-palette case bails). The
+/// preview reads as "this is what an R-click Build would tag here"
+/// while the cursor is parked on a single cell.
 fn show_placement_preview(
     mode: Res<PlayerMode>,
     selected: Res<SelectedBlock>,
@@ -2053,10 +2021,9 @@ fn show_placement_preview(
 }
 
 /// Hide the placement preview ghost when the player just left Plan
-/// mode, or when the hotbar selection flipped to the Destroy slot.
-/// Without this the last-frame ghost would linger on screen — the main
-/// preview system stops running thanks to the `run_if` gate, so
-/// something has to actively flip Visibility on the transition.
+/// mode. Without this the last-frame ghost would linger on screen —
+/// the main preview system stops running thanks to the `run_if` gate,
+/// so something has to actively flip Visibility on the transition.
 fn hide_preview_on_mode_change(
     mode: Res<PlayerMode>,
     selected: Res<SelectedBlock>,

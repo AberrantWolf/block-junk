@@ -257,6 +257,64 @@ impl CraftBookings {
     }
 }
 
+/// Client-side check: does any queued order at this station have
+/// every input satisfied by the current inventory? Used to gate the
+/// L-click work-hold and the outline's "this station is engageable"
+/// purple shade. Returns false if the station has no orders or no
+/// queued order is fully stocked.
+pub fn station_has_work_ready(
+    state: &StationState,
+    recipes: &crate::recipes::RecipeRegistry,
+    items: &crate::items::ItemRegistry,
+) -> bool {
+    state.orders.iter().any(|order| {
+        let Some(recipe_slot) = recipes.slot_of(&block_junk_mod_api::recipes::RecipeId::new(
+            order.recipe_id.clone(),
+        )) else {
+            return false;
+        };
+        let def = recipes.def(recipe_slot);
+        def.inputs.iter().all(|input| {
+            let Some(input_slot) = items.slot_of(&input.item) else {
+                return false;
+            };
+            state.inventory.get(&input_slot).copied().unwrap_or(0) >= input.count
+        })
+    })
+}
+
+/// Client-side check: would depositing one unit of `carry_item` at
+/// this station help any queued order? True when at least one queued
+/// recipe lists `carry_item` as an input and the station's inventory
+/// is still below that input's count. Gates the L-click instant-
+/// deposit fast-path so it doesn't fire when the player's carry is
+/// irrelevant to whatever's queued.
+pub fn station_needs_carry(
+    state: &StationState,
+    recipes: &crate::recipes::RecipeRegistry,
+    items: &crate::items::ItemRegistry,
+    carry_item: ItemSlot,
+) -> bool {
+    state.orders.iter().any(|order| {
+        let Some(recipe_slot) = recipes.slot_of(&block_junk_mod_api::recipes::RecipeId::new(
+            order.recipe_id.clone(),
+        )) else {
+            return false;
+        };
+        let def = recipes.def(recipe_slot);
+        def.inputs.iter().any(|input| {
+            let Some(input_slot) = items.slot_of(&input.item) else {
+                return false;
+            };
+            if input_slot != carry_item {
+                return false;
+            }
+            let have = state.inventory.get(&input_slot).copied().unwrap_or(0);
+            have < input.count
+        })
+    })
+}
+
 /// Server-authoritative + client-mirrored craft-order map. Same
 /// shape on both sides; the server mutates + broadcasts, the client
 /// applies broadcasts.

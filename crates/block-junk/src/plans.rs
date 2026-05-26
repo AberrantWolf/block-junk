@@ -160,57 +160,51 @@ pub(crate) struct ActiveDrag {
     /// button is held.
     second: IVec3,
     /// Captured at mousedown so changing the wheel selection mid-
-    /// drag doesn't shift the build payload partway through.
+    /// drag doesn't shift the build payload partway through. Only
+    /// read for `DragVerb::Build`.
     build_slot: BlockSlot,
     build_orientation: Cardinal,
 }
 
+/// Plan-mode drag verb. Under the L=destroy / R=create Minecraft-style
+/// scheme:
+/// - `LeftSweep`: L-drag against a solid block. At commit time, each
+///   plane cell evaluates independently — solid+untagged cells get a
+///   Remove tag, any tagged cell (Build or Remove) gets cleared.
+///   Empty+untagged cells become no-ops (server rejects them).
+/// - `Build`: R-drag against a solid block with a hotbar block selected.
+///   Rectangle cells shift outward by `face_normal` so the tags land in
+///   the empty space adjacent to the face.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DragVerb {
-    Remove,
+    LeftSweep,
     Build,
-    Cancel,
 }
 
 impl DragVerb {
-    /// Resolve a fresh press into a drag verb. L-click reads the hotbar
-    /// selection: the synthetic [`PaletteSlot::Destroy`] tags for
-    /// removal, any real block tags it for build. R-click is always
-    /// Cancel regardless of the hotbar.
-    fn from_press(button: MouseButton, build_slot: Option<BlockSlot>) -> Option<Self> {
-        match (button, build_slot) {
-            (MouseButton::Left, None) => Some(DragVerb::Remove),
-            (MouseButton::Left, Some(_)) => Some(DragVerb::Build),
-            (MouseButton::Right, _) => Some(DragVerb::Cancel),
-            _ => None,
-        }
-    }
-
     fn button(self) -> MouseButton {
         match self {
-            DragVerb::Remove | DragVerb::Build => MouseButton::Left,
-            DragVerb::Cancel => MouseButton::Right,
-        }
-    }
-
-    fn kind(self, slot: BlockSlot, orientation: Cardinal) -> Option<PlanKind> {
-        match self {
-            DragVerb::Remove => Some(PlanKind::Remove),
-            DragVerb::Build => Some(PlanKind::Build { slot, orientation }),
-            DragVerb::Cancel => None,
+            DragVerb::LeftSweep => MouseButton::Left,
+            DragVerb::Build => MouseButton::Right,
         }
     }
 }
 
-/// Plan-mode input. Drag-paints a rectangle on the clicked face's plane;
-/// release commits a single [`PlanEditBatch`]. A click that doesn't move
-/// the cursor is a 1×1 rectangle (single-cell tag).
+/// Plan-mode input under the L=destroy / R=create scheme.
 ///
-/// L-click reads the hotbar to decide the verb: a real block tags for
-/// build (rectangle cells shifted outward by the face normal), the
-/// synthetic Destroy slot tags for remove. R-click is always cancel.
-/// Escape during a drag aborts without committing. The drag plane is
-/// locked to the initial click's face — no 3D-AABB variant yet.
+/// **L-click (destructive sweep)**: drag-paints against a solid block;
+/// at commit, each plane cell evaluates independently — solid+untagged
+/// becomes a Remove tag, any tagged cell (Build or Remove) gets cleared.
+/// Single-clicking directly on a Build tag floating in empty space
+/// (caught by the plan-aware raycast) commits a one-cell un-tag without
+/// starting a drag.
+///
+/// **R-click (place Build)**: drag-paints against a solid block with a
+/// hotbar block selected; rectangle cells shift outward by the face
+/// normal so the tags land in the empty space adjacent. Inert if the
+/// hotbar has no real block, or if the cursor isn't on a solid block.
+///
+/// Escape during a drag aborts without committing.
 #[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
 fn plan_mode_input(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -250,86 +244,28 @@ fn plan_mode_input(
     let origin = cam_t.translation();
     let dir = *cam_t.forward();
 
-    // Start of drag: capture anchor + verb if no drag is active and a
-    // valid mouse button was just pressed against something tagged-able.
+    // Start of drag.
     if drag.active.is_none() {
-        let pressed = if mouse.just_pressed(MouseButton::Left) {
-            Some(MouseButton::Left)
-        } else if mouse.just_pressed(MouseButton::Right) {
-            Some(MouseButton::Right)
-        } else {
-            None
-        };
-        if let Some(button) = pressed {
-            let build_slot = selected.current_block(&palette);
-            let Some(verb) = DragVerb::from_press(button, build_slot) else {
-                return;
-            };
-            let visible_yaw = pose.yaw + fly.pending_dyaw;
-            // Cancel and Remove anchor against the world. Build does
-            // too — L-click on a wall while a block is in the hotbar,
-            // the rectangle expands across the wall face and each
-            // rect cell's outward neighbour gets tagged-build.
-            //
-            // Remove sees through cells already tagged for removal so
-            // the player can stack tags through a wall. Build keeps
-            // current behaviour — its outward offset would otherwise
-            // land on a still-solid Remove cell, which the server
-            // rejects anyway. Cancel needs to land on the tagged cell
-            // itself to clear it.
-            let skip_plan_remove: Option<&Plans> = match verb {
-                DragVerb::Remove => Some(&plans),
-                DragVerb::Build | DragVerb::Cancel => None,
-            };
-            let world_hit = entity_aware_raycast(
+        let l_pressed = mouse.just_pressed(MouseButton::Left);
+        let r_pressed = mouse.just_pressed(MouseButton::Right);
+        if l_pressed {
+            handle_left_press(
+                origin, dir, &chunks, &chunk_map, &registry, &plans, &mut drag, &mut sender,
+            );
+        } else if r_pressed {
+            handle_right_press(
                 origin,
                 dir,
-                RAYCAST_REACH,
+                fly,
+                pose,
                 &chunks,
                 &chunk_map,
                 &registry,
-                skip_plan_remove,
+                &selected,
+                &palette,
+                &rotation,
+                &mut drag,
             );
-
-            // Cancel also consults the plan-aware raycast and picks
-            // whichever target is closer. Without this, R-clicking a
-            // Build tag (which sits in empty space) would land on the
-            // solid block behind it because the world raycast sees
-            // through the empty cell — the tag could never be cleared
-            // by aiming at it.
-            if verb == DragVerb::Cancel {
-                let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, &plans);
-                let world_dist = world_hit.as_ref().map(|h| cell_centre_dist(h.cell, origin));
-                let plan_dist = plan_hit.as_ref().map(|(d, _)| *d);
-                // Tie-break to world so a Remove tag on a solid block
-                // still kicks off a rectangle drag instead of a
-                // single-cell commit.
-                let prefer_plan = match (plan_dist, world_dist) {
-                    (Some(p), Some(w)) => p < w,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if prefer_plan {
-                    let (_, cell) = plan_hit.unwrap();
-                    commit_batch(&mut sender, None, vec![cell]);
-                    return;
-                }
-            }
-
-            let Some(hit) = world_hit else {
-                return;
-            };
-            drag.active = Some(ActiveDrag {
-                verb,
-                anchor: hit.cell,
-                face_normal: hit.face_normal,
-                second: hit.cell,
-                // EMPTY is fine for Remove/Cancel — `DragVerb::kind`
-                // only reads this field for `Build`, where the hotbar
-                // selection above guarantees a real block.
-                build_slot: build_slot.unwrap_or(BlockSlot::EMPTY),
-                build_orientation: placement_orientation(visible_yaw, rotation.0),
-            });
         }
     }
 
@@ -351,34 +287,165 @@ fn plan_mode_input(
         .unwrap_or(false);
     if release {
         let active = drag.active.take().unwrap();
-        let cells = rect_cells_for_verb(active);
-        if cells.is_empty() {
-            return;
-        }
-        let kind = active.verb.kind(active.build_slot, active.build_orientation);
-        commit_batch(&mut sender, kind, cells);
+        commit_drag(active, &plans, &mut sender);
     }
 }
 
-/// Expand an in-flight drag into the list of cells it would tag.
-/// `Remove` and `Cancel` tag the cells *on* the anchor's face plane;
-/// `Build` tags the cell offset one step outward (face_normal direction)
-/// from each rect cell.
-fn rect_cells_for_verb(drag: ActiveDrag) -> Vec<IVec3> {
+/// L-press handling. First tries a plan-aware raycast to catch Build
+/// tags floating in empty space (a single-cell un-tag without a drag).
+/// Otherwise anchors a destructive-sweep drag against a solid block.
+#[allow(clippy::too_many_arguments)]
+fn handle_left_press(
+    origin: Vec3,
+    dir: Vec3,
+    chunks: &Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: &ChunkMap,
+    registry: &BlockRegistry,
+    plans: &Plans,
+    drag: &mut PlanDragState,
+    sender: &mut Query<&mut MessageSender<PlanEditBatch>>,
+) {
+    let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, plans);
+    // No skip_plan_remove — under the new scheme we want L on a Remove
+    // tag to un-tag it, so the ray must stop AT the tagged cell.
+    let world_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None);
+    let world_dist = world_hit.as_ref().map(|h| cell_centre_dist(h.cell, origin));
+    let plan_dist = plan_hit.as_ref().map(|(d, _)| *d);
+    // If a plan tag (typically a Build floating in empty space) is
+    // strictly closer than the world hit, single-cell un-tag and
+    // don't start a drag — there's no meaningful face plane for an
+    // empty-cell anchor.
+    let prefer_plan = match (plan_dist, world_dist) {
+        (Some(p), Some(w)) => p < w,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if prefer_plan {
+        let (_, cell) = plan_hit.unwrap();
+        commit_batch(sender, None, vec![cell]);
+        return;
+    }
+    let Some(hit) = world_hit else { return };
+    drag.active = Some(ActiveDrag {
+        verb: DragVerb::LeftSweep,
+        anchor: hit.cell,
+        face_normal: hit.face_normal,
+        second: hit.cell,
+        // LeftSweep never reads build_slot/orientation at commit.
+        build_slot: BlockSlot::EMPTY,
+        build_orientation: Cardinal::default(),
+    });
+}
+
+/// R-press handling. Inert if no block is selected in the hotbar or if
+/// the cursor isn't on a solid block. Otherwise anchors a Build drag.
+#[allow(clippy::too_many_arguments)]
+fn handle_right_press(
+    origin: Vec3,
+    dir: Vec3,
+    fly: &FlyCam,
+    pose: &AvatarPose,
+    chunks: &Query<(&Chunk, &ChunkEntities)>,
+    chunk_map: &ChunkMap,
+    registry: &BlockRegistry,
+    selected: &SelectedBlock,
+    palette: &PlaceablePalette,
+    rotation: &PlacementRotation,
+    drag: &mut PlanDragState,
+) {
+    let Some(build_slot) = selected.current_block(palette) else {
+        return;
+    };
+    let Some(hit) =
+        entity_aware_raycast(origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None)
+    else {
+        return;
+    };
+    let visible_yaw = pose.yaw + fly.pending_dyaw;
+    drag.active = Some(ActiveDrag {
+        verb: DragVerb::Build,
+        anchor: hit.cell,
+        face_normal: hit.face_normal,
+        second: hit.cell,
+        build_slot,
+        build_orientation: placement_orientation(visible_yaw, rotation.0),
+    });
+}
+
+/// Compute the cell lists for each batch the release will commit. For
+/// `LeftSweep`, splits plane cells into untag (any existing tag) vs
+/// remove (no existing tag — server validates solid). For `Build`,
+/// shifts plane cells outward by the face normal.
+fn commit_drag(
+    drag: ActiveDrag,
+    plans: &Plans,
+    sender: &mut Query<&mut MessageSender<PlanEditBatch>>,
+) {
+    let plane_cells = rect_cells_on_plane(drag.anchor, drag.second);
+    if plane_cells.is_empty() {
+        return;
+    }
+    match drag.verb {
+        DragVerb::LeftSweep => {
+            let mut untag_cells: Vec<IVec3> = Vec::new();
+            let mut remove_cells: Vec<IVec3> = Vec::new();
+            for cell in plane_cells {
+                if plans.get(cell).is_some() {
+                    untag_cells.push(cell);
+                } else {
+                    // Server rejects Remove tags on empty cells, so
+                    // we don't need to check `cell_is_solid` here.
+                    remove_cells.push(cell);
+                }
+            }
+            cap_to_batch_max(&mut untag_cells);
+            cap_to_batch_max(&mut remove_cells);
+            if !untag_cells.is_empty() {
+                commit_batch(sender, None, untag_cells);
+            }
+            if !remove_cells.is_empty() {
+                commit_batch(sender, Some(PlanKind::Remove), remove_cells);
+            }
+        }
+        DragVerb::Build => {
+            let mut cells: Vec<IVec3> =
+                plane_cells.into_iter().map(|c| c + drag.face_normal).collect();
+            cap_to_batch_max(&mut cells);
+            commit_batch(
+                sender,
+                Some(PlanKind::Build {
+                    slot: drag.build_slot,
+                    orientation: drag.build_orientation,
+                }),
+                cells,
+            );
+        }
+    }
+}
+
+fn cap_to_batch_max(cells: &mut Vec<IVec3>) {
+    // Hard cap. A 64×64 face drag is exactly the cap; bigger drags get
+    // truncated rather than split, since a multi-batch split would need
+    // a contig-id to keep undo coherent in the future.
+    if cells.len() > PLAN_EDIT_BATCH_MAX {
+        cells.truncate(PLAN_EDIT_BATCH_MAX);
+    }
+}
+
+/// Expand an in-flight drag into the cells the preview gizmo would
+/// cover. Build cells live one step outward from the anchor's face
+/// plane; LeftSweep cells stay on it. Same cap as [`commit_drag`] so
+/// the preview matches what will actually commit.
+fn rect_cells_for_preview(drag: ActiveDrag) -> Vec<IVec3> {
     let plane_cells = rect_cells_on_plane(drag.anchor, drag.second);
     let mut out: Vec<IVec3> = match drag.verb {
         DragVerb::Build => plane_cells
             .into_iter()
             .map(|c| c + drag.face_normal)
             .collect(),
-        DragVerb::Remove | DragVerb::Cancel => plane_cells,
+        DragVerb::LeftSweep => plane_cells,
     };
-    // Hard cap. A 64×64 face drag is exactly the cap; bigger drags get
-    // truncated rather than split, since a multi-batch split would need
-    // a contig-id to keep undo coherent in the future.
-    if out.len() > PLAN_EDIT_BATCH_MAX {
-        out.truncate(PLAN_EDIT_BATCH_MAX);
-    }
+    cap_to_batch_max(&mut out);
     out
 }
 
@@ -456,13 +523,16 @@ fn project_to_face_plane(
 }
 
 /// Render an in-flight drag as a translucent gizmo box covering the
-/// rectangle's footprint. Colour matches the verb (red Remove / green
-/// Build / yellow Cancel) so the player can read the action at a glance.
+/// rectangle's footprint. LeftSweep previews red (the dominant verb is
+/// tag-for-remove on a plain wall); Build previews green. LeftSweep on
+/// a rectangle of already-tagged cells *also* paints red — the box just
+/// advertises "destructive sweep is committing here," not the per-cell
+/// outcome, which would need per-cell glyphs and wouldn't help.
 fn draw_drag_preview(drag: Res<PlanDragState>, mut gizmos: Gizmos) {
     let Some(active) = drag.active else {
         return;
     };
-    let cells = rect_cells_for_verb(active);
+    let cells = rect_cells_for_preview(active);
     if cells.is_empty() {
         return;
     }
@@ -475,9 +545,8 @@ fn draw_drag_preview(drag: Res<PlanDragState>, mut gizmos: Gizmos) {
     let centre = (min.as_vec3() + max.as_vec3() + Vec3::ONE) * 0.5;
     let scale = (max - min).as_vec3() + Vec3::ONE;
     let colour = match active.verb {
-        DragVerb::Remove => Color::srgba(1.0, 0.3, 0.3, 1.0),
+        DragVerb::LeftSweep => Color::srgba(1.0, 0.3, 0.3, 1.0),
         DragVerb::Build => Color::srgba(0.3, 1.0, 0.4, 1.0),
-        DragVerb::Cancel => Color::srgba(1.0, 0.9, 0.2, 1.0),
     };
     gizmos.cube(
         Transform::from_translation(centre).with_scale(scale),

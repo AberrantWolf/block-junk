@@ -43,6 +43,8 @@ The `bevy::prelude` is generous — most everyday types are in it. When in doubt
 
 For mouse motion specifically, **prefer `Res<AccumulatedMouseMotion>`** (resource summing this frame's delta) over `MessageReader<MouseMotion>` — fewer lifetimes, simpler code, same data.
 
+**Naming collision with lightyear** (this repo): `lightyear::prelude::Message` is its own networked-message trait and `lightyear_messages` exports a `#[derive(Message)]` proc-macro that conflicts with bevy_ecs's identically-named derive when both are in scope. Since this project uses `lightyear::prelude::*` everywhere, **don't try to use bevy's local `Message`/`MessageWriter`/`MessageReader` for in-process buffered events here** — even if you fully-qualify the trait, the derive name collides. For in-process spawn/event queues use a plain `Resource` with a `Vec<T>` and drain it from a system (see `worldspace_toast.rs` — `PendingToasts` is the template).
+
 ## Window split: `CursorOptions` is its own component
 
 `Window.cursor_options` no longer exists. The window entity carries both `Window` and a separate `CursorOptions` component.

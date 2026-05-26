@@ -24,6 +24,7 @@ use lightyear::prelude::*;
 use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::camera::FlyCam;
 use crate::client::{RAYCAST_REACH, entity_aware_raycast, raycast_npcs, raycast_world_items};
+use crate::craft_stations::CraftStations;
 use crate::items::{ItemRegistry, ItemSlot};
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans, raycast_plans};
@@ -300,23 +301,26 @@ fn receive_npc_details(
     }
 }
 
+#[allow(clippy::too_many_arguments, reason = "inspect render pulls from many sources")]
 fn refresh_inspect_panel(
     target: Res<InspectTarget>,
     registry: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     plans: Res<Plans>,
+    stations: Res<CraftStations>,
     mut roots: Query<&mut Visibility, With<InspectPanelRoot>>,
     mut texts: Query<&mut Text, With<InspectPanelText>>,
 ) {
-    // Re-render on target change *or* plans-mutation. Deposits land
-    // as `Plans` mutations that don't touch `target`, so without the
-    // plans-changed branch a hovered plan panel would freeze at the
-    // initial materials state.
-    if !target.is_changed() && !plans.is_changed() {
+    // Re-render on target change *or* plans/stations mutation. Deposits
+    // land as `Plans` mutations and station updates land as
+    // `CraftStations` mutations — neither touches `target` directly,
+    // so without these branches a hovered panel would freeze at the
+    // initial state.
+    if !target.is_changed() && !plans.is_changed() && !stations.is_changed() {
         return;
     }
-    let body = render_body(&target.state, &registry, &items, &recipes, &plans);
+    let body = render_body(&target.state, &registry, &items, &recipes, &plans, &stations);
     let visibility = match body {
         Some(_) => Visibility::Inherited,
         None => Visibility::Hidden,
@@ -336,6 +340,7 @@ fn render_body(
     items: &ItemRegistry,
     recipes: &crate::recipes::RecipeRegistry,
     plans: &Plans,
+    stations: &CraftStations,
 ) -> Option<String> {
     match state {
         InspectState::None => None,
@@ -351,6 +356,17 @@ fn render_body(
             // tag so the player knows what they could craft.
             if let Some(station_tag) = &registry.def(*slot).station_tag {
                 out.push('\n');
+                // Lead with the action hint when the station has no
+                // queued orders, so a new player sees "what does this
+                // bench do?" → "press R to queue something" at the top
+                // of the panel rather than buried below recipes.
+                let no_orders = stations
+                    .get(*cell)
+                    .map(|s| s.orders.is_empty())
+                    .unwrap_or(true);
+                if no_orders {
+                    out.push_str("→ Right-click to queue up work\n\n");
+                }
                 out.push_str(&format_station_inner(station_tag, recipes, items));
             }
             // Append plan info when the inspected block is tagged

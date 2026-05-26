@@ -30,6 +30,7 @@ mod server;
 mod target_outline;
 mod ui_capture;
 mod voxel;
+mod worldspace_toast;
 
 use core::sync::atomic::AtomicBool;
 use core::time::Duration;
