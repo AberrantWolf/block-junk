@@ -31,6 +31,8 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use std::collections::HashSet;
 
+use crate::menu::AppState;
+
 /// One distinct UI overlay that currently wants the cursor. Add a
 /// variant when you build a new modal/dialog/in-flight cursor-takeover
 /// flow. Variants are compared by equality only — no payload — so
@@ -129,13 +131,35 @@ fn apply_cursor_mode(
     }
 }
 
+/// On entering [`AppState::InGame`], reset the captures set so any
+/// stale flags left over from the previous session (e.g. PauseMenu
+/// held when the player quit via the pause menu) don't leak across
+/// state transitions and silently disable in-world input. The
+/// `set_changed()` call forces Bevy's change detection to fire even
+/// when the set was already empty — that way the next
+/// [`apply_cursor_mode`] tick locks the cursor regardless of whether
+/// `clear` actually mutated anything.
+fn reset_captures_on_ingame_enter(mut captures: ResMut<UiCaptures>) {
+    captures.active.clear();
+    captures.set_changed();
+}
+
 pub struct UiCapturesPlugin;
 
 impl Plugin for UiCapturesPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiCaptures>();
         app.init_resource::<DiscardNextMotion>();
-        app.add_systems(Update, apply_cursor_mode);
+        // apply_cursor_mode is gated on InGame so it doesn't fire at
+        // startup, when AppState is MainMenu and the captures resource
+        // is freshly-added (which would otherwise trip is_changed and
+        // execute the "no captures → lock cursor" branch, eating the
+        // cursor on the menu screen).
+        app.add_systems(
+            Update,
+            apply_cursor_mode.run_if(in_state(AppState::InGame)),
+        );
+        app.add_systems(OnEnter(AppState::InGame), reset_captures_on_ingame_enter);
     }
 }
 
