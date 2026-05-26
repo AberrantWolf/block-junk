@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
-use crate::haul::{HaulAssignments, WorldItemReservations, release_haul_for};
+use crate::haul::HaulStore;
 use crate::interactables::{InteractableIndex, InteractionClaims};
 use crate::items::ItemSlot;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
@@ -748,8 +748,7 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
 #[derive(bevy::ecs::system::SystemParam)]
 struct CraftCtx<'w> {
     stations: ResMut<'w, crate::craft_stations::CraftStations>,
-    workers: ResMut<'w, crate::craft_stations::ActiveWorkers>,
-    assignments: ResMut<'w, crate::craft_stations::CraftAssignments>,
+    bookings: ResMut<'w, crate::craft_stations::CraftBookings>,
     recipes: Res<'w, crate::recipes::RecipeRegistry>,
 }
 
@@ -763,8 +762,7 @@ struct CraftCtx<'w> {
 struct HaulCtx<'w, 's> {
     plans: ResMut<'w, Plans>,
     plan_claims: ResMut<'w, PlanClaims>,
-    assignments: ResMut<'w, HaulAssignments>,
-    reservations: ResMut<'w, WorldItemReservations>,
+    store: ResMut<'w, HaulStore>,
     broadcast: ServerMultiMessageSender<'w, 's>,
     servers: Query<'w, 's, &'static Server>,
     world_items: Query<'w, 's, (Entity, &'static WorldItem)>,
@@ -812,8 +810,7 @@ pub(crate) fn preempt_release_holds(
     goal: &Goal,
     plan_claims: &mut PlanClaims,
     interaction_claims: &mut InteractionClaims,
-    haul_assignments: &mut HaulAssignments,
-    haul_reservations: &mut WorldItemReservations,
+    haul_store: &mut HaulStore,
 ) {
     match goal {
         Goal::Idle | Goal::Resting { .. } => {}
@@ -832,7 +829,7 @@ pub(crate) fn preempt_release_holds(
             | ArrivalAction::DepositAtPlan { .. }
             | ArrivalAction::DepositAtStation { .. }
             | ArrivalAction::PickupTool { .. } => {
-                release_haul_for(npc_id, haul_assignments, haul_reservations);
+                haul_store.release_for_npc(npc_id);
             }
             ArrivalAction::WorkStation { .. } => {
                 // CraftAssignment release handled by the calling
@@ -888,8 +885,7 @@ fn preempt_current_goal(
     pose: &mut AvatarPose,
     plan_claims: &mut PlanClaims,
     interaction_claims: &mut InteractionClaims,
-    haul_assignments: &mut HaulAssignments,
-    haul_reservations: &mut WorldItemReservations,
+    haul_store: &mut HaulStore,
     commands: &mut Commands,
     world: &WorldWalk,
     chunks: &Query<&'static Chunk>,
@@ -905,8 +901,7 @@ fn preempt_current_goal(
         &brain.goal,
         plan_claims,
         interaction_claims,
-        haul_assignments,
-        haul_reservations,
+        haul_store,
     );
     // Eject + unlock only applies when the body is currently snapped
     // into a use-slot mid-interaction. Working / MoveTo / Resting
@@ -1054,8 +1049,7 @@ fn npc_brain_tick(
                     &mut pose,
                     &mut haul.plan_claims,
                     &mut interaction_claims,
-                    &mut haul.assignments,
-                    &mut haul.reservations,
+                    &mut haul.store,
                     &mut commands,
                     &world,
                     &chunks,
@@ -1063,13 +1057,15 @@ fn npc_brain_tick(
                     &chunk_map,
                     &block_registry,
                 );
-                if let Some(cell) = craft_station_cell {
-                    craft.assignments.release_for_npc(*npc_id);
-                    craft.workers.release(cell, entity);
-                    // Don't refund consumed inputs — active_work
-                    // persists so any future worker (player or
-                    // another NPC) can resume the in-progress craft.
-                    // Preempt is a pause, not a cancel.
+                if let Some(_cell) = craft_station_cell {
+                    // Atomic cleanup: drops the NPC's booking AND
+                    // releases the worker slot if it was this NPC's
+                    // entity. Don't refund consumed inputs —
+                    // active_work persists so any future worker
+                    // (player or another NPC) can resume the
+                    // in-progress craft. Preempt is a pause, not a
+                    // cancel.
+                    craft.bookings.release_npc_booking(*npc_id, entity);
                 }
                 preempted_this_tick = true;
                 *intent = MovementIntent::default();
@@ -1127,9 +1123,9 @@ fn npc_brain_tick(
                 // one tick is fine; a None state with nothing to
                 // start is the real end.
                 let station_cell_local = *station_cell;
-                let still_me = craft.workers.worker_at(station_cell_local) == Some(entity);
+                let still_me = craft.bookings.worker_at(station_cell_local) == Some(entity);
                 let still_assigned =
-                    craft.assignments.station_of(*npc_id) == Some(station_cell_local);
+                    craft.bookings.station_of_npc(*npc_id) == Some(station_cell_local);
                 let work_in_progress = craft
                     .stations
                     .get(station_cell_local)
@@ -1277,11 +1273,7 @@ fn npc_brain_tick(
                                 "haul pickup: carry can't accept the reserved item; releasing assignment",
                             );
                         }
-                        release_haul_for(
-                            *npc_id,
-                            &mut haul.assignments,
-                            &mut haul.reservations,
-                        );
+                        haul.store.release_for_npc(*npc_id);
                         brain.goal = Goal::Idle;
                         continue;
                     }
@@ -1293,14 +1285,11 @@ fn npc_brain_tick(
                     let added = carrying.pickup_one(item_slot, cap);
                     debug_assert!(added, "pickup_one rejected after can_accept said yes");
                     commands.entity(item_entity).despawn();
-                    haul.reservations.release(item_entity, *npc_id);
-                    if let Some(assignment) = haul.assignments.get_mut(*npc_id) {
-                        assignment.queue.retain(|r| r.entity != item_entity);
-                    }
+                    haul.store.drop_queue_entry(*npc_id, item_entity);
                     // Plan next leg from the (now updated) assignment.
                     let next_goal = haul
-                        .assignments
-                        .get(*npc_id)
+                        .store
+                        .assignment_of(*npc_id)
                         .and_then(|a| {
                             pick_next_haul_leg(
                                 &pose,
@@ -1331,11 +1320,7 @@ fn npc_brain_tick(
                             // also be the "path failed" branch (Err)
                             // collapsed to Idle — both end the same
                             // way.
-                            release_haul_for(
-                                *npc_id,
-                                &mut haul.assignments,
-                                &mut haul.reservations,
-                            );
+                            haul.store.release_for_npc(*npc_id);
                             brain.goal = Goal::Idle;
                             if !npc_path.0.is_empty() {
                                 npc_path.0.clear();
@@ -1358,11 +1343,7 @@ fn npc_brain_tick(
                             cell = ?plan_cell.to_array(),
                             "haul deposit: plan gone or not a build plan; releasing assignment",
                         );
-                        release_haul_for(
-                            *npc_id,
-                            &mut haul.assignments,
-                            &mut haul.reservations,
-                        );
+                        haul.store.release_for_npc(*npc_id);
                         brain.goal = Goal::Idle;
                         continue;
                     }
@@ -1376,11 +1357,7 @@ fn npc_brain_tick(
                             // Carry empty at deposit — degenerate but
                             // recoverable. Release haul, idle, let the
                             // scheduler try again.
-                            release_haul_for(
-                                *npc_id,
-                                &mut haul.assignments,
-                                &mut haul.reservations,
-                            );
+                            haul.store.release_for_npc(*npc_id);
                             brain.goal = Goal::Idle;
                             continue;
                         }
@@ -1423,8 +1400,8 @@ fn npc_brain_tick(
                         .map(|d| d.carry_capacity)
                         .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
                     let next_goal = haul
-                        .assignments
-                        .get(*npc_id)
+                        .store
+                        .assignment_of(*npc_id)
                         .and_then(|a| {
                             pick_next_haul_leg(
                                 &pose,
@@ -1451,11 +1428,7 @@ fn npc_brain_tick(
                             brain.goal = goal;
                         }
                         None => {
-                            release_haul_for(
-                                *npc_id,
-                                &mut haul.assignments,
-                                &mut haul.reservations,
-                            );
+                            haul.store.release_for_npc(*npc_id);
                             brain.goal = Goal::Idle;
                             if !npc_path.0.is_empty() {
                                 npc_path.0.clear();
@@ -1483,22 +1456,14 @@ fn npc_brain_tick(
                             cell = ?station_cell.to_array(),
                             "haul deposit: station gone; releasing assignment",
                         );
-                        release_haul_for(
-                            *npc_id,
-                            &mut haul.assignments,
-                            &mut haul.reservations,
-                        );
+                        haul.store.release_for_npc(*npc_id);
                         brain.goal = Goal::Idle;
                         continue;
                     }
                     let (carry_item, carry_count) = match (carrying.item, carrying.count) {
                         (Some(slot), c) if c > 0 => (slot, c),
                         _ => {
-                            release_haul_for(
-                                *npc_id,
-                                &mut haul.assignments,
-                                &mut haul.reservations,
-                            );
+                            haul.store.release_for_npc(*npc_id);
                             brain.goal = Goal::Idle;
                             continue;
                         }
@@ -1532,11 +1497,7 @@ fn npc_brain_tick(
                             kind = carry_item.0,
                             "haul deposit: station has no demand for carry; releasing",
                         );
-                        release_haul_for(
-                            *npc_id,
-                            &mut haul.assignments,
-                            &mut haul.reservations,
-                        );
+                        haul.store.release_for_npc(*npc_id);
                         brain.goal = Goal::Idle;
                         continue;
                     }
@@ -1572,8 +1533,8 @@ fn npc_brain_tick(
                         .map(|d| d.carry_capacity)
                         .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
                     let next_goal = haul
-                        .assignments
-                        .get(*npc_id)
+                        .store
+                        .assignment_of(*npc_id)
                         .and_then(|a| {
                             pick_next_haul_leg(
                                 &pose,
@@ -1600,11 +1561,7 @@ fn npc_brain_tick(
                             brain.goal = goal;
                         }
                         None => {
-                            release_haul_for(
-                                *npc_id,
-                                &mut haul.assignments,
-                                &mut haul.reservations,
-                            );
+                            haul.store.release_for_npc(*npc_id);
                             brain.goal = Goal::Idle;
                             if !npc_path.0.is_empty() {
                                 npc_path.0.clear();
@@ -1629,11 +1586,7 @@ fn npc_brain_tick(
                             item = ?item_entity,
                             "haul tool pickup: item gone or mismatch; releasing assignment",
                         );
-                        release_haul_for(
-                            *npc_id,
-                            &mut haul.assignments,
-                            &mut haul.reservations,
-                        );
+                        haul.store.release_for_npc(*npc_id);
                         brain.goal = Goal::Idle;
                         continue;
                     }
@@ -1668,10 +1621,10 @@ fn npc_brain_tick(
                             Name::new(format!("WorldItem(npc_tool_swap:{})", prev_slot.0)),
                         ));
                     }
-                    haul.reservations.release(item_entity, *npc_id);
-                    if let Some(assignment) = haul.assignments.get_mut(*npc_id) {
-                        assignment.pending_tool = None;
-                    }
+                    // pending_tool field + its reservation are coupled
+                    // — `clear_pending_tool` clears both atomically.
+                    let _ = item_entity;
+                    haul.store.clear_pending_tool(*npc_id);
                     // Continue with the next haul leg now that we're
                     // tooled up. If the queue is empty (assignment
                     // was tool-only) we naturally release + idle and
@@ -1682,8 +1635,8 @@ fn npc_brain_tick(
                         .map(|d| d.carry_capacity)
                         .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
                     let next_goal = haul
-                        .assignments
-                        .get(*npc_id)
+                        .store
+                        .assignment_of(*npc_id)
                         .and_then(|a| {
                             pick_next_haul_leg(
                                 &pose,
@@ -1710,11 +1663,7 @@ fn npc_brain_tick(
                             brain.goal = goal;
                         }
                         None => {
-                            release_haul_for(
-                                *npc_id,
-                                &mut haul.assignments,
-                                &mut haul.reservations,
-                            );
+                            haul.store.release_for_npc(*npc_id);
                             brain.goal = Goal::Idle;
                             if !npc_path.0.is_empty() {
                                 npc_path.0.clear();
@@ -1744,7 +1693,7 @@ fn npc_brain_tick(
                             &haul.item_registry,
                             &craft.recipes,
                             &mut craft.stations,
-                            &mut craft.workers,
+                            &mut craft.bookings,
                         )
                         .is_some()
                     } else {
@@ -1768,7 +1717,7 @@ fn npc_brain_tick(
                             station = ?station_cell.to_array(),
                             "craft arrival: no satisfiable order; releasing booking",
                         );
-                        craft.assignments.release_for_npc(*npc_id);
+                        craft.bookings.release_npc_booking(*npc_id, entity);
                         brain.goal = Goal::Idle;
                     }
                 }
@@ -1798,18 +1747,15 @@ fn npc_brain_tick(
                         // Stuck or timed out mid-haul: free the entire
                         // assignment + every reservation it holds. The
                         // scheduler will repick next tick.
-                        release_haul_for(
-                            *npc_id,
-                            &mut haul.assignments,
-                            &mut haul.reservations,
-                        );
+                        haul.store.release_for_npc(*npc_id);
                     }
                     ArrivalAction::WorkStation { .. } => {
                         // Stuck mid-walk-to-station: release the
                         // booking so another NPC (or this one next
                         // tick) can take it. No worker registration
-                        // exists yet — arrival is what registers.
-                        craft.assignments.release_for_npc(*npc_id);
+                        // exists yet — arrival is what registers —
+                        // but `release_npc_booking` handles both.
+                        craft.bookings.release_npc_booking(*npc_id, entity);
                     }
                     _ => {}
                 }
@@ -1961,8 +1907,7 @@ fn npc_brain_tick(
         // the NPC's worker registration was cleared. Done here (not
         // inline in the match) so we don't double-borrow `craft`.
         if let Some(station_cell) = crafting_done_at {
-            craft.workers.release(station_cell, entity);
-            craft.assignments.release_for_npc(*npc_id);
+            craft.bookings.release_npc_booking(*npc_id, entity);
             info!(
                 npc = npc_id.0,
                 station = ?station_cell.to_array(),
@@ -2019,16 +1964,15 @@ fn npc_brain_tick(
             // fallout requirement: free NPCs do skilled work when
             // workable; only idle-skilled-NPCs fall back to hauling.
             if !preempted_this_tick
-                && !craft.assignments.contains_npc(*npc_id)
-                && !haul.assignments.contains(*npc_id)
+                && !craft.bookings.contains_npc(*npc_id)
+                && !haul.store.has_assignment(*npc_id)
                 && let Some(station_cell) =
                     crate::craft_stations::try_schedule_craft_for_npc(
                         *npc_id,
                         pose.translation,
                         &equipped_tool,
                         &craft.stations,
-                        &craft.workers,
-                        &mut craft.assignments,
+                        &mut craft.bookings,
                         &block_registry,
                         &craft.recipes,
                         &haul.item_registry,
@@ -2102,7 +2046,7 @@ fn npc_brain_tick(
                             station = ?station_cell.to_array(),
                             "craft commit: no path to station; releasing booking",
                         );
-                        craft.assignments.release_for_npc(*npc_id);
+                        craft.bookings.release_npc_booking(*npc_id, entity);
                         brain.goal = Goal::Resting {
                             remaining_secs: MIN_REST_SECS,
                         };
@@ -2127,7 +2071,7 @@ fn npc_brain_tick(
             // peeled off for survival would otherwise be instantly
             // reassigned to another haul before the planner could
             // route them to food/sleep.
-            if !preempted_this_tick && !haul.assignments.contains(*npc_id) {
+            if !preempted_this_tick && !haul.store.has_assignment(*npc_id) {
                 crate::haul::try_schedule_haul_for_npc(
                     *npc_id,
                     &kind.0,
@@ -2143,8 +2087,7 @@ fn npc_brain_tick(
                     &chunks,
                     &chunk_map,
                     &haul.world_items,
-                    &mut haul.assignments,
-                    &mut haul.reservations,
+                    &mut haul.store,
                 );
             }
             // Engine-driven haul takes priority over the Lua planner.
@@ -2154,15 +2097,15 @@ fn npc_brain_tick(
             // `pending_assignments` in its snapshot when it is called
             // for a *different* NPC, but never gets to overrule an
             // active haul.
-            if haul.assignments.contains(*npc_id) {
+            if haul.store.has_assignment(*npc_id) {
                 let cap = haul
                     .kind_registry
                     .get(&kind.0)
                     .map(|d| d.carry_capacity)
                     .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
                 let next_goal = haul
-                    .assignments
-                    .get(*npc_id)
+                    .store
+                    .assignment_of(*npc_id)
                     .and_then(|a| {
                         pick_next_haul_leg(
                             &pose,
@@ -2195,11 +2138,7 @@ fn npc_brain_tick(
                         // first leg failed; release and fall through
                         // to the planner so the NPC doesn't burn a
                         // tick doing nothing.
-                        release_haul_for(
-                            *npc_id,
-                            &mut haul.assignments,
-                            &mut haul.reservations,
-                        );
+                        haul.store.release_for_npc(*npc_id);
                     }
                 }
             }
@@ -2215,7 +2154,7 @@ fn npc_brain_tick(
                 &interaction_claims,
                 &haul.plans,
                 &haul.plan_claims,
-                &haul.assignments,
+                &haul.store,
                 &chunks,
                 &chunk_entities_q,
                 &chunk_map,
@@ -2263,11 +2202,7 @@ fn npc_brain_tick(
                     // disabled NPC isn't frozen mid-action.
                     interaction_claims.release_all_for(*npc_id);
                     haul.plan_claims.release_all_for(*npc_id);
-                    release_haul_for(
-                        *npc_id,
-                        &mut haul.assignments,
-                        &mut haul.reservations,
-                    );
+                    haul.store.release_for_npc(*npc_id);
                     commands
                         .entity(entity)
                         .remove::<KinematicLock>()
@@ -3187,7 +3122,7 @@ fn build_snapshot(
     interaction_claims: &InteractionClaims,
     plans: &Plans,
     plan_claims: &PlanClaims,
-    haul_assignments: &HaulAssignments,
+    haul_store: &HaulStore,
     chunks: &Query<&Chunk>,
     chunk_entities: &Query<&'static ChunkEntities>,
     chunk_map: &ChunkMap,
@@ -3230,8 +3165,8 @@ fn build_snapshot(
     // planner gets to weigh in even mid-haul. Wire it through anyway
     // so the surface is stable and the bypass becomes an enable/disable
     // knob rather than a shape change.
-    let pending_assignments = haul_assignments
-        .get(id)
+    let pending_assignments = haul_store
+        .assignment_of(id)
         .map(|a| {
             let cell = a.target.cell();
             vec![PendingAssignment {
@@ -4164,7 +4099,7 @@ mod tests {
     //! can't silently break it.
 
     use super::*;
-    use crate::haul::{HaulAssignment, HaulAssignments, ReservedItem, WorldItemReservations};
+    use crate::haul::{HaulAssignment, HaulStore, ReservedItem};
     use crate::interactables::InteractionClaims;
     use crate::items::ItemSlot;
     use crate::plan_claims::PlanClaims;
@@ -4287,8 +4222,7 @@ mod tests {
         let cell = IVec3::new(5, 6, 7);
         let mut plan_claims = PlanClaims::default();
         let mut interaction_claims = InteractionClaims::default();
-        let mut assignments = HaulAssignments::default();
-        let mut reservations = WorldItemReservations::default();
+        let mut haul_store = HaulStore::default();
         assert!(plan_claims.try_claim(cell, npc));
 
         preempt_release_holds(
@@ -4296,8 +4230,7 @@ mod tests {
             &dummy_work_goal(cell),
             &mut plan_claims,
             &mut interaction_claims,
-            &mut assignments,
-            &mut reservations,
+            &mut haul_store,
         );
 
         // After release, another NPC can claim the same cell.
@@ -4312,11 +4245,10 @@ mod tests {
         let plan_cell = IVec3::new(0, 0, 5);
         let mut plan_claims = PlanClaims::default();
         let mut interaction_claims = InteractionClaims::default();
-        let mut assignments = HaulAssignments::default();
-        let mut reservations = WorldItemReservations::default();
+        let mut haul_store = HaulStore::default();
 
-        assert!(reservations.try_reserve(item_entity, npc));
-        assignments.insert(
+        assert!(haul_store.try_reserve_internal(item_entity, npc));
+        haul_store.commit_assignment(
             npc,
             HaulAssignment {
                 target: crate::haul::HaulTarget::Plan(plan_cell),
@@ -4328,20 +4260,19 @@ mod tests {
                 pending_tool: None,
             },
         );
-        assert!(assignments.contains(npc));
+        assert!(haul_store.has_assignment(npc));
 
         preempt_release_holds(
             npc,
             &dummy_pickup_movetomove(item_entity, plan_cell),
             &mut plan_claims,
             &mut interaction_claims,
-            &mut assignments,
-            &mut reservations,
+            &mut haul_store,
         );
 
-        assert!(!assignments.contains(npc));
+        assert!(!haul_store.has_assignment(npc));
         let other = NpcId(8);
-        assert!(reservations.try_reserve(item_entity, other));
+        assert!(haul_store.try_reserve_internal(item_entity, other));
     }
 
     #[test]
@@ -4350,8 +4281,7 @@ mod tests {
         let cell = IVec3::new(1, 1, 1);
         let mut plan_claims = PlanClaims::default();
         let mut interaction_claims = InteractionClaims::default();
-        let mut assignments = HaulAssignments::default();
-        let mut reservations = WorldItemReservations::default();
+        let mut haul_store = HaulStore::default();
         assert!(plan_claims.try_claim(cell, npc));
 
         preempt_release_holds(
@@ -4359,8 +4289,7 @@ mod tests {
             &Goal::Idle,
             &mut plan_claims,
             &mut interaction_claims,
-            &mut assignments,
-            &mut reservations,
+            &mut haul_store,
         );
         preempt_release_holds(
             npc,
@@ -4369,8 +4298,7 @@ mod tests {
             },
             &mut plan_claims,
             &mut interaction_claims,
-            &mut assignments,
-            &mut reservations,
+            &mut haul_store,
         );
 
         // The unrelated plan claim survives — both no-ops left it

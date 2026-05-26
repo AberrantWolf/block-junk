@@ -1,17 +1,22 @@
-//! Server-only reservation + assignment tables for NPC hauling.
+//! Server-only state for NPC hauling. Holds two coupled tables:
 //!
-//! Two paired resources, mirrored after [`crate::plan_claims::PlanClaims`]:
+//! - The per-NPC assignment map — what each NPC is currently
+//!   delivering, where, and what tool/items they've reserved for it.
+//! - The reservation table — which `WorldItem` entity has been
+//!   earmarked by which NPC.
 //!
-//! - [`WorldItemReservations`] — which `WorldItem` entity has been
-//!   reserved by which NPC. Prevents two NPCs (or the scheduler in two
-//!   consecutive ticks) from queuing the same loose item for delivery.
-//! - [`HaulAssignments`] — per-NPC "you are delivering these items to
-//!   this plan." The brain reads its own assignment on each leg of a
-//!   haul cycle to pick the next destination.
+//! These two MUST stay coupled: a reservation without an owning
+//! assignment is a leak (the item stays locked, no one can claim it),
+//! and an assignment without its reservations is broken (the brain
+//! walks to a freed item that another NPC may grab first). The
+//! previous design exposed them as two separate `Resource`s and
+//! relied on a `release_haul_for` helper to clear them together —
+//! convention rather than enforcement. [`HaulStore`] now wraps both
+//! behind a private API so the only way to mutate them is through
+//! methods that maintain the coupling invariant.
 //!
 //! Neither survives save/load. NPCs reset to `Goal::Idle` on load and
-//! the scheduler re-pairs from scratch — reservations stale-released
-//! implicitly when the assignment map empties.
+//! the scheduler re-pairs from scratch.
 
 use std::collections::HashMap;
 
@@ -19,59 +24,6 @@ use bevy::prelude::*;
 
 use crate::items::ItemSlot;
 use crate::npc::NpcId;
-
-/// Reservation table for [`crate::protocol::WorldItem`] entities.
-/// Keyed by entity (the loose-item entity itself, not a cell) since
-/// items don't live on the 1m grid and several may share a cell.
-#[derive(Resource, Default, Debug)]
-pub struct WorldItemReservations {
-    by_entity: HashMap<Entity, NpcId>,
-}
-
-impl WorldItemReservations {
-    /// Try to reserve `entity` for `npc`. Succeeds if the slot is free
-    /// or already held by the same NPC (re-reserve is idempotent — the
-    /// scheduler may re-call when re-evaluating an existing assignment).
-    pub fn try_reserve(&mut self, entity: Entity, npc: NpcId) -> bool {
-        match self.by_entity.get(&entity) {
-            Some(holder) if holder.0 == npc.0 => true,
-            Some(_) => false,
-            None => {
-                self.by_entity.insert(entity, npc);
-                true
-            }
-        }
-    }
-
-    /// Release `entity`'s reservation if `npc` holds it. Releasing a
-    /// reservation not held by `npc` is silently a no-op — mirrors
-    /// [`crate::plan_claims::PlanClaims::release`].
-    pub fn release(&mut self, entity: Entity, npc: NpcId) {
-        if let Some(holder) = self.by_entity.get(&entity)
-            && holder.0 == npc.0
-        {
-            self.by_entity.remove(&entity);
-        }
-    }
-
-    /// Drop every reservation held by `npc`. Called on NPC despawn /
-    /// haul abandon so a single NPC can't permanently lock items by
-    /// failing in some unanticipated way.
-    pub fn release_all_for(&mut self, npc: NpcId) {
-        self.by_entity.retain(|_, holder| holder.0 != npc.0);
-    }
-
-    /// True if `entity` is currently reserved by anyone other than
-    /// `npc`. Used by the scheduler to filter "available items" without
-    /// taking the reservation — taking happens later, atomically, when
-    /// the scheduler commits an assignment.
-    pub fn is_taken_by_other(&self, entity: Entity, npc: NpcId) -> bool {
-        match self.by_entity.get(&entity) {
-            Some(holder) => holder.0 != npc.0,
-            None => false,
-        }
-    }
-}
 
 /// One loose item the scheduler has earmarked for delivery to a plan.
 /// Caches `item` + `translation` so the brain doesn't need to query the
@@ -136,62 +88,140 @@ pub struct HaulAssignment {
     pub pending_tool: Option<ReservedItem>,
 }
 
-/// Per-NPC assignment map. An NPC with an entry here is being driven
-/// by the engine's haul scheduler — the Lua planner is bypassed for
-/// the duration. Mirrors [`crate::plan_claims::PlanClaims`] in shape.
+/// Server-only paired state for NPC hauling. Wraps the assignment
+/// map and the world-item reservation table behind a private API so
+/// the two can't drift out of sync — the previous version exposed
+/// them as two `Resource`s and relied on a `release_haul_for` helper
+/// being called by every cleanup path. With this wrapper there is no
+/// way to release one without releasing the other.
+///
+/// The scheduler (in this module) has full access to the inner
+/// tables via `pub(super)` getters because its commit flow is
+/// atomic-on-success-with-rollback and needs to reserve items
+/// one-by-one before assembling the final assignment. External
+/// callers (the brain tick in npc.rs) only see the safe public API.
 #[derive(Resource, Default, Debug)]
-pub struct HaulAssignments {
-    by_npc: HashMap<NpcId, HaulAssignment>,
+pub struct HaulStore {
+    assignments: HashMap<NpcId, HaulAssignment>,
+    reservations: HashMap<Entity, NpcId>,
 }
 
-impl HaulAssignments {
-    pub fn get(&self, npc: NpcId) -> Option<&HaulAssignment> {
-        self.by_npc.get(&npc)
+impl HaulStore {
+    /// Read the assignment for `npc`, or `None` if they don't have
+    /// one. The brain tick calls this on every tick to know whether
+    /// to plan a haul leg or fall through to the planner.
+    pub fn assignment_of(&self, npc: NpcId) -> Option<&HaulAssignment> {
+        self.assignments.get(&npc)
     }
 
-    pub fn get_mut(&mut self, npc: NpcId) -> Option<&mut HaulAssignment> {
-        self.by_npc.get_mut(&npc)
+    /// True if `npc` has an active assignment.
+    pub fn has_assignment(&self, npc: NpcId) -> bool {
+        self.assignments.contains_key(&npc)
     }
 
-    pub fn insert(&mut self, npc: NpcId, assignment: HaulAssignment) {
-        self.by_npc.insert(npc, assignment);
+    /// Iterate every active assignment. Used by `build_snapshot` to
+    /// surface the assignment to the Lua planner (currently ignored
+    /// by the planner, but the shape is wired forward).
+    pub fn iter_assignments(&self) -> impl Iterator<Item = (&NpcId, &HaulAssignment)> {
+        self.assignments.iter()
     }
 
-    pub fn remove(&mut self, npc: NpcId) -> Option<HaulAssignment> {
-        self.by_npc.remove(&npc)
-    }
-
-    pub fn contains(&self, npc: NpcId) -> bool {
-        self.by_npc.contains_key(&npc)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&NpcId, &HaulAssignment)> {
-        self.by_npc.iter()
-    }
-}
-
-/// Atomically drop `npc`'s assignment and release every item it had
-/// reserved. The two resources are coupled — an assignment without
-/// reservations is meaningless, and orphan reservations would leak
-/// items out of the scheduler's pool — so cleanup paths should always
-/// call this rather than touching either resource alone.
-pub fn release_haul_for(
-    npc: NpcId,
-    assignments: &mut HaulAssignments,
-    reservations: &mut WorldItemReservations,
-) {
-    if let Some(assignment) = assignments.remove(npc) {
-        for item in assignment.queue {
-            reservations.release(item.entity, npc);
-        }
-        if let Some(tool) = assignment.pending_tool {
-            reservations.release(tool.entity, npc);
+    /// True if `entity` is currently reserved by anyone other than
+    /// `npc`. Used by the scheduler + arrival handlers to detect
+    /// races against another NPC.
+    pub fn reservation_taken_by_other(&self, entity: Entity, npc: NpcId) -> bool {
+        match self.reservations.get(&entity) {
+            Some(holder) => holder.0 != npc.0,
+            None => false,
         }
     }
-    // Belt-and-braces: even if the assignment is gone for some other
-    // reason (manual mutation, future scheduler path), make sure no
-    // stray reservation outlives the assignment.
-    reservations.release_all_for(npc);
+
+    /// Atomically clear `npc`'s assignment and release every
+    /// reservation it held. Every cleanup path on the brain side
+    /// calls this — abandon-on-stuck, planner-error, NPC-despawn,
+    /// preempt-on-need. The two-table coupling is enforced here.
+    /// `release_all_for` belt-and-braces catches any stray
+    /// reservations not tracked by the assignment (shouldn't happen,
+    /// but cheap to defend).
+    pub fn release_for_npc(&mut self, npc: NpcId) {
+        if let Some(assignment) = self.assignments.remove(&npc) {
+            for item in &assignment.queue {
+                self.release_reservation_internal(item.entity, npc);
+            }
+            if let Some(tool) = &assignment.pending_tool {
+                self.release_reservation_internal(tool.entity, npc);
+            }
+        }
+        self.reservations.retain(|_, holder| holder.0 != npc.0);
+    }
+
+    /// Pop the front of `npc`'s pickup queue, releasing its
+    /// reservation atomically. Called from the PickupForPlan arrival
+    /// handler once the brain has consumed the item. Returns the
+    /// popped entry for diagnostic logging.
+    pub fn pop_queue_front(&mut self, npc: NpcId) -> Option<ReservedItem> {
+        let assignment = self.assignments.get_mut(&npc)?;
+        if assignment.queue.is_empty() {
+            return None;
+        }
+        let front = assignment.queue.remove(0);
+        self.release_reservation_internal(front.entity, npc);
+        Some(front)
+    }
+
+    /// Remove the queued reservation matching `entity` (NPC may
+    /// arrive at an item that's no longer the expected entity due to
+    /// a race; the brain calls this to skip past stale entries).
+    pub fn drop_queue_entry(&mut self, npc: NpcId, entity: Entity) {
+        if let Some(assignment) = self.assignments.get_mut(&npc) {
+            assignment.queue.retain(|r| r.entity != entity);
+        }
+        // Release reservation regardless of whether queue had it (a
+        // canonical "remove this stale ref" call).
+        self.release_reservation_internal(entity, npc);
+    }
+
+    /// Clear `npc`'s pending_tool slot and release its reservation.
+    /// Called from the PickupTool arrival once the tool is equipped.
+    pub fn clear_pending_tool(&mut self, npc: NpcId) {
+        if let Some(assignment) = self.assignments.get_mut(&npc) {
+            if let Some(tool) = assignment.pending_tool.take() {
+                self.release_reservation_internal(tool.entity, npc);
+            }
+        }
+    }
+
+    // --- internals; only the scheduler in this module reaches in. ---
+
+    pub(super) fn try_reserve_internal(&mut self, entity: Entity, npc: NpcId) -> bool {
+        match self.reservations.get(&entity) {
+            Some(holder) if holder.0 == npc.0 => true,
+            Some(_) => false,
+            None => {
+                self.reservations.insert(entity, npc);
+                true
+            }
+        }
+    }
+
+    pub(super) fn release_reservation_internal(&mut self, entity: Entity, npc: NpcId) {
+        if let Some(holder) = self.reservations.get(&entity)
+            && holder.0 == npc.0
+        {
+            self.reservations.remove(&entity);
+        }
+    }
+
+    /// Commit an assignment for `npc`. The caller (the scheduler)
+    /// must have already called `try_reserve_internal` for every
+    /// entity referenced by `assignment.queue` and `pending_tool`
+    /// before calling this — the reservations are already in the
+    /// table by the time we register the owner. If the caller bails
+    /// before committing, it's responsible for releasing each
+    /// individual reservation via `release_reservation_internal`.
+    pub(super) fn commit_assignment(&mut self, npc: NpcId, assignment: HaulAssignment) {
+        self.assignments.insert(npc, assignment);
+    }
 }
 
 /// Max Chebyshev distance (cells) from an NPC's foot to a plan the
@@ -236,12 +266,11 @@ pub fn try_schedule_haul_for_npc(
     chunks: &Query<&crate::voxel::Chunk>,
     chunk_map: &crate::voxel::ChunkMap,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
-    assignments: &mut HaulAssignments,
-    reservations: &mut WorldItemReservations,
+    store: &mut HaulStore,
 ) -> bool {
     use crate::protocol::PlanKind;
 
-    if assignments.contains(npc_id) {
+    if store.has_assignment(npc_id) {
         return false;
     }
     let cap = kind_registry
@@ -316,7 +345,7 @@ pub fn try_schedule_haul_for_npc(
             carry = c,
             "haul assignment (deposit-only) committed",
         );
-        assignments.insert(
+        store.commit_assignment(
             npc_id,
             HaulAssignment {
                 target,
@@ -371,7 +400,7 @@ pub fn try_schedule_haul_for_npc(
             &items_by_slot,
             pose,
             npc_id,
-            reservations,
+            store,
         );
         let Some((slot, remaining)) = chosen else {
             continue;
@@ -395,7 +424,7 @@ pub fn try_schedule_haul_for_npc(
                     npc_id,
                     world_items,
                     item_registry,
-                    reservations,
+                    store,
                 )
                 .is_none()
             {
@@ -421,7 +450,7 @@ pub fn try_schedule_haul_for_npc(
             &items_by_slot,
             pose,
             npc_id,
-            reservations,
+            store,
         );
         let Some((slot, remaining)) = chosen else {
             continue;
@@ -461,11 +490,11 @@ pub fn try_schedule_haul_for_npc(
                     npc_id,
                     world_items,
                     item_registry,
-                    reservations,
+                    store,
                 ) else {
                     return false;
                 };
-                if !reservations.try_reserve(entity, npc_id) {
+                if !store.try_reserve_internal(entity, npc_id) {
                     return false;
                 }
                 Some(ReservedItem {
@@ -483,7 +512,7 @@ pub fn try_schedule_haul_for_npc(
 
     let Some(pool) = items_by_slot.get(&item_slot) else {
         if let Some(tool) = &pending_tool {
-            reservations.release(tool.entity, npc_id);
+            store.release_reservation_internal(tool.entity, npc_id);
         }
         return false;
     };
@@ -492,7 +521,7 @@ pub fn try_schedule_haul_for_npc(
     let mut candidates: Vec<(Entity, Vec3, f32)> = pool
         .iter()
         .filter_map(|(entity, translation)| {
-            if reservations.is_taken_by_other(*entity, npc_id) {
+            if store.reservation_taken_by_other(*entity, npc_id) {
                 return None;
             }
             let d = (*translation - pose).length();
@@ -510,7 +539,7 @@ pub fn try_schedule_haul_for_npc(
         if queue.len() >= want {
             break;
         }
-        if reservations.try_reserve(entity, npc_id) {
+        if store.try_reserve_internal(entity, npc_id) {
             queue.push(ReservedItem {
                 entity,
                 item: item_slot,
@@ -520,7 +549,7 @@ pub fn try_schedule_haul_for_npc(
     }
     if queue.is_empty() {
         if let Some(tool) = &pending_tool {
-            reservations.release(tool.entity, npc_id);
+            store.release_reservation_internal(tool.entity, npc_id);
         }
         return false;
     }
@@ -532,7 +561,7 @@ pub fn try_schedule_haul_for_npc(
         tool = ?pending_tool.as_ref().map(|t| t.item.0),
         "haul assignment committed",
     );
-    assignments.insert(
+    store.commit_assignment(
         npc_id,
         HaulAssignment {
             target,
@@ -567,7 +596,7 @@ fn pick_haul_kind(
     >,
     pose: Vec3,
     npc_id: NpcId,
-    reservations: &WorldItemReservations,
+    store: &HaulStore,
 ) -> Option<(crate::items::ItemSlot, u32)> {
     let mut chosen: Option<(crate::items::ItemSlot, u32)> = None;
     for (slot, remaining) in demands {
@@ -578,7 +607,7 @@ fn pick_haul_kind(
             continue;
         };
         let reachable = pool.iter().any(|(entity, translation)| {
-            if reservations.is_taken_by_other(*entity, npc_id) {
+            if store.reservation_taken_by_other(*entity, npc_id) {
                 return false;
             }
             (*translation - pose).length() <= MAX_HAUL_ITEM_RADIUS_M
@@ -706,11 +735,11 @@ fn find_nearest_unreserved_tool(
     npc_id: NpcId,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
     item_registry: &crate::items::ItemRegistry,
-    reservations: &WorldItemReservations,
+    store: &HaulStore,
 ) -> Option<(Entity, crate::items::ItemSlot, Vec3)> {
     let mut best: Option<(Entity, crate::items::ItemSlot, Vec3, f32)> = None;
     for (entity, wi) in world_items.iter() {
-        if reservations.is_taken_by_other(entity, npc_id) {
+        if store.reservation_taken_by_other(entity, npc_id) {
             continue;
         }
         let def = item_registry.def(wi.item);
@@ -732,8 +761,7 @@ pub struct HaulPlugin;
 
 impl Plugin for HaulPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<WorldItemReservations>();
-        app.init_resource::<HaulAssignments>();
+        app.init_resource::<HaulStore>();
     }
 }
 
@@ -748,96 +776,81 @@ mod tests {
         Entity::from_raw_u32(id).expect("nonzero entity id")
     }
 
+    fn assignment_with_queue(entities: &[Entity]) -> HaulAssignment {
+        HaulAssignment {
+            target: HaulTarget::Plan(IVec3::ZERO),
+            queue: entities
+                .iter()
+                .map(|e| ReservedItem {
+                    entity: *e,
+                    item: ItemSlot(0),
+                    translation: Vec3::ZERO,
+                })
+                .collect(),
+            pending_tool: None,
+        }
+    }
+
     #[test]
     fn first_reserve_succeeds_second_fails() {
-        let mut r = WorldItemReservations::default();
+        let mut s = HaulStore::default();
         let e = entity(1);
-        assert!(r.try_reserve(e, NPC_1));
-        assert!(!r.try_reserve(e, NPC_2));
+        assert!(s.try_reserve_internal(e, NPC_1));
+        assert!(!s.try_reserve_internal(e, NPC_2));
     }
 
     #[test]
     fn reserve_by_same_npc_is_idempotent() {
-        let mut r = WorldItemReservations::default();
+        let mut s = HaulStore::default();
         let e = entity(1);
-        assert!(r.try_reserve(e, NPC_1));
-        assert!(r.try_reserve(e, NPC_1));
+        assert!(s.try_reserve_internal(e, NPC_1));
+        assert!(s.try_reserve_internal(e, NPC_1));
     }
 
     #[test]
-    fn release_frees_for_other() {
-        let mut r = WorldItemReservations::default();
+    fn release_reservation_frees_for_other() {
+        let mut s = HaulStore::default();
         let e = entity(1);
-        r.try_reserve(e, NPC_1);
-        r.release(e, NPC_1);
-        assert!(r.try_reserve(e, NPC_2));
+        s.try_reserve_internal(e, NPC_1);
+        s.release_reservation_internal(e, NPC_1);
+        assert!(s.try_reserve_internal(e, NPC_2));
     }
 
     #[test]
     fn release_by_non_owner_is_no_op() {
-        let mut r = WorldItemReservations::default();
+        let mut s = HaulStore::default();
         let e = entity(1);
-        r.try_reserve(e, NPC_1);
-        r.release(e, NPC_2);
-        assert!(!r.try_reserve(e, NPC_2));
-        assert!(r.try_reserve(e, NPC_1));
+        s.try_reserve_internal(e, NPC_1);
+        s.release_reservation_internal(e, NPC_2);
+        assert!(!s.try_reserve_internal(e, NPC_2));
+        assert!(s.try_reserve_internal(e, NPC_1));
     }
 
     #[test]
-    fn release_all_for_drops_only_that_npc() {
-        let mut r = WorldItemReservations::default();
+    fn release_for_npc_clears_assignment_and_all_reservations() {
+        let mut s = HaulStore::default();
         let a = entity(1);
         let b = entity(2);
-        r.try_reserve(a, NPC_1);
-        r.try_reserve(b, NPC_2);
-        r.release_all_for(NPC_1);
-        assert!(r.try_reserve(a, NPC_2));
-        assert!(!r.try_reserve(b, NPC_1));
+        assert!(s.try_reserve_internal(a, NPC_1));
+        assert!(s.try_reserve_internal(b, NPC_1));
+        s.commit_assignment(NPC_1, assignment_with_queue(&[a, b]));
+        assert!(s.has_assignment(NPC_1));
+
+        s.release_for_npc(NPC_1);
+
+        assert!(!s.has_assignment(NPC_1));
+        // Both reservations are now free for anyone else — coupling
+        // enforced regardless of which path the caller took.
+        assert!(s.try_reserve_internal(a, NPC_2));
+        assert!(s.try_reserve_internal(b, NPC_2));
     }
 
     #[test]
-    fn release_haul_for_clears_both_resources() {
-        let mut assignments = HaulAssignments::default();
-        let mut reservations = WorldItemReservations::default();
-        let a = entity(1);
-        let b = entity(2);
-        reservations.try_reserve(a, NPC_1);
-        reservations.try_reserve(b, NPC_1);
-        assignments.insert(
-            NPC_1,
-            HaulAssignment {
-                target: HaulTarget::Plan(IVec3::ZERO),
-                queue: vec![
-                    ReservedItem {
-                        entity: a,
-                        item: ItemSlot(0),
-                        translation: Vec3::ZERO,
-                    },
-                    ReservedItem {
-                        entity: b,
-                        item: ItemSlot(0),
-                        translation: Vec3::ZERO,
-                    },
-                ],
-                pending_tool: None,
-            },
-        );
-
-        release_haul_for(NPC_1, &mut assignments, &mut reservations);
-
-        assert!(!assignments.contains(NPC_1));
-        // Both reservations are now free for anyone else.
-        assert!(reservations.try_reserve(a, NPC_2));
-        assert!(reservations.try_reserve(b, NPC_2));
-    }
-
-    #[test]
-    fn release_haul_for_also_drops_pending_tool() {
-        let mut assignments = HaulAssignments::default();
-        let mut reservations = WorldItemReservations::default();
+    fn release_for_npc_drops_pending_tool() {
+        let mut s = HaulStore::default();
         let tool = entity(10);
-        reservations.try_reserve(tool, NPC_1);
-        assignments.insert(
+        assert!(s.try_reserve_internal(tool, NPC_1));
+        s.commit_assignment(
             NPC_1,
             HaulAssignment {
                 target: HaulTarget::Plan(IVec3::ZERO),
@@ -849,9 +862,70 @@ mod tests {
                 }),
             },
         );
-        release_haul_for(NPC_1, &mut assignments, &mut reservations);
-        assert!(!assignments.contains(NPC_1));
-        // Tool reservation freed too — another NPC can claim it.
-        assert!(reservations.try_reserve(tool, NPC_2));
+
+        s.release_for_npc(NPC_1);
+
+        assert!(!s.has_assignment(NPC_1));
+        assert!(s.try_reserve_internal(tool, NPC_2));
+    }
+
+    #[test]
+    fn release_for_npc_only_clears_that_npcs_state() {
+        let mut s = HaulStore::default();
+        let a = entity(1);
+        let b = entity(2);
+        s.try_reserve_internal(a, NPC_1);
+        s.try_reserve_internal(b, NPC_2);
+        s.commit_assignment(NPC_1, assignment_with_queue(&[a]));
+        s.commit_assignment(NPC_2, assignment_with_queue(&[b]));
+
+        s.release_for_npc(NPC_1);
+
+        assert!(!s.has_assignment(NPC_1));
+        assert!(s.has_assignment(NPC_2));
+        // NPC_2's reservation survives.
+        assert!(!s.try_reserve_internal(b, NPC_1));
+    }
+
+    #[test]
+    fn pop_queue_front_releases_its_reservation() {
+        let mut s = HaulStore::default();
+        let a = entity(1);
+        let b = entity(2);
+        s.try_reserve_internal(a, NPC_1);
+        s.try_reserve_internal(b, NPC_1);
+        s.commit_assignment(NPC_1, assignment_with_queue(&[a, b]));
+
+        let popped = s.pop_queue_front(NPC_1).unwrap();
+        assert_eq!(popped.entity, a);
+        // a is free; b is still reserved.
+        assert!(s.try_reserve_internal(a, NPC_2));
+        assert!(!s.try_reserve_internal(b, NPC_2));
+    }
+
+    #[test]
+    fn clear_pending_tool_releases_its_reservation() {
+        let mut s = HaulStore::default();
+        let tool = entity(7);
+        s.try_reserve_internal(tool, NPC_1);
+        s.commit_assignment(
+            NPC_1,
+            HaulAssignment {
+                target: HaulTarget::Plan(IVec3::ZERO),
+                queue: vec![],
+                pending_tool: Some(ReservedItem {
+                    entity: tool,
+                    item: ItemSlot(0),
+                    translation: Vec3::ZERO,
+                }),
+            },
+        );
+
+        s.clear_pending_tool(NPC_1);
+
+        // Assignment still exists (might have a queue), but tool is freed.
+        assert!(s.has_assignment(NPC_1));
+        assert!(s.assignment_of(NPC_1).unwrap().pending_tool.is_none());
+        assert!(s.try_reserve_internal(tool, NPC_2));
     }
 }

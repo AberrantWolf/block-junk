@@ -129,119 +129,131 @@ impl StationState {
     }
 }
 
-/// Server-only: NPC ↔ station booking, used by the craft scheduler
-/// (Phase 6c-A) to prevent two NPCs walking to the same workstation.
-/// Bidirectional so the scheduler can ask "is this station taken?"
-/// in O(1) without scanning every NPC's assignment.
+/// Server-only paired booking state for craft stations. Wraps:
 ///
-/// Distinct from [`ActiveWorkers`]: this records *intent to work*
-/// (NPC en route or working), keyed by `NpcId`; ActiveWorkers
-/// records *currently powering active_work*, keyed by `Entity`.
-/// Both can exist for the same cell simultaneously (NPC has arrived
-/// + registered as ActiveWorker) or only one (NPC is mid-walk: in
-/// CraftAssignments but not yet ActiveWorkers).
+/// - The NPC ↔ station assignment table (bidirectional so the
+///   scheduler can ask "is this station taken?" in O(1)) — Phase
+///   6c-A "this NPC is going to work that workbench."
+/// - The cell ↔ active-worker entity table — who is currently
+///   powering each station's `active_work`. tick_station_work only
+///   increments elapsed when this map has an entry.
+///
+/// The two share a lifecycle for NPC workers: an NPC arrives, both
+/// the assignment (already held) AND a worker registration get
+/// inserted; the NPC leaves (preempt, completion), both get cleared.
+/// `release_npc_booking` is the atomic clear-both for that case.
+/// Players never set the assignment side — they directly register as
+/// workers via WorkStart, no en-route phase.
 ///
 /// Doesn't persist across save/load — NPCs reset to Idle and the
-/// scheduler re-pairs from scratch, same pattern as HaulAssignments.
+/// scheduler re-pairs from scratch, same pattern as [`HaulStore`].
+///
+/// (crate::haul::HaulStore — the HaulStore reference above.)
 #[derive(Resource, Default, Debug)]
-pub struct CraftAssignments {
-    by_npc: HashMap<crate::npc::NpcId, IVec3>,
-    by_station: HashMap<IVec3, crate::npc::NpcId>,
+pub struct CraftBookings {
+    npc_by_station: HashMap<IVec3, crate::npc::NpcId>,
+    station_by_npc: HashMap<crate::npc::NpcId, IVec3>,
+    worker_by_cell: HashMap<IVec3, Entity>,
 }
 
-impl CraftAssignments {
+impl CraftBookings {
+    // --- NPC assignment side ---
+
     /// Atomically book `npc` for `station`. Succeeds only if both
     /// sides are free (or already point at each other — re-reserve
-    /// is idempotent). Returns true on success. Either-or-neither so
-    /// a half-failed reserve never leaves a dangling reverse entry.
-    pub fn try_reserve(&mut self, npc: crate::npc::NpcId, station: IVec3) -> bool {
-        match (self.by_npc.get(&npc), self.by_station.get(&station)) {
+    /// is idempotent). Returns true on success.
+    pub fn try_book_npc(&mut self, npc: crate::npc::NpcId, station: IVec3) -> bool {
+        match (self.station_by_npc.get(&npc), self.npc_by_station.get(&station)) {
             (Some(existing_cell), Some(existing_npc))
                 if *existing_cell == station && existing_npc.0 == npc.0 =>
             {
                 true
             }
             (None, None) => {
-                self.by_npc.insert(npc, station);
-                self.by_station.insert(station, npc);
+                self.station_by_npc.insert(npc, station);
+                self.npc_by_station.insert(station, npc);
                 true
             }
             _ => false,
         }
     }
 
-    /// Drop the booking held by `npc`, if any. Removes both
-    /// directions in lockstep.
-    pub fn release_for_npc(&mut self, npc: crate::npc::NpcId) {
-        if let Some(station) = self.by_npc.remove(&npc) {
-            self.by_station.remove(&station);
-        }
-    }
-
     /// True when `station` is booked by some NPC other than `npc`.
     /// Scheduler uses this to skip targets already taken.
     pub fn station_taken_by_other(&self, station: IVec3, npc: crate::npc::NpcId) -> bool {
-        match self.by_station.get(&station) {
+        match self.npc_by_station.get(&station) {
             Some(holder) => holder.0 != npc.0,
             None => false,
         }
     }
 
-    pub fn station_of(&self, npc: crate::npc::NpcId) -> Option<IVec3> {
-        self.by_npc.get(&npc).copied()
+    pub fn station_of_npc(&self, npc: crate::npc::NpcId) -> Option<IVec3> {
+        self.station_by_npc.get(&npc).copied()
     }
 
     pub fn contains_npc(&self, npc: crate::npc::NpcId) -> bool {
-        self.by_npc.contains_key(&npc)
-    }
-}
-
-/// Server-only: which connection (player) or future NPC entity is
-/// currently "powering" each station's `active_work`. The server
-/// tick only increments elapsed when this map has an entry for the
-/// cell. Cleared on `WorkStop`, on player disconnect, and on
-/// active_work auto-clear (completion or cancel).
-///
-/// Doesn't replicate — clients only see the elapsed/total progress
-/// via the broadcast StationState; they don't need to know which
-/// specific entity is doing the work.
-#[derive(Resource, Default, Debug)]
-pub struct ActiveWorkers {
-    by_cell: HashMap<IVec3, Entity>,
-}
-
-impl ActiveWorkers {
-    pub fn register(&mut self, cell: IVec3, worker: Entity) {
-        self.by_cell.insert(cell, worker);
+        self.station_by_npc.contains_key(&npc)
     }
 
-    /// Clear the registration at `cell` only if the current worker
-    /// matches `worker`. Lets a disconnected player's cleanup not
-    /// nuke a fresh worker who replaced them mid-tick.
-    pub fn release(&mut self, cell: IVec3, worker: Entity) {
-        if let Some(existing) = self.by_cell.get(&cell)
-            && *existing == worker
-        {
-            self.by_cell.remove(&cell);
+    /// Atomic cleanup for an NPC leaving its craft station: drop
+    /// both the booking AND the active-worker registration (if it
+    /// was this NPC's entity). Called from every preempt / abandon /
+    /// completion path so the two tables can't drift. `npc_entity`
+    /// is the ECS entity that backs the NPC — needed because the
+    /// worker side is keyed by Entity, not NpcId.
+    pub fn release_npc_booking(&mut self, npc: crate::npc::NpcId, npc_entity: Entity) {
+        if let Some(station) = self.station_by_npc.remove(&npc) {
+            self.npc_by_station.remove(&station);
+            // Only clear the worker registration if it was *this NPC's
+            // entity*. If a different entity grabbed the slot in the
+            // meantime, leave it alone — same logic as the original
+            // `ActiveWorkers::release` guard.
+            if let Some(existing) = self.worker_by_cell.get(&station)
+                && *existing == npc_entity
+            {
+                self.worker_by_cell.remove(&station);
+            }
         }
     }
 
-    pub fn force_clear(&mut self, cell: IVec3) {
-        self.by_cell.remove(&cell);
+    // --- Worker registration side (also used by players) ---
+
+    /// Register `worker` as powering `cell`'s active_work. Called on
+    /// WorkStart (player) and NPC arrival.
+    pub fn register_worker(&mut self, cell: IVec3, worker: Entity) {
+        self.worker_by_cell.insert(cell, worker);
     }
 
-    /// Drop every registration held by `worker`. Mirrors
-    /// PlanClaims::release_all_for; used on player disconnect.
-    pub fn release_all_for(&mut self, worker: Entity) {
-        self.by_cell.retain(|_, w| *w != worker);
+    /// Release a worker registration if `worker` is the current
+    /// holder. Lets a stale cleanup not nuke a fresh worker who
+    /// replaced them mid-tick.
+    pub fn release_worker(&mut self, cell: IVec3, worker: Entity) {
+        if let Some(existing) = self.worker_by_cell.get(&cell)
+            && *existing == worker
+        {
+            self.worker_by_cell.remove(&cell);
+        }
+    }
+
+    /// Unconditional clear. Called when active_work auto-completes /
+    /// cancels and the station is fully transitioning to "idle" —
+    /// any future worker (player or NPC) can start fresh.
+    pub fn force_clear_worker(&mut self, cell: IVec3) {
+        self.worker_by_cell.remove(&cell);
+    }
+
+    /// Drop every worker registration held by `entity`. Used on
+    /// player disconnect.
+    pub fn release_all_workers_for(&mut self, entity: Entity) {
+        self.worker_by_cell.retain(|_, w| *w != entity);
     }
 
     pub fn has_worker(&self, cell: IVec3) -> bool {
-        self.by_cell.contains_key(&cell)
+        self.worker_by_cell.contains_key(&cell)
     }
 
     pub fn worker_at(&self, cell: IVec3) -> Option<Entity> {
-        self.by_cell.get(&cell).copied()
+        self.worker_by_cell.get(&cell).copied()
     }
 }
 
@@ -333,8 +345,7 @@ pub fn try_schedule_craft_for_npc(
     pose: Vec3,
     equipped_tool: &crate::protocol::EquippedTool,
     stations: &CraftStations,
-    workers: &ActiveWorkers,
-    assignments: &mut CraftAssignments,
+    bookings: &mut CraftBookings,
     block_registry: &crate::blocks::BlockRegistry,
     recipes: &crate::recipes::RecipeRegistry,
     item_registry: &crate::items::ItemRegistry,
@@ -343,7 +354,7 @@ pub fn try_schedule_craft_for_npc(
 ) -> Option<IVec3> {
     use block_junk_mod_api::recipes::RecipeId;
 
-    if assignments.contains_npc(npc_id) {
+    if bookings.contains_npc(npc_id) {
         return None;
     }
     let foot = IVec3::new(
@@ -354,10 +365,10 @@ pub fn try_schedule_craft_for_npc(
 
     let mut best: Option<(IVec3, i32)> = None;
     for (cell, state) in stations.iter() {
-        if assignments.station_taken_by_other(*cell, npc_id) {
+        if bookings.station_taken_by_other(*cell, npc_id) {
             continue;
         }
-        if workers.has_worker(*cell) {
+        if bookings.has_worker(*cell) {
             continue;
         }
         if state.active_work.is_some() {
@@ -433,7 +444,7 @@ pub fn try_schedule_craft_for_npc(
     }
 
     let (cell, _) = best?;
-    if !assignments.try_reserve(npc_id, cell) {
+    if !bookings.try_book_npc(npc_id, cell) {
         return None;
     }
     info!(
@@ -525,8 +536,7 @@ pub struct CraftStationsClientPlugin;
 impl Plugin for CraftStationsServerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CraftStations>();
-        app.init_resource::<ActiveWorkers>();
-        app.init_resource::<CraftAssignments>();
+        app.init_resource::<CraftBookings>();
         app.add_observer(send_stations_full_sync_on_connect);
         app.add_observer(release_workers_on_disconnect);
         app.add_systems(
@@ -873,7 +883,7 @@ fn receive_work_start(
     item_registry: Res<crate::items::ItemRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
-    mut workers: ResMut<ActiveWorkers>,
+    mut bookings: ResMut<CraftBookings>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
@@ -908,7 +918,7 @@ fn receive_work_start(
             if let Some(state) = stations.get(req.station_cell)
                 && state.active_work.is_some()
             {
-                workers.register(req.station_cell, connection);
+                bookings.register_worker(req.station_cell, connection);
                 continue;
             }
             // Case 2: no active_work. Find the first queued order
@@ -924,7 +934,7 @@ fn receive_work_start(
                 &item_registry,
                 &recipes,
                 &mut stations,
-                &mut workers,
+                &mut bookings,
             )
             .is_some();
             if started {
@@ -944,11 +954,11 @@ fn receive_work_start(
 /// itself persists so a resume picks up where this paused.
 fn receive_work_stop(
     mut receivers: Query<(Entity, &mut MessageReceiver<WorkStop>)>,
-    mut workers: ResMut<ActiveWorkers>,
+    mut bookings: ResMut<CraftBookings>,
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
-            workers.release(req.station_cell, connection);
+            bookings.release_worker(req.station_cell, connection);
         }
     }
 }
@@ -959,9 +969,9 @@ fn receive_work_stop(
 /// another player or NPC can resume by sending `WorkStart`.
 fn release_workers_on_disconnect(
     trigger: On<Remove, Connected>,
-    mut workers: ResMut<ActiveWorkers>,
+    mut bookings: ResMut<CraftBookings>,
 ) {
-    workers.release_all_for(trigger.entity);
+    bookings.release_all_workers_for(trigger.entity);
 }
 
 /// Minimum interval between mid-work broadcasts. Trades a couple
@@ -987,7 +997,7 @@ fn tick_station_work(
     item_registry: Res<crate::items::ItemRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
-    mut workers: ResMut<ActiveWorkers>,
+    mut bookings: ResMut<CraftBookings>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut commands: Commands,
@@ -1017,7 +1027,7 @@ fn tick_station_work(
     let active_cells: Vec<IVec3> = stations
         .iter()
         .filter(|(cell, state)| {
-            state.active_work.is_some() && workers.has_worker(**cell)
+            state.active_work.is_some() && bookings.has_worker(**cell)
         })
         .map(|(cell, _)| *cell)
         .collect();
@@ -1122,7 +1132,7 @@ fn tick_station_work(
         // completion — their hold-L-click UX requires a re-press
         // before the next craft starts. Determining "is this an
         // NPC?" is a single ECS lookup on the worker entity.
-        let worker_entity = workers.worker_at(cell);
+        let worker_entity = bookings.worker_at(cell);
         let worker_is_npc = worker_entity
             .map(|e| npc_q.get(e).is_ok())
             .unwrap_or(false);
@@ -1142,7 +1152,7 @@ fn tick_station_work(
                 &item_registry,
                 &recipes,
                 &mut stations,
-                &mut workers,
+                &mut bookings,
             )
             .is_some()
             {
@@ -1155,7 +1165,7 @@ fn tick_station_work(
             // so the station goes paused (paused-with-active_work
             // never happens here since we already set it to None
             // above; this just frees the slot for the next worker).
-            workers.force_clear(cell);
+            bookings.force_clear_worker(cell);
         }
         let snapshot = stations.get(cell).cloned();
         let now_empty = snapshot.as_ref().map(|s| s.is_empty()).unwrap_or(true);
@@ -1228,7 +1238,7 @@ pub(crate) fn try_start_first_satisfiable_order(
     item_registry: &crate::items::ItemRegistry,
     recipes: &crate::recipes::RecipeRegistry,
     stations: &mut CraftStations,
-    workers: &mut ActiveWorkers,
+    bookings: &mut CraftBookings,
 ) -> Option<String> {
     use block_junk_mod_api::recipes::RecipeId;
     let state = stations.get_mut(station_cell)?;
@@ -1270,7 +1280,7 @@ pub(crate) fn try_start_first_satisfiable_order(
         break;
     }
     if let Some(recipe_id_str) = &started_recipe_id {
-        workers.register(station_cell, worker_entity);
+        bookings.register_worker(station_cell, worker_entity);
         info!(
             cell = ?station_cell.to_array(),
             recipe = %recipe_id_str,
@@ -1304,59 +1314,109 @@ mod tests {
     use super::*;
     use crate::npc::NpcId;
 
+    fn entity(id: u32) -> Entity {
+        Entity::from_raw_u32(id).expect("nonzero entity id")
+    }
+
     #[test]
-    fn craft_assignments_try_reserve_atomic_both_or_neither() {
-        let mut a = CraftAssignments::default();
+    fn try_book_npc_atomic_both_or_neither() {
+        let mut b = CraftBookings::default();
         let npc = NpcId(1);
         let cell = IVec3::new(5, 6, 7);
 
-        // First reserve: succeeds, both sides populated.
-        assert!(a.try_reserve(npc, cell));
-        assert_eq!(a.station_of(npc), Some(cell));
-        assert!(a.contains_npc(npc));
+        // First book: succeeds, both directions populated.
+        assert!(b.try_book_npc(npc, cell));
+        assert_eq!(b.station_of_npc(npc), Some(cell));
+        assert!(b.contains_npc(npc));
 
-        // Re-reserve same pairing: idempotent.
-        assert!(a.try_reserve(npc, cell));
+        // Re-book same pairing: idempotent.
+        assert!(b.try_book_npc(npc, cell));
 
-        // Conflict — same NPC, different station: refuses (NPC already
-        // booked elsewhere). Reverse map untouched.
+        // Conflict — same NPC, different station: refuses.
         let other_cell = IVec3::new(10, 6, 7);
-        assert!(!a.try_reserve(npc, other_cell));
-        assert_eq!(a.station_of(npc), Some(cell));
+        assert!(!b.try_book_npc(npc, other_cell));
+        assert_eq!(b.station_of_npc(npc), Some(cell));
 
         // Conflict — different NPC, same station: refuses.
         let other_npc = NpcId(2);
-        assert!(!a.try_reserve(other_npc, cell));
-        assert!(!a.contains_npc(other_npc));
+        assert!(!b.try_book_npc(other_npc, cell));
+        assert!(!b.contains_npc(other_npc));
     }
 
     #[test]
-    fn craft_assignments_release_clears_both_directions() {
-        let mut a = CraftAssignments::default();
-        let npc = NpcId(7);
-        let cell = IVec3::new(0, 0, 0);
-        assert!(a.try_reserve(npc, cell));
-        a.release_for_npc(npc);
-        assert!(!a.contains_npc(npc));
-        // Reverse map is clean — another NPC can now claim the same
-        // station.
-        let other = NpcId(8);
-        assert!(a.try_reserve(other, cell));
-    }
-
-    #[test]
-    fn craft_assignments_station_taken_by_other_distinguishes_self() {
-        let mut a = CraftAssignments::default();
+    fn station_taken_by_other_distinguishes_self() {
+        let mut b = CraftBookings::default();
         let me = NpcId(1);
         let other = NpcId(2);
         let cell = IVec3::new(3, 4, 5);
-        assert!(a.try_reserve(me, cell));
-        // I don't see my own booking as "taken by other"...
-        assert!(!a.station_taken_by_other(cell, me));
-        // ...but another NPC does.
-        assert!(a.station_taken_by_other(cell, other));
-        // Empty cell is taken by no one.
+        assert!(b.try_book_npc(me, cell));
+        assert!(!b.station_taken_by_other(cell, me));
+        assert!(b.station_taken_by_other(cell, other));
         let empty = IVec3::new(99, 99, 99);
-        assert!(!a.station_taken_by_other(empty, me));
+        assert!(!b.station_taken_by_other(empty, me));
+    }
+
+    #[test]
+    fn release_npc_booking_clears_both_directions_and_worker() {
+        let mut b = CraftBookings::default();
+        let npc = NpcId(7);
+        let npc_entity = entity(70);
+        let cell = IVec3::new(0, 0, 0);
+        assert!(b.try_book_npc(npc, cell));
+        b.register_worker(cell, npc_entity);
+        assert!(b.has_worker(cell));
+
+        b.release_npc_booking(npc, npc_entity);
+
+        assert!(!b.contains_npc(npc));
+        assert!(!b.has_worker(cell));
+        // Reverse map clean — another NPC can now claim.
+        let other = NpcId(8);
+        assert!(b.try_book_npc(other, cell));
+    }
+
+    #[test]
+    fn release_npc_booking_keeps_unrelated_worker() {
+        let mut b = CraftBookings::default();
+        let npc = NpcId(1);
+        let npc_entity = entity(10);
+        let other_entity = entity(20); // e.g., a player who took over the slot
+        let cell = IVec3::new(1, 2, 3);
+        assert!(b.try_book_npc(npc, cell));
+        // Someone else grabbed the worker slot in the meantime.
+        b.register_worker(cell, other_entity);
+
+        b.release_npc_booking(npc, npc_entity);
+
+        // NPC's booking is cleared, but the unrelated worker survives.
+        assert!(!b.contains_npc(npc));
+        assert_eq!(b.worker_at(cell), Some(other_entity));
+    }
+
+    #[test]
+    fn worker_release_guarded_by_holder() {
+        let mut b = CraftBookings::default();
+        let a = entity(1);
+        let other = entity(2);
+        let cell = IVec3::new(0, 0, 0);
+        b.register_worker(cell, a);
+        b.release_worker(cell, other); // wrong holder
+        assert_eq!(b.worker_at(cell), Some(a));
+        b.release_worker(cell, a); // correct
+        assert!(!b.has_worker(cell));
+    }
+
+    #[test]
+    fn release_all_workers_for_only_clears_that_entity() {
+        let mut b = CraftBookings::default();
+        let a = entity(1);
+        let c = entity(2);
+        let cell_a = IVec3::new(0, 0, 0);
+        let cell_c = IVec3::new(1, 0, 0);
+        b.register_worker(cell_a, a);
+        b.register_worker(cell_c, c);
+        b.release_all_workers_for(a);
+        assert!(!b.has_worker(cell_a));
+        assert_eq!(b.worker_at(cell_c), Some(c));
     }
 }
