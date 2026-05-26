@@ -90,7 +90,11 @@ fn close_on_block_gone(
     }
 }
 
-fn close_on_escape(
+/// Esc closes the craft modal. `pub(crate)` so [`crate::menu::toggle_pause`]
+/// can order itself `.before()` this — the pause-menu toggle suppresses
+/// itself when the modal is open, which it can only determine while the
+/// modal is still in the open state, before this system clears it.
+pub(crate) fn close_on_escape(
     keys: Res<ButtonInput<KeyCode>>,
     mut ui_state: ResMut<CraftStationUiState>,
 ) {

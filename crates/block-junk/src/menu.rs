@@ -226,7 +226,15 @@ impl Plugin for MenuPlugin {
             ),
         );
 
-        app.add_systems(Update, toggle_pause.run_if(in_state(AppState::InGame)));
+        // toggle_pause must read `CraftStationUiState::is_open()` BEFORE
+        // `close_on_escape` clears it on this same Esc press — otherwise
+        // the same keypress closes the modal and opens the pause menu.
+        app.add_systems(
+            Update,
+            toggle_pause
+                .before(crate::craft_ui::close_on_escape)
+                .run_if(in_state(AppState::InGame)),
+        );
 
         // Server thread lifecycle is tied to *session* boundaries, not to
         // InGame ↔ Paused. Pausing must not tear down the server; only
@@ -579,15 +587,31 @@ fn debug_overlay_ui(
 /// cursor handling mirrors `camera::capture`/`release_cursor`; going
 /// through those would require introducing a state-transition the
 /// rest of the codebase doesn't want.
+///
+/// Esc priority: the craft modal (and any future modal/dialog/in-flight
+/// action that consumes Esc) takes precedence. Without this, a single
+/// Esc press fired by both `close_on_escape` and `toggle_pause` would
+/// close the modal *and* open the pause menu in the same tick, which
+/// (a) double-acts on one keypress and (b) leaves the cursor unlocked
+/// after the visible modal goes away — silently disabling L-click
+/// pickup and other in-world input. System ordering puts this fn
+/// `.before(close_on_escape)` so we can read the modal's open state
+/// before it gets cleared.
 fn toggle_pause(
     keys: Res<ButtonInput<KeyCode>>,
     mut open: ResMut<PauseMenuOpen>,
+    craft_ui: Res<crate::craft_stations::CraftStationUiState>,
     mut windows: Query<
         (&mut bevy::window::Window, &mut bevy::window::CursorOptions),
         With<bevy::window::PrimaryWindow>,
     >,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    // Topmost-overlay-wins: if anything else is open, that overlay
+    // consumes the Esc — pause menu stays as it was.
+    if craft_ui.is_open() {
         return;
     }
     open.0 = !open.0;
