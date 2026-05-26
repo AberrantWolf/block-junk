@@ -180,13 +180,6 @@ impl Default for DebugNoSaveOnExit {
 #[derive(Component)]
 pub struct GameRoot;
 
-/// True while the in-game pause/options overlay is visible. The world
-/// keeps simulating regardless — the "Paused" overlay is just a menu
-/// that happens to release the cursor so its buttons are clickable.
-/// Toggled by `toggle_pause`.
-#[derive(Resource, Default)]
-pub struct PauseMenuOpen(pub bool);
-
 pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
@@ -200,7 +193,6 @@ impl Plugin for MenuPlugin {
         app.init_resource::<NewWorldName>();
         app.init_resource::<SaveListing>();
         app.init_resource::<SaveStatus>();
-        app.init_resource::<PauseMenuOpen>();
         app.add_systems(OnEnter(AppState::MainMenu), refresh_save_listing);
 
         // bevy_egui attaches its primary context to the FIRST camera that
@@ -226,11 +218,10 @@ impl Plugin for MenuPlugin {
             ),
         );
 
-        // No `.before()` ordering needed: Esc priority is now data-
-        // driven through `UiCaptures::has_other_than`. Each overlay's
-        // Esc handler reads the captures at its own pace; toggle_pause
-        // simply skips when some other capture is held.
-        app.add_systems(Update, toggle_pause.run_if(in_state(AppState::InGame)));
+        // Esc handling is centralized in `ui_capture::handle_escape` —
+        // it dispatches to the topmost capture (or opens pause if
+        // nothing held). No per-overlay Esc handlers, no per-overlay
+        // priority logic. See that module for the dispatch table.
 
         // Server thread lifecycle is tied to *session* boundaries, not to
         // InGame ↔ Paused. Pausing must not tear down the server; only
@@ -474,15 +465,11 @@ fn relative_time(unix_seconds: u64) -> String {
 
 fn pause_menu_ui(
     mut contexts: EguiContexts,
-    mut open: ResMut<PauseMenuOpen>,
+    mut captures: ResMut<crate::ui_capture::UiCaptures>,
     mut session: ResMut<ServerSession>,
     mut exit: MessageWriter<AppExit>,
-    mut windows: Query<
-        (&mut bevy::window::Window, &mut bevy::window::CursorOptions),
-        With<bevy::window::PrimaryWindow>,
-    >,
 ) {
-    if !open.0 {
+    if !captures.contains(crate::ui_capture::UiCapture::PauseMenu) {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -529,14 +516,11 @@ fn pause_menu_ui(
             });
         });
     if close_request {
-        open.0 = false;
-        if let Ok((mut window, mut cursor)) = windows.single_mut() {
-            let centre =
-                Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
-            window.set_cursor_position(Some(centre));
-            cursor.grab_mode = bevy::window::CursorGrabMode::Locked;
-            cursor.visible = false;
-        }
+        // Single state mutation handles everything: capture released
+        // ⇒ apply_cursor_mode relocks the cursor + clears
+        // DiscardNextMotion, ⇒ in-world input gates re-enable. No
+        // manual window touching, no separate "open" flag to update.
+        captures.release(crate::ui_capture::UiCapture::PauseMenu);
     }
 }
 
@@ -575,41 +559,6 @@ fn debug_overlay_ui(
             ));
             ui.label(format!("yaw   {:>7.2}", pose.yaw));
         });
-}
-
-/// Esc toggles the in-game pause overlay. Doesn't change `AppState`
-/// — the world keeps simulating while the menu is up.
-///
-/// Cursor lock is NOT touched here — [`UiCaptures`] is the source of
-/// truth for cursor state. Acquiring `UiCapture::PauseMenu` is
-/// enough; the `apply_cursor_mode` system in [`ui_capture`] applies
-/// the window's grab_mode. This is how we avoid the bug class where a
-/// "menu close" path forgot to re-lock the cursor (or a "menu open"
-/// path forgot to unlock) and in-world input silently desynced from
-/// what the player saw on screen.
-///
-/// Esc priority: if some other overlay is captured (craft modal,
-/// debug panel, etc.), that overlay's own Esc handler consumes the
-/// press and this toggle skips. The check is data-driven via
-/// `has_other_than(PauseMenu)` — adding a new overlay doesn't
-/// require updating this function.
-fn toggle_pause(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut open: ResMut<PauseMenuOpen>,
-    mut captures: ResMut<crate::ui_capture::UiCaptures>,
-) {
-    if !keys.just_pressed(KeyCode::Escape) {
-        return;
-    }
-    if captures.has_other_than(crate::ui_capture::UiCapture::PauseMenu) {
-        return;
-    }
-    open.0 = !open.0;
-    if open.0 {
-        captures.acquire(crate::ui_capture::UiCapture::PauseMenu);
-    } else {
-        captures.release(crate::ui_capture::UiCapture::PauseMenu);
-    }
 }
 
 /// On entering InGame in a host mode, spawn the server thread. On JoinRemote

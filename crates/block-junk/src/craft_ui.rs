@@ -45,7 +45,6 @@ impl Plugin for CraftUiPlugin {
             Update,
             (
                 close_on_block_gone,
-                close_on_escape,
                 toggle_modal_with_f_key,
                 sync_craft_modal_capture,
             )
@@ -88,23 +87,6 @@ fn close_on_block_gone(
         })
         .unwrap_or(false);
     if !still_station {
-        ui_state.open_cell = None;
-        ui_state.pending_quantities.clear();
-    }
-}
-
-/// Esc closes the craft modal. `pub(crate)` so [`crate::menu::toggle_pause`]
-/// can order itself `.before()` this — the pause-menu toggle suppresses
-/// itself when the modal is open, which it can only determine while the
-/// modal is still in the open state, before this system clears it.
-pub(crate) fn close_on_escape(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut ui_state: ResMut<CraftStationUiState>,
-) {
-    if !ui_state.is_open() {
-        return;
-    }
-    if keys.just_pressed(KeyCode::Escape) {
         ui_state.open_cell = None;
         ui_state.pending_quantities.clear();
     }

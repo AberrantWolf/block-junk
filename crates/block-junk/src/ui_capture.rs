@@ -77,14 +77,13 @@ impl UiCaptures {
         !self.active.is_empty()
     }
 
-    /// True when *some other* overlay than `me` is capturing. Used by
-    /// Esc handlers so a key press routes to the topmost overlay
-    /// rather than firing two close-handlers in the same tick. Self
-    /// is excluded so an overlay can ask "should I respond to this
-    /// Esc, or is something else going to consume it?"
-    pub fn has_other_than(&self, me: UiCapture) -> bool {
-        self.active.iter().any(|c| *c != me)
+    /// True when this specific capture is currently held. Used by an
+    /// overlay's UI render system to decide whether to draw, and by
+    /// `handle_escape` to dispatch close to the topmost overlay.
+    pub fn contains(&self, capture: UiCapture) -> bool {
+        self.active.contains(&capture)
     }
+
 }
 
 /// Set on every cursor recentre. The camera's mouse-look reader
@@ -144,6 +143,51 @@ fn reset_captures_on_ingame_enter(mut captures: ResMut<UiCaptures>) {
     captures.set_changed();
 }
 
+/// Centralized Esc dispatcher. The only system that listens for the
+/// Escape key — no per-overlay Esc handlers. This is the SSOT
+/// principle applied to one specific input: "what does Esc do?" is a
+/// single fact derived from the current capture state, not a race
+/// between independent handlers each owning their own state.
+///
+/// Priority (topmost-first):
+///   1. Craft modal — clears `CraftStationUiState`; the modal's own
+///      capture-sync system releases the capture next tick.
+///   2. Debug panel — releases its capture directly.
+///   3. Pause menu — releases its capture directly.
+///   4. Nothing captured — opens the pause menu.
+///
+/// Adding a new overlay = one new branch here. The previous design
+/// had every overlay registering its own `keys.just_pressed(Escape)`
+/// system, which (a) made priority depend on system-execution order
+/// and (b) let Esc fire two close-handlers on the same press,
+/// causing the cursor/input desync that motivated this whole
+/// refactor.
+fn handle_escape(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut captures: ResMut<UiCaptures>,
+    mut craft_ui: ResMut<crate::craft_stations::CraftStationUiState>,
+) {
+    if !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    if captures.contains(UiCapture::CraftModal) {
+        // Clear the modal's data; `sync_craft_modal_capture` mirrors
+        // the empty `open_cell` into the captures set next tick.
+        craft_ui.open_cell = None;
+        craft_ui.pending_quantities.clear();
+        return;
+    }
+    if captures.contains(UiCapture::DebugPanel) {
+        captures.release(UiCapture::DebugPanel);
+        return;
+    }
+    if captures.contains(UiCapture::PauseMenu) {
+        captures.release(UiCapture::PauseMenu);
+        return;
+    }
+    captures.acquire(UiCapture::PauseMenu);
+}
+
 pub struct UiCapturesPlugin;
 
 impl Plugin for UiCapturesPlugin {
@@ -157,7 +201,7 @@ impl Plugin for UiCapturesPlugin {
         // cursor on the menu screen).
         app.add_systems(
             Update,
-            apply_cursor_mode.run_if(in_state(AppState::InGame)),
+            (apply_cursor_mode, handle_escape).run_if(in_state(AppState::InGame)),
         );
         app.add_systems(OnEnter(AppState::InGame), reset_captures_on_ingame_enter);
     }
@@ -171,7 +215,7 @@ mod tests {
     fn empty_is_not_captured() {
         let c = UiCaptures::default();
         assert!(!c.is_captured());
-        assert!(!c.has_other_than(UiCapture::PauseMenu));
+        assert!(!c.contains(UiCapture::PauseMenu));
     }
 
     #[test]
@@ -179,8 +223,10 @@ mod tests {
         let mut c = UiCaptures::default();
         c.acquire(UiCapture::CraftModal);
         assert!(c.is_captured());
+        assert!(c.contains(UiCapture::CraftModal));
         c.release(UiCapture::CraftModal);
         assert!(!c.is_captured());
+        assert!(!c.contains(UiCapture::CraftModal));
     }
 
     #[test]
@@ -200,21 +246,11 @@ mod tests {
     }
 
     #[test]
-    fn has_other_than_excludes_self() {
+    fn contains_distinguishes_variants() {
         let mut c = UiCaptures::default();
-        c.acquire(UiCapture::CraftModal);
-        assert!(!c.has_other_than(UiCapture::CraftModal));
-        assert!(c.has_other_than(UiCapture::PauseMenu));
-    }
-
-    #[test]
-    fn has_other_than_with_multiple_captures() {
-        let mut c = UiCaptures::default();
-        c.acquire(UiCapture::CraftModal);
         c.acquire(UiCapture::DebugPanel);
-        // Both captures are active; each one still "has another."
-        assert!(c.has_other_than(UiCapture::CraftModal));
-        assert!(c.has_other_than(UiCapture::DebugPanel));
-        assert!(c.has_other_than(UiCapture::PauseMenu));
+        assert!(c.contains(UiCapture::DebugPanel));
+        assert!(!c.contains(UiCapture::PauseMenu));
+        assert!(!c.contains(UiCapture::CraftModal));
     }
 }

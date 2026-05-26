@@ -37,7 +37,6 @@ pub struct DebugClientPlugin;
 
 impl Plugin for DebugClientPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<DebugPanelOpen>();
         app.init_resource::<InstantPlayerBuilds>();
         app.add_systems(
             Update,
@@ -76,12 +75,6 @@ impl Plugin for DebugServerPlugin {
     }
 }
 
-/// Whether the debug overlay window is currently visible. Persists
-/// across pause/unpause (intentional — re-opening it every time you
-/// come back from the menu would be tedious during a debug session).
-#[derive(Resource, Default)]
-pub struct DebugPanelOpen(pub bool);
-
 /// When true, the player's Normal-mode self-work (L-click on a tagged
 /// plan) and direct-destroy (R-click on a solid block) skip the action
 /// timer and resolve immediately — the way clicks worked before mode-
@@ -97,25 +90,22 @@ impl Default for InstantPlayerBuilds {
     }
 }
 
-/// Toggle the debug panel on F3. Cursor lock is NOT handled here —
-/// `UiCaptures` is the SSOT; acquiring `UiCapture::DebugPanel` is
-/// enough, the `apply_cursor_mode` system in [`crate::ui_capture`]
-/// handles the window. See that module's docs for why direct cursor
-/// toggling here would re-introduce the cursor/input-state desync
-/// bug class.
+/// Toggle the debug panel on F3. The captures set IS the open state
+/// — there is no separate `DebugPanelOpen` flag to keep in sync. The
+/// debug panel UI renders based on `captures.contains(DebugPanel)`,
+/// the cursor follows captures, in-world input gates on captures.
+/// One fact, one source.
 fn toggle_debug_panel(
     keys: Res<ButtonInput<KeyCode>>,
-    mut open: ResMut<DebugPanelOpen>,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
 ) {
     if !keys.just_pressed(KeyCode::F3) {
         return;
     }
-    open.0 = !open.0;
-    if open.0 {
-        captures.acquire(crate::ui_capture::UiCapture::DebugPanel);
-    } else {
+    if captures.contains(crate::ui_capture::UiCapture::DebugPanel) {
         captures.release(crate::ui_capture::UiCapture::DebugPanel);
+    } else {
+        captures.acquire(crate::ui_capture::UiCapture::DebugPanel);
     }
 }
 
@@ -133,7 +123,6 @@ const BUMPABLE_NEEDS: &[(&str, &str)] = &[
 #[allow(clippy::too_many_arguments, reason = "debug panel queries several senders")]
 fn debug_panel_ui(
     mut contexts: EguiContexts,
-    mut open: ResMut<DebugPanelOpen>,
     mut instant_builds: ResMut<InstantPlayerBuilds>,
     clock: Option<Res<WorldClock>>,
     mut advance_sender: Query<&mut MessageSender<DebugAdvanceTime>>,
@@ -143,7 +132,7 @@ fn debug_panel_ui(
     mut spawn_workbench_sender: Query<&mut MessageSender<DebugSpawnWorkbench>>,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
 ) {
-    if !open.0 {
+    if !captures.contains(crate::ui_capture::UiCapture::DebugPanel) {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -181,7 +170,11 @@ fn debug_panel_ui(
         if d < f32::EPSILON { 1.0 } else { d }
     };
 
-    let mut show_open = open.0;
+    // `show_open` tracks the egui Window's open flag — the user can
+    // close via egui's title-bar X. We mirror back into captures after
+    // .show() returns. Pre-populated with `true` because we only run
+    // when the capture says we're open in the first place.
+    let mut show_open = true;
     egui::Window::new("Debug")
         .open(&mut show_open)
         .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-12.0, 12.0))
@@ -251,15 +244,13 @@ fn debug_panel_ui(
                 });
             }
         });
-    // If egui's title-bar X just closed the window, mirror the F3
-    // path: release the DebugPanel capture so apply_cursor_mode
-    // relocks the cursor automatically. Direct cursor toggling here
-    // would re-introduce the bug class UiCaptures was built to
-    // eliminate.
-    if open.0 && !show_open {
+    // egui's title-bar X sets show_open=false. Mirror that into the
+    // captures set — apply_cursor_mode relocks the cursor and the
+    // panel UI early-returns next frame. No separate "open" flag to
+    // keep in sync.
+    if !show_open {
         captures.release(crate::ui_capture::UiCapture::DebugPanel);
     }
-    open.0 = show_open;
 
     if let Some(secs) = advance_secs {
         // MessageSender lives on the connection entity; one in solo
