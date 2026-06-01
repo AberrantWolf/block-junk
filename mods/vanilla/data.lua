@@ -629,6 +629,18 @@ engine.npcs.set_work_defaults {
     duration_secs = 4.0,
 }
 
+-- Civilization clustering. Two matched rooms join the same cluster when
+-- the Chebyshev distance between their bboxes is <= max_room_distance_cells;
+-- NPCs that have claimed a cluster (today by sleeping there) sample
+-- wander targets inside the cluster's bbox inflated by buffer_cells.
+-- 32 cells ≈ 2 chunks, big enough to stitch a small village across a
+-- gap; 8 cells of buffer keeps NPCs near the walls without crowding
+-- exactly onto them.
+engine.civilization.set_params {
+    max_room_distance_cells = 32,
+    buffer_cells = 8,
+}
+
 -- Animation clips. The client loads each one's glTF asset at session
 -- start, indexed via `clip_index` into that file's clip list, and
 -- builds a unified AnimationGraph keyed by id. KayKit ships rig

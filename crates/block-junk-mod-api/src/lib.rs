@@ -32,6 +32,7 @@
 
 pub mod animations;
 pub mod blocks;
+pub mod civilization;
 pub mod items;
 pub mod npcs;
 pub mod recipes;

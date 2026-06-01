@@ -193,6 +193,29 @@ impl RoomMap {
         })
     }
 
+    /// Volumetric AABB of a room (inclusive min/max in world cells). Returns
+    /// `None` if the id is unknown. Used by the civilization clusterer to
+    /// measure inter-room distance and union member bboxes — keeps the
+    /// private `rooms` map sealed while still exposing one geometric read.
+    pub fn room_bbox(&self, id: RoomId) -> Option<(IVec3, IVec3)> {
+        self.rooms.get(&id).map(|r| (r.bbox_min, r.bbox_max))
+    }
+
+    /// Every matched room as `(id, bbox_min, bbox_max)`. Used by the
+    /// civilization clusterer for first-hit join scans and for bbox
+    /// containment lookups (e.g. "what room does this bed cell belong
+    /// to?" — solid interactable blocks aren't in `cell_to_room` because
+    /// that index is floor-cells-only).
+    pub fn iter_matched_with_bbox(&self) -> impl Iterator<Item = (RoomId, IVec3, IVec3)> + '_ {
+        self.rooms.iter().filter_map(|(&id, room)| {
+            if room.pattern.is_some() {
+                Some((id, room.bbox_min, room.bbox_max))
+            } else {
+                None
+            }
+        })
+    }
+
     /// If `cell` is a floor cell of a matched room, return a floor cell
     /// from the same room picked by `rng_unit` (a uniform `[0, 1)`
     /// value). Otherwise return `None`.

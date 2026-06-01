@@ -573,6 +573,7 @@ fn spawn_loaded_npc(
             Brain {
                 goal: Goal::Idle,
                 rng: npc.rng,
+                home_cluster: None,
             },
             carry,
             tool,

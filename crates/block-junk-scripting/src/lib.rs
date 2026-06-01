@@ -14,6 +14,7 @@ use block_junk_mod_api::{
     API_VERSION, ApiVersion, ModManifest, Side,
     animations::AnimationDef,
     blocks::BlockDef,
+    civilization::CivilizationParams,
     items::ItemDef,
     npcs::{NeedDef, NpcKindDef, NpcKindId, NpcSnapshot, PlannerGoal, WorkDefaults},
     recipes::RecipeDef,
@@ -86,6 +87,10 @@ pub struct LoadContext {
     /// failure on second call so two mods can't silently overwrite each
     /// other's balance — matches the "never silently degrade" rule.
     pub pending_work_defaults: Arc<Mutex<Option<WorkDefaults>>>,
+    /// At most one set of civilization-cluster params. Same single-writer
+    /// rule as work-defaults — two mods can't silently disagree on how
+    /// rooms group into clusters.
+    pub pending_civilization_params: Arc<Mutex<Option<CivilizationParams>>>,
 }
 
 impl LoadContext {
@@ -144,6 +149,13 @@ impl LoadContext {
     /// [`WorkDefaults::default`].
     pub fn take_work_defaults(&self) -> Option<WorkDefaults> {
         std::mem::take(&mut *self.pending_work_defaults.lock().unwrap())
+    }
+
+    /// Take the optional civilization-cluster params. `None` ⇒ no mod
+    /// called `engine.civilization.set_params`; the engine uses
+    /// [`CivilizationParams::default`].
+    pub fn take_civilization_params(&self) -> Option<CivilizationParams> {
+        std::mem::take(&mut *self.pending_civilization_params.lock().unwrap())
     }
 }
 
@@ -596,6 +608,26 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     }
 
     engine.set("npcs", npcs_table)?;
+
+    // engine.civilization.set_params({ max_room_distance_cells = N,
+    //                                  buffer_cells = M }) — same
+    // single-writer rule as set_work_defaults; vanilla owns the slot,
+    // a second caller errors loudly so two mods can't silently disagree.
+    let civ_table = lua.create_table()?;
+    let pending_civ_params = ctx.pending_civilization_params.clone();
+    let set_civ_params = lua.create_function(move |lua, value: Value| {
+        let def: CivilizationParams = lua.from_value(value)?;
+        let mut slot = pending_civ_params.lock().unwrap();
+        if slot.is_some() {
+            return Err(mlua::Error::external(
+                "engine.civilization.set_params called twice; only one mod may set civilization params",
+            ));
+        }
+        *slot = Some(def);
+        Ok(())
+    })?;
+    civ_table.set("set_params", set_civ_params)?;
+    engine.set("civilization", civ_table)?;
 
     // engine.masks.register(def) — both sides accumulate identical mask
     // sets so slot ordering matches across the wire. The engine bakes

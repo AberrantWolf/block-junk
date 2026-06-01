@@ -408,6 +408,14 @@ pub struct Brain {
     /// splitmix-seeded PRNG state. Per-NPC so two NPCs spawned the same
     /// tick don't pick identical wander targets.
     pub rng: u64,
+    /// Civilization cluster this NPC calls home. NPCs without a claim
+    /// (`None`) wander freely; claimed NPCs sample wander targets inside
+    /// the cluster's inflated bbox so they don't drift into the
+    /// wilderness. Provisional claim mechanic: an NPC claims whatever
+    /// cluster contains the cell it just slept in. Claims aren't saved
+    /// across world reloads — `ClusterId` isn't stable across restarts;
+    /// the NPC re-claims on next sleep.
+    pub home_cluster: Option<crate::civilization::ClusterId>,
 }
 
 /// Default wander radius for the native fallback path (no planner
@@ -673,6 +681,7 @@ fn spawn_initial_npc_on_first_connect(
                 Brain {
                     goal: Goal::Idle,
                     rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
+                    home_cluster: None,
                 },
                 crate::protocol::Carrying::default(),
                 crate::protocol::EquippedTool::default(),
@@ -769,6 +778,17 @@ struct HaulCtx<'w, 's> {
     world_items: Query<'w, 's, (Entity, &'static WorldItem)>,
     kind_registry: Res<'w, NpcKindRegistry>,
     item_registry: Res<'w, crate::items::ItemRegistry>,
+}
+
+/// Read-only world-anchor bundle: room registry plus civilization
+/// clusters and their tuning params. Folded so we can swap out the
+/// previous top-level `room_map` slot for one bundle slot that carries
+/// civ too, without busting the SystemParam ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+struct WorldAnchorsCtx<'w> {
+    rooms: Res<'w, RoomMap>,
+    civilization: Res<'w, crate::civilization::Civilization>,
+    civ_params: Res<'w, crate::civilization::CivilizationParamsRes>,
 }
 
 /// Goals the preempt check considers abortable. Goals the Lua planner
@@ -943,7 +963,7 @@ fn npc_brain_tick(
     mods: Res<ServerMods>,
     need_registry: Res<NeedRegistry>,
     work_defaults: Res<WorkDefaultsRes>,
-    room_map: Res<RoomMap>,
+    anchors: WorldAnchorsCtx,
     interactable_index: Res<InteractableIndex>,
     mut interaction_claims: ResMut<InteractionClaims>,
     mut haul: HaulCtx,
@@ -1781,6 +1801,9 @@ fn npc_brain_tick(
             // a stale snapshot" is the consistent outcome at every
             // upstream layer, and we still credit the NPC for
             // sticking it out.
+            // Capture the bits we need before mutating brain.home_cluster
+            // below — &brain.goal borrows the brain.
+            let mut sleep_cell: Option<IVec3> = None;
             if let Goal::Interacting {
                 need_restore,
                 anchor_cell,
@@ -1806,6 +1829,13 @@ fn npc_brain_tick(
                             "interaction complete but NPC has no entry for need; ignoring",
                         );
                     }
+                    // Provisional home-cluster claim: finishing a sleep
+                    // anywhere claims the cluster that owns that cell.
+                    // Match is by need id ("sleep"), not block kind, so
+                    // any future sleep-restoring interactable counts.
+                    if nr.need == "sleep" {
+                        sleep_cell = Some(*target_cell);
+                    }
                 } else {
                     info!(
                         npc = npc_id.0,
@@ -1817,6 +1847,21 @@ fn npc_brain_tick(
                     interaction_claims.release(*anchor_cell, *npc_id);
                 }
                 interact_done = Some(*target_cell);
+            }
+            if let Some(cell) = sleep_cell
+                && let Some(cluster) = anchors
+                    .civilization
+                    .cluster_containing_cell(cell, &anchors.rooms)
+            {
+                if brain.home_cluster != Some(cluster) {
+                    info!(
+                        npc = npc_id.0,
+                        cluster = cluster.0,
+                        cell = ?cell.to_array(),
+                        "claimed home cluster on sleep",
+                    );
+                }
+                brain.home_cluster = Some(cluster);
             }
         }
         if work_done {
@@ -2150,7 +2195,7 @@ fn npc_brain_tick(
                 &pose,
                 &needs,
                 &equipped_tool,
-                &room_map,
+                &anchors.rooms,
                 &interactable_index,
                 &interaction_claims,
                 &haul.plans,
@@ -2275,7 +2320,24 @@ fn npc_brain_tick(
                     let timeout = timeout_secs.clamp(1.0, MAX_WANDER_TIMEOUT_SECS);
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                    match pick_wander_path(foot, radius, &mut brain.rng, &world) {
+                    // Bounded-wander resolution. An NPC that claimed a
+                    // home cluster samples wander targets inside that
+                    // cluster's inflated bbox so they don't drift across
+                    // the map. A dangling claim (cluster pruned after
+                    // its last room was destroyed) lazy-clears here.
+                    let home_bbox = match brain.home_cluster {
+                        Some(id) => {
+                            let inflated = anchors
+                                .civilization
+                                .cluster_bbox_inflated(id, anchors.civ_params.0.buffer_cells);
+                            if inflated.is_none() {
+                                brain.home_cluster = None;
+                            }
+                            inflated
+                        }
+                        None => None,
+                    };
+                    match pick_wander_path(foot, radius, home_bbox, &mut brain.rng, &world) {
                         Some(path) => {
                             // set_if_neq keeps the wire quiet on the
                             // rare repeat path; planner-driven calls
@@ -2328,7 +2390,8 @@ fn npc_brain_tick(
                     // actor-vs-actor collision into a stampede. For
                     // out-of-room Gotos (raw waypoint cells) the helper
                     // returns None and the planner cell is used as-is.
-                    let target = room_map
+                    let target = anchors
+                        .rooms
                         .random_floor_cell_in_same_room(planner_target, rand_unit(&mut brain.rng))
                         .unwrap_or(planner_target);
                     // Already at the target: the planner picked a cell
@@ -2881,23 +2944,42 @@ fn aim_yaw_step(pose_xz: Vec2, current_yaw: f32, aim: Vec2, dt: f32) -> Option<f
     Some(delta.clamp(-NPC_TURN_RATE * dt, NPC_TURN_RATE * dt))
 }
 
-/// Try a few random XZ targets within `radius_cells` of `foot`; project
-/// each onto the surface via `nearest_standable_below`; run A*. Return
-/// the first path that has at least one step. `None` if every attempt
-/// fails (caller stays Idle and retries next tick).
+/// Try a few random XZ targets and run A* to the first that's
+/// reachable. Sampling box:
+///
+/// - `home_bbox = None` — sample within `radius_cells` of `foot`
+///   (legacy free-wander).
+/// - `home_bbox = Some((min, max))` — sample uniformly inside the
+///   inflated cluster bbox; `foot`/`radius_cells` are ignored for
+///   target picking but still used as the A* start.
+///
+/// Returns the first smoothed path with at least one step. `None` if
+/// every attempt fails (caller stays Idle and retries next tick).
 fn pick_wander_path<W: Walkability>(
     foot: IVec3,
     radius_cells: i32,
+    home_bbox: Option<(IVec3, IVec3)>,
     rng: &mut u64,
     world: &W,
 ) -> Option<Vec<IVec3>> {
     let radius = radius_cells.max(1) as f32;
     for _ in 0..MAX_WANDER_ATTEMPTS {
-        let dx = (rand_unit(rng) * 2.0 - 1.0) * radius;
-        let dz = (rand_unit(rng) * 2.0 - 1.0) * radius;
-        // Probe from a few cells above the NPC's foot Y — if the
-        // candidate is on a small hill we still see its top.
-        let probe = foot + IVec3::new(dx as i32, 4, dz as i32);
+        // XZ candidate. The probe Y is the cluster's bbox top + 4 when
+        // we're bounded (matches the home's vertical extent so a
+        // multi-storey building's roof doesn't shadow the ground); the
+        // foot's Y + 4 when we're free-wandering.
+        let (tx, tz, probe_y) = if let Some((bmin, bmax)) = home_bbox {
+            let span_x = (bmax.x - bmin.x).max(0) as f32;
+            let span_z = (bmax.z - bmin.z).max(0) as f32;
+            let x = bmin.x as f32 + rand_unit(rng) * span_x;
+            let z = bmin.z as f32 + rand_unit(rng) * span_z;
+            (x, z, bmax.y + 4)
+        } else {
+            let dx = (rand_unit(rng) * 2.0 - 1.0) * radius;
+            let dz = (rand_unit(rng) * 2.0 - 1.0) * radius;
+            (foot.x as f32 + dx, foot.z as f32 + dz, foot.y + 4)
+        };
+        let probe = IVec3::new(tx as i32, probe_y, tz as i32);
         let Some(target) = nearest_standable_below(world, probe, WANDER_DROP_BUDGET) else {
             continue;
         };

@@ -48,6 +48,7 @@ impl Plugin for ServerScriptingPlugin {
             ramps,
             animations,
             work_defaults,
+            civilization_params,
         } = load_side(Side::Server);
         app.insert_resource(ServerMods(mods));
         app.insert_resource(blocks);
@@ -61,6 +62,7 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(ramps);
         app.insert_resource(animations);
         app.insert_resource(work_defaults);
+        app.insert_resource(civilization_params);
         app.add_systems(
             Update,
             (dispatch_block_placed, dispatch_room_events).in_set(GameSet::PostSimulation),
@@ -85,6 +87,7 @@ impl Plugin for ClientScriptingPlugin {
             ramps,
             animations,
             work_defaults,
+            civilization_params: _,
         } = load_side(Side::Client);
         app.insert_resource(ClientMods(mods));
         app.insert_resource(blocks);
@@ -116,6 +119,7 @@ struct LoadResult {
     ramps: RampRegistry,
     animations: AnimationRegistry,
     work_defaults: WorkDefaultsRes,
+    civilization_params: crate::civilization::CivilizationParamsRes,
 }
 
 /// Run mod loading for one side, then build the resulting registries.
@@ -256,6 +260,17 @@ fn load_side(side: Side) -> LoadResult {
     if let Err(e) = blocks.validate_layers(&masks, &ramps) {
         panic!("{} block layer validation failed: {e}", side.as_str());
     }
+    // Civilization-cluster params. Lua-supplied via
+    // `engine.civilization.set_params`; default if no mod set them.
+    let civilization_params = crate::civilization::CivilizationParamsRes(
+        ctx.take_civilization_params().unwrap_or_default(),
+    );
+    info!(
+        "[{}] civilization params: max_room_distance={} buffer={}",
+        side.as_str(),
+        civilization_params.0.max_room_distance_cells,
+        civilization_params.0.buffer_cells,
+    );
     LoadResult {
         mods,
         blocks,
@@ -269,6 +284,7 @@ fn load_side(side: Side) -> LoadResult {
         ramps,
         animations,
         work_defaults,
+        civilization_params,
     }
 }
 

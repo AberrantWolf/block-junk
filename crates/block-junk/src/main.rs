@@ -1,6 +1,7 @@
 mod block_textures;
 mod blocks;
 mod camera;
+mod civilization;
 mod client;
 mod collision;
 mod craft_progress_hud;
@@ -149,6 +150,7 @@ fn run_server_inner(
         mode: NetMode::Server,
     });
     app.add_plugins(server::ServerPlugin);
+    app.add_plugins(civilization::CivilizationPlugin);
 
     if let Some(flag) = shutdown {
         app.insert_resource(ServerShutdownFlag(flag));
