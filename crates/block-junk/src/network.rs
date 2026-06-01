@@ -147,6 +147,7 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<crate::npc::NpcKind>();
         app.register_component::<NpcAnimOverride>();
         app.register_component::<NpcPath>();
+        app.register_component::<crate::civilization::ClusterBboxReplica>();
         // Loose items in the world. No prediction (items don't move
         // server-side in Phase 1) and no interpolation (no per-tick
         // updates to lerp between). Initial replicate carries the

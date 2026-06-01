@@ -38,6 +38,7 @@ pub struct DebugClientPlugin;
 impl Plugin for DebugClientPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<InstantPlayerBuilds>();
+        app.init_resource::<ShowCivilizationClusters>();
         app.add_systems(
             Update,
             toggle_debug_panel
@@ -90,6 +91,19 @@ impl Default for InstantPlayerBuilds {
     }
 }
 
+/// Toggles the orange wireframe overlay drawn around each civilization
+/// cluster's inflated bbox. Off by default; flip from the F3 debug
+/// panel. Pure client-side state — the server always replicates the
+/// `ClusterBboxReplica` entities, the client decides whether to render.
+#[derive(Resource)]
+pub struct ShowCivilizationClusters(pub bool);
+
+impl Default for ShowCivilizationClusters {
+    fn default() -> Self {
+        Self(false)
+    }
+}
+
 /// Toggle the debug panel on F3. The captures set IS the open state
 /// — there is no separate `DebugPanelOpen` flag to keep in sync. The
 /// debug panel UI renders based on `captures.contains(DebugPanel)`,
@@ -124,6 +138,7 @@ const BUMPABLE_NEEDS: &[(&str, &str)] = &[
 fn debug_panel_ui(
     mut contexts: EguiContexts,
     mut instant_builds: ResMut<InstantPlayerBuilds>,
+    mut show_clusters: ResMut<ShowCivilizationClusters>,
     clock: Option<Res<WorldClock>>,
     mut advance_sender: Query<&mut MessageSender<DebugAdvanceTime>>,
     mut need_sender: Query<&mut MessageSender<DebugBumpNeed>>,
@@ -186,6 +201,10 @@ fn debug_panel_ui(
             ui.checkbox(
                 &mut instant_builds.0,
                 "Instant self-work (skip action timer)",
+            );
+            ui.checkbox(
+                &mut show_clusters.0,
+                "Show civilization clusters (orange)",
             );
             if ui.button("Fill nearest plan").clicked() {
                 fill_nearest_plan = true;

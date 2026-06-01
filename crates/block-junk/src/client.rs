@@ -209,6 +209,7 @@ impl Plugin for ClientPlugin {
                     update_tool_hud,
                     update_action_progress_ui,
                     draw_npc_paths,
+                    draw_civilization_clusters,
                 )
                     .in_set(GameSet::PostSimulation),
             )
@@ -3178,6 +3179,35 @@ fn draw_npc_paths(mut gizmos: Gizmos, paths: Query<&NpcPath>) {
             let b = window[1].as_vec3() + raise;
             gizmos.line(a, b, color);
         }
+    }
+}
+
+/// Debug overlay: orange wireframe cuboid around each civilization
+/// cluster's inflated bbox. The min/max on
+/// [`crate::civilization::ClusterBboxReplica`] are already inflated by
+/// the server's `CivilizationParams::buffer_cells`, so this is the same
+/// box NPCs sample wander targets from. Gated on
+/// [`crate::debug::ShowCivilizationClusters`] so it stays off by default.
+/// Cell-inclusive: a 1-cell-wide bbox draws an actual unit cube (we add
+/// `Vec3::ONE` to span max+1).
+fn draw_civilization_clusters(
+    mut gizmos: Gizmos,
+    bboxes: Query<&crate::civilization::ClusterBboxReplica>,
+    show: Res<crate::debug::ShowCivilizationClusters>,
+) {
+    if !show.0 {
+        return;
+    }
+    let color = Color::srgb(1.0, 0.55, 0.1);
+    for bbox in bboxes.iter() {
+        let min = bbox.min.as_vec3();
+        let max = bbox.max.as_vec3() + Vec3::ONE;
+        let centre = (min + max) * 0.5;
+        let size = max - min;
+        gizmos.cube(
+            Transform::from_translation(centre).with_scale(size),
+            color,
+        );
     }
 }
 

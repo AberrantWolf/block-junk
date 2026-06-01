@@ -28,9 +28,22 @@ use std::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use block_junk_mod_api::civilization::CivilizationParams;
 use block_junk_mod_api::rooms::{RoomEvent, RoomId};
+use lightyear::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::GameSet;
 use crate::rooms::{RoomEventMsg, RoomMap, process_dirty};
+
+/// Replicated cluster bounding box. One entity per live cluster spawned
+/// by the server; the client's gizmo overlay reads `Query<&ClusterBboxReplica>`
+/// to draw the wander box. `min`/`max` are *already inflated* by
+/// `CivilizationParams::buffer_cells` so the client doesn't need to know
+/// the buffer.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClusterBboxReplica {
+    pub min: IVec3,
+    pub max: IVec3,
+}
 
 /// Stable opaque cluster handle. Allocated by [`Civilization`] from a
 /// monotonic counter; never reused inside one session. Brains stamp
@@ -57,6 +70,10 @@ pub struct Civilization {
     clusters: HashMap<ClusterId, Cluster>,
     room_to_cluster: HashMap<RoomId, ClusterId>,
     next_id: u32,
+    /// One Bevy entity per live cluster, carrying a replicated
+    /// [`ClusterBboxReplica`] so the client overlay can draw the wander
+    /// box. Maintained by [`sync_cluster_entities`] each tick.
+    cluster_entities: HashMap<ClusterId, Entity>,
 }
 
 impl Civilization {
@@ -252,13 +269,75 @@ impl Plugin for CivilizationPlugin {
         app.init_resource::<Civilization>();
         app.init_resource::<CivilizationParamsRes>();
         // Runs after process_dirty so the RoomMap state we read matches
-        // the events being delivered this tick.
+        // the events being delivered this tick. Entity sync chains
+        // directly after — it consumes the same Civilization state and
+        // doesn't need to wait for anything else.
         app.add_systems(
             Update,
-            update_civilization
+            (update_civilization, sync_cluster_entities)
+                .chain()
                 .after(process_dirty)
                 .in_set(GameSet::Simulation),
         );
+    }
+}
+
+/// Maintain one Bevy entity per live cluster with a replicated
+/// [`ClusterBboxReplica`] component. Idempotent — spawns entities for
+/// new clusters, updates `ClusterBboxReplica` for existing ones, and
+/// despawns entities of pruned clusters. Runs after
+/// [`update_civilization`] every tick (cheap: hashmap walk and a
+/// `set_if_neq` per cluster).
+fn sync_cluster_entities(
+    mut civilization: ResMut<Civilization>,
+    params: Res<CivilizationParamsRes>,
+    mut bboxes: Query<&mut ClusterBboxReplica>,
+    mut commands: Commands,
+) {
+    let buffer = params.0.buffer_cells.max(0);
+    // Despawn entities whose cluster is gone. Drain into a Vec first to
+    // avoid mutating cluster_entities while iterating it.
+    let stale: Vec<ClusterId> = civilization
+        .cluster_entities
+        .keys()
+        .copied()
+        .filter(|id| !civilization.clusters.contains_key(id))
+        .collect();
+    for id in stale {
+        if let Some(entity) = civilization.cluster_entities.remove(&id) {
+            commands.entity(entity).despawn();
+        }
+    }
+    // Borrow-split: pull cluster_entities out so we can iterate clusters
+    // and mutate cluster_entities in the same loop.
+    let Civilization {
+        clusters,
+        cluster_entities,
+        ..
+    } = &mut *civilization;
+    for (cluster_id, cluster) in clusters.iter() {
+        let pad = IVec3::splat(buffer);
+        let next = ClusterBboxReplica {
+            min: cluster.bbox_min - pad,
+            max: cluster.bbox_max + pad,
+        };
+        match cluster_entities.get(cluster_id) {
+            Some(&entity) => {
+                if let Ok(mut bbox) = bboxes.get_mut(entity) {
+                    bbox.set_if_neq(next);
+                }
+            }
+            None => {
+                let entity = commands
+                    .spawn((
+                        next,
+                        Replicate::to_clients(NetworkTarget::All),
+                        Name::new(format!("ClusterBbox({})", cluster_id.0)),
+                    ))
+                    .id();
+                cluster_entities.insert(*cluster_id, entity);
+            }
+        }
     }
 }
 
