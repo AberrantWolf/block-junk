@@ -120,6 +120,15 @@ impl Plugin for ServerPlugin {
                 .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
         );
+        // Station teardown rides the same CellEdit bus. Separate
+        // add_systems call: the chained tuple above sits at the Bevy
+        // 0.18 trait-resolution limit already.
+        app.add_systems(
+            Update,
+            crate::craft_stations::clear_destroyed_stations
+                .after(receive_block_edits)
+                .in_set(GameSet::Simulation),
+        );
         app.add_systems(
             Update,
             receive_npc_inspection_requests.in_set(GameSet::Simulation),
@@ -1223,8 +1232,45 @@ fn forget_disconnected_client(
     mut commands: Commands,
     mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
+    states: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
 ) {
     if let Some(avatar) = avatars.0.remove(&trigger.entity) {
+        // Spill the carry stack + equipped tool as world items where
+        // the player stood — despawning them with the avatar silently
+        // destroyed resources on every disconnect, and the reconnect
+        // starter-axe fallback then minted a fresh axe on top. With
+        // the drop, a rejoining player walks back and picks their
+        // things up. (Per-client persistence needs the stable client
+        // identity we don't have yet.)
+        if let Ok((pose, carry, tool)) = states.get(avatar) {
+            let cell = pose.translation.floor().as_ivec3();
+            let base = pose.translation + Vec3::new(0.0, 0.05, 0.0);
+            let mut units: Vec<crate::items::ItemSlot> = Vec::new();
+            if let Some(item) = carry.item {
+                units.extend(std::iter::repeat_n(item, carry.count as usize));
+            }
+            units.extend(tool.item);
+            for (i, slot) in units.iter().enumerate() {
+                let translation = base + crate::items::drop_jitter(cell, i as u32);
+                commands.spawn((
+                    WorldItem {
+                        item: *slot,
+                        translation,
+                    },
+                    Transform::from_translation(translation),
+                    GlobalTransform::default(),
+                    Replicate::to_clients(NetworkTarget::All),
+                    Name::new(format!("WorldItem(disconnect:{})", slot.0)),
+                ));
+            }
+            if !units.is_empty() {
+                info!(
+                    count = units.len(),
+                    at = ?cell.to_array(),
+                    "disconnect: dropped carried items into the world",
+                );
+            }
+        }
         commands.entity(avatar).despawn();
     }
     sent.0.remove(&trigger.entity);
@@ -1843,6 +1889,12 @@ fn receive_pickup_requests(
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut commands: Commands,
 ) {
+    // Despawns are deferred Commands, so the world_items query stays
+    // stale for the whole system run — two requests matching the same
+    // item in one tick (two players clicking one pile, or a double
+    // click) would both "succeed" and duplicate it. Track what this
+    // run already claimed.
+    let mut claimed: HashSet<Entity> = HashSet::default();
     for (connection, mut receiver) in receivers.iter_mut() {
         let requests: Vec<PickupRequest> = receiver.receive().collect();
         for req in requests {
@@ -1864,6 +1916,9 @@ fn receive_pickup_requests(
             // Closest WorldItem within the match radius.
             let mut best: Option<(Entity, crate::items::ItemSlot, f32)> = None;
             for (entity, wi) in world_items.iter() {
+                if claimed.contains(&entity) {
+                    continue;
+                }
                 let d = (wi.translation - req.target).length();
                 if d > PICKUP_MATCH_RADIUS {
                     continue;
@@ -1877,6 +1932,13 @@ fn receive_pickup_requests(
             };
             let is_tool = !item_registry.def(item_slot).tool_tags.is_empty();
             if is_tool {
+                // Identical to the held tool → pure no-op. The swap
+                // path would despawn the ground tool and then skip
+                // respawning the "displaced" one (same slot), silently
+                // destroying a tool.
+                if tool.item == Some(item_slot) {
+                    continue;
+                }
                 // Swap into the tool slot. Drop the displaced tool
                 // (if any) where the picked-up item *was* —
                 // `req.target` is the client's click position, which
@@ -1887,6 +1949,7 @@ fn receive_pickup_requests(
                 // (potentially inside the body collider or behind
                 // them).
                 let displaced = tool.item.replace(item_slot);
+                claimed.insert(entity);
                 commands.entity(entity).despawn();
                 info!(
                     new_tool = item_slot.0,
@@ -1914,6 +1977,7 @@ fn receive_pickup_requests(
                     // world item stays in the world.
                     continue;
                 }
+                claimed.insert(entity);
                 commands.entity(entity).despawn();
             }
         }
@@ -2244,20 +2308,7 @@ fn spawn_drops_on_destroy(
     items: Res<ItemRegistry>,
 ) {
     use block_junk_mod_api::items::ItemId;
-
-    // Small deterministic-per-spawn hash for the jitter offset. Doesn't
-    // need to be reproducible across sessions, just unique enough that
-    // siblings don't perfectly overlap — pile reads as a heap.
-    fn jitter(cell: IVec3, unit_index: u32) -> Vec3 {
-        let h = (cell.x as i64)
-            .wrapping_mul(73_856_093)
-            .wrapping_add((cell.y as i64).wrapping_mul(19_349_663))
-            .wrapping_add((cell.z as i64).wrapping_mul(83_492_791))
-            .wrapping_add(unit_index as i64 * 2_654_435_761) as u64;
-        let fx = ((h & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.4;
-        let fz = (((h >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.4;
-        Vec3::new(fx, 0.0, fz)
-    }
+    use crate::items::drop_jitter as jitter;
 
     for edit in reader.read() {
         if !edit.slot.is_empty() || edit.prev_slot.is_empty() {

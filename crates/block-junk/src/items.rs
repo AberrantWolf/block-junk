@@ -33,6 +33,21 @@ pub struct ItemSlot(pub u16);
 /// ships.
 pub const PLAYER_CARRY_CAPACITY: u32 = 5;
 
+/// Deterministic-per-spawn lateral jitter for piles of dropped items, so
+/// siblings don't perfectly overlap and a pile reads as a heap. Doesn't
+/// need cross-session reproducibility — just spatial variety. Shared by
+/// block drops, station-destroy spills, and disconnect drops.
+pub(crate) fn drop_jitter(cell: bevy::math::IVec3, unit_index: u32) -> bevy::math::Vec3 {
+    let h = (cell.x as i64)
+        .wrapping_mul(73_856_093)
+        .wrapping_add((cell.y as i64).wrapping_mul(19_349_663))
+        .wrapping_add((cell.z as i64).wrapping_mul(83_492_791))
+        .wrapping_add(unit_index as i64 * 2_654_435_761) as u64;
+    let fx = ((h & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.4;
+    let fz = (((h >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.4;
+    bevy::math::Vec3::new(fx, 0.0, fz)
+}
+
 #[derive(Debug, Error)]
 pub enum ItemBootstrapError {
     #[error("duplicate item id {0}")]

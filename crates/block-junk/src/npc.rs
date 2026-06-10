@@ -1710,6 +1710,7 @@ fn npc_brain_tick(
                         crate::craft_stations::try_start_first_satisfiable_order(
                             station_cell,
                             entity,
+                            equipped_tool.item,
                             &station_def,
                             &haul.item_registry,
                             &craft.recipes,

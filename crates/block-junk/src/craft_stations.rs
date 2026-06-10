@@ -249,6 +249,17 @@ impl CraftBookings {
         self.worker_by_cell.retain(|_, w| *w != entity);
     }
 
+    /// Tear down everything pointing at `station`: the NPC booking
+    /// pair and the worker registration. Called when the station
+    /// block itself is destroyed — the cell no longer exists as a
+    /// workplace, whoever was attached re-plans on their next tick.
+    pub fn force_clear_station(&mut self, station: IVec3) {
+        if let Some(npc) = self.npc_by_station.remove(&station) {
+            self.station_by_npc.remove(&npc);
+        }
+        self.worker_by_cell.remove(&station);
+    }
+
     pub fn has_worker(&self, cell: IVec3) -> bool {
         self.worker_by_cell.contains_key(&cell)
     }
@@ -969,7 +980,10 @@ fn receive_work_start(
     mut receivers: Query<(Entity, &mut MessageReceiver<WorkStart>)>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
-    poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
+    poses: Query<
+        (&crate::protocol::AvatarPose, &crate::protocol::EquippedTool),
+        With<crate::protocol::Avatar>,
+    >,
     chunks: Query<&crate::voxel::Chunk>,
     chunk_map: Res<crate::voxel::ChunkMap>,
     block_registry: Res<crate::blocks::BlockRegistry>,
@@ -988,7 +1002,7 @@ fn receive_work_start(
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
-            let Ok(pose) = poses.get(avatar) else {
+            let Ok((pose, tool)) = poses.get(avatar) else {
                 continue;
             };
             let centre = req.station_cell.as_vec3() + Vec3::splat(0.5);
@@ -1009,6 +1023,7 @@ fn receive_work_start(
             ) else {
                 continue;
             };
+            let worker_tool = tool.item;
             // Case 1: existing active_work — just re-register the
             // worker. The recipe + station agreement was validated
             // when active_work was first created; trust that here.
@@ -1029,6 +1044,7 @@ fn receive_work_start(
             let started = try_start_first_satisfiable_order(
                 req.station_cell,
                 connection,
+                worker_tool,
                 &station_def,
                 &item_registry,
                 &recipes,
@@ -1059,6 +1075,85 @@ fn receive_work_stop(
         for req in receiver.receive() {
             bookings.release_worker(req.station_cell, connection);
         }
+    }
+}
+
+/// Server: a station block was broken or replaced — tear its state
+/// down instead of leaking it. Deposited inventory AND the active
+/// craft's already-consumed inputs spill as world items at the cell;
+/// bookings clear so the scheduler stops treating the cell as taken;
+/// clients get a `None` update so their mirrors drop the entry.
+/// Without this, the orphaned state resurrected when any station was
+/// later placed at the same cell, a player-worked craft kept ticking
+/// against the missing block (output from thin air), and everything
+/// deposited was silently destroyed.
+pub(crate) fn clear_destroyed_stations(
+    mut reader: MessageReader<crate::protocol::CellEdit>,
+    block_registry: Res<crate::blocks::BlockRegistry>,
+    recipes: Res<crate::recipes::RecipeRegistry>,
+    item_registry: Res<crate::items::ItemRegistry>,
+    mut stations: ResMut<CraftStations>,
+    mut bookings: ResMut<CraftBookings>,
+    mut broadcast: ServerMultiMessageSender,
+    servers: Query<&Server>,
+    mut commands: Commands,
+) {
+    use block_junk_mod_api::recipes::RecipeId;
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for edit in reader.read() {
+        if edit.prev_slot.is_empty()
+            || block_registry.def(edit.prev_slot).station_tag.is_none()
+        {
+            continue;
+        }
+        bookings.force_clear_station(edit.world);
+        let Some(mut state) = stations.remove(edit.world) else {
+            continue;
+        };
+        // Inputs the active craft consumed up-front go back into the
+        // inventory tally so they spill with everything else — the
+        // craft can never complete now, so "locked in" no longer
+        // applies. Same refund the cancel path does.
+        if let Some(active) = state.active_work.take() {
+            let recipe_id = RecipeId::new(active.recipe_id);
+            if let Some(recipe_slot) = recipes.slot_of(&recipe_id) {
+                for input in &recipes.def(recipe_slot).inputs {
+                    if let Some(slot) = item_registry.slot_of(&input.item) {
+                        state.deposit(slot, input.count);
+                    }
+                }
+            }
+        }
+        let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
+        let mut unit_index = 0u32;
+        let mut spilled = 0u32;
+        for (slot, count) in state.inventory.iter() {
+            for _ in 0..*count {
+                let translation =
+                    centre + crate::items::drop_jitter(edit.world, unit_index);
+                unit_index += 1;
+                spilled += 1;
+                commands.spawn((
+                    crate::protocol::WorldItem {
+                        item: *slot,
+                        translation,
+                    },
+                    Transform::from_translation(translation),
+                    GlobalTransform::default(),
+                    Replicate::to_clients(NetworkTarget::All),
+                    Name::new(format!("WorldItem(station_spill:{})", slot.0)),
+                ));
+            }
+        }
+        info!(
+            cell = ?edit.world.to_array(),
+            spilled,
+            dropped_orders = state.orders.len(),
+            "station destroyed; cleared state and spilled inventory",
+        );
+        broadcast_station(&mut broadcast, server, edit.world, None);
     }
 }
 
@@ -1104,6 +1199,7 @@ fn tick_station_work(
     chunk_map: Res<crate::voxel::ChunkMap>,
     block_registry: Res<crate::blocks::BlockRegistry>,
     npc_q: Query<(), With<crate::npc::Npc>>,
+    tools: Query<&crate::protocol::EquippedTool>,
     mut next_broadcast_in: Local<f32>,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
@@ -1171,17 +1267,45 @@ fn tick_station_work(
             broadcast_station(&mut broadcast, server, cell, Some(state.clone()));
             continue;
         };
-        // Spawn output(s) on top of the station.
-        let top_of_station = Vec3::new(
-            cell.x as f32 + 0.5,
-            cell.y as f32 + 1.05,
-            cell.z as f32 + 0.5,
-        );
+        // Spawn output(s) in the first EMPTY cell around the station —
+        // straight above first, then that cell's horizontal
+        // neighbours, then beside the station itself. Spawning blind
+        // into a solid cell swallows the output invisibly (WorldItems
+        // don't settle, and pickup needs a 0.5 m click match).
+        let above = cell + IVec3::Y;
+        let candidates = [
+            above,
+            above + IVec3::X,
+            above - IVec3::X,
+            above + IVec3::Z,
+            above - IVec3::Z,
+            cell + IVec3::X,
+            cell - IVec3::X,
+            cell + IVec3::Z,
+            cell - IVec3::Z,
+        ];
+        let cell_is_empty = |c: IVec3| {
+            let (coord, local) = crate::voxel::world_to_chunk(c);
+            chunk_map
+                .0
+                .get(&coord)
+                .and_then(|&e| chunks.get(e).ok())
+                .map(|ch| ch.get(local).is_empty())
+                .unwrap_or(false)
+        };
+        let spawn_cell = candidates.into_iter().find(|&c| cell_is_empty(c)).unwrap_or_else(|| {
+            warn!(
+                cell = ?cell.to_array(),
+                "station fully enclosed; crafted output spawning inside solid cell",
+            );
+            above
+        });
+        let spawn_base = spawn_cell.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
         for unit in 0..recipe.output.count {
             let angle = (unit as f32) * std::f32::consts::TAU
                 / recipe.output.count.max(1) as f32;
             let offset = Vec3::new(angle.cos() * 0.12, 0.0, angle.sin() * 0.12);
-            let translation = top_of_station + offset;
+            let translation = spawn_base + offset;
             commands.spawn((
                 crate::protocol::WorldItem {
                     item: output_slot,
@@ -1247,6 +1371,7 @@ fn tick_station_work(
             ) && try_start_first_satisfiable_order(
                 cell,
                 worker,
+                tools.get(worker).ok().and_then(|t| t.item),
                 &station_def,
                 &item_registry,
                 &recipes,
@@ -1333,6 +1458,7 @@ pub(crate) fn lookup_station_def(
 pub(crate) fn try_start_first_satisfiable_order(
     station_cell: IVec3,
     worker_entity: Entity,
+    worker_tool: Option<crate::items::ItemSlot>,
     station_def: &StationDefView,
     item_registry: &crate::items::ItemRegistry,
     recipes: &crate::recipes::RecipeRegistry,
@@ -1353,6 +1479,15 @@ pub(crate) fn try_start_first_satisfiable_order(
         };
         let recipe = recipes.def(recipe_slot);
         if recipe.station != station_def.tag || recipe.tier > station_def.tier {
+            continue;
+        }
+        // Tool gate — the same check the NPC scheduler applies before
+        // walking over. Previously only the scheduler enforced it, so
+        // players (and NPC auto-continue) crafted tool-gated recipes
+        // bare-handed.
+        if let Some(tag) = &recipe.required_tool
+            && !item_registry.tool_has_tag(worker_tool, tag)
+        {
             continue;
         }
         let inputs_ok = recipe.inputs.iter().all(|input| {
