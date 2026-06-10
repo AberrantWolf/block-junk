@@ -177,13 +177,13 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    /// The finish path must evaluate without panicking. (Whether it
+    /// actually differs from plain depends on the doc's finish params,
+    /// so asserting inequality here would be flaky by design.)
     #[test]
-    fn finish_modulates_brightness() {
+    fn finish_path_evaluates() {
         let baked = &bake_set(&simple_doc()).unwrap()[0];
-        let plain = composite_at(baked, 5.0, 9.0, [0.0; 3], false);
-        let finished = composite_at(baked, 5.0, 9.0, [0.0; 3], true);
-        // Same hue family, slightly different magnitude (almost surely).
-        assert!(plain != finished || true); // non-flaky: just must not panic
-        let _ = (plain, finished);
+        let _plain = composite_at(baked, 5.0, 9.0, [0.0; 3], false);
+        let _finished = composite_at(baked, 5.0, 9.0, [0.0; 3], true);
     }
 }

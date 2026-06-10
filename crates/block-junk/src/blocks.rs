@@ -159,6 +159,15 @@ impl BlockRegistry {
         self.defs_by_slot.len()
     }
 
+    /// Block id per slot, in slot order — the table a `SaveFile` embeds
+    /// so saved chunk grids survive registration-order changes.
+    pub fn slot_table(&self) -> Vec<String> {
+        self.defs_by_slot
+            .iter()
+            .map(|d| d.id.as_str().to_owned())
+            .collect()
+    }
+
     /// Iterate every registered (slot, def) pair in slot order. Used to
     /// build the `BlockManifest` server → client message.
     pub fn iter(&self) -> impl Iterator<Item = (BlockSlot, &BlockDef)> + '_ {

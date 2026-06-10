@@ -29,7 +29,7 @@ use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::craft_stations::{ActiveWork, CraftOrder, CraftStations, StationState};
-use crate::save::{SAVE_VERSION, SaveFile, SavedActiveWork, SavedCarry, SavedChunk, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save, write_save};
+use crate::save::{SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save, remap_block_slots, write_save};
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
     world_to_chunk,
@@ -64,6 +64,7 @@ impl Plugin for ServerPlugin {
         app.init_resource::<PendingSpawnPose>();
         app.init_resource::<PendingSpawnCarry>();
         app.init_resource::<PendingSpawnTool>();
+        app.init_resource::<SaveWriteGuard>();
         app.init_resource::<RoomMap>();
         app.init_resource::<DetectionDirty>();
         // World clock. Start at 0.25 (sunrise) so a fresh session begins
@@ -199,6 +200,17 @@ pub struct PendingSpawnCarry(pub Option<Carrying>);
 #[derive(Resource, Default)]
 pub struct PendingSpawnTool(pub Option<EquippedTool>);
 
+/// Set by `load_from_save` when a load was attempted and failed (corrupt
+/// blob, version mismatch, missing block ids). The session then runs on
+/// an empty world — and every save path refuses to write to the
+/// configured name, so the original file is never clobbered by the
+/// accidental fresh world. A *missing* save (hosting a new world) does
+/// NOT set this; there's nothing to protect.
+#[derive(Resource, Default)]
+pub struct SaveWriteGuard {
+    pub reason: Option<String>,
+}
+
 /// Item id the engine equips on a freshly-spawned player when no save
 /// override is present. One hardcode — easy to lift to mod data when
 /// a starter-loadout system needs more than one item. Mod-side
@@ -213,6 +225,9 @@ const STARTER_TOOL_ID: &str = "vanilla:axe";
 ///
 /// A load failure does NOT abort startup — we log and continue with an
 /// empty world. Better than an unbootable session if a save is corrupt.
+/// But the failure arms [`SaveWriteGuard`], so nothing this session
+/// writes back over the file that failed to load — the empty world is
+/// throwaway, the original save is not.
 #[allow(clippy::too_many_arguments, reason = "load_from_save touches every persisted system")]
 fn load_from_save(
     mut commands: Commands,
@@ -224,6 +239,7 @@ fn load_from_save(
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
     mut stations: ResMut<CraftStations>,
+    mut guard: ResMut<SaveWriteGuard>,
     config: Option<Res<ServerSaveConfig>>,
     block_registry: Res<BlockRegistry>,
     item_registry: Res<ItemRegistry>,
@@ -238,13 +254,37 @@ fn load_from_save(
     let Some(name) = config.save_name.as_deref() else {
         return;
     };
-    let save = match read_save(name) {
+    let fail = |e: &SaveError, guard: &mut SaveWriteGuard| {
+        error!(
+            "load save {name:?} failed: {e}; continuing with an EMPTY world. \
+             Saving to {name:?} is disabled for this session so the \
+             original file stays intact."
+        );
+        guard.reason = Some(e.to_string());
+    };
+    let mut save = match read_save(name) {
         Ok(s) => s,
+        Err(e @ SaveError::NotFound { .. }) => {
+            // Hosting a fresh world under a new name — nothing to
+            // protect, saving stays enabled.
+            info!("no existing save ({e}); starting fresh");
+            return;
+        }
         Err(e) => {
-            error!("load save {name:?} failed: {e}; continuing with empty world");
+            fail(&e, &mut guard);
             return;
         }
     };
+    // Saved chunk grids + Build plans store raw slots; rewrite them
+    // through the save's own slot table into the live registry before
+    // anything downstream reads a slot. Refuses (load fails, guard
+    // arms) if the save references a block id that's no longer
+    // registered — loading would silently transmute those cells.
+    let lookup = |id: &str| block_registry.slot_of(&block_junk_mod_api::blocks::BlockId::new(id));
+    if let Err(e) = remap_block_slots(&mut save, lookup) {
+        fail(&e, &mut guard);
+        return;
+    }
     info!(
         "loading {} edited chunks + {} NPCs + {} plans + {} world items from save {name:?}",
         save.edited_chunks.len(),
@@ -604,21 +644,11 @@ fn save_on_request(
     stations: Res<CraftStations>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
-    npcs: Query<
-        (
-            &NpcId,
-            &NpcKind,
-            &AvatarPose,
-            &MovementMode,
-            &Needs,
-            &Brain,
-            &Carrying,
-            &EquippedTool,
-        ),
-        With<Npc>,
-    >,
+    npcs: SavedNpcQuery,
     world_items: Query<&WorldItem>,
     item_registry: Res<ItemRegistry>,
+    block_registry: Res<BlockRegistry>,
+    guard: Res<SaveWriteGuard>,
 ) {
     let Some(flag) = flag else {
         return;
@@ -632,43 +662,25 @@ fn save_on_request(
     let Some(name) = &config.save_name else {
         return;
     };
-    let edited: Vec<SavedChunk> = chunks
-        .iter()
-        .map(|(coord, ch, ce)| SavedChunk {
-            coord: *coord,
-            chunk: ch.clone(),
-            entities: ce.clone(),
-        })
-        .collect();
-    let saved_npcs = collect_saved_npcs(&npcs, &item_registry);
-    let chunk_count = edited.len();
-    let npc_count = saved_npcs.len();
-    let saved_plans = convert_saved_plans(&plans, &item_registry);
-    let plan_count = saved_plans.len();
-    let saved_items = collect_saved_world_items(&world_items, &item_registry);
-    let item_count = saved_items.len();
-    let saved_stations = convert_saved_stations(&stations, &item_registry);
-    let station_count = saved_stations.len();
-    let (saved_pose, saved_carry, saved_player_tool) =
-        first_avatar_state(&avatars, &item_registry);
-    let save = SaveFile {
-        version: SAVE_VERSION,
-        edited_chunks: edited,
-        last_player_pose: saved_pose,
-        npcs: saved_npcs,
-        world_clock: Some(*clock),
-        plans: saved_plans,
-        world_items: saved_items,
-        last_player_carry: saved_carry,
-        last_player_tool: saved_player_tool,
-        craft_stations: saved_stations,
-    };
-    match write_save(name, &save) {
-        Ok(()) => info!(
-            "save-on-request: wrote {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items + {station_count} stations to {name:?}",
-        ),
-        Err(e) => error!("save-on-request to {name:?} failed: {e}"),
+    if let Some(reason) = &guard.reason {
+        error!(
+            "NOT saving to {name:?}: this session's load failed ({reason}); \
+             the original save file is preserved untouched"
+        );
+        return;
     }
+    let save = assemble_save_file(
+        &clock,
+        &plans,
+        &stations,
+        &chunks,
+        &avatars,
+        &npcs,
+        &world_items,
+        &item_registry,
+        &block_registry,
+    );
+    write_save_logged(name, &save);
 }
 
 /// Convert the engine-side `CraftStations` snapshot to the on-disk
@@ -793,19 +805,7 @@ fn first_avatar_state(
 /// consistently broken planner will re-disable each NPC on its first
 /// tick after load (and log loudly each time).
 fn collect_saved_npcs(
-    npcs: &Query<
-        (
-            &NpcId,
-            &NpcKind,
-            &AvatarPose,
-            &MovementMode,
-            &Needs,
-            &Brain,
-            &Carrying,
-            &EquippedTool,
-        ),
-        With<Npc>,
-    >,
+    npcs: &SavedNpcQuery,
     item_registry: &ItemRegistry,
 ) -> Vec<SavedNpc> {
     npcs.iter()
@@ -852,21 +852,11 @@ fn save_then_shutdown(
     stations: Res<CraftStations>,
     chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
     avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
-    npcs: Query<
-        (
-            &NpcId,
-            &NpcKind,
-            &AvatarPose,
-            &MovementMode,
-            &Needs,
-            &Brain,
-            &Carrying,
-            &EquippedTool,
-        ),
-        With<Npc>,
-    >,
+    npcs: SavedNpcQuery,
     world_items: Query<&WorldItem>,
     item_registry: Res<ItemRegistry>,
+    block_registry: Res<BlockRegistry>,
+    guard: Res<SaveWriteGuard>,
     mut exit: MessageWriter<AppExit>,
     mut handled: Local<bool>,
 ) {
@@ -884,42 +874,24 @@ fn save_then_shutdown(
     if let Some(config) = config {
         match (&config.save_name, config.no_save_on_exit) {
             (Some(name), false) => {
-                let edited: Vec<SavedChunk> = chunks
-                    .iter()
-                    .map(|(coord, ch, ce)| SavedChunk {
-                        coord: *coord,
-                        chunk: ch.clone(),
-                        entities: ce.clone(),
-                    })
-                    .collect();
-                let saved_npcs = collect_saved_npcs(&npcs, &item_registry);
-                let saved_plans = convert_saved_plans(&plans, &item_registry);
-                let saved_items = collect_saved_world_items(&world_items, &item_registry);
-                let saved_stations = convert_saved_stations(&stations, &item_registry);
-                let (saved_pose, saved_carry, saved_player_tool) =
-                    first_avatar_state(&avatars, &item_registry);
-                let chunk_count = edited.len();
-                let npc_count = saved_npcs.len();
-                let plan_count = saved_plans.len();
-                let item_count = saved_items.len();
-                let station_count = saved_stations.len();
-                let save = SaveFile {
-                    version: SAVE_VERSION,
-                    edited_chunks: edited,
-                    last_player_pose: saved_pose,
-                    npcs: saved_npcs,
-                    world_clock: Some(*clock),
-                    plans: saved_plans,
-                    world_items: saved_items,
-                    last_player_carry: saved_carry,
-                    last_player_tool: saved_player_tool,
-                    craft_stations: saved_stations,
-                };
-                match write_save(name, &save) {
-                    Ok(()) => info!(
-                        "saved {chunk_count} chunks + {npc_count} NPCs + {plan_count} plans + {item_count} items + {station_count} stations to {name:?}",
-                    ),
-                    Err(e) => error!("save to {name:?} failed: {e}"),
+                if let Some(reason) = &guard.reason {
+                    error!(
+                        "NOT saving to {name:?}: this session's load failed ({reason}); \
+                         the original save file is preserved untouched"
+                    );
+                } else {
+                    let save = assemble_save_file(
+                        &clock,
+                        &plans,
+                        &stations,
+                        &chunks,
+                        &avatars,
+                        &npcs,
+                        &world_items,
+                        &item_registry,
+                        &block_registry,
+                    );
+                    write_save_logged(name, &save);
                 }
             }
             (Some(name), true) => {
@@ -930,6 +902,78 @@ fn save_then_shutdown(
     }
 
     exit.write(AppExit::Success);
+}
+
+/// Every component the save format captures per NPC. One alias so the
+/// two save systems and `collect_saved_npcs` can't drift.
+type SavedNpcQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static NpcId,
+        &'static NpcKind,
+        &'static AvatarPose,
+        &'static MovementMode,
+        &'static Needs,
+        &'static Brain,
+        &'static Carrying,
+        &'static EquippedTool,
+    ),
+    With<Npc>,
+>;
+
+/// Snapshot every persisted system into a `SaveFile`. Shared by the
+/// quit-save and Save Now paths so the two can't drift on what gets
+/// persisted.
+#[allow(clippy::too_many_arguments, reason = "touches every persisted system")]
+fn assemble_save_file(
+    clock: &WorldClock,
+    plans: &Plans,
+    stations: &CraftStations,
+    chunks: &Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
+    avatars: &Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
+    npcs: &SavedNpcQuery,
+    world_items: &Query<&WorldItem>,
+    item_registry: &ItemRegistry,
+    block_registry: &BlockRegistry,
+) -> SaveFile {
+    let edited: Vec<SavedChunk> = chunks
+        .iter()
+        .map(|(coord, ch, ce)| SavedChunk {
+            coord: *coord,
+            chunk: ch.clone(),
+            entities: ce.clone(),
+        })
+        .collect();
+    let (saved_pose, saved_carry, saved_player_tool) = first_avatar_state(avatars, item_registry);
+    SaveFile {
+        version: SAVE_VERSION,
+        block_slots: block_registry.slot_table(),
+        edited_chunks: edited,
+        last_player_pose: saved_pose,
+        npcs: collect_saved_npcs(npcs, item_registry),
+        world_clock: Some(*clock),
+        plans: convert_saved_plans(plans, item_registry),
+        world_items: collect_saved_world_items(world_items, item_registry),
+        last_player_carry: saved_carry,
+        last_player_tool: saved_player_tool,
+        craft_stations: convert_saved_stations(stations, item_registry),
+    }
+}
+
+/// `write_save` + the standard outcome log line.
+fn write_save_logged(name: &str, save: &SaveFile) {
+    match write_save(name, save) {
+        Ok(()) => info!(
+            "saved {} chunks + {} NPCs + {} plans + {} items + {} stations to {name:?}",
+            save.edited_chunks.len(),
+            save.npcs.len(),
+            save.plans.len(),
+            save.world_items.len(),
+            save.craft_stations.len(),
+        ),
+        Err(e) => error!("save to {name:?} failed: {e}"),
+    }
 }
 
 /// Connection entity → avatar entity. The avatar carries the authoritative

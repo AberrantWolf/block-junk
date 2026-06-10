@@ -61,7 +61,14 @@ use crate::voxel::{Chunk, ChunkEntities};
 ///                  (serde-defaulted) so a save mid-craft-timer
 ///                  resumes with the work intact. Required by the
 ///                  "no instant crafting" rule landing alongside.
-pub const SAVE_VERSION: u32 = 11;
+/// v12 (2026-06-10): added `block_slots` — the slot→id table the chunk
+///                  grids and Build plans were written against. Loaders
+///                  remap saved slots through it into the live registry
+///                  and refuse the load if a *referenced* id is no
+///                  longer registered. Closes the last raw-slot hole
+///                  (items/recipes already stored ids). Writes also
+///                  became atomic (tmp + rename) in the same pass.
+pub const SAVE_VERSION: u32 = 12;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -88,6 +95,17 @@ pub enum SaveError {
         found: u32,
         expected: u32,
     },
+    #[error(
+        "save references block ids that are no longer registered: {}; \
+         restore the missing mod(s) or delete the save — loading would \
+         silently corrupt the world",
+        .ids.join(", ")
+    )]
+    MissingBlockIds { ids: Vec<String> },
+    #[error(
+        "save chunk references block slot {slot} but the save's slot table only has {table_len} entries — the save is corrupt or predates the slot table"
+    )]
+    SlotOutOfRange { slot: u16, table_len: usize },
     #[error("bincode encode error: {0}")]
     BincodeEncode(#[from] bincode::error::EncodeError),
     #[error("bincode decode error: {0}")]
@@ -110,6 +128,14 @@ pub struct SaveMetadata {
 #[derive(Serialize, Deserialize)]
 pub struct SaveFile {
     pub version: u32,
+    /// Block id per slot, indexed by `BlockSlot.0`, as registered when
+    /// this save was written. Chunk grids and `PlanKind::Build` store
+    /// raw slots (a string per cell would dwarf the save); this table
+    /// is what makes those slots meaningful across sessions. The load
+    /// path remaps every saved slot through it into the live registry
+    /// — see [`remap_block_slots`].
+    #[serde(default)]
+    pub block_slots: Vec<String>,
     pub edited_chunks: Vec<SavedChunk>,
     /// Position + yaw of the player at save time. For solo play this is
     /// where the next-connecting client respawns. For multi-host this is
@@ -295,6 +321,74 @@ pub struct SavedNpc {
     pub tool: Option<SavedTool>,
 }
 
+/// Rewrite every saved [`BlockSlot`] (chunk cells — padding included,
+/// since padding ships to clients and feeds the mesher — and
+/// `PlanKind::Build` slots) from the save's own `block_slots` table
+/// into the live registry via `lookup` (id string → current slot).
+///
+/// Two passes: detect, then apply. Detection collects the full set of
+/// problems before touching anything, so the error lists *every*
+/// missing id (the player fixes their mod set once, not once per id).
+/// Ids in the table that no chunk/plan actually references are fine to
+/// lose — only referenced ids block the load.
+pub fn remap_block_slots(
+    save: &mut SaveFile,
+    lookup: impl Fn(&str) -> Option<crate::blocks::BlockSlot>,
+) -> Result<(), SaveError> {
+    use crate::blocks::BlockSlot;
+
+    let map: Vec<Option<BlockSlot>> = save
+        .block_slots
+        .iter()
+        .map(|id| lookup(id))
+        .collect();
+
+    let mut missing = std::collections::BTreeSet::new();
+    let mut check = |slot: BlockSlot| -> Result<(), SaveError> {
+        let idx = slot.0 as usize;
+        match map.get(idx) {
+            None => Err(SaveError::SlotOutOfRange {
+                slot: slot.0,
+                table_len: map.len(),
+            }),
+            Some(None) => {
+                missing.insert(save.block_slots[idx].clone());
+                Ok(())
+            }
+            Some(Some(_)) => Ok(()),
+        }
+    };
+    for saved in &save.edited_chunks {
+        for slot in &saved.chunk.blocks {
+            check(*slot)?;
+        }
+    }
+    for (_, plan) in &save.plans {
+        if let PlanKind::Build { slot, .. } = plan.kind {
+            check(slot)?;
+        }
+    }
+    if !missing.is_empty() {
+        return Err(SaveError::MissingBlockIds {
+            ids: missing.into_iter().collect(),
+        });
+    }
+
+    // Apply. Detection proved every referenced slot maps, so the
+    // unwraps here are structural.
+    for saved in &mut save.edited_chunks {
+        for slot in &mut saved.chunk.blocks {
+            *slot = map[slot.0 as usize].unwrap();
+        }
+    }
+    for (_, plan) in &mut save.plans {
+        if let PlanKind::Build { slot, .. } = &mut plan.kind {
+            *slot = map[slot.0 as usize].unwrap();
+        }
+    }
+    Ok(())
+}
+
 pub fn save_root() -> PathBuf {
     PathBuf::from(SAVE_ROOT)
 }
@@ -335,15 +429,35 @@ fn read_metadata(dir: &Path) -> Result<SaveMetadata, SaveError> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Write `bytes` to `path` atomically: write a sibling `*.tmp`, then
+/// rename over the target. A crash mid-write leaves either the old file
+/// intact or a stray tmp — never a truncated/interleaved target.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| SaveError::Io {
+        path: tmp.clone(),
+        source: e,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| SaveError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
 fn write_metadata(dir: &Path, meta: &SaveMetadata) -> Result<(), SaveError> {
-    let path = dir.join(METADATA_FILE);
     let bytes = serde_json::to_vec_pretty(meta)?;
-    std::fs::write(&path, bytes).map_err(|e| SaveError::Io { path, source: e })
+    write_atomic(&dir.join(METADATA_FILE), &bytes)
 }
 
 /// Write a save to disk, creating the directory if needed. Preserves an
 /// existing `created_at` if the save already exists; updates `modified_at`
 /// to now.
+///
+/// Blob lands before metadata: loaders read metadata first (the version
+/// gate), so a crash between the two renames leaves a save whose
+/// metadata still describes the previous write — stale, but coherent
+/// and loadable. The reverse order could stamp a fresh version onto a
+/// blob that never arrived.
 pub fn write_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
     validate_name(name)?;
     let dir = save_dir_for(name);
@@ -351,6 +465,9 @@ pub fn write_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
         path: dir.clone(),
         source: e,
     })?;
+    let bytes = bincode::serde::encode_to_vec(save, bincode::config::standard())?;
+    write_atomic(&dir.join(BLOB_FILE), &bytes)?;
+
     let now = now_unix()?;
     let created_at = read_metadata(&dir).map(|m| m.created_at).unwrap_or(now);
     let meta = SaveMetadata {
@@ -359,15 +476,7 @@ pub fn write_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
         modified_at: now,
         version: SAVE_VERSION,
     };
-    write_metadata(&dir, &meta)?;
-
-    let blob = dir.join(BLOB_FILE);
-    let bytes = bincode::serde::encode_to_vec(save, bincode::config::standard())?;
-    std::fs::write(&blob, bytes).map_err(|e| SaveError::Io {
-        path: blob,
-        source: e,
-    })?;
-    Ok(())
+    write_metadata(&dir, &meta)
 }
 
 pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
@@ -445,6 +554,7 @@ mod tests {
     use super::*;
     use bevy::math::Vec3;
     use block_junk_mod_api::blocks::Cardinal;
+    use ndshape::ConstShape;
 
     use crate::blocks::BlockSlot;
 
@@ -491,6 +601,7 @@ mod tests {
         ];
         let original = SaveFile {
             version: SAVE_VERSION,
+            block_slots: vec!["vanilla:empty".to_owned(), "vanilla:stone".to_owned()],
             edited_chunks: vec![],
             last_player_pose: Some(AvatarPose {
                 translation: Vec3::new(1.0, 2.0, 3.0),
@@ -554,6 +665,7 @@ mod tests {
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
 
         assert_eq!(decoded.version, original.version);
+        assert_eq!(decoded.block_slots, original.block_slots);
         assert_eq!(decoded.npcs.len(), 1);
         let np = &decoded.npcs[0];
         assert_eq!(np.id, 7);
@@ -599,5 +711,120 @@ mod tests {
         assert_eq!(active.recipe_id, "vanilla:planks_from_log");
         assert_eq!(active.total_secs, 4.0);
         assert_eq!(active.elapsed_secs, 1.25);
+    }
+
+    /// Minimal SaveFile carrying one chunk + one Build plan, written
+    /// against the given slot table. Cell values are raw indices into
+    /// `chunk.blocks` so tests can poke specific cells without going
+    /// through `Chunk::set`'s interior-only filter (padding cells hold
+    /// slots too and must remap — they ship to clients and feed the
+    /// mesher).
+    fn remap_fixture(table: &[&str], cells: &[(usize, u16)], plan_slot: u16) -> SaveFile {
+        let mut blocks = vec![BlockSlot::EMPTY; crate::voxel::ChunkShape::USIZE];
+        for &(idx, slot) in cells {
+            blocks[idx] = BlockSlot(slot);
+        }
+        SaveFile {
+            version: SAVE_VERSION,
+            block_slots: table.iter().map(|s| s.to_string()).collect(),
+            edited_chunks: vec![SavedChunk {
+                coord: ChunkCoord(IVec3::ZERO),
+                chunk: Chunk { blocks },
+                entities: ChunkEntities::default(),
+            }],
+            last_player_pose: None,
+            npcs: vec![],
+            world_clock: None,
+            plans: vec![(
+                IVec3::new(1, 2, 3),
+                SavedPlanState {
+                    kind: PlanKind::Build {
+                        slot: BlockSlot(plan_slot),
+                        orientation: Cardinal::North,
+                    },
+                    materials: vec![],
+                },
+            )],
+            world_items: vec![],
+            last_player_carry: None,
+            last_player_tool: None,
+            craft_stations: vec![],
+        }
+    }
+
+    /// Registry lookup standing in for a session where registration
+    /// order changed: ids "a" and "b" swapped slots since the save was
+    /// written, and "gone" is no longer registered at all.
+    fn reordered_lookup(id: &str) -> Option<BlockSlot> {
+        match id {
+            "vanilla:empty" => Some(BlockSlot::EMPTY),
+            "a" => Some(BlockSlot(2)),
+            "b" => Some(BlockSlot(1)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn remap_rewrites_chunk_cells_and_build_plans() {
+        // Saved with table [empty, a, b]: cell 10 holds "a" (slot 1),
+        // cell 11 holds "b" (slot 2); the Build plan targets "b".
+        let mut save = remap_fixture(&["vanilla:empty", "a", "b"], &[(10, 1), (11, 2)], 2);
+        remap_block_slots(&mut save, reordered_lookup).unwrap();
+        let blocks = &save.edited_chunks[0].chunk.blocks;
+        assert_eq!(blocks[10], BlockSlot(2), "cell holding \"a\" follows its id");
+        assert_eq!(blocks[11], BlockSlot(1), "cell holding \"b\" follows its id");
+        assert_eq!(blocks[0], BlockSlot::EMPTY);
+        let PlanKind::Build { slot, .. } = save.plans[0].1.kind else {
+            panic!("plan kind changed shape");
+        };
+        assert_eq!(slot, BlockSlot(1), "Build plan follows \"b\"");
+    }
+
+    #[test]
+    fn remap_tolerates_missing_id_nothing_references() {
+        // "gone" is in the table but no cell/plan uses slot 3 — the
+        // load must succeed (a removed mod only blocks loads of worlds
+        // that actually contain its blocks).
+        let mut save = remap_fixture(&["vanilla:empty", "a", "b", "gone"], &[(5, 1)], 1);
+        remap_block_slots(&mut save, reordered_lookup).unwrap();
+        assert_eq!(save.edited_chunks[0].chunk.blocks[5], BlockSlot(2));
+    }
+
+    #[test]
+    fn remap_refuses_missing_id_in_use_and_lists_it() {
+        let mut save = remap_fixture(&["vanilla:empty", "a", "gone"], &[(5, 2)], 1);
+        let err = remap_block_slots(&mut save, reordered_lookup).unwrap_err();
+        match err {
+            SaveError::MissingBlockIds { ids } => assert_eq!(ids, vec!["gone".to_owned()]),
+            other => panic!("expected MissingBlockIds, got {other}"),
+        }
+        // Refusal must leave the save untouched (caller may report and
+        // keep the file for a later load with the mod restored).
+        assert_eq!(save.edited_chunks[0].chunk.blocks[5], BlockSlot(2));
+    }
+
+    #[test]
+    fn remap_refuses_slot_beyond_table() {
+        let mut save = remap_fixture(&["vanilla:empty", "a"], &[(5, 9)], 1);
+        let err = remap_block_slots(&mut save, reordered_lookup).unwrap_err();
+        assert!(
+            matches!(err, SaveError::SlotOutOfRange { slot: 9, table_len: 2 }),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_content() {
+        let dir = std::env::temp_dir().join(format!("bj-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob.bin");
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "tmp file must not linger after a successful rename"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
