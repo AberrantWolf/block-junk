@@ -35,7 +35,6 @@ use block_junk_mod_api::shared::BlockPos;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
@@ -78,7 +77,8 @@ pub struct NpcPath(pub Vec<IVec3>);
 
 /// Stable identifier for an NPC across save/load. Distinct from Bevy
 /// `Entity` because Entity values aren't preserved across reboots.
-/// Allocated server-side from a monotonic counter and exposed to mods
+/// Allocated server-side from the monotonic [`NpcIdAllocator`] (every
+/// runtime spawn path must use it) and exposed to mods
 /// in [`NpcSnapshot::id`]. Replicated so the client can refer to a
 /// specific NPC across the wire — needed for inspection requests
 /// (the client raycasts an entity, looks up the NpcId, and sends it
@@ -416,7 +416,25 @@ pub struct Brain {
     /// across world reloads — `ClusterId` isn't stable across restarts;
     /// the NPC re-claims on next sleep.
     pub home_cluster: Option<crate::civilization::ClusterId>,
+    /// Seconds until the next survival preempt may fire. Set after
+    /// every preempt so an *unsatisfiable* critical need (exhausted at
+    /// noon when sleep is night-gated; starving with no food in range)
+    /// can't thrash abort→plan→claim→A*→abort at full tick rate — the
+    /// NPC works in [`PREEMPT_RETRY_COOLDOWN_SECS`] chunks until the
+    /// need becomes satisfiable. Runtime-only; not persisted.
+    pub preempt_cooldown_secs: f32,
 }
+
+/// Minimum spacing between survival preempts for one NPC. See
+/// [`Brain::preempt_cooldown_secs`].
+const PREEMPT_RETRY_COOLDOWN_SECS: f32 = 5.0;
+
+/// How long a haul target whose last leg failed pathfinding stays
+/// memoized as unreachable before the scheduler may retry it. Without
+/// the memo, a nearby item in a pit (or a walled-off plan) pins its
+/// nearest hauler in a deterministic assign→path-fail→release loop
+/// forever — the NPC never hauls anything else.
+const HAUL_UNREACHABLE_RETRY_SECS: f32 = 30.0;
 
 /// Default wander radius for the native fallback path (no planner
 /// registered for this NPC's kind). The Lua planner provides its own
@@ -541,11 +559,19 @@ pub struct NpcServerPlugin;
 
 impl Plugin for NpcServerPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<NpcIdAllocator>();
+        app.init_resource::<SmokeClusterSpawned>();
         // Spawn deferred to first client connect rather than Startup —
         // chunks aren't loaded until a client's AoI requests them, and
         // an NPC spawned into an empty world falls past unloaded chunks
         // forever (no candidates to collide against).
         app.add_observer(spawn_initial_npc_on_first_connect);
+        // Lifecycle backstop: ANY NPC despawn (death, debug removal, a
+        // mod) releases every claim/booking/reservation keyed by its
+        // id. Without this a removed NPC's bed/plan/station claims and
+        // item reservations would lock permanently — every claim table
+        // assumes this observer exists.
+        app.add_observer(release_claims_on_npc_despawn);
         // Local-bus message: brain emits on Working timer completion;
         // server-side consumer (in server.rs) applies the underlying
         // BlockEdit + clears the plan tag. Splits these concerns so the
@@ -603,10 +629,62 @@ pub struct NpcWorkCompleted {
     pub plan_kind: PlanKind,
 }
 
-/// Latches on the first `Connected` so subsequent reconnects don't
-/// re-spawn the smoke-test cluster. `AtomicBool` rather than
-/// `Local<bool>` because observers don't take `Local`.
-static SMOKE_TEST_SPAWNED: AtomicBool = AtomicBool::new(false);
+/// Observer: an NPC entity is despawning — release everything keyed by
+/// its id or entity across the four claim tables. Components are still
+/// readable inside a `Remove` observer, so the id lookup works.
+fn release_claims_on_npc_despawn(
+    trigger: On<Remove, Npc>,
+    ids: Query<&NpcId>,
+    mut plan_claims: ResMut<crate::plan_claims::PlanClaims>,
+    mut interaction_claims: ResMut<crate::interactables::InteractionClaims>,
+    mut haul_store: ResMut<crate::haul::HaulStore>,
+    mut bookings: ResMut<crate::craft_stations::CraftBookings>,
+) {
+    let Ok(&id) = ids.get(trigger.entity) else {
+        return;
+    };
+    plan_claims.release_all_for(id);
+    interaction_claims.release_all_for(id);
+    haul_store.release_for_npc(id);
+    bookings.release_npc_booking(id, trigger.entity);
+    info!(npc = id.0, "npc despawned; released all claims");
+}
+
+/// Server-side monotonic [`NpcId`] source. EVERY runtime NPC spawn must
+/// allocate from here — ids key the claim tables (plans, interactions,
+/// hauls, craft bookings), so two NPCs sharing an id silently share
+/// claims. `load_from_save` bumps the counter past the highest saved id
+/// before any runtime spawn can fire.
+#[derive(Resource)]
+pub struct NpcIdAllocator {
+    next: u64,
+}
+
+impl Default for NpcIdAllocator {
+    fn default() -> Self {
+        Self { next: 1 }
+    }
+}
+
+impl NpcIdAllocator {
+    pub fn allocate(&mut self) -> NpcId {
+        let id = NpcId(self.next);
+        self.next += 1;
+        id
+    }
+
+    /// Bump the counter past an id already in use (saved NPCs keep
+    /// their persisted ids). Idempotent; safe to call per loaded NPC.
+    pub fn reserve_through(&mut self, used: u64) {
+        self.next = self.next.max(used + 1);
+    }
+}
+
+/// Once-per-session latch for the smoke-test cluster. A `Resource` (not
+/// a process-wide static) so a future in-process server restart starts
+/// fresh with its own App state.
+#[derive(Resource, Default)]
+struct SmokeClusterSpawned(bool);
 
 /// Smoke-test cluster — a small ring of NPCs near the player's default
 /// landing spot (player spawn = (0, 32, 60)). Each is offset by a few
@@ -632,15 +710,16 @@ fn spawn_initial_npc_on_first_connect(
     mut commands: Commands,
     kinds: Res<NpcKindRegistry>,
     existing: Query<(), With<Npc>>,
+    mut spawned: ResMut<SmokeClusterSpawned>,
+    mut allocator: ResMut<NpcIdAllocator>,
 ) {
-    if SMOKE_TEST_SPAWNED.swap(true, Ordering::SeqCst) {
+    if std::mem::replace(&mut spawned.0, true) {
         return;
     }
     // If a save was loaded at startup, NPCs already exist with their
-    // persisted ids — spawning the smoke-test cluster on top would
-    // duplicate ids (the cluster hardcodes 1..=4 and a freshly-saved
-    // world has those same ids). Skip silently; the atomic above still
-    // latches so subsequent reconnects don't re-attempt.
+    // persisted ids — the cluster would just pile more bodies onto the
+    // spawn point. Skip silently; the latch above still holds so
+    // subsequent reconnects don't re-attempt.
     if !existing.is_empty() {
         info!("NPCs already present (loaded from save); skipping smoke-test cluster spawn");
         return;
@@ -666,8 +745,8 @@ fn spawn_initial_npc_on_first_connect(
         Vec3::new(2.0, 32.0, 62.0),
         Vec3::new(4.0, 32.0, 64.0),
     ];
-    for (i, translation) in cluster.into_iter().enumerate() {
-        let id: u64 = (i + 1) as u64;
+    for translation in cluster.into_iter() {
+        let id = allocator.allocate();
         // Nested tuples work around Bevy's 15-element Bundle cap. Two
         // groups: identity/brain (cheap markers + structured state) and
         // physics + replication (per-frame state + lightyear).
@@ -675,13 +754,14 @@ fn spawn_initial_npc_on_first_connect(
             (
                 Actor,
                 Npc,
-                NpcId(id),
+                id,
                 NpcKind(kind_id.into()),
                 Needs(default_needs.clone()),
                 Brain {
                     goal: Goal::Idle,
-                    rng: 0xDEAD_BEEF_CAFE_F00D ^ id,
+                    rng: 0xDEAD_BEEF_CAFE_F00D ^ id.0,
                     home_cluster: None,
+                    preempt_cooldown_secs: 0.0,
                 },
                 crate::protocol::Carrying::default(),
                 crate::protocol::EquippedTool::default(),
@@ -698,7 +778,7 @@ fn spawn_initial_npc_on_first_connect(
             NpcAnimOverride::default(),
             Replicate::to_clients(NetworkTarget::All),
             InterpolationTarget::to_clients(NetworkTarget::All),
-            Name::new(format!("npc:{id}")),
+            Name::new(format!("npc:{}", id.0)),
         ));
     }
     info!(kind = kind_id, count = cluster.len(), "spawned smoke-test NPC cluster");
@@ -988,6 +1068,7 @@ fn npc_brain_tick(
     >,
 ) {
     let dt = time.delta_secs();
+    let now_secs = time.elapsed_secs();
     let world = WorldWalk {
         chunks: &chunks,
         chunk_map: &chunk_map,
@@ -1032,7 +1113,8 @@ fn npc_brain_tick(
         // aborted hauler doesn't get instantly reassigned to another
         // haul before the planner gets a turn.
         let mut preempted_this_tick = false;
-        if preempt_eligible(&brain.goal) {
+        brain.preempt_cooldown_secs = (brain.preempt_cooldown_secs - dt).max(0.0);
+        if brain.preempt_cooldown_secs <= 0.0 && preempt_eligible(&brain.goal) {
             let crossed = needs.0.iter().find_map(|(id, value)| {
                 need_registry
                     .preempt_threshold(id)
@@ -1089,6 +1171,7 @@ fn npc_brain_tick(
                     craft.bookings.release_npc_booking(*npc_id, entity);
                 }
                 preempted_this_tick = true;
+                brain.preempt_cooldown_secs = PREEMPT_RETRY_COOLDOWN_SECS;
                 *intent = MovementIntent::default();
             }
         }
@@ -1220,6 +1303,42 @@ fn npc_brain_tick(
             // whose target block had a `use_slot` populated this. The
             // follow-on action just decides what the locked body
             // does (sleep/consume/work).
+            // An Interact target may have been broken or replaced
+            // while we walked over. Validate BEFORE the snap below —
+            // the documented degrade is "stand briefly, then idle",
+            // not "sleep mid-air where the bed used to be and still
+            // collect the restore".
+            if let ArrivalAction::Interact {
+                target_cell,
+                anchor_cell,
+                exclusive,
+                ..
+            } = &action
+            {
+                let still_interactable = {
+                    let (coord, local) = world_to_chunk(*target_cell);
+                    chunk_map
+                        .0
+                        .get(&coord)
+                        .and_then(|&e| chunks.get(e).ok())
+                        .map(|chunk| chunk.get(local))
+                        .filter(|slot| !slot.is_empty())
+                        .map(|slot| block_registry.def(slot).interactable.is_some())
+                        .unwrap_or(false)
+                };
+                if !still_interactable {
+                    info!(
+                        npc = npc_id.0,
+                        cell = ?target_cell.to_array(),
+                        "interact arrival: block gone or no longer interactable; abandoning",
+                    );
+                    if *exclusive {
+                        interaction_claims.release(*anchor_cell, *npc_id);
+                    }
+                    brain.goal = Goal::Idle;
+                    continue;
+                }
+            }
             if let Some(s) = snap {
                 pose.translation = s.translation;
                 pose.yaw = s.yaw;
@@ -1252,6 +1371,20 @@ fn npc_brain_tick(
                     plan_kind,
                     need_restore,
                 } => {
+                    // The plan may have been cancelled (or retagged)
+                    // while we walked over — the mod-api contract says
+                    // a cancelled plan's work completes silently, so
+                    // don't start the timer against a stale snapshot.
+                    if haul.plans.kind(target_cell) != Some(plan_kind) {
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?target_cell.to_array(),
+                            "work arrival: plan gone or changed; abandoning",
+                        );
+                        haul.plan_claims.release(target_cell, *npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
                     brain.goal = Goal::Working {
                         remaining_secs: duration_secs,
                         target_cell,
@@ -1308,46 +1441,22 @@ fn npc_brain_tick(
                     commands.entity(item_entity).despawn();
                     haul.store.drop_queue_entry(*npc_id, item_entity);
                     // Plan next leg from the (now updated) assignment.
-                    let next_goal = haul
-                        .store
-                        .assignment_of(*npc_id)
-                        .and_then(|a| {
-                            pick_next_haul_leg(
-                                &pose,
-                                a.target,
-                                &carrying,
-                                cap,
-                                a.pending_tool.as_ref(),
-                                &a.queue,
-                                &haul.plans,
-                                &craft.stations,
-                                &craft.recipes,
-                                &haul.item_registry,
-                                &world,
-                            )
-                            .map(Some)
-                            .unwrap_or(Some(None))
-                        })
-                        .flatten();
-                    match next_goal {
-                        Some(goal) => {
-                            if let Goal::MoveTo { path, .. } = &goal {
-                                npc_path.set_if_neq(NpcPath(path.clone()));
-                            }
-                            brain.goal = goal;
-                        }
-                        None => {
-                            // No more legs; release haul cleanly. May
-                            // also be the "path failed" branch (Err)
-                            // collapsed to Idle — both end the same
-                            // way.
-                            haul.store.release_for_npc(*npc_id);
-                            brain.goal = Goal::Idle;
-                            if !npc_path.0.is_empty() {
-                                npc_path.0.clear();
-                            }
-                        }
-                    }
+                    continue_haul_or_release(
+                        *npc_id,
+                        kind,
+                        now_secs,
+                        &pose,
+                        &carrying,
+                        &mut brain,
+                        &mut npc_path,
+                        &mut haul.store,
+                        &haul.plans,
+                        &haul.kind_registry,
+                        &haul.item_registry,
+                        &craft.stations,
+                        &craft.recipes,
+                        &world,
+                    );
                     let _ = plan_cell; // captured for diagnostics; unused after pickup
                 }
                 ArrivalAction::DepositAtPlan { plan_cell } => {
@@ -1384,7 +1493,25 @@ fn npc_brain_tick(
                         }
                     };
                     let accepted = haul.plans.deposit(plan_cell, carry_item, carry_count);
-                    if accepted > 0 {
+                    if accepted == 0 {
+                        // Plan no longer needs this kind (another
+                        // hauler or the player filled it between
+                        // assignment and arrival). Without this
+                        // release, pick_next_haul_leg re-plans the
+                        // same deposit leg forever — a silent 60 Hz
+                        // livelock holding the assignment. Mirrors
+                        // the `want == 0` guard on the station path.
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?plan_cell.to_array(),
+                            kind = carry_item.0,
+                            "haul deposit: plan has no demand for carry; releasing",
+                        );
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    {
                         carrying.count = carry_count - accepted;
                         if carrying.count == 0 {
                             carrying.item = None;
@@ -1415,47 +1542,22 @@ fn npc_brain_tick(
                     // Decide what's next. After a deposit the queue
                     // may still have items (multi-trip haul); a
                     // plan-satisfied state ends the assignment.
-                    let cap = haul
-                        .kind_registry
-                        .get(&kind.0)
-                        .map(|d| d.carry_capacity)
-                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
-                    let next_goal = haul
-                        .store
-                        .assignment_of(*npc_id)
-                        .and_then(|a| {
-                            pick_next_haul_leg(
-                                &pose,
-                                a.target,
-                                &carrying,
-                                cap,
-                                a.pending_tool.as_ref(),
-                                &a.queue,
-                                &haul.plans,
-                                &craft.stations,
-                                &craft.recipes,
-                                &haul.item_registry,
-                                &world,
-                            )
-                            .map(Some)
-                            .unwrap_or(Some(None))
-                        })
-                        .flatten();
-                    match next_goal {
-                        Some(goal) => {
-                            if let Goal::MoveTo { path, .. } = &goal {
-                                npc_path.set_if_neq(NpcPath(path.clone()));
-                            }
-                            brain.goal = goal;
-                        }
-                        None => {
-                            haul.store.release_for_npc(*npc_id);
-                            brain.goal = Goal::Idle;
-                            if !npc_path.0.is_empty() {
-                                npc_path.0.clear();
-                            }
-                        }
-                    }
+                    continue_haul_or_release(
+                        *npc_id,
+                        kind,
+                        now_secs,
+                        &pose,
+                        &carrying,
+                        &mut brain,
+                        &mut npc_path,
+                        &mut haul.store,
+                        &haul.plans,
+                        &haul.kind_registry,
+                        &haul.item_registry,
+                        &craft.stations,
+                        &craft.recipes,
+                        &world,
+                    );
                 }
                 ArrivalAction::DepositAtStation { station_cell } => {
                     // Validate the cell is still a station block. A
@@ -1548,47 +1650,22 @@ fn npc_brain_tick(
                     }
                     // Pick next leg from the (possibly still active)
                     // assignment. Same pattern as DepositAtPlan.
-                    let cap = haul
-                        .kind_registry
-                        .get(&kind.0)
-                        .map(|d| d.carry_capacity)
-                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
-                    let next_goal = haul
-                        .store
-                        .assignment_of(*npc_id)
-                        .and_then(|a| {
-                            pick_next_haul_leg(
-                                &pose,
-                                a.target,
-                                &carrying,
-                                cap,
-                                a.pending_tool.as_ref(),
-                                &a.queue,
-                                &haul.plans,
-                                &craft.stations,
-                                &craft.recipes,
-                                &haul.item_registry,
-                                &world,
-                            )
-                            .map(Some)
-                            .unwrap_or(Some(None))
-                        })
-                        .flatten();
-                    match next_goal {
-                        Some(goal) => {
-                            if let Goal::MoveTo { path, .. } = &goal {
-                                npc_path.set_if_neq(NpcPath(path.clone()));
-                            }
-                            brain.goal = goal;
-                        }
-                        None => {
-                            haul.store.release_for_npc(*npc_id);
-                            brain.goal = Goal::Idle;
-                            if !npc_path.0.is_empty() {
-                                npc_path.0.clear();
-                            }
-                        }
-                    }
+                    continue_haul_or_release(
+                        *npc_id,
+                        kind,
+                        now_secs,
+                        &pose,
+                        &carrying,
+                        &mut brain,
+                        &mut npc_path,
+                        &mut haul.store,
+                        &haul.plans,
+                        &haul.kind_registry,
+                        &haul.item_registry,
+                        &craft.stations,
+                        &craft.recipes,
+                        &world,
+                    );
                 }
                 ArrivalAction::PickupTool { item_entity, item_slot } => {
                     // Validate the reserved tool item still exists +
@@ -1650,47 +1727,22 @@ fn npc_brain_tick(
                     // tooled up. If the queue is empty (assignment
                     // was tool-only) we naturally release + idle and
                     // the scheduler will repick.
-                    let cap = haul
-                        .kind_registry
-                        .get(&kind.0)
-                        .map(|d| d.carry_capacity)
-                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
-                    let next_goal = haul
-                        .store
-                        .assignment_of(*npc_id)
-                        .and_then(|a| {
-                            pick_next_haul_leg(
-                                &pose,
-                                a.target,
-                                &carrying,
-                                cap,
-                                a.pending_tool.as_ref(),
-                                &a.queue,
-                                &haul.plans,
-                                &craft.stations,
-                                &craft.recipes,
-                                &haul.item_registry,
-                                &world,
-                            )
-                            .map(Some)
-                            .unwrap_or(Some(None))
-                        })
-                        .flatten();
-                    match next_goal {
-                        Some(goal) => {
-                            if let Goal::MoveTo { path, .. } = &goal {
-                                npc_path.set_if_neq(NpcPath(path.clone()));
-                            }
-                            brain.goal = goal;
-                        }
-                        None => {
-                            haul.store.release_for_npc(*npc_id);
-                            brain.goal = Goal::Idle;
-                            if !npc_path.0.is_empty() {
-                                npc_path.0.clear();
-                            }
-                        }
-                    }
+                    continue_haul_or_release(
+                        *npc_id,
+                        kind,
+                        now_secs,
+                        &pose,
+                        &carrying,
+                        &mut brain,
+                        &mut npc_path,
+                        &mut haul.store,
+                        &haul.plans,
+                        &haul.kind_registry,
+                        &haul.item_registry,
+                        &craft.stations,
+                        &craft.recipes,
+                        &world,
+                    );
                 }
                 ArrivalAction::WorkStation { station_cell } => {
                     // Resolve the station def + try to start the first
@@ -1706,7 +1758,27 @@ fn npc_brain_tick(
                         &chunk_map,
                         &block_registry,
                     );
-                    let started = if let Some(station_def) = station_def {
+    // A worker-less in-progress craft is a resume: register as
+                    // the worker and let the ticker continue from the saved
+                    // elapsed_secs. The scheduler tool-gated us before sending
+                    // us over. Fresh starts go through the shared
+                    // first-satisfiable-order path.
+                    let resumable = station_def.is_some()
+                        && craft
+                            .stations
+                            .get(station_cell)
+                            .map(|st| st.active_work.is_some())
+                            .unwrap_or(false)
+                        && craft.bookings.worker_at(station_cell).is_none();
+                    let started = if resumable {
+                        craft.bookings.register_worker(station_cell, entity);
+                        info!(
+                            npc = npc_id.0,
+                            station = ?station_cell.to_array(),
+                            "craft arrival: resuming paused in-progress work",
+                        );
+                        true
+                    } else if let Some(station_def) = station_def {
                         crate::craft_stations::try_start_first_satisfiable_order(
                             station_cell,
                             entity,
@@ -1906,10 +1978,24 @@ fn npc_brain_tick(
                         "work complete (no need change)",
                     );
                 }
-                commands.write_message(NpcWorkCompleted {
-                    cell: *target_cell,
-                    plan_kind: *plan_kind,
-                });
+                // Cancelled mid-work → the effort still counts (the
+                // need restore above already applied) but the world
+                // mutation must NOT happen: "cancel cancels" is the
+                // player-facing contract, and a Remove plan firing
+                // after its tag was cleared destroys a block the
+                // player decided to keep.
+                if haul.plans.kind(*target_cell) == Some(*plan_kind) {
+                    commands.write_message(NpcWorkCompleted {
+                        cell: *target_cell,
+                        plan_kind: *plan_kind,
+                    });
+                } else {
+                    info!(
+                        npc = npc_id.0,
+                        cell = ?target_cell.to_array(),
+                        "work complete but plan was cancelled; completing silently",
+                    );
+                }
                 haul.plan_claims.release(*target_cell, *npc_id);
                 interact_done = Some(*target_cell);
             }
@@ -2135,6 +2221,7 @@ fn npc_brain_tick(
                     &chunk_map,
                     &haul.world_items,
                     &mut haul.store,
+                    now_secs,
                 );
             }
             // Engine-driven haul takes priority over the Lua planner.
@@ -2145,48 +2232,28 @@ fn npc_brain_tick(
             // for a *different* NPC, but never gets to overrule an
             // active haul.
             if haul.store.has_assignment(*npc_id) {
-                let cap = haul
-                    .kind_registry
-                    .get(&kind.0)
-                    .map(|d| d.carry_capacity)
-                    .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
-                let next_goal = haul
-                    .store
-                    .assignment_of(*npc_id)
-                    .and_then(|a| {
-                        pick_next_haul_leg(
-                            &pose,
-                            a.target,
-                            &carrying,
-                            cap,
-                            a.pending_tool.as_ref(),
-                            &a.queue,
-                            &haul.plans,
-                            &craft.stations,
-                            &craft.recipes,
-                            &haul.item_registry,
-                            &world,
-                        )
-                        .map(Some)
-                        .unwrap_or(Some(None))
-                    })
-                    .flatten();
-                match next_goal {
-                    Some(goal) => {
-                        if let Goal::MoveTo { path, .. } = &goal {
-                            npc_path.set_if_neq(NpcPath(path.clone()));
-                        }
-                        brain.goal = goal;
-                        *intent = MovementIntent::default();
-                        continue;
-                    }
-                    None => {
-                        // Assignment was empty or pathfinding to the
-                        // first leg failed; release and fall through
-                        // to the planner so the NPC doesn't burn a
-                        // tick doing nothing.
-                        haul.store.release_for_npc(*npc_id);
-                    }
+                // Committed a leg → done deciding this tick. A clean
+                // release (or path failure, which also memoizes the
+                // target) falls through to the planner so the NPC
+                // doesn't burn a tick doing nothing.
+                if continue_haul_or_release(
+                    *npc_id,
+                    kind,
+                    now_secs,
+                    &pose,
+                    &carrying,
+                    &mut brain,
+                    &mut npc_path,
+                    &mut haul.store,
+                    &haul.plans,
+                    &haul.kind_registry,
+                    &haul.item_registry,
+                    &craft.stations,
+                    &craft.recipes,
+                    &world,
+                ) {
+                    *intent = MovementIntent::default();
+                    continue;
                 }
             }
             let kind_id = NpcKindId(kind.0.clone());
@@ -3062,6 +3129,90 @@ fn plan_haul_move<W: Walkability>(
         on_arrive,
         snap: None,
     })
+}
+
+/// Continue the NPC's active haul assignment: pick the next leg and
+/// commit it as the brain goal, or end the assignment (release + Idle).
+/// Returns true when a new goal was committed — callers in the Idle
+/// entry use that to skip the planner this tick.
+///
+/// One implementation for what used to be five hand-copied blocks (two
+/// of which had drifted and grown bugs). Failure semantics live here:
+/// a pathfinding failure memoizes the assignment's target as
+/// unreachable for [`HAUL_UNREACHABLE_RETRY_SECS`] so the scheduler
+/// doesn't immediately re-pair the same NPC to the same impossible
+/// target.
+#[allow(clippy::too_many_arguments, reason = "haul continuation spans plan + station ctx")]
+fn continue_haul_or_release<W: Walkability>(
+    npc_id: NpcId,
+    kind: &NpcKind,
+    now_secs: f32,
+    pose: &AvatarPose,
+    carrying: &Carrying,
+    brain: &mut Brain,
+    npc_path: &mut Mut<NpcPath>,
+    store: &mut HaulStore,
+    plans: &Plans,
+    kind_registry: &NpcKindRegistry,
+    item_registry: &crate::items::ItemRegistry,
+    stations: &crate::craft_stations::CraftStations,
+    recipes: &crate::recipes::RecipeRegistry,
+    world: &W,
+) -> bool {
+    let cap = kind_registry
+        .get(&kind.0)
+        .map(|d| d.carry_capacity)
+        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+    let leg = match store.assignment_of(npc_id) {
+        None => Ok(None),
+        Some(a) => pick_next_haul_leg(
+            pose,
+            a.target,
+            carrying,
+            cap,
+            a.pending_tool.as_ref(),
+            &a.queue,
+            plans,
+            stations,
+            recipes,
+            item_registry,
+            world,
+        )
+        .map_err(|()| a.target),
+    };
+    match leg {
+        Ok(Some(goal)) => {
+            if let Goal::MoveTo { path, .. } = &goal {
+                npc_path.set_if_neq(NpcPath(path.clone()));
+            }
+            brain.goal = goal;
+            true
+        }
+        Ok(None) => {
+            // Assignment naturally done (or already gone); clean release.
+            store.release_for_npc(npc_id);
+            brain.goal = Goal::Idle;
+            if !npc_path.0.is_empty() {
+                npc_path.0.clear();
+            }
+            false
+        }
+        Err(target) => {
+            info!(
+                npc = npc_id.0,
+                target = ?target,
+                retry_in = HAUL_UNREACHABLE_RETRY_SECS,
+                "haul leg pathfinding failed; memoizing target as unreachable",
+            );
+            store.memo_unreachable(target, now_secs + HAUL_UNREACHABLE_RETRY_SECS);
+            store.release_for_npc(npc_id);
+            brain.goal = Goal::Idle;
+            if !npc_path.0.is_empty() {
+                npc_path.0.clear();
+            }
+            false
+        }
+    }
 }
 
 /// Pick the next leg of a haul cycle after a pickup or deposit
@@ -4194,6 +4345,7 @@ fn rand_unit(state: &mut u64) -> f32 {
 
 #[cfg(test)]
 mod tests {
+
     //! Pure-data tests for the preempt path. The full integration
     //! ("preempted NPC ends up Resting / Interacting next tick") needs
     //! a real brain-tick app and is covered by manual smoke. Here we
@@ -4407,5 +4559,17 @@ mod tests {
         // alone, so another NPC still can't take it.
         let other = NpcId(2);
         assert!(!plan_claims.try_claim(cell, other));
+    }
+
+    #[test]
+    fn npc_id_allocator_is_monotonic_and_respects_loaded_ids() {
+        let mut alloc = NpcIdAllocator::default();
+        assert_eq!(alloc.allocate(), NpcId(1));
+        assert_eq!(alloc.allocate(), NpcId(2));
+        // Loading a save with ids up to 9 must push the counter past
+        // them — and reserving something already-passed is a no-op.
+        alloc.reserve_through(9);
+        alloc.reserve_through(3);
+        assert_eq!(alloc.allocate(), NpcId(10));
     }
 }

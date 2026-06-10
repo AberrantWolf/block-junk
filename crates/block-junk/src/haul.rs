@@ -45,7 +45,7 @@ pub struct ReservedItem {
 ///
 /// Tool prereqs only apply to Plan targets (the *work* needs a tool;
 /// delivery doesn't). Station haul never carries a `pending_tool`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HaulTarget {
     Plan(IVec3),
     Station(IVec3),
@@ -104,6 +104,14 @@ pub struct HaulAssignment {
 pub struct HaulStore {
     assignments: HashMap<NpcId, HaulAssignment>,
     reservations: HashMap<Entity, NpcId>,
+    /// Targets whose last haul leg failed pathfinding, mapped to the
+    /// `Time::elapsed_secs` timestamp when a retry is allowed. The
+    /// scheduler skips memoized targets so one walled-off plan (or an
+    /// item in a pit) can't pin its nearest hauler in a deterministic
+    /// assign→path-fail→release loop forever. Entries expire lazily on
+    /// check; the world edit that makes a target reachable again is
+    /// picked up on the first retry after expiry.
+    unreachable_until: HashMap<HaulTarget, f32>,
 }
 
 impl HaulStore {
@@ -153,6 +161,25 @@ impl HaulStore {
             }
         }
         self.reservations.retain(|_, holder| holder.0 != npc.0);
+    }
+
+    /// Record that pathing toward `target` just failed; the scheduler
+    /// won't offer it again until `retry_at` (elapsed seconds).
+    pub fn memo_unreachable(&mut self, target: HaulTarget, retry_at: f32) {
+        self.unreachable_until.insert(target, retry_at);
+    }
+
+    /// True while `target` is memoized as unreachable. Expired entries
+    /// are pruned on check.
+    pub fn is_unreachable(&mut self, target: HaulTarget, now: f32) -> bool {
+        match self.unreachable_until.get(&target) {
+            Some(&retry_at) if now < retry_at => true,
+            Some(_) => {
+                self.unreachable_until.remove(&target);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Pop the front of `npc`'s pickup queue, releasing its
@@ -267,6 +294,7 @@ pub fn try_schedule_haul_for_npc(
     chunk_map: &crate::voxel::ChunkMap,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
     store: &mut HaulStore,
+    now_secs: f32,
 ) -> bool {
     use crate::protocol::PlanKind;
 
@@ -318,6 +346,9 @@ pub fn try_schedule_haul_for_npc(
             if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
                 continue;
             }
+            if store.is_unreachable(HaulTarget::Plan(*cell), now_secs) {
+                continue;
+            }
             if best.map(|(_, d)| dist < d).unwrap_or(true) {
                 best = Some((HaulTarget::Plan(*cell), dist));
             }
@@ -329,6 +360,9 @@ pub fn try_schedule_haul_for_npc(
             }
             let dist = chebyshev(*cell, foot);
             if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
+                continue;
+            }
+            if store.is_unreachable(HaulTarget::Station(*cell), now_secs) {
                 continue;
             }
             if best.map(|(_, d)| dist < d).unwrap_or(true) {
@@ -432,6 +466,9 @@ pub fn try_schedule_haul_for_npc(
                 continue;
             }
         }
+        if store.is_unreachable(HaulTarget::Plan(*cell), now_secs) {
+            continue;
+        }
         if best.map(|(_, _, _, d)| dist < d).unwrap_or(true) {
             best = Some((HaulTarget::Plan(*cell), slot, remaining, dist));
         }
@@ -455,6 +492,9 @@ pub fn try_schedule_haul_for_npc(
         let Some((slot, remaining)) = chosen else {
             continue;
         };
+        if store.is_unreachable(HaulTarget::Station(*cell), now_secs) {
+            continue;
+        }
         if best.map(|(_, _, _, d)| dist < d).unwrap_or(true) {
             best = Some((HaulTarget::Station(*cell), slot, remaining, dist));
         }
@@ -767,6 +807,7 @@ impl Plugin for HaulPlugin {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     const NPC_1: NpcId = NpcId(1);
@@ -927,5 +968,20 @@ mod tests {
         assert!(s.has_assignment(NPC_1));
         assert!(s.assignment_of(NPC_1).unwrap().pending_tool.is_none());
         assert!(s.try_reserve_internal(tool, NPC_2));
+    }
+
+    #[test]
+    fn unreachable_memo_expires_and_prunes() {
+        let mut store = HaulStore::default();
+        let target = HaulTarget::Plan(IVec3::new(1, 2, 3));
+        store.memo_unreachable(target, 30.0);
+        assert!(store.is_unreachable(target, 10.0));
+        assert!(store.is_unreachable(target, 29.9));
+        // Expiry boundary: at/after retry_at the memo clears...
+        assert!(!store.is_unreachable(target, 30.0));
+        // ...and stays cleared (entry pruned, not just ignored).
+        assert!(!store.is_unreachable(target, 0.0));
+        // Other targets unaffected.
+        assert!(!store.is_unreachable(HaulTarget::Station(IVec3::ZERO), 0.0));
     }
 }

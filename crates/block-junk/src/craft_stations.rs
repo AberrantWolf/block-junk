@@ -441,12 +441,33 @@ pub fn try_schedule_craft_for_npc(
         if bookings.has_worker(*cell) {
             continue;
         }
-        if state.active_work.is_some() {
-            // 6c-A skips abandoned in-progress crafts. A future patch
-            // can add a "resume if my tool matches" branch.
-            continue;
-        }
-        if state.orders.is_empty() {
+        // An in-progress craft whose worker left (preempt, player
+        // disconnect) is RESUMABLE — without this branch a paused
+        // active_work blocked the whole station forever: the ticker
+        // won't advance worker-less work, and the queue behind it
+        // never drains. Resume requires the right tool for the active
+        // recipe; fresh starts go through the order checks below.
+        let resume = state.active_work.is_some();
+        if resume {
+            let tool_ok = state
+                .active_work
+                .as_ref()
+                .and_then(|aw| {
+                    let recipe_id = RecipeId::new(aw.recipe_id.clone());
+                    recipes.slot_of(&recipe_id).map(|rs| {
+                        recipes
+                            .def(rs)
+                            .required_tool
+                            .as_ref()
+                            .map(|tag| item_registry.tool_has_tag(equipped_tool.item, tag))
+                            .unwrap_or(true)
+                    })
+                })
+                .unwrap_or(false);
+            if !tool_ok {
+                continue;
+            }
+        } else if state.orders.is_empty() {
             continue;
         }
 
@@ -507,7 +528,7 @@ pub fn try_schedule_craft_for_npc(
                 state.inventory.get(&slot).copied().unwrap_or(0) >= input.count
             })
         });
-        if !any_workable {
+        if !resume && !any_workable {
             continue;
         }
         best = Some((*cell, dist));

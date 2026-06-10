@@ -250,6 +250,7 @@ fn load_from_save(
     mut plans: ResMut<Plans>,
     mut stations: ResMut<CraftStations>,
     mut guard: ResMut<SaveWriteGuard>,
+    mut npc_ids: ResMut<crate::npc::NpcIdAllocator>,
     config: Option<Res<ServerSaveConfig>>,
     block_registry: Res<BlockRegistry>,
     item_registry: Res<ItemRegistry>,
@@ -475,6 +476,9 @@ fn load_from_save(
         info!("primed {dirty_marked} room-bounding cells for re-detection after load");
     }
     for npc in save.npcs {
+        // Keep the runtime allocator ahead of every persisted id so a
+        // post-load spawn can't collide (claim tables key on NpcId).
+        npc_ids.reserve_through(npc.id);
         spawn_loaded_npc(&mut commands, npc, &kind_registry, &item_registry);
     }
     // Loose items in the world. Resolve item ids → slots through the
@@ -644,6 +648,7 @@ fn spawn_loaded_npc(
                 goal: Goal::Idle,
                 rng: npc.rng,
                 home_cluster: None,
+                preempt_cooldown_secs: 0.0,
             },
             carry,
             tool,
@@ -1791,6 +1796,7 @@ fn apply_npc_work(
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
+    plans: Res<Plans>,
     servers: Query<&Server>,
     mut broadcast: ServerMultiMessageSender,
     mut bus: MessageWriter<CellEdit>,
@@ -1799,6 +1805,17 @@ fn apply_npc_work(
         return;
     };
     for completion in reader.read() {
+        // Authoritative half of "cancel cancels": the brain re-checks
+        // before emitting, but a plan edit can land between that check
+        // and this apply. Never mutate the world for a plan that no
+        // longer exists as completed.
+        if plans.kind(completion.cell) != Some(completion.plan_kind) {
+            info!(
+                cell = ?completion.cell.to_array(),
+                "npc work completion against missing/changed plan; skipping edit",
+            );
+            continue;
+        }
         let edit = match completion.plan_kind {
             PlanKind::Remove => BlockEdit {
                 anchor: completion.cell,
