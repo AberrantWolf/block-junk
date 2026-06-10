@@ -18,11 +18,12 @@ use crate::physics::{
 };
 use crate::plans::Plans;
 use crate::protocol::{
-    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
+    ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
+    BlockManifest,
     CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet,
+    DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet, INTERACT_REACH,
     MovementIntent, MovementMode,
-    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind,
+    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind, REACH_SLACK, RejectReason,
     RequestNpcDetails, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
@@ -1380,12 +1381,39 @@ fn aoi_around(centre: ChunkCoord) -> HashSet<ChunkCoord> {
     set
 }
 
+/// Reply to one client that its request was received and refused. No-op
+/// if the connection has no sender (mid-disconnect) — the request was
+/// already dropped, this is just the courtesy note feeding the client's
+/// rejection toast.
+pub(crate) fn send_rejection(
+    senders: &mut Query<&mut MessageSender<ActionRejected>>,
+    client: Entity,
+    cell: IVec3,
+    reason: RejectReason,
+) {
+    if let Ok(mut sender) = senders.get_mut(client) {
+        sender.send::<WorldChannel>(ActionRejected { cell, reason });
+    }
+}
+
+/// Server-side reach gate, shared by every mutating request handler.
+/// `target` is the point being acted on (cell centre for blocks). The
+/// slack absorbs the camera-eye vs avatar-pose measurement difference
+/// so a click the client's exact-reach raycast accepted isn't refused.
+pub(crate) fn within_reach(pose: &AvatarPose, target: Vec3, reach: f32) -> bool {
+    (pose.translation - target).length() <= reach + REACH_SLACK
+}
+
+#[allow(clippy::too_many_arguments, reason = "edit pipeline + reach gate + rejection reply")]
 fn receive_block_edits(
     mut commands: Commands,
-    mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<BlockEdit>)>,
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
+    avatars: Res<ClientAvatars>,
+    poses: Query<&AvatarPose, With<Avatar>>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut bus: MessageWriter<CellEdit>,
@@ -1393,9 +1421,28 @@ fn receive_block_edits(
     let Ok(server) = servers.single() else {
         return;
     };
-    for mut receiver in receivers.iter_mut() {
+    for (connection, mut receiver) in receivers.iter_mut() {
         let edits: Vec<BlockEdit> = receiver.receive().collect();
         for edit in edits {
+            // Reach gate — the server half of the INTERACT_REACH
+            // contract. Mining/placing was the one mutating verb with
+            // no server-side validation at all.
+            let Some(&avatar) = avatars.0.get(&connection) else {
+                continue;
+            };
+            let Ok(pose) = poses.get(avatar) else {
+                continue;
+            };
+            let centre = edit.anchor.as_vec3() + Vec3::splat(0.5);
+            if !within_reach(pose, centre, INTERACT_REACH) {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    edit.anchor,
+                    RejectReason::OutOfReach,
+                );
+                continue;
+            }
             apply_block_edit(
                 edit,
                 &mut commands,
@@ -1775,11 +1822,6 @@ fn receive_npc_inspection_requests(
 /// pile by accident.
 const PICKUP_MATCH_RADIUS: f32 = 0.5;
 
-/// Anti-cheat distance from player eye to the pickup target. Generous —
-/// a real reach gate based on the avatar's actual cursor raycast lives
-/// client-side; this just rejects gross outliers.
-const PICKUP_PLAYER_REACH: f32 = 12.0;
-
 /// Apply a client's pickup request. Per request: find the player's
 /// avatar, find the closest `WorldItem` to the requested translation,
 /// then route the pickup based on item kind:
@@ -1798,6 +1840,7 @@ fn receive_pickup_requests(
     mut players: Query<(&AvatarPose, &mut Carrying, &mut EquippedTool), With<Avatar>>,
     world_items: Query<(Entity, &WorldItem)>,
     item_registry: Res<ItemRegistry>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut commands: Commands,
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
@@ -1809,9 +1852,13 @@ fn receive_pickup_requests(
             let Ok((pose, mut carry, mut tool)) = players.get_mut(avatar) else {
                 continue;
             };
-            // Anti-cheat reach. Computed against eye position to match
-            // how the client raycast measures distance.
-            if (pose.translation - req.target).length() > PICKUP_PLAYER_REACH {
+            if !within_reach(pose, req.target, INTERACT_REACH) {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.target.floor().as_ivec3(),
+                    RejectReason::OutOfReach,
+                );
                 continue;
             }
             // Closest WorldItem within the match radius.
@@ -2029,8 +2076,9 @@ fn drop_target_position(
 fn receive_deposit_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<DepositRequest>)>,
     avatars: Res<ClientAvatars>,
-    mut players: Query<&mut Carrying, With<Avatar>>,
+    mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
     mut plans: ResMut<Plans>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
@@ -2043,9 +2091,13 @@ fn receive_deposit_requests(
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
-            let Ok(mut carry) = players.get_mut(avatar) else {
+            let Ok((pose, mut carry)) = players.get_mut(avatar) else {
                 continue;
             };
+            if !within_reach(pose, req.cell.as_vec3() + Vec3::splat(0.5), INTERACT_REACH) {
+                send_rejection(&mut rejections, connection, req.cell, RejectReason::OutOfReach);
+                continue;
+            }
             // Empty carry → nothing to deposit.
             let (carry_item, carry_count) = match (carry.item, carry.count) {
                 (Some(slot), c) if c > 0 => (slot, c),

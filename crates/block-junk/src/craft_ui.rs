@@ -129,7 +129,7 @@ fn open_modal_on_right_click(
     let Some(hit) = crate::client::entity_aware_raycast(
         origin,
         dir,
-        crate::client::RAYCAST_REACH,
+        crate::protocol::INTERACT_REACH,
         &chunks,
         &chunk_map,
         &registry,

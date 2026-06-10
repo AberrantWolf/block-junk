@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::items::ItemSlot;
 use crate::menu::AppState;
-use crate::protocol::{GameSet, WorldChannel};
+use crate::protocol::{ActionRejected, GameSet, INTERACT_REACH, RejectReason, WorldChannel};
+use crate::server::{send_rejection, within_reach};
 
 /// One queued craft at a station. `total` is what the player asked
 /// for; `completed` rises by 1 per Work cycle. When `completed ==
@@ -724,13 +725,11 @@ pub fn sync_craft_modal_capture(
 /// also clamps client-side; this is the server-of-record cap.
 const MAX_ORDER_QUANTITY: u32 = 99;
 
-/// Anti-cheat reach gate. Same magnitude as the pickup / craft
-/// constants in `server.rs`.
-const STATION_REACH: f32 = 12.0;
 
 #[allow(clippy::too_many_arguments, reason = "wire handler joins many subsystems")]
 fn receive_queue_orders(
     mut receivers: Query<(Entity, &mut MessageReceiver<QueueOrder>)>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     chunks: Query<&crate::voxel::Chunk>,
@@ -754,7 +753,13 @@ fn receive_queue_orders(
                 continue;
             };
             let centre = req.station_cell.as_vec3() + Vec3::splat(0.5);
-            if (pose.translation - centre).length() > STATION_REACH {
+            if !within_reach(pose, centre, INTERACT_REACH) {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.station_cell,
+                    RejectReason::OutOfReach,
+                );
                 continue;
             }
             let Some(station_def) = lookup_station_def(
@@ -798,6 +803,9 @@ fn receive_queue_orders(
 #[allow(clippy::too_many_arguments, reason = "cancel refunds need item registry + recipes")]
 fn receive_cancel_orders(
     mut receivers: Query<(Entity, &mut MessageReceiver<CancelOrder>)>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
+    avatars: Res<crate::server::ClientAvatars>,
+    poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     item_registry: Res<crate::items::ItemRegistry>,
     mut stations: ResMut<CraftStations>,
@@ -808,8 +816,27 @@ fn receive_cancel_orders(
     let Ok(server) = servers.single() else {
         return;
     };
-    for (_connection, mut receiver) in receivers.iter_mut() {
+    for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
+            // Same reach gate as every other station verb — cancel was
+            // the one handler accepting any cell from any connection
+            // (it force-clears active work, so it's mutating too).
+            let Some(&avatar) = avatars.0.get(&connection) else {
+                continue;
+            };
+            let Ok(pose) = poses.get(avatar) else {
+                continue;
+            };
+            let centre = req.station_cell.as_vec3() + Vec3::splat(0.5);
+            if !within_reach(pose, centre, INTERACT_REACH) {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.station_cell,
+                    RejectReason::OutOfReach,
+                );
+                continue;
+            }
             let Some(state) = stations.get_mut(req.station_cell) else {
                 continue;
             };
@@ -868,6 +895,7 @@ fn receive_cancel_orders(
 #[allow(clippy::too_many_arguments, reason = "wire handler joins many subsystems")]
 fn receive_deposit_to_station(
     mut receivers: Query<(Entity, &mut MessageReceiver<DepositToStation>)>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     mut players: Query<
         (&crate::protocol::AvatarPose, &mut crate::protocol::Carrying),
@@ -892,7 +920,13 @@ fn receive_deposit_to_station(
                 continue;
             };
             let centre = req.station_cell.as_vec3() + Vec3::splat(0.5);
-            if (pose.translation - centre).length() > STATION_REACH {
+            if !within_reach(pose, centre, INTERACT_REACH) {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.station_cell,
+                    RejectReason::OutOfReach,
+                );
                 continue;
             }
             // Block must still be a station.
@@ -933,6 +967,7 @@ fn receive_deposit_to_station(
 #[allow(clippy::too_many_arguments, reason = "wire handler joins many subsystems")]
 fn receive_work_start(
     mut receivers: Query<(Entity, &mut MessageReceiver<WorkStart>)>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     chunks: Query<&crate::voxel::Chunk>,
@@ -957,7 +992,13 @@ fn receive_work_start(
                 continue;
             };
             let centre = req.station_cell.as_vec3() + Vec3::splat(0.5);
-            if (pose.translation - centre).length() > STATION_REACH {
+            if !within_reach(pose, centre, INTERACT_REACH) {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.station_cell,
+                    RejectReason::OutOfReach,
+                );
                 continue;
             }
             let Some(station_def) = lookup_station_def(

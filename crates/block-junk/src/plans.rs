@@ -19,15 +19,16 @@ use lightyear::prelude::*;
 use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::camera::FlyCam;
 use crate::client::{
-    PlaceablePalette, PlacementRotation, RAYCAST_REACH, SelectedBlock, entity_aware_raycast,
+    PlaceablePalette, PlacementRotation, SelectedBlock, entity_aware_raycast,
     placement_orientation,
 };
 use crate::menu::AppState;
 use crate::player_mode::PlayerMode;
 use crate::protocol::{
-    AvatarPose, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX, PlanEdit, PlanEditBatch,
-    PlanFullSync, PlanKind, PlanState, WorldChannel,
+    ActionRejected, Avatar, AvatarPose, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX, PLAN_REACH,
+    PlanEdit, PlanEditBatch, PlanFullSync, PlanKind, PlanState, RejectReason, WorldChannel,
 };
+use crate::server::{send_rejection, within_reach};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
 
 #[derive(Resource, Default, Debug)]
@@ -305,10 +306,10 @@ fn handle_left_press(
     drag: &mut PlanDragState,
     sender: &mut Query<&mut MessageSender<PlanEditBatch>>,
 ) {
-    let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, plans);
+    let plan_hit = raycast_plans(origin, dir, PLAN_REACH, plans);
     // No skip_plan_remove — under the new scheme we want L on a Remove
     // tag to un-tag it, so the ray must stop AT the tagged cell.
-    let world_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None);
+    let world_hit = entity_aware_raycast(origin, dir, PLAN_REACH, chunks, chunk_map, registry, None);
     let world_dist = world_hit.as_ref().map(|h| cell_centre_dist(h.cell, origin));
     let plan_dist = plan_hit.as_ref().map(|(d, _)| *d);
     // If a plan tag (typically a Build floating in empty space) is
@@ -357,7 +358,7 @@ fn handle_right_press(
         return;
     };
     let Some(hit) =
-        entity_aware_raycast(origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None)
+        entity_aware_raycast(origin, dir, PLAN_REACH, chunks, chunk_map, registry, None)
     else {
         return;
     };
@@ -638,22 +639,39 @@ fn build_initial_materials(
 /// edit. Reject (silently) edits that don't make sense against the
 /// world (tag-remove on empty, tag-build on solid).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "wire handler + reach gate + rejection reply")]
 fn receive_plan_edits(
-    mut receivers: Query<&mut MessageReceiver<PlanEdit>>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<PlanEdit>)>,
     mut plans: ResMut<Plans>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
     item_registry: Res<crate::items::ItemRegistry>,
+    avatars: Res<crate::server::ClientAvatars>,
+    poses: Query<&AvatarPose, With<Avatar>>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
-    for mut receiver in receivers.iter_mut() {
+    for (connection, mut receiver) in receivers.iter_mut() {
         let edits: Vec<PlanEdit> = receiver.receive().collect();
         for edit in edits {
+            // Designation reach: deliberately looser than INTERACT_REACH
+            // (tags are NPC orders, not direct mutations) but bounded so
+            // a client can't tag cells far beyond anything it can see.
+            let Some(&avatar) = avatars.0.get(&connection) else {
+                continue;
+            };
+            let Ok(pose) = poses.get(avatar) else {
+                continue;
+            };
+            if !within_reach(pose, edit.cell.as_vec3() + Vec3::splat(0.5), PLAN_REACH) {
+                send_rejection(&mut rejections, connection, edit.cell, RejectReason::OutOfReach);
+                continue;
+            }
             let (accepted_state, materials_for_broadcast) = match edit.kind {
                 Some(PlanKind::Remove) => {
                     if !cell_is_solid(edit.cell, &chunks, &chunk_map) {
@@ -700,21 +718,42 @@ fn receive_plan_edits(
 /// cells so clients see exactly what the server accepted.
 #[allow(clippy::too_many_arguments)]
 fn receive_plan_edit_batches(
-    mut receivers: Query<&mut MessageReceiver<PlanEditBatch>>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<PlanEditBatch>)>,
     mut plans: ResMut<Plans>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
     item_registry: Res<crate::items::ItemRegistry>,
+    avatars: Res<crate::server::ClientAvatars>,
+    poses: Query<&AvatarPose, With<Avatar>>,
+    mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
-    for mut receiver in receivers.iter_mut() {
+    for (connection, mut receiver) in receivers.iter_mut() {
         let batches: Vec<PlanEditBatch> = receiver.receive().collect();
-        for batch in batches {
+        for mut batch in batches {
+            let Some(&avatar) = avatars.0.get(&connection) else {
+                continue;
+            };
+            let Ok(pose) = poses.get(avatar) else {
+                continue;
+            };
+            // Server-of-record batch cap. A well-behaved client
+            // truncates before sending; anything past the cap here is
+            // a bug or a hostile peer, so drop the excess loudly
+            // rather than relaying an unbounded vec to every client.
+            if batch.cells.len() > PLAN_EDIT_BATCH_MAX {
+                warn!(
+                    got = batch.cells.len(),
+                    cap = PLAN_EDIT_BATCH_MAX,
+                    "plan batch over server cap; truncating",
+                );
+                batch.cells.truncate(PLAN_EDIT_BATCH_MAX);
+            }
             // Compute the shared materials list once per batch — every
             // Build cell in the batch shares the same `kind` and
             // therefore the same materials_needed.
@@ -725,7 +764,15 @@ fn receive_plan_edit_batches(
                 _ => Vec::new(),
             };
             let mut accepted: Vec<IVec3> = Vec::with_capacity(batch.cells.len());
+            let mut first_out_of_reach: Option<IVec3> = None;
             for cell in batch.cells {
+                // Same designation reach as single edits. A drag can
+                // legitimately straddle the boundary — keep the cells
+                // in range, toast once for the dropped remainder.
+                if !within_reach(pose, cell.as_vec3() + Vec3::splat(0.5), PLAN_REACH) {
+                    first_out_of_reach.get_or_insert(cell);
+                    continue;
+                }
                 match batch.kind {
                     Some(PlanKind::Remove) => {
                         if !cell_is_solid(cell, &chunks, &chunk_map) {
@@ -744,6 +791,9 @@ fn receive_plan_edit_batches(
                     }
                 }
                 accepted.push(cell);
+            }
+            if let Some(cell) = first_out_of_reach {
+                send_rejection(&mut rejections, connection, cell, RejectReason::OutOfReach);
             }
             if accepted.is_empty() {
                 continue;

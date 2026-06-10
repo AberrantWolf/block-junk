@@ -38,13 +38,15 @@ use lightyear::prelude::Predicted;
 
 use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::client::{
-    PlaceablePalette, RAYCAST_REACH, SelectedBlock, entity_aware_raycast, raycast_world_items,
+    PlaceablePalette, SelectedBlock, entity_aware_raycast, raycast_world_items,
 };
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans, raycast_plans};
 use crate::player_mode::PlayerMode;
-use crate::protocol::{Avatar, Carrying, EquippedTool, GameSet, PlanKind, WorldItem};
+use crate::protocol::{
+    Avatar, Carrying, EquippedTool, GameSet, INTERACT_REACH, PLAN_REACH, PlanKind, WorldItem,
+};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
 
 pub struct TargetOutlinePlugin;
@@ -159,8 +161,8 @@ fn draw_plan_target(
     // L can land on a Build tag floating in empty space; check the
     // plan raycast and prefer whichever target is closer.
     let world_hit =
-        entity_aware_raycast(origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None);
-    let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, plans);
+        entity_aware_raycast(origin, dir, PLAN_REACH, chunks, chunk_map, registry, None);
+    let plan_hit = raycast_plans(origin, dir, PLAN_REACH, plans);
     let world_dist = world_hit
         .as_ref()
         .map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - origin).length());
@@ -213,7 +215,7 @@ fn draw_normal_target(
     // L-click resolves to (1) or (2) at the action input; R-click acts
     // on (3). Outline matches whichever the next click would commit.
     let world_hit = entity_aware_raycast(
-        origin, dir, RAYCAST_REACH, chunks, chunk_map, registry, None,
+        origin, dir, INTERACT_REACH, chunks, chunk_map, registry, None,
     );
     let world_hit_dist = world_hit
         .as_ref()
@@ -224,8 +226,8 @@ fn draw_normal_target(
             (dist, h.cell)
         })
     });
-    let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, plans);
-    let item_hit = raycast_world_items(origin, dir, RAYCAST_REACH, world_items);
+    let plan_hit = raycast_plans(origin, dir, INTERACT_REACH, plans);
+    let item_hit = raycast_world_items(origin, dir, INTERACT_REACH, world_items);
 
     // Pick the tagged candidate (world or plan), whichever is closer.
     let tagged_target = match (world_tagged, plan_hit) {

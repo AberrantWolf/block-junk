@@ -30,11 +30,13 @@ use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
 use crate::target_outline::TargetOutlinePlugin;
 use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
 use crate::protocol::{
-    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
+    ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
+    BlockManifest,
     Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest,
-    DropRequest, DropToolRequest, EquippedTool, GameSet, MovementIntent, MovementMode,
-    NpcAnimOverride, PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync,
-    WorldItem,
+    DropRequest, DropToolRequest, EquippedTool, GameSet, INTERACT_REACH, MovementIntent,
+    MovementMode,
+    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, WorldChannel, WorldClock,
+    WorldClockSync, WorldItem,
 };
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -162,6 +164,7 @@ impl Plugin for ClientPlugin {
                     receive_block_edit_broadcasts,
                     receive_chunk_unloads,
                     receive_world_clock,
+                    receive_action_rejections,
                 )
                     .chain()
                     .in_set(GameSet::Simulation),
@@ -1158,8 +1161,10 @@ fn update_day_night_lighting(
     clear.0 = Color::srgb(mix.x, mix.y, mix.z);
 }
 
-/// Reach in world cells. Generous because the camera is a flying free-cam;
-/// real survival reach (Minecraft-y ~5 blocks) lands when there's an avatar.
+/// Sight reach for READ-ONLY raycasts (the inspect panel). Anything that
+/// mutates targets with [`INTERACT_REACH`] (direct verbs) or
+/// [`PLAN_REACH`] (designations) so the client never advertises an
+/// action the server's reach gate would refuse.
 pub(crate) const RAYCAST_REACH: f32 = 256.0;
 
 /// Convenience: compose the player's facing-derived orientation with the
@@ -1320,14 +1325,14 @@ fn normal_mode_action_input(
     let world_hit = entity_aware_raycast(
         cam_pos,
         cam_dir,
-        RAYCAST_REACH,
+        INTERACT_REACH,
         &ctx.chunks,
         &ctx.chunk_map,
         &ctx.blocks,
         None,
     );
-    let item_hit = raycast_world_items(cam_pos, cam_dir, RAYCAST_REACH, &ctx.world_items);
-    let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, RAYCAST_REACH, &ctx.plans);
+    let item_hit = raycast_world_items(cam_pos, cam_dir, INTERACT_REACH, &ctx.world_items);
+    let plan_hit = crate::plans::raycast_plans(cam_pos, cam_dir, INTERACT_REACH, &ctx.plans);
 
     let world_dist = world_hit
         .as_ref()
@@ -2109,7 +2114,7 @@ fn update_placement_preview(
     let Some(hit) = entity_aware_raycast(
         cam_pos,
         cam_dir,
-        RAYCAST_REACH,
+        PLAN_REACH,
         &chunks,
         &chunk_map,
         &registry,
@@ -2616,6 +2621,24 @@ fn receive_chunk_unloads(
 /// the client is expected to read it from local state). Cells that fall
 /// in unloaded chunks are silently skipped; their sidecar will arrive
 /// via `ChunkSnapshot` whenever the chunk enters AoI.
+/// Server told us a request of ours was refused — surface the reason as
+/// a worldspace toast at the cell the player targeted. This is the
+/// client half of the `ActionRejected` contract: the player sees *why*
+/// the click did nothing instead of inferring a bug.
+fn receive_action_rejections(
+    mut receivers: Query<&mut MessageReceiver<ActionRejected>>,
+    mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
+) {
+    for mut receiver in receivers.iter_mut() {
+        for rejection in receiver.receive() {
+            toasts.push(crate::worldspace_toast::SpawnToast {
+                cell: rejection.cell,
+                text: rejection.reason.text().to_owned(),
+            });
+        }
+    }
+}
+
 fn receive_block_edit_broadcasts(
     mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,

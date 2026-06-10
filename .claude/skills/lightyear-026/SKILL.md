@@ -219,6 +219,8 @@ The prelude is split into a top-level part and `client`/`server` submodules. Ite
 
 **Rule of thumb**: try the top-level prelude first. If something resolves but doesn't compile (or doesn't exist), check `prelude::server` for server-only lifecycle types and `prelude::client` for `Authentication` exceptions and the netcode client config.
 
+**Mixing broadcast + targeted replies in one system is safe.** `ServerMultiMessageSender` is a SystemParam over `Query<(&mut MessageManager, &mut Transport)>` (see `lightyear_messages/src/multi.rs`) — it does NOT touch `MessageSender<M>` components, so a system can take both `broadcast: ServerMultiMessageSender` and `senders: Query<&mut MessageSender<SomeReply>>` without a B0001 param conflict. Used by the reach-gate handlers (broadcast the applied edit, targeted `ActionRejected` reply).
+
 When `NetcodeConfig` ambiguity bites, use scoped function-local imports: `use lightyear::prelude::server::NetcodeConfig;` inside `start_netcode_server`, etc.
 
 ## Prediction + interpolation + input replication (the simple_box pattern)

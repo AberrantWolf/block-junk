@@ -76,6 +76,10 @@ impl Plugin for ProtocolPlugin {
 
         app.register_message::<BlockEdit>()
             .add_direction(NetworkDirection::Bidirectional);
+        // Targeted reply to a refused request (reach gate etc.); feeds
+        // the rejection-toast UI on the requesting client only.
+        app.register_message::<crate::protocol::ActionRejected>()
+            .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<PlanEdit>()
             .add_direction(NetworkDirection::Bidirectional);
         app.register_message::<PlanEditBatch>()

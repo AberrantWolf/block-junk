@@ -41,6 +41,54 @@ pub struct BlockEdit {
     pub orientation: Cardinal,
 }
 
+/// The ONE reach for direct world interactions — mine, place, pickup,
+/// deposit, station work. The client's targeting raycast uses it so the
+/// outline never advertises a verb the server would refuse; the server
+/// enforces it (plus [`REACH_SLACK`]) on every mutating request. Keep
+/// these two uses on the same constant: the 256-vs-12 split this
+/// replaced meant the UI lied at range and the server dropped the
+/// click silently.
+pub const INTERACT_REACH: f32 = 12.0;
+
+/// Reach for Plan-mode designation (Build/Remove tags). Deliberately
+/// longer than [`INTERACT_REACH`] — tags are orders NPCs walk to, not
+/// direct mutations, so planning works at "anything I can see" scale —
+/// but still bounded so a client can't tag cells in chunks far outside
+/// its own view.
+pub const PLAN_REACH: f32 = 64.0;
+
+/// Server-side tolerance added to reach gates. The client measures from
+/// the camera eye, the server from the avatar pose; without slack a
+/// click the client legitimately accepted at max range gets rejected by
+/// the height difference.
+pub const REACH_SLACK: f32 = 1.0;
+
+/// Server → requesting client when a request was received and refused.
+/// Feeds the worldspace-toast UI: the player sees *why* their click did
+/// nothing instead of inferring packet loss. Sent only for requests a
+/// well-behaved client believed were valid — silent drops remain the
+/// right call for impossible inputs.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ActionRejected {
+    /// Cell the toast anchors to — the target of the refused action.
+    pub cell: IVec3,
+    pub reason: RejectReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RejectReason {
+    OutOfReach,
+}
+
+impl RejectReason {
+    /// Player-facing toast text.
+    pub fn text(self) -> &'static str {
+        match self {
+            RejectReason::OutOfReach => "Too far away",
+        }
+    }
+}
+
 /// Server-internal local-bus event, NOT a wire message. Emitted once per
 /// world cell whose slot changed. Subscribers (room dirty-marking, drop
 /// spawning, mod scripting hooks) react cell-by-cell without needing to
