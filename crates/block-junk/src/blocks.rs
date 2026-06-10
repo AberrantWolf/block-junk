@@ -11,9 +11,8 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::{BlockDef, BlockId};
-use block_junk_mod_api::textures::{MaskId, RampId};
 
-use crate::block_textures::{MaskRegistry, RampRegistry};
+use crate::block_textures::TextureRegistry;
 use block_mesh::{MergeVoxel, Voxel, VoxelVisibility};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -69,22 +68,10 @@ pub enum BootstrapError {
         "block {block} work_action.duration_secs = {value}; must be > 0 (use the engine default by omitting work_action)"
     )]
     WorkActionDurationOutOfRange { block: BlockId, value: f32 },
-    #[error("duplicate mask id {0}")]
-    DuplicateMaskId(MaskId),
-    #[error("duplicate ramp id {0}")]
-    DuplicateRampId(RampId),
-    #[error("mask registry exceeds u16 slot space ({slots} masks registered)")]
-    MaskSlotOverflow { slots: usize },
-    #[error("ramp registry exceeds u16 slot space ({slots} ramps registered)")]
-    RampSlotOverflow { slots: usize },
-    #[error("mask {mask} source.worley.cells = {cells}; must be ≥ 1")]
-    MaskWorleyCellsInvalid { mask: MaskId, cells: u32 },
-    #[error("ramp {ramp} has {stops} stop(s); needs ≥ 2 (use two identical stops for a flat ramp)")]
-    RampTooFewStops { ramp: RampId, stops: usize },
-    #[error("block {block} layer references unregistered mask {mask}")]
-    BlockLayerMaskUnknown { block: BlockId, mask: MaskId },
-    #[error("block {block} layer references unregistered ramp {ramp}")]
-    BlockLayerRampUnknown { block: BlockId, ramp: RampId },
+    #[error(
+        "block {block} references texture \"{texture}\", which no mod's textures.lua defines"
+    )]
+    BlockTextureUnknown { block: BlockId, texture: String },
     #[error(
         "block {block} use_slot.approach is empty — at least one standable cell is required, or omit use_slot to fall back to nearest-neighbour"
     )]
@@ -260,27 +247,17 @@ impl BlockRegistry {
         Ok(())
     }
 
-    /// Cross-validate every block's `layers` against the mask and ramp
-    /// registries. Each layer's `mask` and `ramp` ids must resolve to
-    /// registered defs — a typo or a missing registration is a
-    /// load-time error rather than a runtime "garbage texture" surprise.
-    pub fn validate_layers(
-        &self,
-        masks: &MaskRegistry,
-        ramps: &RampRegistry,
-    ) -> Result<(), BootstrapError> {
+    /// Cross-validate every block's `texture` reference against the
+    /// texture registry. A typo or a missing textures.lua entry is a
+    /// load-time error rather than a runtime "fallback color" surprise.
+    pub fn validate_textures(&self, textures: &TextureRegistry) -> Result<(), BootstrapError> {
         for def in &self.defs_by_slot {
-            for layer in &def.layers {
-                if masks.slot_of(&layer.mask).is_none() {
-                    return Err(BootstrapError::BlockLayerMaskUnknown {
+            let Some(tex) = &def.texture else { continue };
+            for id in tex.ids() {
+                if !textures.contains(id) {
+                    return Err(BootstrapError::BlockTextureUnknown {
                         block: def.id.clone(),
-                        mask: layer.mask.clone(),
-                    });
-                }
-                if ramps.slot_of(&layer.ramp).is_none() {
-                    return Err(BootstrapError::BlockLayerRampUnknown {
-                        block: def.id.clone(),
-                        ramp: layer.ramp.clone(),
+                        texture: id.to_owned(),
                     });
                 }
             }

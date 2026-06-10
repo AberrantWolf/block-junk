@@ -3237,10 +3237,10 @@ fn mesh_chunks(
                     ..default()
                 },
                 extension: BlockTextureExt {
-                    atlas: textures.array_handle.clone(),
-                    mask_atlas: textures.mask_atlas.clone(),
-                    ramp_atlas: textures.ramp_atlas.clone(),
-                    stacks: textures.stacks.clone(),
+                    tiles: textures.tiles.clone(),
+                    blocks: textures.blocks.clone(),
+                    textures: textures.textures.clone(),
+                    layers: textures.layers.clone(),
                 },
             })));
         }

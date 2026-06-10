@@ -4,6 +4,8 @@ members = [
     "crates/block-junk",
     "crates/block-junk-mod-api",
     "crates/block-junk-scripting",
+    "crates/block-junk-textures",
+    "crates/texture-studio",
 ]
 default-members = ["crates/block-junk"]
 

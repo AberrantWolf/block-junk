@@ -320,6 +320,49 @@ app.add_systems(
 
 In-repo: `menu.rs::pause_menu_ui` and `debug.rs::debug_panel_ui` both use this schedule. Other system ordering (`GameSet::Input` etc.) still applies to the input *handlers* (keyboard toggles, etc.) — only the egui UI itself needs the special schedule.
 
+## Texture/material learnings from the procedural-texture build (2026-06)
+
+- **`embedded_asset!` in a library crate** works like in a binary: the path is
+  relative to the *invoking file's* directory, and the URL is
+  `embedded://<crate_name_snake_case>/<path-from-src>`. E.g. `src/render.rs` in
+  `block-junk-textures` calling `embedded_asset!(app, "render/chunk_material.wgsl")`
+  embeds `src/render/chunk_material.wgsl` as
+  `embedded://block_junk_textures/render/chunk_material.wgsl`.
+- **`AsBindGroup` texture without a sampler is valid** — `#[texture(100,
+  dimension = "2d_array")]` with no `#[sampler]` pairs fine with a shader that
+  only uses `textureLoad`. Nearest pixel fetch with manual wrap (varying used
+  extents inside one fixed-size array slot) is exactly the textureLoad use case.
+- **Storage-buffer bindings must be non-empty.** `ShaderStorageBuffer::from(vec![])`
+  builds a zero-size buffer wgpu rejects at bind time. Push a dummy element when
+  a table can legitimately be empty.
+- **`AccumulatedMouseScroll`** exists as a resource (sibling of
+  `AccumulatedMouseMotion`) — no `MessageReader<MouseWheel>` needed for zoom.
+- **Ambient light** is the `GlobalAmbientLight` resource (set `.brightness`).
+- **Srgb vs blend math**: storing color tiles as `Rgba8Unorm` (NOT `…Srgb`) keeps
+  shader-side layer blending in display space, byte-matching CPU previews; convert
+  to linear once at the end (`srgb_to_linear`) before handing PBR the base color.
+
+### bevy_egui 0.39 specifics
+
+- `EguiContexts::ctx_mut()` returns `Result` — `let Ok(ctx) = … else { return }`.
+- `egui::ImageButton` is deprecated: use
+  `egui::Button::image(SizedTexture::new(id, size)).selected(bool)`.
+- CPU-generated preview images don't need bevy assets:
+  `ctx.load_texture(name, ColorImage::from_rgba_unmultiplied(…), TextureOptions::NEAREST)`
+  returns an egui-managed `TextureHandle` (Send+Sync, fine inside a `Local`).
+- Closing a `menu_button` popup after a click: `ui.close()`.
+- Reading `ctx.wants_pointer_input()` / `wants_keyboard_input()` from a plain
+  `Update` system (to gate camera orbit / shortcuts) works; only *interactive
+  widget* code must live in `EguiPrimaryContextPass`.
+- **egui's bundled fonts have thin symbol coverage** — arrows ↑↓, triangles
+  ◀▶, ✕, ⌘, die faces render as tofu. This repo vendors DejaVu Sans as a
+  fallback: call `block_junk_textures::egui_fonts::install(ctx)` once per
+  context (feature `egui-fonts`; the game does it in
+  `menu.rs::install_fallback_fonts`, the studio in `studio_ui`). DejaVu covers
+  BMP symbols but NOT emoji-plane glyphs (🎲 U+1F3B2 etc.) — pick BMP icons.
+  The `egui` dep there must track bevy_egui's pin (0.39 → egui 0.33) or the
+  `Context` types won't unify.
+
 ## When a check fails
 
 The cached crate source at `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/<crate>-<version>/` is the source of truth. Before guessing at an API:

@@ -89,45 +89,9 @@ engine.items.register {
     color = { 0.60, 0.58, 0.55 },
 }
 
--- Masks + ramps composited per-block by the chunk fragment shader.
--- Slot order is registration order; refs from `layers` below resolve
--- against these by id at boot. Mods can register their own with
--- `engine.masks.register` / `engine.ramps.register` and reference them
--- from their own blocks; the atlas grows accordingly.
-
-engine.masks.register {
-    id = "vanilla:bubbles_large",
-    -- Worley with 4 cells per tile = a handful of fat blobs. Good for
-    -- grass-rocks scale at scale = 2.0 in world space.
-    source = { kind = "worley", cells = 4 },
-}
-
-engine.masks.register {
-    id = "vanilla:bubbles_small",
-    -- Same algorithm at 2x cell count: many smaller blobs. Good for
-    -- moss-on-stone speckle at scale = 1.0.
-    source = { kind = "worley", cells = 8 },
-}
-
-engine.ramps.register {
-    id = "vanilla:stone_grey",
-    -- Mid-grey → slightly lighter cool grey. Reads as rock-blob
-    -- highlights when used over green grass.
-    stops = {
-        { 0.32, 0.32, 0.34 },
-        { 0.58, 0.58, 0.60 },
-    },
-}
-
-engine.ramps.register {
-    id = "vanilla:grass_green",
-    -- Dark olive → brighter grass green. Drives the moss-on-stone
-    -- effect when stone uses it under bubbles_small.
-    stops = {
-        { 0.18, 0.32, 0.10 },
-        { 0.45, 0.65, 0.20 },
-    },
-}
+-- Block surface textures live in textures.lua (a pure-data file owned by
+-- the texture-studio tool); blocks reference them by id via `texture`.
+-- `color` stays as the HUD-chip / untextured-face fallback.
 
 register {
     id = "vanilla:stone",
@@ -138,18 +102,7 @@ register {
         support_below = true,
     },
     color = { 0.55, 0.55, 0.58 },
-    pattern = "speckle",
-    -- Green moss patches scattered across stone. High threshold so most
-    -- pixels stay grey; soft edge to read as moss spreading.
-    layers = {
-        {
-            mask = "vanilla:bubbles_small",
-            ramp = "vanilla:grass_green",
-            scale = 1.0,
-            threshold = 0.70,
-            softness = 0.20,
-        },
-    },
+    texture = "vanilla:stone",
     drops = {
         { item = "vanilla:stone_chunk", count = 1 },
     },
@@ -175,7 +128,7 @@ register {
         support_below = true,
     },
     color = { 0.45, 0.32, 0.20 },
-    pattern = "noise",
+    texture = "vanilla:dirt",
 }
 
 register {
@@ -187,17 +140,11 @@ register {
         support_below = true,
     },
     color = { 0.36, 0.62, 0.30 },
-    pattern = "noise",
-    -- Grey rock blobs embedded in the grass. Low softness for crisp
-    -- cartoon edges; scale = 2.0 so the blobs span ~2 world cells.
-    layers = {
-        {
-            mask = "vanilla:bubbles_large",
-            ramp = "vanilla:stone_grey",
-            scale = 2.0,
-            threshold = 0.62,
-            softness = 0.05,
-        },
+    -- Per-face: green top, dirt-with-overhang sides, plain dirt below.
+    texture = {
+        top = "vanilla:grass_top",
+        side = "vanilla:grass_side",
+        bottom = "vanilla:dirt",
     },
 }
 
@@ -210,7 +157,7 @@ register {
         support_below = true,
     },
     color = { 0.55, 0.40, 0.22 },
-    pattern = "planks",
+    texture = "vanilla:wood",
     -- Phase 1: destroying a wood block drops one Wood Log item.
     -- Trees in terrain are stamped from this same block, so chopping
     -- a tree trunk yields wood the same way breaking a placed wood
@@ -243,7 +190,7 @@ register {
         support_below = true,
     },
     color = { 0.20, 0.50, 0.25 },
-    pattern = "leaves",
+    texture = "vanilla:leaves",
 }
 
 -- Doors. `walkable_boundary` marks them as access points the room
@@ -260,7 +207,7 @@ register {
         support_below = true,
     },
     color = { 0.40, 0.18, 0.05 },
-    pattern = "door",
+    texture = "vanilla:door",
 }
 
 -- KayKit "bed_single_A" mesh. The asset's local frame is the KayKit
@@ -529,6 +476,25 @@ register {
     station_tier = 1,
     materials = {
         { item = "vanilla:stone_chunk", count = 4 },
+    },
+}
+
+-- Gravel: showcase block for the multi-period texture system (stones
+-- shaded per voronoi cell at a 3-block span + a 7-block earthy tint —
+-- the combined pattern repeats only every 21 blocks). Registered after
+-- the original block set so existing slot order is untouched.
+register {
+    id = "vanilla:gravel",
+    display_name = "Gravel",
+    flags = {
+        solid = true,
+        room_boundary = true,
+        support_below = true,
+    },
+    color = { 0.48, 0.46, 0.45 },
+    texture = "vanilla:gravel",
+    drops = {
+        { item = "vanilla:stone_chunk", count = 1 },
     },
 }
 

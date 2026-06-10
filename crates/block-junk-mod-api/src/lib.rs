@@ -37,7 +37,6 @@ pub mod items;
 pub mod npcs;
 pub mod recipes;
 pub mod rooms;
-pub mod textures;
 
 use serde::{Deserialize, Serialize};
 

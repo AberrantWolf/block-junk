@@ -26,3 +26,4 @@ thiserror = "2"
 
 block-junk-mod-api = { path = "../block-junk-mod-api" }
 block-junk-scripting = { path = "../block-junk-scripting" }
+block-junk-textures = { path = "../block-junk-textures", features = ["render", "egui-fonts"] }

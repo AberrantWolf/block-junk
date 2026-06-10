@@ -8,7 +8,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::items::ItemDrop;
-use crate::textures::LayerDef;
 
 /// Stable string identifier for a block kind, "namespace:name" by convention.
 /// The namespace matches the mod that registered the block ("vanilla",
@@ -116,25 +115,18 @@ pub struct BlockDef {
     /// [`TagId`] for the namespace convention.
     #[serde(default)]
     pub tags: Vec<TagId>,
-    /// Base colour for the block's procedurally-generated 16×16 texture and
-    /// the hotbar icon. Ignored when `mesh` is `Some` (mesh blocks bring
-    /// their own materials). RGB only — alpha is added at the render call
-    /// site.
+    /// Fallback / accent colour: used for HUD chips, the hotbar swatch of
+    /// mesh blocks, and any face that has no `texture`. RGB only — alpha
+    /// is added at the render call site.
     pub color: [f32; 3],
-    /// Procedural pattern applied over `color` when generating the block's
-    /// texture and hotbar icon. See the `Pattern` enum in
-    /// `block_textures.rs` for the recognised values. `None` defaults to
-    /// `"noise"` (a subtle per-pixel jitter) — a uniform colour reads as
-    /// flat, which is the look this whole field exists to fix.
+    /// Procedural texture reference(s) into the mod's `textures.lua`.
+    /// Either one id for all faces (`texture = "vanilla:stone"`) or a
+    /// per-face table (`texture = { top = ..., side = ..., bottom = ... }`;
+    /// omitted faces fall back to `side`, then to `color`). Resolved and
+    /// validated against the texture registry at boot. Ignored when
+    /// `mesh` is `Some` (mesh blocks bring their own materials).
     #[serde(default)]
-    pub pattern: Option<String>,
-    /// Optional mask+ramp layer stack composited over the base texture
-    /// in the chunk fragment shader. Each entry references a previously
-    /// registered mask and ramp by id; the engine resolves them to slot
-    /// indices at boot. See [`LayerDef`] for the per-layer parameters
-    /// and the `textures` module docs for the authoring model.
-    #[serde(default)]
-    pub layers: Vec<LayerDef>,
+    pub texture: Option<BlockTextureRef>,
     /// Optional asset path for a non-cube visual. When set, the client
     /// renders this block as a separate ECS entity loaded from the given
     /// glTF (or scene) path, instead of baking cube faces into the chunk
@@ -247,6 +239,57 @@ pub struct BlockDef {
     /// nothing on destroy).
     #[serde(default)]
     pub materials: Vec<ItemDrop>,
+}
+
+/// Reference(s) from a block to procedural texture ids defined in a
+/// `textures.lua`. Untagged so Lua authors write either a bare string or
+/// a per-face table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BlockTextureRef {
+    /// One texture for every face.
+    Single(String),
+    /// Per-face overrides. `top`/`bottom` fall back to `side`; a fully
+    /// unset face falls back to the block's flat `color`.
+    PerFace {
+        #[serde(default)]
+        top: Option<String>,
+        #[serde(default)]
+        side: Option<String>,
+        #[serde(default)]
+        bottom: Option<String>,
+    },
+}
+
+impl BlockTextureRef {
+    /// Effective ids as `[top, side, bottom]`, with per-face fallbacks
+    /// applied.
+    pub fn faces(&self) -> [Option<&str>; 3] {
+        match self {
+            BlockTextureRef::Single(id) => [Some(id.as_str()); 3],
+            BlockTextureRef::PerFace { top, side, bottom } => {
+                let side = side.as_deref();
+                [
+                    top.as_deref().or(side),
+                    side,
+                    bottom.as_deref().or(side),
+                ]
+            }
+        }
+    }
+
+    /// Every distinct id referenced (for validation).
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        let faces = match self {
+            BlockTextureRef::Single(id) => vec![id.as_str()],
+            BlockTextureRef::PerFace { top, side, bottom } => [top, side, bottom]
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+        };
+        faces.into_iter()
+    }
 }
 
 /// Block-level "this is something NPCs can use" declaration. One

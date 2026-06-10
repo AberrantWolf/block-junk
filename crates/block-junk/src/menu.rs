@@ -180,6 +180,19 @@ impl Default for DebugNoSaveOnExit {
 #[derive(Component)]
 pub struct GameRoot;
 
+/// Register DejaVu Sans as an egui fallback font (once). egui's bundled
+/// fonts render arrows / triangles / die faces / ⌘ as tofu; any UI glyph
+/// outside plain ASCII needs this. Font bytes are compiled in — see
+/// `block_junk_textures::egui_fonts`.
+fn install_fallback_fonts(mut contexts: EguiContexts, mut done: Local<bool>) {
+    if *done {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    block_junk_textures::egui_fonts::install(ctx);
+    *done = true;
+}
+
 pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
@@ -206,6 +219,7 @@ impl Plugin for MenuPlugin {
         app.add_systems(
             bevy_egui::EguiPrimaryContextPass,
             (
+                install_fallback_fonts,
                 main_menu_ui.run_if(in_state(AppState::MainMenu)),
                 // Pause menu rides on top of InGame — the world keeps
                 // simulating beneath it, the menu just releases the

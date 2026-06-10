@@ -12,7 +12,7 @@ use block_junk_mod_api::server::BlockPlacedEvent;
 use block_junk_mod_api::shared::BlockPos;
 use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
 
-use crate::block_textures::{MaskRegistry, RampRegistry};
+use crate::block_textures::TextureRegistry;
 use crate::blocks::{BlockRegistry, WorldSlots};
 use crate::items::ItemRegistry;
 use crate::npc_registry::{AnimationRegistry, NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
@@ -44,8 +44,7 @@ impl Plugin for ServerScriptingPlugin {
             rooms,
             needs,
             npc_kinds,
-            masks,
-            ramps,
+            textures,
             animations,
             work_defaults,
             civilization_params,
@@ -58,8 +57,7 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
-        app.insert_resource(masks);
-        app.insert_resource(ramps);
+        app.insert_resource(textures);
         app.insert_resource(animations);
         app.insert_resource(work_defaults);
         app.insert_resource(civilization_params);
@@ -83,8 +81,7 @@ impl Plugin for ClientScriptingPlugin {
             rooms,
             needs,
             npc_kinds,
-            masks,
-            ramps,
+            textures,
             animations,
             work_defaults,
             civilization_params: _,
@@ -97,8 +94,7 @@ impl Plugin for ClientScriptingPlugin {
         app.insert_resource(rooms);
         app.insert_resource(needs);
         app.insert_resource(npc_kinds);
-        app.insert_resource(masks);
-        app.insert_resource(ramps);
+        app.insert_resource(textures);
         app.insert_resource(animations);
         app.insert_resource(work_defaults);
         // No client-only hooks yet — the registry is in place so adding one
@@ -115,8 +111,7 @@ struct LoadResult {
     rooms: RoomPatternRegistry,
     needs: NeedRegistry,
     npc_kinds: NpcKindRegistry,
-    masks: MaskRegistry,
-    ramps: RampRegistry,
+    textures: TextureRegistry,
     animations: AnimationRegistry,
     work_defaults: WorkDefaultsRes,
     civilization_params: crate::civilization::CivilizationParamsRes,
@@ -240,25 +235,20 @@ fn load_side(side: Side) -> LoadResult {
         side.as_str(),
         npc_kinds.kind_count()
     );
-    // Mask + ramp registries feed the chunk material's mask/ramp
-    // atlases. Build them before validating block layers — the
-    // validator needs both to resolve every layer ref.
-    let masks = match MaskRegistry::build(ctx.take_masks()) {
+    // Procedural texture docs (per-mod textures.lua, pure data — not
+    // run through the mod sandbox). Both sides parse + validate so a
+    // broken file fails the headless server too; only the client bakes.
+    let textures = match TextureRegistry::load_from_mods_dir(&PathBuf::from(MODS_DIR)) {
         Ok(r) => r,
-        Err(e) => panic!("{} mask registry build failed: {e}", side.as_str()),
-    };
-    let ramps = match RampRegistry::build(ctx.take_ramps()) {
-        Ok(r) => r,
-        Err(e) => panic!("{} ramp registry build failed: {e}", side.as_str()),
+        Err(e) => panic!("{} texture load failed: {e}", side.as_str()),
     };
     info!(
-        "[{}] texture registries: {} mask(s), {} ramp(s)",
+        "[{}] texture registry: {} texture(s)",
         side.as_str(),
-        masks.slot_count(),
-        ramps.slot_count(),
+        textures.texture_count(),
     );
-    if let Err(e) = blocks.validate_layers(&masks, &ramps) {
-        panic!("{} block layer validation failed: {e}", side.as_str());
+    if let Err(e) = blocks.validate_textures(&textures) {
+        panic!("{} block texture validation failed: {e}", side.as_str());
     }
     // Civilization-cluster params. Lua-supplied via
     // `engine.civilization.set_params`; default if no mod set them.
@@ -280,8 +270,7 @@ fn load_side(side: Side) -> LoadResult {
         rooms,
         needs,
         npc_kinds,
-        masks,
-        ramps,
+        textures,
         animations,
         work_defaults,
         civilization_params,
