@@ -2289,10 +2289,27 @@ fn receive_snapshots(
 ) {
     for mut receiver in receivers.iter_mut() {
         for snapshot in receiver.receive() {
-            let chunk = match snapshot.data {
+            let mut chunk = match snapshot.data {
                 ChunkData::Procedural => Chunk::from_terrain(snapshot.coord, &terrain_slots),
                 ChunkData::Edited(blocks) => Chunk { blocks },
             };
+            // Seam sync against already-loaded neighbours, both ways.
+            // Pull: a Procedural regen knows only the terrain function,
+            // so its padding misses any edits in loaded neighbours.
+            // Push: a loaded neighbour's padding misses edits made to
+            // THIS chunk while it was outside our AoI (those broadcasts
+            // were dropped). Same-batch arrivals can't see each other
+            // (spawns flush after the system) and don't need to — the
+            // server cut them at the same tick, mutually consistent.
+            chunk.refresh_padding(snapshot.coord, |world| {
+                let (ncoord, nlocal) = crate::voxel::world_to_chunk(world);
+                map.0
+                    .get(&ncoord)
+                    .and_then(|&e| chunks.get(e).ok())
+                    .map(|(c, _)| c.get(nlocal))
+            });
+            let borders = chunk.border_cells(snapshot.coord);
+            crate::voxel::apply_padding_mirrors(&borders, &map, &mut chunks);
             let entities = ChunkEntities {
                 entries: snapshot.entities,
             };
@@ -2627,6 +2644,17 @@ fn apply_broadcast_edit(
     let slot = if edit.slot.is_empty() {
         let (anchor_coord, anchor_local) = crate::voxel::world_to_chunk(edit.anchor);
         let Some(&anchor_entity) = map.0.get(&anchor_coord) else {
+            // The owning chunk isn't loaded, but loaded neighbours may
+            // mirror this cell in their padding. We can't expand the
+            // footprint without reading the anchor slot, so multi-cell
+            // ghosts are missed here — acceptable: the owner chunk
+            // ships correct padding whenever it enters AoI, and the
+            // single-cell case (the common one) is covered.
+            crate::voxel::apply_padding_mirrors(
+                &[(edit.anchor, BlockSlot::EMPTY)],
+                map,
+                chunks,
+            );
             return;
         };
         let Ok((chunk, _)) = chunks.get(anchor_entity) else {
@@ -2651,7 +2679,7 @@ fn apply_broadcast_edit(
     };
     let needs_sidecar = def.mesh.is_some();
 
-    for cell in cells {
+    for &cell in &cells {
         let (coord, local) = crate::voxel::world_to_chunk(cell);
         let Some(&entity) = map.0.get(&coord) else {
             continue;
@@ -2677,6 +2705,13 @@ fn apply_broadcast_edit(
             entities.insert(cell, kind);
         }
     }
+    // Echo into loaded neighbours' padding so their seam faces re-cull.
+    // Runs over ALL footprint cells, not just the ones whose owning
+    // chunk is loaded — a border cell's owner can be outside our AoI
+    // while its mirror sits in a chunk we render right now.
+    let mirror_cells: Vec<(IVec3, BlockSlot)> =
+        cells.iter().map(|&cell| (cell, new_slot)).collect();
+    crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
 }
 
 /// Paint replicated avatar entities with the shared cuboid mesh, EXCEPT

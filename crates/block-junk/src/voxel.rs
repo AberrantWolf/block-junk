@@ -134,6 +134,86 @@ impl Chunk {
         true
     }
 
+    /// Mirror of [`Chunk::set`] for the padding ring: writes a padding
+    /// cell, rejecting interior cells. Padding duplicates neighbour
+    /// chunks' border interiors so the mesher can cull faces across
+    /// chunk seams — every interior edit must be echoed into the
+    /// padding of the neighbours that mirror that cell (see
+    /// [`padding_mirrors`]) or their seam faces cull against stale
+    /// data. Returns true if the value actually changed.
+    pub fn set_padding(&mut self, cell: IVec3, block: BlockSlot) -> bool {
+        if Self::is_interior(cell) {
+            return false;
+        }
+        let Some(i) = Self::cell_index(cell) else {
+            return false;
+        };
+        if self.blocks[i] == block {
+            return false;
+        }
+        self.blocks[i] = block;
+        true
+    }
+
+    /// Overwrite this chunk's padding ring from authoritative neighbour
+    /// data: `lookup(world_cell)` returns the neighbour-interior value
+    /// for that cell, or `None` to leave the current value (neighbour
+    /// not loaded / not relevant). Used when a chunk is (re)created
+    /// next to chunks that have diverged from terrain — freshly
+    /// generated server chunks pull from edited neighbours, client
+    /// snapshot arrivals pull from loaded neighbours. Returns how many
+    /// cells changed.
+    pub fn refresh_padding(
+        &mut self,
+        coord: ChunkCoord,
+        lookup: impl Fn(IVec3) -> Option<BlockSlot>,
+    ) -> usize {
+        let mut changed = 0;
+        for i in 0..ChunkShape::SIZE {
+            let [lx, ly, lz] = ChunkShape::delinearize(i);
+            let local = IVec3::new(lx as i32, ly as i32, lz as i32);
+            if Self::is_interior(local) {
+                continue;
+            }
+            let world = chunk_local_to_world(coord, local);
+            if let Some(slot) = lookup(world)
+                && self.blocks[i as usize] != slot
+            {
+                self.blocks[i as usize] = slot;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// Every interior cell on this chunk's border, as (world cell, slot)
+    /// pairs — the cells that neighbour chunks mirror in their padding.
+    /// Feed to [`apply_padding_mirrors`] when a chunk (re)appears next
+    /// to already-loaded neighbours, so their seam padding catches up
+    /// with this chunk's actual contents.
+    pub fn border_cells(&self, coord: ChunkCoord) -> Vec<(IVec3, BlockSlot)> {
+        let lo = 1;
+        let hi = (CHUNK_PADDED - 2) as i32;
+        let mut out = Vec::new();
+        for i in 0..ChunkShape::SIZE {
+            let [lx, ly, lz] = ChunkShape::delinearize(i);
+            let local = IVec3::new(lx as i32, ly as i32, lz as i32);
+            if !Self::is_interior(local) {
+                continue;
+            }
+            let on_border = local.x == lo
+                || local.y == lo
+                || local.z == lo
+                || local.x == hi
+                || local.y == hi
+                || local.z == hi;
+            if on_border {
+                out.push((chunk_local_to_world(coord, local), self.blocks[i as usize]));
+            }
+        }
+        out
+    }
+
     fn cell_index(cell: IVec3) -> Option<usize> {
         if cell.x < 0 || cell.y < 0 || cell.z < 0 {
             return None;
@@ -260,6 +340,70 @@ pub fn world_to_chunk(world: IVec3) -> (ChunkCoord, IVec3) {
     (coord, local)
 }
 
+/// Every (chunk, padded-local cell) location that mirrors `world` in a
+/// *neighbour* chunk's padding ring. Empty for cells away from chunk
+/// borders; 1 entry for a face cell, 3 for an edge cell, 7 for a corner
+/// cell (face + edge + corner neighbours in 3D). The owning chunk's own
+/// interior copy is NOT included — that's `world_to_chunk`'s job.
+pub fn padding_mirrors(world: IVec3) -> Vec<(ChunkCoord, IVec3)> {
+    let size = CHUNK_SIZE as i32;
+    let (owner, local) = world_to_chunk(world);
+    // Per axis: which neighbour directions see this cell in their
+    // padding. First interior layer (local == 1) → the -1 neighbour;
+    // last (local == size) → the +1 neighbour.
+    let dirs = |l: i32| -> &'static [i32] {
+        match l {
+            1 => &[-1],
+            l if l == CHUNK_PADDED as i32 - 2 => &[1],
+            _ => &[],
+        }
+    };
+    let mut out = Vec::new();
+    for &dx in [0].iter().chain(dirs(local.x)) {
+        for &dy in [0].iter().chain(dirs(local.y)) {
+            for &dz in [0].iter().chain(dirs(local.z)) {
+                let d = IVec3::new(dx, dy, dz);
+                if d == IVec3::ZERO {
+                    continue;
+                }
+                // The same world cell, addressed in the neighbour's
+                // local space, lands on its padding ring.
+                out.push((ChunkCoord(owner.0 + d), local - d * size));
+            }
+        }
+    }
+    out
+}
+
+/// Echo a set of just-written cells into the padding rings of every
+/// loaded neighbour chunk that mirrors them. Call after any interior
+/// write (place, break, snapshot arrival) with the cells' new values;
+/// chunks the map doesn't know about are skipped (they regenerate or
+/// refresh their padding when they appear). Compare-first so an
+/// already-current mirror doesn't trip `Changed<Chunk>` — on the
+/// client that flag is a full remesh.
+pub fn apply_padding_mirrors(
+    cells: &[(IVec3, BlockSlot)],
+    map: &ChunkMap,
+    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
+) {
+    for &(world, slot) in cells {
+        for (coord, local) in padding_mirrors(world) {
+            let Some(&entity) = map.0.get(&coord) else {
+                continue;
+            };
+            let Ok((mut chunk, _)) = chunks.get_mut(entity) else {
+                continue;
+            };
+            // `get` goes through Deref (no change flag); only the
+            // actual write DerefMuts and marks the chunk changed.
+            if chunk.get(local) != slot {
+                chunk.set_padding(local, slot);
+            }
+        }
+    }
+}
+
 /// World-space transform for a chunk's render entity. Aligns interior cell
 /// `(1,1,1)` of the chunk with world cell `(coord*CHUNK_SIZE)`.
 pub fn chunk_world_transform(coord: ChunkCoord) -> Transform {
@@ -350,4 +494,132 @@ fn is_tree_root(x: i32, z: i32) -> bool {
     // path, sparse enough that flat-grass-with-occasional-tree still
     // reads as the dominant terrain.
     (h & 0x1F) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIZE: i32 = CHUNK_SIZE as i32;
+
+    fn empty_chunk() -> Chunk {
+        Chunk {
+            blocks: vec![BlockSlot::EMPTY; ChunkShape::USIZE],
+        }
+    }
+
+    /// Every mirror must address the SAME world cell from the
+    /// neighbour's local space, and land on its padding ring (never
+    /// interior — a world cell has exactly one interior owner).
+    fn assert_mirrors_roundtrip(world: IVec3, expected_count: usize) {
+        let mirrors = padding_mirrors(world);
+        assert_eq!(mirrors.len(), expected_count, "mirror count for {world}");
+        let (owner, _) = world_to_chunk(world);
+        for (coord, local) in mirrors {
+            assert_ne!(coord, owner, "owner is not a mirror");
+            assert_eq!(
+                chunk_local_to_world(coord, local),
+                world,
+                "mirror ({coord:?}, {local}) must address {world}"
+            );
+            assert!(
+                !Chunk::is_interior(local),
+                "mirror local {local} must be padding"
+            );
+        }
+    }
+
+    #[test]
+    fn padding_mirrors_by_cell_class() {
+        // Deep interior: no mirrors.
+        assert_mirrors_roundtrip(IVec3::new(5, 5, 5), 0);
+        // Face cells (one axis on a border): 1 mirror, both sides.
+        assert_mirrors_roundtrip(IVec3::new(0, 5, 5), 1);
+        assert_mirrors_roundtrip(IVec3::new(SIZE - 1, 5, 5), 1);
+        // Edge cell (two axes): face + face + edge neighbours = 3.
+        assert_mirrors_roundtrip(IVec3::new(0, 0, 5), 3);
+        // Corner cell (three axes): 3 face + 3 edge + 1 corner = 7.
+        assert_mirrors_roundtrip(IVec3::new(0, 0, 0), 7);
+        // Negative coords land on the right neighbours too.
+        assert_mirrors_roundtrip(IVec3::new(-1, -1, -1), 7);
+        assert_mirrors_roundtrip(IVec3::new(-SIZE, 7, 9), 1);
+    }
+
+    #[test]
+    fn set_and_set_padding_split_the_grid() {
+        let mut chunk = empty_chunk();
+        let interior = IVec3::new(1, 5, 5);
+        let padding = IVec3::new(0, 5, 5);
+        assert!(chunk.set(interior, BlockSlot(2)));
+        assert!(!chunk.set(padding, BlockSlot(2)), "set must reject padding");
+        assert!(chunk.set_padding(padding, BlockSlot(2)));
+        assert!(
+            !chunk.set_padding(interior, BlockSlot(3)),
+            "set_padding must reject interior"
+        );
+        assert_eq!(chunk.get(padding), BlockSlot(2));
+        assert!(!chunk.set_padding(padding, BlockSlot(2)), "no-op write");
+    }
+
+    #[test]
+    fn refresh_padding_pulls_only_offered_cells() {
+        let mut chunk = empty_chunk();
+        // World (-1, 5, 5) sits in chunk (0,0,0)'s low-x padding at
+        // local (0, 6, 6).
+        let target_world = IVec3::new(-1, 5, 5);
+        let changed = chunk.refresh_padding(ChunkCoord(IVec3::ZERO), |w| {
+            (w == target_world).then_some(BlockSlot(7))
+        });
+        assert_eq!(changed, 1);
+        assert_eq!(chunk.get(IVec3::new(0, 6, 6)), BlockSlot(7));
+        // Second pass: value already current, nothing changes.
+        let changed = chunk.refresh_padding(ChunkCoord(IVec3::ZERO), |w| {
+            (w == target_world).then_some(BlockSlot(7))
+        });
+        assert_eq!(changed, 0);
+    }
+
+    #[test]
+    fn border_cells_cover_the_interior_shell() {
+        let chunk = empty_chunk();
+        let coord = ChunkCoord(IVec3::new(2, -1, 0));
+        let borders = chunk.border_cells(coord);
+        // Interior shell = interior volume minus the strict interior.
+        let expected = (SIZE * SIZE * SIZE - (SIZE - 2) * (SIZE - 2) * (SIZE - 2)) as usize;
+        assert_eq!(borders.len(), expected);
+        for (world, _) in &borders {
+            let (owner, local) = world_to_chunk(*world);
+            assert_eq!(owner, coord, "border cell {world} owned elsewhere");
+            assert!(Chunk::is_interior(local));
+            assert!(
+                !padding_mirrors(*world).is_empty(),
+                "border cell {world} must have at least one mirror"
+            );
+        }
+    }
+
+    /// The seam invariant end-to-end (no ECS): edit a cell at the high-x
+    /// border of chunk A, write the mirrors, and B's padding must agree
+    /// with A's interior about that world cell.
+    #[test]
+    fn mirror_write_keeps_seam_consistent() {
+        let mut a = empty_chunk();
+        let mut b = empty_chunk();
+        let a_coord = ChunkCoord(IVec3::ZERO);
+        let b_coord = ChunkCoord(IVec3::new(1, 0, 0));
+        let world = IVec3::new(SIZE - 1, 5, 5); // A's last interior column on x
+
+        let (owner, local) = world_to_chunk(world);
+        assert_eq!(owner, a_coord);
+        assert!(a.set(local, BlockSlot(4)));
+
+        let mirrors = padding_mirrors(world);
+        assert_eq!(mirrors.len(), 1);
+        let (mirror_coord, mirror_local) = mirrors[0];
+        assert_eq!(mirror_coord, b_coord);
+        assert!(b.set_padding(mirror_local, BlockSlot(4)));
+
+        // Both chunks now answer "what's at `world`?" identically.
+        assert_eq!(a.get(local), b.get(mirror_local));
+    }
 }

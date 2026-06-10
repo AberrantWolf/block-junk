@@ -403,6 +403,26 @@ fn load_from_save(
     // the moment-of-load timestamp so the existing DEBOUNCE window
     // applies and the first `process_dirty` tick after Startup runs
     // the detection.
+    // Saved padding is maintained at runtime, so chunks from a healthy
+    // save are already mutually consistent — this refresh is a no-op
+    // there. It exists to heal saves written before padding write-
+    // through landed (stale mirrors of edited neighbours baked into
+    // the file). Padding facing *procedural* chunks needs no fixup:
+    // a never-edited neighbour matches terrain, which is what
+    // generation put in the padding.
+    let originals: HashMap<ChunkCoord, Chunk> = save
+        .edited_chunks
+        .iter()
+        .map(|sc| (sc.coord, sc.chunk.clone()))
+        .collect();
+    for sc in &mut save.edited_chunks {
+        sc.chunk.refresh_padding(sc.coord, |world| {
+            let (ncoord, nlocal) = world_to_chunk(world);
+            originals.get(&ncoord).map(|c| c.get(nlocal))
+        });
+    }
+    drop(originals);
+
     let now = Instant::now();
     let mut dirty_marked = 0usize;
     for SavedChunk {
@@ -1216,6 +1236,7 @@ fn poll_chunk_gen(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut pending: ResMut<PendingChunks>,
+    edited: Query<&Chunk, With<ChunkEdited>>,
 ) {
     let mut completed: Vec<(ChunkCoord, Chunk)> = Vec::new();
     pending.0.retain(|coord, task| {
@@ -1226,7 +1247,20 @@ fn poll_chunk_gen(
             true
         }
     });
-    for (coord, chunk) in completed {
+    for (coord, mut chunk) in completed {
+        // The gen task only knows the terrain function. If a neighbour
+        // chunk has been *edited* at the shared border, this chunk's
+        // terrain-derived padding is already stale — pull the real
+        // values before the chunk goes live. Unedited neighbours match
+        // terrain by definition, so only edited ones are consulted.
+        chunk.refresh_padding(coord, |world| {
+            let (ncoord, nlocal) = world_to_chunk(world);
+            chunk_map
+                .0
+                .get(&ncoord)
+                .and_then(|&e| edited.get(e).ok())
+                .map(|c| c.get(nlocal))
+        });
         let entity = commands
             .spawn((
                 chunk,
@@ -1508,6 +1542,13 @@ fn apply_place(
         }
         commands.entity(chunk_entity).insert(ChunkEdited);
     }
+    // Echo border cells into loaded neighbours' padding rings (own pass
+    // — the per-chunk loop above holds a mutable borrow per chunk, and a
+    // cell's mirrors live in *other* chunks, possibly ones in this very
+    // footprint).
+    let mirror_cells: Vec<(IVec3, BlockSlot)> =
+        cells.iter().map(|&world| (world, edit.slot)).collect();
+    crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
 
     if let Err(err) = broadcast.send::<BlockEdit, WorldChannel>(&edit, server, &NetworkTarget::All)
     {
@@ -1616,6 +1657,11 @@ fn apply_break(
         }
         commands.entity(chunk_entity).insert(ChunkEdited);
     }
+    // Echo the cleared cells into loaded neighbours' padding rings
+    // (separate pass for the same borrow reason as the place path).
+    let mirror_cells: Vec<(IVec3, BlockSlot)> =
+        cells.iter().map(|&world| (world, BlockSlot::EMPTY)).collect();
+    crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
 
     // Broadcast the canonical applied break with the resolved anchor +
     // orientation, so other clients can compute the footprint themselves.
