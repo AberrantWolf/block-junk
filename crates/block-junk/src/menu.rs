@@ -109,15 +109,16 @@ impl Default for JoinTarget {
 /// Handle to the server thread spawned when hosting. None when running as a
 /// pure client (JoinRemote) or before any game has started.
 ///
-/// Three Arc<AtomicBool> flags coordinate cross-thread state with the server
-/// App. The client sets them; the server polls and acts. We use atomics
-/// rather than channels because (a) the server doesn't need backpressure
-/// and (b) atomics survive cleanly if the client crashes mid-set.
+/// Arc<AtomicBool> flags coordinate cross-thread state with the server App.
+/// The client sets them; the server polls and acts. We use atomics rather
+/// than channels because (a) the server doesn't need backpressure and (b)
+/// atomics survive cleanly if the client crashes mid-set.
 #[derive(Resource, Default)]
 pub struct ServerSession {
     handle: Option<JoinHandle<()>>,
     shutdown: Option<Arc<AtomicBool>>,
     save_request: Option<Arc<AtomicBool>>,
+    shutdown_requested: bool,
 }
 
 impl ServerSession {
@@ -125,25 +126,52 @@ impl ServerSession {
         self.handle.is_some()
     }
 
-    /// Signal the server thread to exit, then detach. We *don't* join here:
-    /// joining would block the main thread for a tick or two, and on
-    /// quit-to-desktop we're about to terminate the process anyway — the OS
-    /// reaps the thread. The trade-off is that a noisy server (still
-    /// flushing UDP, say) might keep a thread alive a few ms after main
-    /// exits; harmless. If we ever need a clean handover (e.g. quit-to-menu
-    /// followed immediately by re-host on the same port), we'd join here.
-    pub fn signal_shutdown(&mut self) {
-        if let Some(flag) = self.shutdown.take() {
+    /// Ask the hosted server App to save/exit. The thread handle is retained
+    /// until [`join_if_finished`] observes the server has actually returned;
+    /// quitting the client before that point can lose the quit-save.
+    pub fn request_shutdown(&mut self) {
+        if self.shutdown_requested {
+            return;
+        }
+        if let Some(flag) = self.shutdown.as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
-        // Drop the handle to detach. We're not waiting.
-        let _ = self.handle.take();
+        self.shutdown_requested = true;
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    /// Join the hosted server once it has already finished. Returns `true`
+    /// when no hosted server remains, so callers can safely continue with
+    /// client shutdown.
+    pub fn join_if_finished(&mut self) -> bool {
+        if let Some(handle) = self.handle.as_ref()
+            && !handle.is_finished()
+        {
+            return false;
+        }
+
+        if let Some(handle) = self.handle.take() {
+            match handle.join() {
+                Ok(()) => info!("hosted server thread joined after shutdown"),
+                Err(_) => error!("hosted server thread panicked during shutdown"),
+            }
+        }
+        self.shutdown = None;
+        self.save_request = None;
+        self.shutdown_requested = false;
+        true
     }
 
     /// Request a mid-session save. Server clears the flag once it has
     /// written to disk; spamming the button is harmless (extra requests
     /// during the same tick just collapse).
     pub fn request_save(&self) {
+        if self.shutdown_requested {
+            return;
+        }
         if let Some(flag) = self.save_request.as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
@@ -170,16 +198,27 @@ pub struct ServerShutdownFlag(pub Arc<AtomicBool>);
 #[derive(Resource, Clone)]
 pub struct ServerSaveRequestFlag(pub Arc<AtomicBool>);
 
-/// Don't auto-save on Quit-to-menu / Quit-to-desktop. Defaulting to `true`
-/// during development per design note — pre-ship pass will flip to `false`.
-/// Visible in the pause menu as a checkbox so it can be flipped per-session
-/// without rebuilding.
-#[derive(Resource, Clone, Copy)]
+/// Debug override for skipping the hosted-server quit-save. Normal play
+/// saves on quit by default; tests/dev tooling can insert `Self(true)` when
+/// they need a disposable session.
+#[derive(Resource, Clone, Copy, Default)]
 pub struct DebugNoSaveOnExit(pub bool);
 
-impl Default for DebugNoSaveOnExit {
-    fn default() -> Self {
-        Self(true)
+/// Set after an in-game quit button is clicked. `drive_pending_quit` keeps
+/// the client alive until the hosted server thread has saved, exited, and
+/// joined.
+#[derive(Resource, Debug)]
+struct PendingQuit {
+    requested_at: f32,
+    warned_slow: bool,
+}
+
+impl PendingQuit {
+    fn new(requested_at: f32) -> Self {
+        Self {
+            requested_at,
+            warned_slow: false,
+        }
     }
 }
 
@@ -253,6 +292,7 @@ impl Plugin for MenuPlugin {
         // InGame ↔ Paused. Pausing must not tear down the server; only
         // explicit quit (to menu or desktop) does.
         app.add_systems(OnEnter(AppState::InGame), spawn_server_if_hosting);
+        app.add_systems(Update, drive_pending_quit);
     }
 }
 
@@ -510,8 +550,8 @@ fn relative_time(unix_seconds: u64) -> String {
     }
 }
 
-/// Tracks the in-flight Save Now request so the pause menu can show
-/// "Saving…" while the server flushes and "Saved" for a moment after.
+/// Tracks the in-flight Save Now request so the pause menu can show saving
+/// feedback while the server flushes and completion for a moment after.
 #[derive(Default)]
 struct SaveFeedback {
     /// A Save Now click is outstanding (set on click, cleared when the
@@ -525,8 +565,9 @@ struct SaveFeedback {
 fn pause_menu_ui(
     mut contexts: EguiContexts,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
+    mut commands: Commands,
     mut session: ResMut<ServerSession>,
-    mut exit: MessageWriter<AppExit>,
+    debug_no_save: Res<DebugNoSaveOnExit>,
     time: Res<Time>,
     mut save_feedback: Local<SaveFeedback>,
 ) {
@@ -537,6 +578,7 @@ fn pause_menu_ui(
         return;
     };
     let hosting = session.is_hosting();
+    let quit_pending = session.shutdown_requested();
     // Resolve the save round-trip: the server clears the flag once the
     // file is on disk. Checked before drawing so the label flips in the
     // same frame the flag drops.
@@ -545,6 +587,7 @@ fn pause_menu_ui(
         save_feedback.completed_at = Some(time.elapsed_secs());
     }
     let mut close_request = false;
+    let mut quit_request = false;
     egui::Window::new("Paused")
         .collapsible(false)
         .resizable(false)
@@ -553,46 +596,49 @@ fn pause_menu_ui(
             ui.label("The world is still running.");
             ui.add_space(4.0);
             ui.vertical_centered(|ui| {
-                if ui.button("Resume").clicked() {
-                    close_request = true;
+                if quit_pending {
+                    let label = if debug_no_save.0 {
+                        "Shutting down..."
+                    } else {
+                        "Saving and shutting down..."
+                    };
+                    ui.label(egui::RichText::new(label).weak());
                 }
-                // Save Now bypasses DebugNoSaveOnExit so you can verify a
-                // save without quitting. Disabled on JoinRemote (the
-                // local App isn't authoritative over the world).
-                ui.add_enabled_ui(hosting, |ui| {
-                    if ui.button("Save Now").clicked() {
-                        session.request_save();
-                        save_feedback.requested = true;
-                        save_feedback.completed_at = None;
+                ui.add_enabled_ui(!quit_pending, |ui| {
+                    if ui.button("Resume").clicked() {
+                        close_request = true;
+                    }
+                    // Save Now bypasses DebugNoSaveOnExit so you can verify a
+                    // save without quitting. Disabled on JoinRemote (the
+                    // local App isn't authoritative over the world).
+                    ui.add_enabled_ui(hosting, |ui| {
+                        if ui.button("Save Now").clicked() {
+                            session.request_save();
+                            save_feedback.requested = true;
+                            save_feedback.completed_at = None;
+                        }
+                    });
+                    if save_feedback.requested {
+                        ui.label(egui::RichText::new("Saving...").weak());
+                    } else if let Some(done) = save_feedback.completed_at
+                        && time.elapsed_secs() - done < 3.0
+                    {
+                        ui.label(
+                            egui::RichText::new("Saved")
+                                .color(egui::Color32::from_rgb(180, 230, 150)),
+                        );
+                    }
+                    // Quit-to-menu is a stub: in-world state cleanup
+                    // (despawning replicated entities, resetting resources)
+                    // isn't built yet, so we exit the process the same way as
+                    // Quit-to-Desktop. See module docs.
+                    if ui.button("Quit to Menu (exits process for now)").clicked() {
+                        quit_request = true;
+                    }
+                    if ui.button("Quit to Desktop").clicked() {
+                        quit_request = true;
                     }
                 });
-                if save_feedback.requested {
-                    ui.label(egui::RichText::new("Saving…").weak());
-                } else if let Some(done) = save_feedback.completed_at
-                    && time.elapsed_secs() - done < 3.0
-                {
-                    ui.label(
-                        egui::RichText::new("Saved ✓")
-                            .color(egui::Color32::from_rgb(180, 230, 150)),
-                    );
-                }
-                // Quit-to-menu is a stub: in-world state cleanup
-                // (despawning replicated entities, resetting resources)
-                // isn't built yet, so we exit the process the same way as
-                // Quit-to-Desktop. See module docs.
-                if ui.button("Quit to Menu (exits process for now)").clicked() {
-                    session.signal_shutdown();
-                    exit.write(AppExit::Success);
-                    // 3s gives the server thread time to flush a save if one
-                    // is in progress; a "no save" quit completes well under
-                    // that. See `arm_quit_watchdog` doc.
-                    arm_quit_watchdog(Duration::from_secs(3));
-                }
-                if ui.button("Quit to Desktop").clicked() {
-                    session.signal_shutdown();
-                    exit.write(AppExit::Success);
-                    arm_quit_watchdog(Duration::from_secs(3));
-                }
             });
             ui.add_space(8.0);
             // The full keybind reference. Several binds (Q/T/F1/wheel)
@@ -634,6 +680,37 @@ fn pause_menu_ui(
         // DiscardNextMotion, ⇒ in-world input gates re-enable. No
         // manual window touching, no separate "open" flag to update.
         captures.release(crate::ui_capture::UiCapture::PauseMenu);
+    }
+    if quit_request {
+        session.request_shutdown();
+        save_feedback.requested = false;
+        save_feedback.completed_at = None;
+        commands.insert_resource(PendingQuit::new(time.elapsed_secs()));
+    }
+}
+
+fn drive_pending_quit(
+    mut commands: Commands,
+    mut session: ResMut<ServerSession>,
+    pending: Option<ResMut<PendingQuit>>,
+    time: Res<Time>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(mut pending) = pending else {
+        return;
+    };
+
+    session.request_shutdown();
+    if session.join_if_finished() {
+        commands.remove_resource::<PendingQuit>();
+        exit.write(AppExit::Success);
+        arm_quit_watchdog(Duration::from_secs(3));
+        return;
+    }
+
+    if !pending.warned_slow && time.elapsed_secs() - pending.requested_at > 5.0 {
+        pending.warned_slow = true;
+        warn!("waiting for hosted server to save and shut down before exiting");
     }
 }
 
@@ -741,4 +818,53 @@ pub fn shutdown_after(flag: &Arc<AtomicBool>, after: Duration) {
         std::thread::sleep(after);
         flag.store(true, Ordering::SeqCst);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autosave_on_exit_is_the_default() {
+        assert!(!DebugNoSaveOnExit::default().0);
+    }
+
+    #[test]
+    fn shutdown_request_keeps_handle_until_thread_can_be_joined() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let allow_exit = Arc::new(AtomicBool::new(false));
+        let shutdown_for_thread = shutdown.clone();
+        let finished_for_thread = finished.clone();
+        let allow_exit_for_thread = allow_exit.clone();
+        let handle = std::thread::spawn(move || {
+            while !shutdown_for_thread.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            finished_for_thread.store(true, Ordering::SeqCst);
+            while !allow_exit_for_thread.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        let mut session = ServerSession {
+            handle: Some(handle),
+            shutdown: Some(shutdown),
+            save_request: None,
+            shutdown_requested: false,
+        };
+
+        session.request_shutdown();
+        while !finished.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(!session.join_if_finished());
+        allow_exit.store(true, Ordering::SeqCst);
+        while !session.join_if_finished() {
+            std::thread::yield_now();
+        }
+
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(!session.is_hosting());
+        assert!(!session.shutdown_requested());
+    }
 }
