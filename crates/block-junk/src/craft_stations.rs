@@ -164,7 +164,10 @@ impl CraftBookings {
     /// sides are free (or already point at each other — re-reserve
     /// is idempotent). Returns true on success.
     pub fn try_book_npc(&mut self, npc: crate::npc::NpcId, station: IVec3) -> bool {
-        match (self.station_by_npc.get(&npc), self.npc_by_station.get(&station)) {
+        match (
+            self.station_by_npc.get(&npc),
+            self.npc_by_station.get(&station),
+        ) {
             (Some(existing_cell), Some(existing_npc))
                 if *existing_cell == station && existing_npc.0 == npc.0 =>
             {
@@ -409,7 +412,10 @@ pub(crate) const MAX_CRAFT_STATION_RADIUS_CELLS: i32 = 48;
 /// Atomic: the final `try_reserve` is the only mutation. A scheduler
 /// call that picks a target but loses the reservation race returns
 /// `None` and the next tick retries.
-#[allow(clippy::too_many_arguments, reason = "scheduler reaches into many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "scheduler reaches into many subsystems"
+)]
 pub fn try_schedule_craft_for_npc(
     npc_id: crate::npc::NpcId,
     pose: Vec3,
@@ -655,7 +661,10 @@ impl Plugin for CraftStationsClientPlugin {
         app.init_resource::<CraftStationUiState>();
         app.add_systems(
             Update,
-            (receive_stations_full_sync, receive_station_update_broadcasts)
+            (
+                receive_stations_full_sync,
+                receive_station_update_broadcasts,
+            )
                 .chain()
                 .in_set(GameSet::Simulation)
                 .run_if(in_state(AppState::InGame)),
@@ -757,8 +766,10 @@ pub fn sync_craft_modal_capture(
 /// also clamps client-side; this is the server-of-record cap.
 const MAX_ORDER_QUANTITY: u32 = 99;
 
-
-#[allow(clippy::too_many_arguments, reason = "wire handler joins many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wire handler joins many subsystems"
+)]
 fn receive_queue_orders(
     mut receivers: Query<(Entity, &mut MessageReceiver<QueueOrder>)>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
@@ -794,12 +805,9 @@ fn receive_queue_orders(
                 );
                 continue;
             }
-            let Some(station_def) = lookup_station_def(
-                req.station_cell,
-                &chunks,
-                &chunk_map,
-                &block_registry,
-            ) else {
+            let Some(station_def) =
+                lookup_station_def(req.station_cell, &chunks, &chunk_map, &block_registry)
+            else {
                 continue;
             };
             // Recipe must exist + match the station's tag + tier.
@@ -821,7 +829,12 @@ fn receive_queue_orders(
                 total: quantity,
                 completed: 0,
             });
-            broadcast_station(&mut broadcast, server, req.station_cell, Some(state.clone()));
+            broadcast_station(
+                &mut broadcast,
+                server,
+                req.station_cell,
+                Some(state.clone()),
+            );
             info!(
                 cell = ?req.station_cell.to_array(),
                 recipe = %req.recipe_id,
@@ -832,7 +845,10 @@ fn receive_queue_orders(
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "cancel refunds need item registry + recipes")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "cancel refunds need item registry + recipes"
+)]
 fn receive_cancel_orders(
     mut receivers: Query<(Entity, &mut MessageReceiver<CancelOrder>)>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
@@ -924,7 +940,10 @@ fn receive_cancel_orders(
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "wire handler joins many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wire handler joins many subsystems"
+)]
 fn receive_deposit_to_station(
     mut receivers: Query<(Entity, &mut MessageReceiver<DepositToStation>)>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
@@ -971,7 +990,12 @@ fn receive_deposit_to_station(
             };
             let state = stations.get_or_insert(req.station_cell);
             state.deposit(item, count);
-            broadcast_station(&mut broadcast, server, req.station_cell, Some(state.clone()));
+            broadcast_station(
+                &mut broadcast,
+                server,
+                req.station_cell,
+                Some(state.clone()),
+            );
             info!(
                 cell = ?req.station_cell.to_array(),
                 item = item.0,
@@ -996,7 +1020,10 @@ fn receive_deposit_to_station(
 ///    whose inputs the inventory satisfies; consume inputs, set
 ///    active_work, register the worker. Silent skip if no such
 ///    order exists.
-#[allow(clippy::too_many_arguments, reason = "wire handler joins many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wire handler joins many subsystems"
+)]
 fn receive_work_start(
     mut receivers: Query<(Entity, &mut MessageReceiver<WorkStart>)>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
@@ -1036,12 +1063,9 @@ fn receive_work_start(
                 );
                 continue;
             }
-            let Some(station_def) = lookup_station_def(
-                req.station_cell,
-                &chunks,
-                &chunk_map,
-                &block_registry,
-            ) else {
+            let Some(station_def) =
+                lookup_station_def(req.station_cell, &chunks, &chunk_map, &block_registry)
+            else {
                 continue;
             };
             let worker_tool = tool.item;
@@ -1124,9 +1148,7 @@ pub(crate) fn clear_destroyed_stations(
         return;
     };
     for edit in reader.read() {
-        if edit.prev_slot.is_empty()
-            || block_registry.def(edit.prev_slot).station_tag.is_none()
-        {
+        if edit.prev_slot.is_empty() || block_registry.def(edit.prev_slot).station_tag.is_none() {
             continue;
         }
         bookings.force_clear_station(edit.world);
@@ -1152,8 +1174,7 @@ pub(crate) fn clear_destroyed_stations(
         let mut spilled = 0u32;
         for (slot, count) in state.inventory.iter() {
             for _ in 0..*count {
-                let translation =
-                    centre + crate::items::drop_jitter(edit.world, unit_index);
+                let translation = centre + crate::items::drop_jitter(edit.world, unit_index);
                 unit_index += 1;
                 spilled += 1;
                 commands.spawn((
@@ -1206,7 +1227,10 @@ const WORK_PROGRESS_BROADCAST_INTERVAL_SECS: f32 = 0.25;
 /// `WORK_PROGRESS_BROADCAST_INTERVAL_SECS` so the modal's progress
 /// label can advance. The completion broadcast happens regardless.
 #[allow(clippy::too_many_arguments, reason = "tick joins many subsystems")]
-#[allow(clippy::too_many_arguments, reason = "completion path joins many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "completion path joins many subsystems"
+)]
 fn tick_station_work(
     time: Res<Time>,
     item_registry: Res<crate::items::ItemRegistry>,
@@ -1242,9 +1266,7 @@ fn tick_station_work(
     // until someone resumes via WorkStart.
     let active_cells: Vec<IVec3> = stations
         .iter()
-        .filter(|(cell, state)| {
-            state.active_work.is_some() && bookings.has_worker(**cell)
-        })
+        .filter(|(cell, state)| state.active_work.is_some() && bookings.has_worker(**cell))
         .map(|(cell, _)| *cell)
         .collect();
     for cell in active_cells {
@@ -1314,17 +1336,19 @@ fn tick_station_work(
                 .map(|ch| ch.get(local).is_empty())
                 .unwrap_or(false)
         };
-        let spawn_cell = candidates.into_iter().find(|&c| cell_is_empty(c)).unwrap_or_else(|| {
-            warn!(
-                cell = ?cell.to_array(),
-                "station fully enclosed; crafted output spawning inside solid cell",
-            );
-            above
-        });
+        let spawn_cell = candidates
+            .into_iter()
+            .find(|&c| cell_is_empty(c))
+            .unwrap_or_else(|| {
+                warn!(
+                    cell = ?cell.to_array(),
+                    "station fully enclosed; crafted output spawning inside solid cell",
+                );
+                above
+            });
         let spawn_base = spawn_cell.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
         for unit in 0..recipe.output.count {
-            let angle = (unit as f32) * std::f32::consts::TAU
-                / recipe.output.count.max(1) as f32;
+            let angle = (unit as f32) * std::f32::consts::TAU / recipe.output.count.max(1) as f32;
             let offset = Vec3::new(angle.cos() * 0.12, 0.0, angle.sin() * 0.12);
             let translation = spawn_base + offset;
             commands.spawn((
@@ -1377,29 +1401,24 @@ fn tick_station_work(
         // before the next craft starts. Determining "is this an
         // NPC?" is a single ECS lookup on the worker entity.
         let worker_entity = bookings.worker_at(cell);
-        let worker_is_npc = worker_entity
-            .map(|e| npc_q.get(e).is_ok())
-            .unwrap_or(false);
+        let worker_is_npc = worker_entity.map(|e| npc_q.get(e).is_ok()).unwrap_or(false);
         let mut auto_continued = false;
         if worker_is_npc && let Some(worker) = worker_entity {
             // Look up the station def fresh in case the block was
             // replaced mid-craft (degenerate but defensive).
-            if let Some(station_def) = lookup_station_def(
-                cell,
-                &chunks,
-                &chunk_map,
-                &block_registry,
-            ) && try_start_first_satisfiable_order(
-                cell,
-                worker,
-                tools.get(worker).ok().and_then(|t| t.item),
-                &station_def,
-                &item_registry,
-                &recipes,
-                &mut stations,
-                &mut bookings,
-            )
-            .is_some()
+            if let Some(station_def) =
+                lookup_station_def(cell, &chunks, &chunk_map, &block_registry)
+                && try_start_first_satisfiable_order(
+                    cell,
+                    worker,
+                    tools.get(worker).ok().and_then(|t| t.item),
+                    &station_def,
+                    &item_registry,
+                    &recipes,
+                    &mut stations,
+                    &mut bookings,
+                )
+                .is_some()
             {
                 auto_continued = true;
             }
@@ -1555,11 +1574,9 @@ pub(crate) fn broadcast_station(
     state: Option<StationState>,
 ) {
     let msg = StationUpdate { cell, state };
-    if let Err(err) = broadcast.send::<StationUpdate, WorldChannel>(
-        &msg,
-        server,
-        &NetworkTarget::All,
-    ) {
+    if let Err(err) =
+        broadcast.send::<StationUpdate, WorldChannel>(&msg, server, &NetworkTarget::All)
+    {
         warn!("station update broadcast failed: {err}");
     }
 }

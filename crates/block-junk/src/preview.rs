@@ -127,6 +127,23 @@ impl Material for PreviewBack {
     }
 }
 
+/// On a `SceneRoot` entity whose glTF materials should be replaced by
+/// the preview front/back pair. The material-swap observer (in
+/// `client.rs`) fires on `SceneInstanceReady` for any root carrying
+/// this component — the cursor placement preview installs the shared
+/// re-tinted pair, plan ghosts install per-block fixed-tint handles.
+#[derive(Component)]
+pub struct PreviewMaterialPair {
+    pub front: Handle<PreviewFront>,
+    pub back: Handle<PreviewBack>,
+}
+
+/// Inserted on a preview scene root once the material swap completed.
+/// Until then the scene stays `Visibility::Hidden` so the player never
+/// sees a frame of the original glTF materials.
+#[derive(Component)]
+pub struct PreviewSceneReady;
+
 /// Plugin: registers both materials with the renderer and embeds the
 /// shader so the binary is self-contained (no `assets/shaders/...` to
 /// ship at runtime).

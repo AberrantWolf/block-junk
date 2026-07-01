@@ -20,6 +20,8 @@ use block_junk_mod_api::{
     recipes::RecipeDef,
     rooms::{RoomEvent, RoomPattern},
     server::BlockPlacedEvent,
+    shared::BlockPos,
+    ui::{InspectTarget, UiToast},
 };
 use mlua::{Function, Lua, LuaSerdeExt, SerializeOptions, Table, Value};
 use thiserror::Error;
@@ -59,6 +61,7 @@ pub enum LoadError {
 /// Slot in the per-mod `engine` table where a registered hook callback lives.
 const BLOCK_PLACED_SLOT: &str = "_block_placed_handler";
 const ROOM_EVENT_SLOT: &str = "_room_event_handler";
+const INSPECT_SLOT: &str = "_inspect_handler";
 /// Sub-table on `engine` holding per-kind NPC planner callbacks. Unlike
 /// the single-slot hooks above, planners are keyed by NPC kind id so one
 /// mod can plan for multiple kinds it has registered.
@@ -88,6 +91,11 @@ pub struct LoadContext {
     /// rule as work-defaults — two mods can't silently disagree on how
     /// rooms group into clusters.
     pub pending_civilization_params: Arc<Mutex<Option<CivilizationParams>>>,
+    /// Unlike the `pending_*` buffers above (drained once after load),
+    /// this is a **runtime** queue: `engine.ui.toast` pushes into it for
+    /// the lifetime of the session and the engine drains it every tick.
+    /// The engine keeps a clone of the Arc (see [`Self::ui_toast_queue`]).
+    pub ui_toasts: Arc<Mutex<Vec<UiToast>>>,
 }
 
 impl LoadContext {
@@ -143,6 +151,13 @@ impl LoadContext {
     /// [`CivilizationParams::default`].
     pub fn take_civilization_params(&self) -> Option<CivilizationParams> {
         std::mem::take(&mut *self.pending_civilization_params.lock().unwrap())
+    }
+
+    /// Clone the live `engine.ui.toast` queue handle. The engine stores
+    /// this in a resource and drains it every tick — pushes from Lua at
+    /// any later point land in the same queue.
+    pub fn ui_toast_queue(&self) -> Arc<Mutex<Vec<UiToast>>> {
+        self.ui_toasts.clone()
     }
 }
 
@@ -222,6 +237,29 @@ impl ModRegistry {
                 m.disabled = true;
             }
         }
+    }
+
+    /// Client-side: collect inspect-panel contributions for the hovered
+    /// target. Each active mod's `engine.ui.on_inspect` callback may
+    /// return one string (a line/block of text appended to the panel)
+    /// or nil. A callback that errors disables its mod for the session,
+    /// same policy as the server-side hooks.
+    pub fn call_inspect(&mut self, target: &InspectTarget) -> Vec<String> {
+        let mut lines = Vec::new();
+        for m in &mut self.mods {
+            if m.disabled {
+                continue;
+            }
+            match call_inspect_hook(&m.lua, target) {
+                Ok(Some(text)) => lines.push(text),
+                Ok(None) => {}
+                Err(e) => {
+                    error!(mod_name = %m.name, error = %e, "disabling mod after callback error");
+                    m.disabled = true;
+                }
+            }
+        }
+        lines
     }
 
     /// Server-only: dispatch a room-detector event to every active mod.
@@ -317,13 +355,12 @@ fn load_mod(side: Side, dir: &Path, ctx: &LoadContext) -> Result<LoadedMod, Load
         source: e,
     })?;
 
-    let target = ApiVersion::parse(&manifest.api_version).map_err(|reason| {
-        LoadError::ApiVersion {
+    let target =
+        ApiVersion::parse(&manifest.api_version).map_err(|reason| LoadError::ApiVersion {
             name: manifest.name.clone(),
             target: manifest.api_version.clone(),
             reason: reason.to_owned(),
-        }
-    })?;
+        })?;
     if !ApiVersion::is_compatible_with(target, API_VERSION) {
         return Err(LoadError::ApiVersion {
             name: manifest.name.clone(),
@@ -488,10 +525,9 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     let get_need = lua.create_function(move |lua, id: String| -> mlua::Result<Value> {
         let buf = pending_needs_get.lock().unwrap();
         match buf.iter().find(|n| n.id.as_str() == id) {
-            Some(def) => Ok(lua.to_value_with(
-                def,
-                SerializeOptions::new().serialize_none_to_null(false),
-            )?),
+            Some(def) => {
+                Ok(lua.to_value_with(def, SerializeOptions::new().serialize_none_to_null(false))?)
+            }
             None => Ok(Value::Nil),
         }
     })?;
@@ -616,6 +652,30 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     civ_table.set("set_params", set_civ_params)?;
     engine.set("civilization", civ_table)?;
 
+    // engine.ui — the content-level UI seed (see mod-api's `ui` module
+    // docs). Both sides expose the same two entries:
+    //   - toast(pos, text): pushes into this side's runtime queue. On
+    //     the server the engine broadcasts drained toasts to every
+    //     client; on the client they render locally.
+    //   - on_inspect(fn): stores a hover-inspect callback. Only the
+    //     client ever calls it, but registering is side-agnostic so
+    //     mods can do it from data.lua without an `engine.side` check.
+    let ui_table = lua.create_table()?;
+    let toast_queue = ctx.ui_toasts.clone();
+    let push_toast = lua.create_function(move |lua, (pos, text): (Value, String)| {
+        let pos: BlockPos = lua.from_value(pos)?;
+        toast_queue.lock().unwrap().push(UiToast { pos, text });
+        Ok(())
+    })?;
+    ui_table.set("toast", push_toast)?;
+    let register_inspect = lua.create_function(|lua, callback: Function| {
+        let engine: Table = lua.globals().get("engine")?;
+        engine.set(INSPECT_SLOT, callback)?;
+        Ok(())
+    })?;
+    ui_table.set("on_inspect", register_inspect)?;
+    engine.set("ui", ui_table)?;
+
     if side == Side::Server {
         let register = lua.create_function(|lua, callback: Function| {
             let engine: Table = lua.globals().get("engine")?;
@@ -655,6 +715,27 @@ fn call_block_placed(lua: &Lua, event: &BlockPlacedEvent) -> Result<(), mlua::Er
     };
     let event_value = lua.to_value_with(event, lua_event_options())?;
     handler.call::<()>(event_value)
+}
+
+/// Invoke one mod's inspect hook. `Ok(None)` covers both "no handler
+/// registered" and "handler returned nil"; any non-string non-nil
+/// return is an error (the mod author's bug should be loud).
+fn call_inspect_hook(lua: &Lua, target: &InspectTarget) -> Result<Option<String>, mlua::Error> {
+    let engine: Table = lua.globals().get("engine")?;
+    let handler: Value = engine.get(INSPECT_SLOT)?;
+    let Value::Function(handler) = handler else {
+        return Ok(None);
+    };
+    let target_value = lua.to_value_with(target, lua_event_options())?;
+    let returned: Value = handler.call(target_value)?;
+    match returned {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_owned())),
+        other => Err(mlua::Error::external(format!(
+            "engine.ui.on_inspect callback must return a string or nil, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 fn call_room_event(lua: &Lua, event: &RoomEvent) -> Result<(), mlua::Error> {

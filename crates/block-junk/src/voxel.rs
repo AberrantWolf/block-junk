@@ -68,10 +68,7 @@ pub enum EntryKind {
 impl ChunkEntities {
     /// Linear lookup. O(n) but n is tiny in practice.
     pub fn get(&self, cell: IVec3) -> Option<EntryKind> {
-        self.entries
-            .iter()
-            .find(|e| e.cell == cell)
-            .map(|e| e.kind)
+        self.entries.iter().find(|e| e.cell == cell).map(|e| e.kind)
     }
 
     /// Set or replace the entry at `cell`. Returns the previous entry if
@@ -93,7 +90,6 @@ impl ChunkEntities {
             .position(|e| e.cell == cell)
             .map(|i| self.entries.swap_remove(i).kind)
     }
-
 }
 
 impl Chunk {
@@ -229,12 +225,7 @@ impl Chunk {
     fn is_interior(cell: IVec3) -> bool {
         let lo = 1;
         let hi = (CHUNK_PADDED - 1) as i32;
-        cell.x >= lo
-            && cell.y >= lo
-            && cell.z >= lo
-            && cell.x < hi
-            && cell.y < hi
-            && cell.z < hi
+        cell.x >= lo && cell.y >= lo && cell.z >= lo && cell.x < hi && cell.y < hi && cell.z < hi
     }
 
     pub fn build_mesh(&self, registry: &BlockRegistry) -> Option<Mesh> {

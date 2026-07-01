@@ -269,11 +269,7 @@ impl BlockTextureRef {
             BlockTextureRef::Single(id) => [Some(id.as_str()); 3],
             BlockTextureRef::PerFace { top, side, bottom } => {
                 let side = side.as_deref();
-                [
-                    top.as_deref().or(side),
-                    side,
-                    bottom.as_deref().or(side),
-                ]
+                [top.as_deref().or(side), side, bottom.as_deref().or(side)]
             }
         }
     }

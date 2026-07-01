@@ -89,6 +89,17 @@ impl RejectReason {
     }
 }
 
+/// Server → all clients: a worldspace toast requested by a mod via
+/// `engine.ui.toast`. Sparse by design (mods toast on events, not per
+/// tick) so broadcasting a short string stays well inside the bandwidth
+/// budget; text is length-capped at the drain site.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct WorldToast {
+    /// Cell the toast anchors to.
+    pub cell: IVec3,
+    pub text: String,
+}
+
 /// Server-internal local-bus event, NOT a wire message. Emitted once per
 /// world cell whose slot changed. Subscribers (room dirty-marking, drop
 /// spawning, mod scripting hooks) react cell-by-cell without needing to
@@ -208,7 +219,9 @@ pub struct NpcAnimOverride(pub Option<String>);
 /// when a creative-mode toggle is allowed; today the request is granted
 /// unconditionally. Replicated + predicted so the owner client stays in
 /// sync without needing to wait a round-trip after pressing F1.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[derive(
+    Component, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Reflect,
+)]
 pub enum MovementMode {
     /// Walking: gravity, jump, AABB collision against the world.
     #[default]
@@ -338,7 +351,11 @@ impl Carrying {
         let item = self.item.take()?;
         let count = self.count;
         self.count = 0;
-        if count == 0 { None } else { Some((item, count)) }
+        if count == 0 {
+            None
+        } else {
+            Some((item, count))
+        }
     }
 }
 
@@ -375,12 +392,18 @@ impl EquippedTool {
 /// plan. Server-authoritative entity; replicated to every client.
 ///
 /// `item` is the registry slot (compact wire format, like `BlockSlot`
-/// for chunk storage). `translation` is the entity's world position at
-/// spawn — items don't move in Phase 1, so this is set once on the
-/// server and never updated, but lightyear still re-syncs on initial
-/// replicate and on any future server-side mutation. Yaw is omitted
-/// for now (items are tumbled visually with a per-entity random offset
-/// derived from spawn position; no facing direction to track).
+/// for chunk storage). `translation` is the entity's world position and
+/// the server-side source of truth (haul/pickup proximity and the save
+/// read it, not `Transform`). It is set on spawn and then mutated only
+/// when the item settles: drops fall to solid ground when spawned or
+/// when the block under them is mined, and rise when a block is built
+/// into their cell (see `settle_item_cell`). Each change is one
+/// replicated delta — items are otherwise static, so there is no
+/// per-tick traffic. `translation.y` is always the resting cell's base
+/// plus a tiny lift, so `translation.floor()` recovers the owning cell.
+/// Yaw is omitted for now (items are tumbled visually with a per-entity
+/// random offset derived from spawn position; no facing direction to
+/// track).
 ///
 /// 14 bytes on the wire (Vec3 + u16). Stacks of 5 dropped from one
 /// destroyed block are 5 entities = 70 B/spawn. Profile if drop rates

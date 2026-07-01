@@ -1,6 +1,5 @@
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::menu::AppState;
 use crate::protocol::AvatarPose;
@@ -34,43 +33,12 @@ pub struct FlyCamPlugin;
 
 impl Plugin for FlyCamPlugin {
     fn build(&self, app: &mut App) {
-        // Cursor capture is bound to AppState transitions: entering
-        // InGame locks the cursor, leaving releases. During gameplay
-        // the [`UiCaptures`] SSOT owns the cursor — overlays
-        // acquire/release captures and the apply_cursor_mode system
-        // handles the window. lock_cursor / release_cursor here only
-        // bridge the state-transition boundary.
-        app.add_systems(OnEnter(AppState::InGame), lock_cursor)
-            .add_systems(OnExit(AppState::InGame), release_cursor)
-            .add_systems(Update, fly_cam_input.run_if(in_state(AppState::InGame)));
+        // Cursor lock/release is fully owned by [`crate::ui_capture`]
+        // — including the AppState transition boundaries. This plugin
+        // never touches `CursorOptions`; it only *reads* the capture
+        // state to gate mouse-look.
+        app.add_systems(Update, fly_cam_input.run_if(in_state(AppState::InGame)));
     }
-}
-
-fn lock_cursor(
-    mut windows: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
-    mut discard: ResMut<DiscardNextMotion>,
-) {
-    if let Ok((mut window, mut cursor)) = windows.single_mut() {
-        capture(&mut window, &mut cursor, &mut discard);
-    }
-}
-
-fn release_cursor(mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>) {
-    if let Ok(mut cursor) = cursors.single_mut() {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-    }
-}
-
-/// Lock the cursor *and* yank it to the window centre. Without the recentre,
-/// a click immediately after capture lands at whatever screen position the
-/// cursor was at — often outside the game window — activating other apps.
-fn capture(window: &mut Window, cursor: &mut CursorOptions, discard: &mut DiscardNextMotion) {
-    let centre = Vec2::new(window.resolution.width(), window.resolution.height()) * 0.5;
-    window.set_cursor_position(Some(centre));
-    cursor.grab_mode = CursorGrabMode::Locked;
-    cursor.visible = false;
-    discard.0 = true;
 }
 
 fn fly_cam_input(

@@ -560,10 +560,7 @@ pub fn process_dirty(
 /// Canonical key for a floor-cell set: the lexicographically minimum cell.
 /// Stable across re-detection as long as the set itself doesn't change.
 fn canonical_min(cells: &[IVec3]) -> Option<IVec3> {
-    cells
-        .iter()
-        .copied()
-        .min_by_key(|c| (c.y, c.x, c.z))
+    cells.iter().copied().min_by_key(|c| (c.y, c.x, c.z))
 }
 
 fn bbox_contains(min: IVec3, max: IVec3, p: IVec3) -> bool {
@@ -583,11 +580,7 @@ fn bbox_contains(min: IVec3, max: IVec3, p: IVec3) -> bool {
 /// still enclosed; the player just bumps their head. Headroom is a
 /// pathing/standability concern, not a room-detection one — it'll
 /// belong to NPC AI when that lands.
-fn is_floor_cell(
-    c: IVec3,
-    get_block: &impl Fn(IVec3) -> BlockSlot,
-    reg: &BlockRegistry,
-) -> bool {
+fn is_floor_cell(c: IVec3, get_block: &impl Fn(IVec3) -> BlockSlot, reg: &BlockRegistry) -> bool {
     let here_slot = get_block(c);
     let here_def = reg.def(here_slot);
     let here_passable = here_slot.is_empty() || here_def.flags.support_in_cell;
@@ -831,10 +824,7 @@ fn compute_signature(
 
 /// Find the deepest matching pattern (with the parent chain's constraints
 /// also satisfied), breaking ties by `priority` then registration order.
-fn match_pattern(
-    sig: &RoomSignature,
-    registry: &RoomPatternRegistry,
-) -> Option<RoomPatternId> {
+fn match_pattern(sig: &RoomSignature, registry: &RoomPatternRegistry) -> Option<RoomPatternId> {
     let mut best: Option<(&RoomPattern, u32)> = None;
     'pattern: for pattern in registry.iter() {
         if pattern.domain != sig.domain {

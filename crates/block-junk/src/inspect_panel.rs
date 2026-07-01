@@ -27,11 +27,11 @@ use crate::client::{RAYCAST_REACH, entity_aware_raycast, raycast_npcs, raycast_w
 use crate::craft_stations::CraftStations;
 use crate::items::{ItemRegistry, ItemSlot};
 use crate::menu::AppState;
+use crate::npc::{Npc, NpcId};
 use crate::plans::{PlanDragState, Plans, raycast_plans};
 use crate::protocol::{
     AvatarPose, GameSet, NpcDetails, PlanKind, RequestNpcDetails, WorldChannel, WorldItem,
 };
-use crate::npc::{Npc, NpcId};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
 pub struct InspectPanelPlugin;
@@ -42,7 +42,11 @@ impl Plugin for InspectPanelPlugin {
         app.add_systems(OnEnter(AppState::InGame), spawn_inspect_panel);
         app.add_systems(
             Update,
-            (refresh_inspect_target, receive_npc_details, refresh_inspect_panel)
+            (
+                refresh_inspect_target,
+                receive_npc_details,
+                refresh_inspect_panel,
+            )
                 .chain()
                 .in_set(GameSet::Input)
                 .run_if(in_state(AppState::InGame)),
@@ -77,7 +81,9 @@ pub enum InspectState {
     /// every refresh to show the current materials progress — we
     /// don't snapshot here so deposits update without per-tick
     /// state-resolution churn.
-    Plan { cell: IVec3 },
+    Plan {
+        cell: IVec3,
+    },
     /// A loose [`WorldItem`] under the cursor — wins over block /
     /// NPC / plan hits when it's the closest target. Keyed by
     /// [`ItemSlot`] (not the entity) because the panel only renders
@@ -85,7 +91,9 @@ pub enum InspectState {
     /// drives same/different change detection. Stack-merging or
     /// per-entity inspection (count badges, "who reserved this")
     /// would need the Entity instead.
-    Item { slot: ItemSlot },
+    Item {
+        slot: ItemSlot,
+    },
 }
 
 #[derive(Component)]
@@ -113,8 +121,8 @@ fn spawn_inspect_panel(mut commands: Commands, existing: Query<(), With<InspectP
                 row_gap: Val::Px(6.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.10, 0.08, 0.07, 0.85)),
-            BorderColor::all(Color::srgba(0.95, 0.85, 0.55, 0.45)),
+            BackgroundColor(crate::ui_theme::PANEL_BG),
+            BorderColor::all(crate::ui_theme::PANEL_BORDER),
             Visibility::Hidden,
         ))
         .with_children(|panel| {
@@ -124,13 +132,16 @@ fn spawn_inspect_panel(mut commands: Commands, existing: Query<(), With<InspectP
                     font_size: 14.0,
                     ..default()
                 },
-                TextColor(Color::srgb(0.95, 0.92, 0.85)),
+                TextColor(crate::ui_theme::TEXT),
                 InspectPanelText,
             ));
         });
 }
 
-#[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "input system spans many subsystems"
+)]
 fn refresh_inspect_target(
     captures: Res<crate::ui_capture::UiCaptures>,
     drag: Res<PlanDragState>,
@@ -162,7 +173,15 @@ fn refresh_inspect_target(
     // raycast returns the cell; NPC raycast returns the body-AABB
     // hit's t (its distance directly). For block hits we approximate
     // distance as the centre of the cell.
-    let block_hit = entity_aware_raycast(origin, dir, RAYCAST_REACH, &chunks, &chunk_map, &registry, None);
+    let block_hit = entity_aware_raycast(
+        origin,
+        dir,
+        RAYCAST_REACH,
+        &chunks,
+        &chunk_map,
+        &registry,
+        None,
+    );
     let npc_hit = raycast_npcs(origin, dir, RAYCAST_REACH, &npcs);
     let plan_hit = raycast_plans(origin, dir, RAYCAST_REACH, &plans);
     let item_hit = raycast_world_items(origin, dir, RAYCAST_REACH, &world_items);
@@ -187,9 +206,7 @@ fn refresh_inspect_target(
                 && plan_dist.map(|p| i < p).unwrap_or(true)
         })
         .unwrap_or(false);
-    if item_beats_all
-        && let Some((_, _, slot)) = item_hit
-    {
+    if item_beats_all && let Some((_, _, slot)) = item_hit {
         let same = matches!(&target.state, InspectState::Item { slot: s } if *s == slot);
         if !same {
             target.state = InspectState::Item { slot };
@@ -212,7 +229,8 @@ fn refresh_inspect_target(
         (Some(_), None) => true,
         _ => false,
     };
-    if plan_beats_block && plan_beats_npc
+    if plan_beats_block
+        && plan_beats_npc
         && let Some((_, cell)) = plan_hit
     {
         let same = matches!(&target.state, InspectState::Plan { cell: c } if *c == cell);
@@ -301,7 +319,10 @@ fn receive_npc_details(
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "inspect render pulls from many sources")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "inspect render pulls from many sources"
+)]
 fn refresh_inspect_panel(
     target: Res<InspectTarget>,
     registry: Res<BlockRegistry>,
@@ -309,6 +330,7 @@ fn refresh_inspect_panel(
     recipes: Res<crate::recipes::RecipeRegistry>,
     plans: Res<Plans>,
     stations: Res<CraftStations>,
+    mut mods: ResMut<crate::scripting::ClientMods>,
     mut roots: Query<&mut Visibility, With<InspectPanelRoot>>,
     mut texts: Query<&mut Text, With<InspectPanelText>>,
 ) {
@@ -320,7 +342,25 @@ fn refresh_inspect_panel(
     if !target.is_changed() && !plans.is_changed() && !stations.is_changed() {
         return;
     }
-    let body = render_body(&target.state, &registry, &items, &recipes, &plans, &stations);
+    let mut body = render_body(
+        &target.state,
+        &registry,
+        &items,
+        &recipes,
+        &plans,
+        &stations,
+    );
+    // Mod contributions (`engine.ui.on_inspect`) append below the
+    // engine-rendered body. Only consulted on actual re-render — Lua
+    // is never called per-frame while the cursor parks on one target.
+    if let Some(text) = body.as_mut()
+        && let Some(mod_target) = mod_inspect_target(&target.state, &registry, &items, &plans)
+    {
+        for line in mods.0.call_inspect(&mod_target) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
     let visibility = match body {
         Some(_) => Visibility::Inherited,
         None => Visibility::Hidden,
@@ -330,6 +370,60 @@ fn refresh_inspect_panel(
     }
     for mut text in texts.iter_mut() {
         text.0 = body.clone().unwrap_or_default();
+    }
+}
+
+/// Map the panel's state to the side-agnostic [`InspectTarget`] handed
+/// to `engine.ui.on_inspect` callbacks. `None` for states with nothing
+/// stable to describe (empty space, in-flight NPC fetch).
+fn mod_inspect_target(
+    state: &InspectState,
+    registry: &BlockRegistry,
+    items: &ItemRegistry,
+    plans: &Plans,
+) -> Option<block_junk_mod_api::ui::InspectTarget> {
+    use block_junk_mod_api::shared::BlockPos;
+    use block_junk_mod_api::ui::InspectTarget as ModTarget;
+    let pos = |cell: IVec3| BlockPos {
+        x: cell.x,
+        y: cell.y,
+        z: cell.z,
+    };
+    match state {
+        InspectState::None | InspectState::PendingNpc { .. } => None,
+        InspectState::Npc(details) => Some(ModTarget {
+            kind: "npc".to_owned(),
+            id: details.kind.clone(),
+            pos: None,
+        }),
+        InspectState::Block { cell, slot } => {
+            if slot.is_empty() {
+                return None;
+            }
+            Some(ModTarget {
+                kind: "block".to_owned(),
+                id: registry.id_of(*slot).to_string(),
+                pos: Some(pos(*cell)),
+            })
+        }
+        InspectState::Plan { cell } => {
+            let id = match plans.get(*cell).map(|s| &s.kind) {
+                Some(PlanKind::Build { slot, .. }) if (slot.0 as usize) < registry.slot_count() => {
+                    registry.id_of(*slot).to_string()
+                }
+                _ => String::new(),
+            };
+            Some(ModTarget {
+                kind: "plan".to_owned(),
+                id,
+                pos: Some(pos(*cell)),
+            })
+        }
+        InspectState::Item { slot } => Some(ModTarget {
+            kind: "item".to_owned(),
+            id: items.id_of(*slot).to_string(),
+            pos: None,
+        }),
     }
 }
 
@@ -344,10 +438,14 @@ fn render_body(
 ) -> Option<String> {
     match state {
         InspectState::None => None,
-        InspectState::PendingNpc { last_seen: Some(prev), .. } => Some(format_npc(prev, true)),
-        InspectState::PendingNpc { last_seen: None, npc_id } => {
-            Some(format!("NPC #{} — fetching…", npc_id.0))
-        }
+        InspectState::PendingNpc {
+            last_seen: Some(prev),
+            ..
+        } => Some(format_npc(prev, true)),
+        InspectState::PendingNpc {
+            last_seen: None,
+            npc_id,
+        } => Some(format!("NPC #{} — fetching…", npc_id.0)),
         InspectState::Npc(details) => Some(format_npc(details, false)),
         InspectState::Block { cell, slot } => {
             let mut out = format_block(*cell, *slot, registry);
@@ -374,14 +472,14 @@ fn render_body(
             // resolves them).
             if let Some(plan_state) = plans.get(*cell) {
                 out.push('\n');
-                out.push_str(&format_plan_inner(plan_state, items));
+                out.push_str(&format_plan_inner(plan_state, registry, items));
             }
             Some(out)
         }
         InspectState::Plan { cell } => {
             let header = format!("Plan ({}, {}, {})\n", cell.x, cell.y, cell.z);
             let body = match plans.get(*cell) {
-                Some(state) => format_plan_inner(state, items),
+                Some(state) => format_plan_inner(state, registry, items),
                 None => "(tag cleared)".to_owned(),
             };
             Some(format!("{header}{body}"))
@@ -459,21 +557,21 @@ fn format_station_inner(
 /// on the surrounding context).
 fn format_plan_inner(
     state: &crate::protocol::PlanState,
+    registry: &BlockRegistry,
     items: &ItemRegistry,
 ) -> String {
     let mut out = String::new();
     let kind_str = match &state.kind {
         PlanKind::Remove => "tag: remove".to_owned(),
         PlanKind::Build { slot, .. } => {
-            let def = std::panic::catch_unwind(|| {
-                // BlockRegistry::def panics on unknown slots; this
-                // shouldn't happen in practice (slots come from the
-                // same boot registry), but catch defensively.
-                slot.0
-            });
-            match def {
-                Ok(_) => format!("tag: build (slot {})", slot.0),
-                Err(_) => "tag: build (unknown slot)".to_owned(),
+            // Show the player the block's name, not its internal slot
+            // number. Bounds-check before `def` (which panics on
+            // unknown slots) so a stale plan from a mismatched save
+            // degrades to a readable label instead of a crash.
+            if (slot.0 as usize) < registry.slot_count() {
+                format!("tag: build {}", registry.def(*slot).display_name)
+            } else {
+                format!("tag: build (unknown block, slot {})", slot.0)
             }
         }
     };
@@ -531,7 +629,10 @@ fn format_block(cell: IVec3, slot: BlockSlot, registry: &BlockRegistry) -> Strin
     if let Some(i) = def.interactable.as_ref() {
         out.push_str("\ninteractable\n");
         if let Some(nr) = &i.need_restore {
-            out.push_str(&format!("  need: {}\n  restores: {:.2}\n", nr.need, nr.restores));
+            out.push_str(&format!(
+                "  need: {}\n  restores: {:.2}\n",
+                nr.need, nr.restores
+            ));
         }
         out.push_str(&format!("  duration: {:.1}s\n", i.duration_secs));
         out.push_str(&format!("  exclusive: {}\n", i.exclusive));

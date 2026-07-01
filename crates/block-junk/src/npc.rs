@@ -43,10 +43,7 @@ use crate::interactables::{InteractableIndex, InteractionClaims};
 use crate::items::ItemSlot;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
-use crate::rooms::RoomMap;
-use crate::physics::{
-    EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, standing_pose_translation,
-};
+use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, standing_pose_translation};
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
@@ -54,6 +51,7 @@ use crate::protocol::{
     MovementIntent, MovementMode, NpcAnimOverride, PlanEdit, PlanKind, WorldChannel, WorldClock,
     WorldItem,
 };
+use crate::rooms::RoomMap;
 use crate::scripting::ServerMods;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, world_to_chunk};
 
@@ -122,7 +120,10 @@ pub struct Needs(pub HashMap<String, f32>);
 /// planner that errors per-NPC will accumulate disabled NPCs visibly,
 /// each one logged on the way out.
 #[derive(Component, Clone, Debug)]
-#[allow(dead_code, reason = "field is read by debug HUD (future) and shows up in logs today")]
+#[allow(
+    dead_code,
+    reason = "field is read by debug HUD (future) and shows up in logs today"
+)]
 pub struct BrainDisabled {
     pub reason: String,
 }
@@ -357,9 +358,7 @@ pub enum ArrivalAction {
     /// just sits there until something else does — there's no
     /// auto-drop, since spilling a NPC's stack mid-air would be
     /// surprising).
-    DepositAtPlan {
-        plan_cell: IVec3,
-    },
+    DepositAtPlan { plan_cell: IVec3 },
     /// Prereq leg of a haul cycle: arrive at a reserved tool item
     /// and equip it. Phase 5b — created by the scheduler when an NPC
     /// is assigned to a plan whose `work_action.required_tool`
@@ -608,9 +607,9 @@ fn refresh_npc_activity(
     for (brain, kind, mut override_) in npcs.iter_mut() {
         let next = match &brain.goal {
             Goal::Interacting { animation, .. } => NpcAnimOverride(animation.clone()),
-            Goal::Working { .. } => NpcAnimOverride(
-                kinds.get(&kind.0).map(|k| k.animations.work.clone()),
-            ),
+            Goal::Working { .. } => {
+                NpcAnimOverride(kinds.get(&kind.0).map(|k| k.animations.work.clone()))
+            }
             _ => NpcAnimOverride(None),
         };
         override_.set_if_neq(next);
@@ -781,7 +780,11 @@ fn spawn_initial_npc_on_first_connect(
             Name::new(format!("npc:{}", id.0)),
         ));
     }
-    info!(kind = kind_id, count = cluster.len(), "spawned smoke-test NPC cluster");
+    info!(
+        kind = kind_id,
+        count = cluster.len(),
+        "spawned smoke-test NPC cluster"
+    );
 }
 
 /// Adapter that lets pathfinding query the live world. Treats unloaded
@@ -976,7 +979,10 @@ pub(crate) fn preempt_release_holds(
 ///
 /// Phase 6c will add a `Goal::CraftingAtStation` arm that refunds
 /// consumed recipe inputs back to the station's inventory.
-#[allow(clippy::too_many_arguments, reason = "bundles cleanup-target refs from the brain tick's hot loop")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bundles cleanup-target refs from the brain tick's hot loop"
+)]
 fn preempt_current_goal(
     npc_id: NpcId,
     entity: Entity,
@@ -1033,7 +1039,10 @@ fn preempt_current_goal(
     brain.goal = Goal::Idle;
 }
 
-#[allow(clippy::too_many_arguments, reason = "brain tick spans many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "brain tick spans many subsystems"
+)]
 fn npc_brain_tick(
     time: Res<Time>,
     chunks: Query<&'static Chunk>,
@@ -1667,7 +1676,10 @@ fn npc_brain_tick(
                         &world,
                     );
                 }
-                ArrivalAction::PickupTool { item_entity, item_slot } => {
+                ArrivalAction::PickupTool {
+                    item_entity,
+                    item_slot,
+                } => {
                     // Validate the reserved tool item still exists +
                     // matches the kind we reserved. A despawn between
                     // reserve and arrival (player grabbed it, future
@@ -1758,7 +1770,7 @@ fn npc_brain_tick(
                         &chunk_map,
                         &block_registry,
                     );
-    // A worker-less in-progress craft is a resume: register as
+                    // A worker-less in-progress craft is a resume: register as
                     // the worker and let the ticker continue from the saved
                     // elapsed_secs. The scheduler tool-gated us before sending
                     // us over. Fresh starts go through the shared
@@ -1795,8 +1807,7 @@ fn npc_brain_tick(
                     };
                     if started {
                         if let Some(server) = server {
-                            let snapshot =
-                                craft.stations.get(station_cell).cloned();
+                            let snapshot = craft.stations.get(station_cell).cloned();
                             crate::craft_stations::broadcast_station(
                                 &mut haul.broadcast,
                                 server,
@@ -2014,11 +2025,8 @@ fn npc_brain_tick(
         if let Some(target_cell) = interact_done {
             if is_locked {
                 let slot = slot_at_cell(target_cell, &chunks, &chunk_map, &block_registry);
-                let (anchor_cell, orientation) = resolve_anchor_with_orientation(
-                    target_cell,
-                    &chunk_entities_q,
-                    &chunk_map,
-                );
+                let (anchor_cell, orientation) =
+                    resolve_anchor_with_orientation(target_cell, &chunk_entities_q, &chunk_map);
                 if !try_eject_to_cells(
                     &mut pose,
                     eject_candidates_for_slot(slot.as_ref(), anchor_cell, orientation),
@@ -2099,19 +2107,18 @@ fn npc_brain_tick(
             if !preempted_this_tick
                 && !craft.bookings.contains_npc(*npc_id)
                 && !haul.store.has_assignment(*npc_id)
-                && let Some(station_cell) =
-                    crate::craft_stations::try_schedule_craft_for_npc(
-                        *npc_id,
-                        pose.translation,
-                        &equipped_tool,
-                        &craft.stations,
-                        &mut craft.bookings,
-                        &block_registry,
-                        &craft.recipes,
-                        &haul.item_registry,
-                        &chunks,
-                        &chunk_map,
-                    )
+                && let Some(station_cell) = crate::craft_stations::try_schedule_craft_for_npc(
+                    *npc_id,
+                    pose.translation,
+                    &equipped_tool,
+                    &craft.stations,
+                    &mut craft.bookings,
+                    &block_registry,
+                    &craft.recipes,
+                    &haul.item_registry,
+                    &chunks,
+                    &chunk_map,
+                )
             {
                 // Walk to a standable neighbour of the station block.
                 // Station cells are solid (the workbench itself), so
@@ -2124,15 +2131,9 @@ fn npc_brain_tick(
                     if stand == foot {
                         Some(vec![foot])
                     } else {
-                        find_path(
-                            foot,
-                            stand,
-                            &world,
-                            ASTAR_NODE_BUDGET,
-                            ASTAR_PATH_BUDGET,
-                        )
-                        .map(|raw| smooth_path(raw, &world))
-                        .filter(|p| p.len() >= 1)
+                        find_path(foot, stand, &world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
+                            .map(|raw| smooth_path(raw, &world))
+                            .filter(|p| p.len() >= 1)
                     }
                 });
                 match path {
@@ -2477,15 +2478,10 @@ fn npc_brain_tick(
                         *intent = MovementIntent::default();
                         continue;
                     }
-                    let path = find_path(
-                        foot,
-                        target,
-                        &world,
-                        ASTAR_NODE_BUDGET,
-                        ASTAR_PATH_BUDGET,
-                    )
-                    .map(|raw| smooth_path(raw, &world))
-                    .filter(|p| p.len() >= 2);
+                    let path =
+                        find_path(foot, target, &world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
+                            .map(|raw| smooth_path(raw, &world))
+                            .filter(|p| p.len() >= 2);
                     match path {
                         Some(path) => {
                             npc_path.set_if_neq(NpcPath(path.clone()));
@@ -2552,18 +2548,14 @@ fn npc_brain_tick(
                     // (multi-cell entities contend on one slot).
                     // Orientation rotates both `use_slot.approach`
                     // and `use_slot.pose` into world space.
-                    let (anchor_cell, orientation) = resolve_anchor_with_orientation(
-                        target_cell,
-                        &chunk_entities_q,
-                        &chunk_map,
-                    );
+                    let (anchor_cell, orientation) =
+                        resolve_anchor_with_orientation(target_cell, &chunk_entities_q, &chunk_map);
                     // Atomic claim — only attempted for exclusive
                     // blocks. Non-exclusive interactions (food on a
                     // shelf, water at a well) don't contend; a
                     // queue of NPCs can use them in parallel from
                     // different cells.
-                    if interactable.exclusive
-                        && !interaction_claims.try_claim(anchor_cell, *npc_id)
+                    if interactable.exclusive && !interaction_claims.try_claim(anchor_cell, *npc_id)
                     {
                         info!(
                             npc = npc_id.0,
@@ -2813,8 +2805,7 @@ fn npc_brain_tick(
                     );
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                    let Some(stand_cell) =
-                        nearest_standable_neighbor(target_cell, foot, &world)
+                    let Some(stand_cell) = nearest_standable_neighbor(target_cell, foot, &world)
                     else {
                         info!(
                             npc = npc_id.0,
@@ -2905,9 +2896,7 @@ fn npc_brain_tick(
         // Idle and Resting clear intent (default = no motion).
         let pose_xz = Vec2::new(pose.translation.x, pose.translation.z);
         match &brain.goal {
-            Goal::MoveTo {
-                path, progress, ..
-            } => {
+            Goal::MoveTo { path, progress, .. } => {
                 // Pure-pursuit aim: LOOKAHEAD_DIST ahead of the closest
                 // projection along the path. The `forward` in
                 // `apply_walk_step` is `(-sin(yaw), 0, -cos(yaw))`, so
@@ -3116,9 +3105,15 @@ fn plan_haul_move<W: Walkability>(
     let path = if stand_cell == foot {
         vec![foot]
     } else {
-        find_path(foot, stand_cell, world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
-            .map(|raw| smooth_path(raw, world))
-            .filter(|p| p.len() >= 2)?
+        find_path(
+            foot,
+            stand_cell,
+            world,
+            ASTAR_NODE_BUDGET,
+            ASTAR_PATH_BUDGET,
+        )
+        .map(|raw| smooth_path(raw, world))
+        .filter(|p| p.len() >= 2)?
     };
     Some(Goal::MoveTo {
         path,
@@ -3142,7 +3137,10 @@ fn plan_haul_move<W: Walkability>(
 /// unreachable for [`HAUL_UNREACHABLE_RETRY_SECS`] so the scheduler
 /// doesn't immediately re-pair the same NPC to the same impossible
 /// target.
-#[allow(clippy::too_many_arguments, reason = "haul continuation spans plan + station ctx")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "haul continuation spans plan + station ctx"
+)]
 fn continue_haul_or_release<W: Walkability>(
     npc_id: NpcId,
     kind: &NpcKind,
@@ -3225,7 +3223,10 @@ fn continue_haul_or_release<W: Walkability>(
 /// - `Err(())` — pathfinding failed for whichever destination was
 ///   next; caller releases the haul and parks briefly. Same recovery
 ///   as the existing WorkPlan path-failure branch.
-#[allow(clippy::too_many_arguments, reason = "haul leg picker spans plan + station ctx")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "haul leg picker spans plan + station ctx"
+)]
 fn pick_next_haul_leg<W: Walkability>(
     pose: &AvatarPose,
     target: crate::haul::HaulTarget,
@@ -3345,7 +3346,10 @@ fn pose_to_foot_cell_of(translation: Vec3) -> IVec3 {
 /// is cheap to compute server-side and ranks correctly for "nearer is
 /// better"; a planner that needs euclidean can derive it from `foot` +
 /// `anchor`.
-#[allow(clippy::too_many_arguments, reason = "snapshot builder collates many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "snapshot builder collates many subsystems"
+)]
 fn build_snapshot(
     id: NpcId,
     kind: &NpcKindId,
@@ -3442,8 +3446,14 @@ fn build_snapshot(
 /// `work_action` (Build: block being placed; Remove: live block at
 /// cell) with `WorkDefaults` as the fallback. Planners use these to
 /// pick the highest-payoff nearby plan when several are equidistant.
-#[allow(clippy::too_many_arguments, reason = "snapshot collector mirrors live brain lookups")]
-#[allow(clippy::too_many_arguments, reason = "snapshot collector mirrors live brain lookups")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "snapshot collector mirrors live brain lookups"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "snapshot collector mirrors live brain lookups"
+)]
 fn collect_nearby_plans(
     plans: &Plans,
     plan_claims: &PlanClaims,
@@ -3508,12 +3518,14 @@ fn collect_nearby_plans(
             PlanKind::Build { slot, .. } => Some(slot),
             PlanKind::Remove => {
                 let (coord, local) = world_to_chunk(*cell);
-                chunk_map.0.get(&coord).and_then(|&e| chunks.get(e).ok()).and_then(
-                    |chunk| {
+                chunk_map
+                    .0
+                    .get(&coord)
+                    .and_then(|&e| chunks.get(e).ok())
+                    .and_then(|chunk| {
                         let s = chunk.get(local);
                         if s.is_empty() { None } else { Some(s) }
-                    },
-                )
+                    })
             }
         };
         if let Some(slot) = block_slot
@@ -3638,7 +3650,11 @@ fn interactable_with_slot_at_cell(
     chunks: &Query<&Chunk>,
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
-) -> Option<(Interactable, Option<UseSlot>, block_junk_mod_api::blocks::BlockId)> {
+) -> Option<(
+    Interactable,
+    Option<UseSlot>,
+    block_junk_mod_api::blocks::BlockId,
+)> {
     let (coord, local) = world_to_chunk(cell);
     let entity = *chunk_map.0.get(&coord)?;
     let chunk = chunks.get(entity).ok()?;
@@ -3697,7 +3713,10 @@ fn resolve_use_slot_target<W: Walkability>(
                 }
             }
             let stand = best?.0;
-            Some((stand, Some(compute_use_slot_snap(slot, anchor_cell, orientation))))
+            Some((
+                stand,
+                Some(compute_use_slot_snap(slot, anchor_cell, orientation)),
+            ))
         }
         None => {
             let stand = nearest_standable_neighbor(target_cell, foot, world)?;
@@ -3857,8 +3876,7 @@ fn compute_use_slot_snap(slot: &UseSlot, anchor_cell: IVec3, orientation: Cardin
     // same amount, so the round trip leaves the body where the
     // author asked.
     let model_origin = anchor_origin + Vec3::new(rx, slot.pose[1], rz);
-    let translation =
-        model_origin + Vec3::Y * (EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y);
+    let translation = model_origin + Vec3::Y * (EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y);
     let yaw = orientation.yaw() + slot.yaw;
     UseSlotSnap { translation, yaw }
 }
@@ -3879,7 +3897,10 @@ fn compute_use_slot_snap(slot: &UseSlot, anchor_cell: IVec3, orientation: Cardin
 /// Distance is Manhattan (consistent with `nearby_rooms.distance`);
 /// the radius filter uses Chebyshev because that matches how the
 /// index's `iter_within` is bounded.
-#[allow(clippy::too_many_arguments, reason = "merges per-cell + per-anchor lookups")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "merges per-cell + per-anchor lookups"
+)]
 fn collect_nearby_interactions(
     index: &InteractableIndex,
     claims: &InteractionClaims,
@@ -3936,7 +3957,6 @@ fn collect_nearby_interactions(
     out.truncate(limit);
     out
 }
-
 
 /// Find a standable cell adjacent to `target` that an NPC can stand on
 /// while interacting with `target`. Consumables are typically solid

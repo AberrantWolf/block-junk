@@ -5,12 +5,15 @@
 //! host mode, mirroring the eventual networked split.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 use block_junk_mod_api::Side;
 use block_junk_mod_api::server::BlockPlacedEvent;
 use block_junk_mod_api::shared::BlockPos;
+use block_junk_mod_api::ui::UiToast;
 use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
+use lightyear::prelude::{NetworkTarget, Server, ServerMultiMessageSender};
 
 use crate::block_textures::TextureRegistry;
 use crate::blocks::{BlockRegistry, WorldSlots};
@@ -28,8 +31,42 @@ const MODS_DIR: &str = "./mods";
 pub struct ServerMods(pub ModRegistry);
 
 #[derive(Resource)]
-#[allow(dead_code, reason = "field is read once we add the first client-side hook")]
 pub struct ClientMods(pub ModRegistry);
+
+/// Live handle to this side's `engine.ui.toast` queue. Lua pushes into
+/// it at any point during the session; one drain system per side
+/// empties it every tick (server → broadcast, client → local toasts).
+#[derive(Resource)]
+pub struct ModToastQueue(pub Arc<Mutex<Vec<UiToast>>>);
+
+/// Hard cap on a single mod toast's length. Toasts are glanceable
+/// worldspace chips, not dialogue boxes — and the server broadcasts
+/// the string to everyone, so unbounded text is also a wire concern.
+const TOAST_TEXT_MAX: usize = 120;
+
+/// Drain this side's mod-toast queue, normalising text length. Shared
+/// by both drain systems.
+fn drain_toast_queue(queue: &ModToastQueue) -> Vec<crate::protocol::WorldToast> {
+    let mut drained = queue.0.lock().unwrap();
+    drained
+        .drain(..)
+        .map(|t| {
+            let mut text = t.text;
+            if text.len() > TOAST_TEXT_MAX {
+                let mut end = TOAST_TEXT_MAX;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push('…');
+            }
+            crate::protocol::WorldToast {
+                cell: bevy::math::IVec3::new(t.pos.x, t.pos.y, t.pos.z),
+                text,
+            }
+        })
+        .collect()
+}
 
 pub struct ServerScriptingPlugin;
 
@@ -48,8 +85,10 @@ impl Plugin for ServerScriptingPlugin {
             animations,
             work_defaults,
             civilization_params,
+            ui_toasts,
         } = load_side(Side::Server);
         app.insert_resource(ServerMods(mods));
+        app.insert_resource(ModToastQueue(ui_toasts));
         app.insert_resource(blocks);
         app.insert_resource(slots);
         app.insert_resource(items);
@@ -63,7 +102,12 @@ impl Plugin for ServerScriptingPlugin {
         app.insert_resource(civilization_params);
         app.add_systems(
             Update,
-            (dispatch_block_placed, dispatch_room_events).in_set(GameSet::PostSimulation),
+            (
+                dispatch_block_placed,
+                dispatch_room_events,
+                broadcast_mod_toasts,
+            )
+                .in_set(GameSet::PostSimulation),
         );
     }
 }
@@ -85,8 +129,10 @@ impl Plugin for ClientScriptingPlugin {
             animations,
             work_defaults,
             civilization_params: _,
+            ui_toasts,
         } = load_side(Side::Client);
         app.insert_resource(ClientMods(mods));
+        app.insert_resource(ModToastQueue(ui_toasts));
         app.insert_resource(blocks);
         app.insert_resource(slots);
         app.insert_resource(items);
@@ -97,8 +143,51 @@ impl Plugin for ClientScriptingPlugin {
         app.insert_resource(textures);
         app.insert_resource(animations);
         app.insert_resource(work_defaults);
-        // No client-only hooks yet — the registry is in place so adding one
-        // is a single-system addition rather than a wiring change.
+        // Client-side mod toasts render locally — no round-trip. The
+        // inspect-panel hook (`engine.ui.on_inspect`) is pulled, not
+        // pushed: `inspect_panel::refresh_inspect_panel` calls into
+        // `ClientMods` directly.
+        app.add_systems(
+            Update,
+            drain_client_mod_toasts.in_set(GameSet::PostSimulation),
+        );
+    }
+}
+
+/// Server side: drained `engine.ui.toast` calls become [`WorldToast`]
+/// broadcasts. Sparse traffic — mods toast on events, not per tick.
+fn broadcast_mod_toasts(
+    queue: Res<ModToastQueue>,
+    mut broadcast: ServerMultiMessageSender,
+    servers: Query<&Server>,
+) {
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for toast in drain_toast_queue(&queue) {
+        if let Err(err) = broadcast
+            .send::<crate::protocol::WorldToast, crate::protocol::WorldChannel>(
+                &toast,
+                server,
+                &NetworkTarget::All,
+            )
+        {
+            warn!("mod toast broadcast failed: {err}");
+        }
+    }
+}
+
+/// Client side: drained `engine.ui.toast` calls go straight to the
+/// local worldspace-toast queue.
+fn drain_client_mod_toasts(
+    queue: Res<ModToastQueue>,
+    mut pending: ResMut<crate::worldspace_toast::PendingToasts>,
+) {
+    for toast in drain_toast_queue(&queue) {
+        pending.push(crate::worldspace_toast::SpawnToast {
+            cell: toast.cell,
+            text: toast.text,
+        });
     }
 }
 
@@ -115,6 +204,8 @@ struct LoadResult {
     animations: AnimationRegistry,
     work_defaults: WorkDefaultsRes,
     civilization_params: crate::civilization::CivilizationParamsRes,
+    /// Live `engine.ui.toast` queue handle (runtime, not load-time).
+    ui_toasts: Arc<Mutex<Vec<UiToast>>>,
 }
 
 /// Run mod loading for one side, then build the resulting registries.
@@ -183,7 +274,11 @@ fn load_side(side: Side) -> LoadResult {
         Ok(r) => r,
         Err(e) => panic!("{} need registry build failed: {e}", side.as_str()),
     };
-    info!("[{}] need registry: {} need(s)", side.as_str(), needs.need_count());
+    info!(
+        "[{}] need registry: {} need(s)",
+        side.as_str(),
+        needs.need_count()
+    );
     // Work-action defaults reference a need id, so the need registry
     // must exist first. Either side might consult these (the snapshot
     // builder runs server-side today but the resource is mirrored).
@@ -224,7 +319,10 @@ fn load_side(side: Side) -> LoadResult {
         animations.len()
     );
     if let Err(e) = blocks.validate_use_slot_animations(&animations) {
-        panic!("{} use_slot animation validation failed: {e}", side.as_str());
+        panic!(
+            "{} use_slot animation validation failed: {e}",
+            side.as_str()
+        );
     }
     let npc_kinds = match NpcKindRegistry::build(ctx.take_npc_kinds(), &needs, &animations) {
         Ok(r) => r,
@@ -274,6 +372,7 @@ fn load_side(side: Side) -> LoadResult {
         animations,
         work_defaults,
         civilization_params,
+        ui_toasts: ctx.ui_toast_queue(),
     }
 }
 
@@ -295,10 +394,7 @@ fn dispatch_block_placed(
     }
 }
 
-fn dispatch_room_events(
-    mut reader: MessageReader<RoomEventMsg>,
-    mut mods: ResMut<ServerMods>,
-) {
+fn dispatch_room_events(mut reader: MessageReader<RoomEventMsg>, mut mods: ResMut<ServerMods>) {
     for msg in reader.read() {
         mods.0.dispatch_room_event(&msg.0);
     }

@@ -83,7 +83,6 @@ impl UiCaptures {
     pub fn contains(&self, capture: UiCapture) -> bool {
         self.active.contains(&capture)
     }
-
 }
 
 /// Set on every cursor recentre. The camera's mouse-look reader
@@ -136,11 +135,23 @@ fn apply_cursor_mode(
 /// state transitions and silently disable in-world input. The
 /// `set_changed()` call forces Bevy's change detection to fire even
 /// when the set was already empty — that way the next
-/// [`apply_cursor_mode`] tick locks the cursor regardless of whether
-/// `clear` actually mutated anything.
+/// [`apply_cursor_mode`] tick locks the cursor (with recentre +
+/// motion discard) regardless of whether `clear` actually mutated
+/// anything.
 fn reset_captures_on_ingame_enter(mut captures: ResMut<UiCaptures>) {
     captures.active.clear();
     captures.set_changed();
+}
+
+/// On leaving [`AppState::InGame`], hand the cursor back to the OS.
+/// [`apply_cursor_mode`] only runs in-game, so the transition boundary
+/// needs an explicit release — and it lives here, not in the camera
+/// plugin, because this module is the only writer of `CursorOptions`.
+fn release_cursor_on_ingame_exit(mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>) {
+    if let Ok(mut cursor) = cursors.single_mut() {
+        cursor.grab_mode = CursorGrabMode::None;
+        cursor.visible = true;
+    }
 }
 
 /// Centralized Esc dispatcher. The only system that listens for the
@@ -150,6 +161,11 @@ fn reset_captures_on_ingame_enter(mut captures: ResMut<UiCaptures>) {
 /// between independent handlers each owning their own state.
 ///
 /// Priority (topmost-first):
+///   0. In-flight Plan-mode drag — aborts without committing. Not a
+///      capture (the cursor stays locked mid-drag), but it's the
+///      "topmost" thing Esc should mean while it exists; without
+///      this branch the same press would both cancel the drag (in
+///      plans.rs) and open the pause menu here.
 ///   1. Craft modal — clears `CraftStationUiState`; the modal's own
 ///      capture-sync system releases the capture next tick.
 ///   2. Debug panel — releases its capture directly.
@@ -166,8 +182,13 @@ fn handle_escape(
     keys: Res<ButtonInput<KeyCode>>,
     mut captures: ResMut<UiCaptures>,
     mut craft_ui: ResMut<crate::craft_stations::CraftStationUiState>,
+    mut drag: ResMut<crate::plans::PlanDragState>,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    if drag.active.is_some() {
+        drag.active = None;
         return;
     }
     if captures.contains(UiCapture::CraftModal) {
@@ -204,6 +225,7 @@ impl Plugin for UiCapturesPlugin {
             (apply_cursor_mode, handle_escape).run_if(in_state(AppState::InGame)),
         );
         app.add_systems(OnEnter(AppState::InGame), reset_captures_on_ingame_enter);
+        app.add_systems(OnExit(AppState::InGame), release_cursor_on_ingame_exit);
     }
 }
 

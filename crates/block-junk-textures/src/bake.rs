@@ -141,8 +141,14 @@ mod tests {
         ramp.params.insert(
             "stops".into(),
             ParamValue::Stops(vec![
-                RampStop { pos: 0.0, color: [0.2, 0.2, 0.2] },
-                RampStop { pos: 1.0, color: [0.8, 0.8, 0.8] },
+                RampStop {
+                    pos: 0.0,
+                    color: [0.2, 0.2, 0.2],
+                },
+                RampStop {
+                    pos: 1.0,
+                    color: [0.8, 0.8, 0.8],
+                },
             ]),
         );
         TextureSetDoc {

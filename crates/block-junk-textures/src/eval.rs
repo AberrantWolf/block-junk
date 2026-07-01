@@ -288,9 +288,15 @@ fn eval_grey_op(p: &Params, ctx: &EvalCtx, at: &str) -> Result<Outputs, TexError
     let spec = p.spec;
     let buf = match spec.name {
         "fbm" => {
-            let (cells, octaves, gain, seed) =
-                (p.u32("cells"), p.u32("octaves"), p.f32("gain"), p.u32("seed"));
-            GreyBuf::fill(size, |u, v| noise::fbm_periodic(u, v, cells, octaves, gain, seed))
+            let (cells, octaves, gain, seed) = (
+                p.u32("cells"),
+                p.u32("octaves"),
+                p.f32("gain"),
+                p.u32("seed"),
+            );
+            GreyBuf::fill(size, |u, v| {
+                noise::fbm_periodic(u, v, cells, octaves, gain, seed)
+            })
         }
         "voronoi" => {
             let (cells, jitter, seed) = (p.u32("cells"), p.f32("jitter"), p.u32("seed"));
@@ -409,11 +415,7 @@ fn eval_grey_op(p: &Params, ctx: &EvalCtx, at: &str) -> Result<Outputs, TexError
                     for wy in -1..=1 {
                         for wx in -1..=1 {
                             let off = [wx as f32, wy as f32];
-                            let d = dist_point_segment(
-                                [u + off[0], v + off[1]],
-                                *a,
-                                *b,
-                            );
+                            let d = dist_point_segment([u + off[0], v + off[1]], *a, *b);
                             best = best.min(d);
                         }
                     }
@@ -484,9 +486,9 @@ fn eval_grey_op(p: &Params, ctx: &EvalCtx, at: &str) -> Result<Outputs, TexError
         }
         "warp" => {
             let input = ctx.input(p, "input", at)?;
-            let by_ref = p.reference("by").ok_or_else(|| {
-                TexError::invalid(at, "warp requires a \"by\" reference")
-            })?;
+            let by_ref = p
+                .reference("by")
+                .ok_or_else(|| TexError::invalid(at, "warp requires a \"by\" reference"))?;
             let by = ctx.resolve(by_ref, at)?.clone();
             let amount = p.f32("amount");
             GreyBuf::fill(size, |u, v| {
@@ -498,9 +500,9 @@ fn eval_grey_op(p: &Params, ctx: &EvalCtx, at: &str) -> Result<Outputs, TexError
         }
         "math" => {
             let a = ctx.input(p, "a", at)?;
-            let b_ref = p.reference("b").ok_or_else(|| {
-                TexError::invalid(at, "math requires a \"b\" reference")
-            })?;
+            let b_ref = p
+                .reference("b")
+                .ok_or_else(|| TexError::invalid(at, "math requires a \"b\" reference"))?;
             let b = ctx.resolve(b_ref, at)?;
             let mode = p.enum_str("mode").to_owned();
             let mut out = GreyBuf::new(size);
@@ -526,7 +528,10 @@ fn eval_grey_op(p: &Params, ctx: &EvalCtx, at: &str) -> Result<Outputs, TexError
             ));
         }
     };
-    Ok(vec![(spec.outputs.first().copied().unwrap_or("value"), buf)])
+    Ok(vec![(
+        spec.outputs.first().copied().unwrap_or("value"),
+        buf,
+    )])
 }
 
 fn eval_paint_op(
@@ -659,8 +664,14 @@ mod tests {
 
     fn stops() -> ParamValue {
         ParamValue::Stops(vec![
-            RampStop { pos: 0.0, color: [0.1, 0.1, 0.1] },
-            RampStop { pos: 1.0, color: [0.9, 0.9, 0.9] },
+            RampStop {
+                pos: 0.0,
+                color: [0.1, 0.1, 0.1],
+            },
+            RampStop {
+                pos: 1.0,
+                color: [0.9, 0.9, 0.9],
+            },
         ])
     }
 
@@ -669,7 +680,11 @@ mod tests {
         let layer = LayerDef {
             steps: vec![
                 step("fbm", &[("seed", ParamValue::U32(3))], Some("n")),
-                step("ramp", &[("input", ParamValue::Str("n".into())), ("stops", stops())], None),
+                step(
+                    "ramp",
+                    &[("input", ParamValue::Str("n".into())), ("stops", stops())],
+                    None,
+                ),
             ],
             ..LayerDef::default()
         };
@@ -700,7 +715,10 @@ mod tests {
                 step("voronoi", &[], Some("v")),
                 step(
                     "ramp",
-                    &[("input", ParamValue::Str("v.cells".into())), ("stops", stops())],
+                    &[
+                        ("input", ParamValue::Str("v.cells".into())),
+                        ("stops", stops()),
+                    ],
                     None,
                 ),
             ],
@@ -714,7 +732,10 @@ mod tests {
         let layer = LayerDef {
             steps: vec![step(
                 "ramp",
-                &[("input", ParamValue::Str("nope".into())), ("stops", stops())],
+                &[
+                    ("input", ParamValue::Str("nope".into())),
+                    ("stops", stops()),
+                ],
                 None,
             )],
             ..LayerDef::default()
@@ -728,7 +749,11 @@ mod tests {
     fn mask_gates_paint_coverage() {
         let layer = LayerDef {
             steps: vec![
-                step("gradient", &[("dir", ParamValue::Str("x".into()))], Some("g")),
+                step(
+                    "gradient",
+                    &[("dir", ParamValue::Str("x".into()))],
+                    Some("g"),
+                ),
                 step(
                     "fill",
                     &[

@@ -37,6 +37,7 @@ pub mod items;
 pub mod npcs;
 pub mod recipes;
 pub mod rooms;
+pub mod ui;
 
 use serde::{Deserialize, Serialize};
 
@@ -153,6 +154,7 @@ pub mod server {
 }
 
 pub mod client {
-    // No client-side hooks yet — placeholder so the partition is visible to
-    // mod authors. Add hooks here as systems that need them appear.
+    // Client-leaning hooks live in [`crate::ui`] (`engine.ui.on_inspect`).
+    // This module stays as the partition marker for future client-only
+    // surfaces that aren't UI-shaped.
 }

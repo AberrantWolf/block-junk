@@ -19,8 +19,7 @@ use lightyear::prelude::*;
 use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::camera::FlyCam;
 use crate::client::{
-    PlaceablePalette, PlacementRotation, SelectedBlock, entity_aware_raycast,
-    placement_orientation,
+    PlaceablePalette, PlacementRotation, SelectedBlock, entity_aware_raycast, placement_orientation,
 };
 use crate::menu::AppState;
 use crate::player_mode::PlayerMode;
@@ -104,8 +103,7 @@ impl Plugin for PlansServerPlugin {
         app.add_observer(send_plan_full_sync_on_connect);
         app.add_systems(
             Update,
-            (receive_plan_edits, receive_plan_edit_batches)
-                .in_set(GameSet::Simulation),
+            (receive_plan_edits, receive_plan_edit_batches).in_set(GameSet::Simulation),
         );
     }
 }
@@ -206,10 +204,12 @@ impl DragVerb {
 /// hotbar has no real block, or if the cursor isn't on a solid block.
 ///
 /// Escape during a drag aborts without committing.
-#[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "input system spans many subsystems"
+)]
 fn plan_mode_input(
     mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
     captures: Res<crate::ui_capture::UiCaptures>,
     mode: Res<PlayerMode>,
     cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
@@ -233,11 +233,10 @@ fn plan_mode_input(
         drag.active = None;
         return;
     }
-    // Escape aborts an in-flight drag without committing.
-    if keys.just_pressed(KeyCode::Escape) {
-        drag.active = None;
-        return;
-    }
+    // Escape aborting an in-flight drag lives in the central
+    // `ui_capture::handle_escape` dispatcher (drag cancel is the
+    // topmost Esc consumer) — reading the key here as well would
+    // double-fire and also open the pause menu on the same press.
 
     let Ok((cam_t, fly, pose)) = cam.single() else {
         return;
@@ -251,21 +250,19 @@ fn plan_mode_input(
         let r_pressed = mouse.just_pressed(MouseButton::Right);
         if l_pressed {
             handle_left_press(
-                origin, dir, &chunks, &chunk_map, &registry, &plans, &mut drag, &mut sender,
-            );
-        } else if r_pressed {
-            handle_right_press(
                 origin,
                 dir,
-                fly,
-                pose,
                 &chunks,
                 &chunk_map,
                 &registry,
-                &selected,
-                &palette,
-                &rotation,
+                &plans,
                 &mut drag,
+                &mut sender,
+            );
+        } else if r_pressed {
+            handle_right_press(
+                origin, dir, fly, pose, &chunks, &chunk_map, &registry, &selected, &palette,
+                &rotation, &mut drag,
             );
         }
     }
@@ -309,7 +306,8 @@ fn handle_left_press(
     let plan_hit = raycast_plans(origin, dir, PLAN_REACH, plans);
     // No skip_plan_remove — under the new scheme we want L on a Remove
     // tag to un-tag it, so the ray must stop AT the tagged cell.
-    let world_hit = entity_aware_raycast(origin, dir, PLAN_REACH, chunks, chunk_map, registry, None);
+    let world_hit =
+        entity_aware_raycast(origin, dir, PLAN_REACH, chunks, chunk_map, registry, None);
     let world_dist = world_hit.as_ref().map(|h| cell_centre_dist(h.cell, origin));
     let plan_dist = plan_hit.as_ref().map(|(d, _)| *d);
     // If a plan tag (typically a Build floating in empty space) is
@@ -409,8 +407,10 @@ fn commit_drag(
             }
         }
         DragVerb::Build => {
-            let mut cells: Vec<IVec3> =
-                plane_cells.into_iter().map(|c| c + drag.face_normal).collect();
+            let mut cells: Vec<IVec3> = plane_cells
+                .into_iter()
+                .map(|c| c + drag.face_normal)
+                .collect();
             cap_to_batch_max(&mut cells);
             commit_batch(
                 sender,
@@ -639,7 +639,10 @@ fn build_initial_materials(
 /// edit. Reject (silently) edits that don't make sense against the
 /// world (tag-remove on empty, tag-build on solid).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments, reason = "wire handler + reach gate + rejection reply")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wire handler + reach gate + rejection reply"
+)]
 fn receive_plan_edits(
     mut receivers: Query<(Entity, &mut MessageReceiver<PlanEdit>)>,
     mut plans: ResMut<Plans>,
@@ -669,7 +672,12 @@ fn receive_plan_edits(
                 continue;
             };
             if !within_reach(pose, edit.cell.as_vec3() + Vec3::splat(0.5), PLAN_REACH) {
-                send_rejection(&mut rejections, connection, edit.cell, RejectReason::OutOfReach);
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    edit.cell,
+                    RejectReason::OutOfReach,
+                );
                 continue;
             }
             let (accepted_state, materials_for_broadcast) = match edit.kind {
@@ -677,18 +685,17 @@ fn receive_plan_edits(
                     if !cell_is_solid(edit.cell, &chunks, &chunk_map) {
                         continue;
                     }
-                    (Some(PlanState::new(PlanKind::Remove, Vec::new())), Vec::new())
+                    (
+                        Some(PlanState::new(PlanKind::Remove, Vec::new())),
+                        Vec::new(),
+                    )
                 }
                 Some(kind @ PlanKind::Build { .. }) => {
                     if cell_is_solid(edit.cell, &chunks, &chunk_map) {
                         continue;
                     }
-                    let materials =
-                        build_initial_materials(kind, &block_registry, &item_registry);
-                    (
-                        Some(PlanState::new(kind, materials.clone())),
-                        materials,
-                    )
+                    let materials = build_initial_materials(kind, &block_registry, &item_registry);
+                    (Some(PlanState::new(kind, materials.clone())), materials)
                 }
                 None => {
                     plans.clear(edit.cell);
@@ -803,11 +810,9 @@ fn receive_plan_edit_batches(
                 cells: accepted,
                 materials: shared_materials,
             };
-            if let Err(err) = broadcast.send::<PlanEditBatch, WorldChannel>(
-                &reply,
-                server,
-                &NetworkTarget::All,
-            ) {
+            if let Err(err) =
+                broadcast.send::<PlanEditBatch, WorldChannel>(&reply, server, &NetworkTarget::All)
+            {
                 warn!("PlanEditBatch broadcast failed: {err}");
             }
         }

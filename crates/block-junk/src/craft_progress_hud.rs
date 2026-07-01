@@ -91,7 +91,10 @@ impl Plugin for CraftProgressHudPlugin {
 /// `Visibility::Hidden` (rather than despawned) so brief view
 /// occlusion doesn't churn UI entities every camera turn. Despawn
 /// only fires when the underlying `active_work` goes away.
-#[allow(clippy::too_many_arguments, reason = "UI tracker pulls camera + nodes + state")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "UI tracker pulls camera + nodes + state"
+)]
 fn update_station_progress_bars(
     mut commands: Commands,
     stations: Res<CraftStations>,
@@ -104,7 +107,13 @@ fn update_station_progress_bars(
         &mut Visibility,
         &Children,
     )>,
-    mut fills: Query<&mut Node, (With<WorldspaceProgressBarFill>, Without<WorldspaceProgressBar>)>,
+    mut fills: Query<
+        &mut Node,
+        (
+            With<WorldspaceProgressBarFill>,
+            Without<WorldspaceProgressBar>,
+        ),
+    >,
 ) {
     let Ok((camera, camera_transform)) = cameras.single() else {
         return;
@@ -155,8 +164,7 @@ fn update_station_progress_bars(
                 continue;
             }
         }
-        let progress =
-            (active.elapsed_secs / active.total_secs.max(0.001)).clamp(0.0, 1.0);
+        let progress = (active.elapsed_secs / active.total_secs.max(0.001)).clamp(0.0, 1.0);
         for child in children.iter() {
             if let Ok(mut fill_node) = fills.get_mut(child) {
                 fill_node.width = Val::Percent(progress * 100.0);
@@ -195,7 +203,7 @@ fn spawn_bar_entity(commands: &mut Commands, station_cell: IVec3) -> Entity {
                 ..default()
             },
             BorderColor::all(Color::srgba(0.0, 0.0, 0.0, 0.85)),
-            BackgroundColor(Color::srgba(0.12, 0.10, 0.14, 0.9)),
+            BackgroundColor(crate::ui_theme::PANEL_BG),
             Visibility::Hidden,
         ))
         .with_children(|root| {
@@ -209,7 +217,7 @@ fn spawn_bar_entity(commands: &mut Commands, station_cell: IVec3) -> Entity {
                 // Same magenta-pink the station outline uses in Normal
                 // mode — keeps the visual language consistent ("this
                 // is a craft station thing").
-                BackgroundColor(Color::srgb(0.78, 0.42, 0.95)),
+                BackgroundColor(crate::ui_theme::ACCENT_STATION),
             ));
         })
         .id()

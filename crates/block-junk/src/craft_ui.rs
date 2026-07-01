@@ -97,7 +97,10 @@ fn close_on_block_gone(
 /// R-click on a station block opens the craft-order modal. Esc and
 /// the modal's Close button drive close; this system never closes.
 /// Only `just_pressed` — held R doesn't re-open per frame.
-#[allow(clippy::too_many_arguments, reason = "modal open pulls from many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "modal open pulls from many subsystems"
+)]
 fn open_modal_on_right_click(
     mouse: Res<ButtonInput<MouseButton>>,
     captures: Res<crate::ui_capture::UiCaptures>,
@@ -151,7 +154,10 @@ fn open_modal_on_right_click(
     ui_state.open_cell = Some(hit.cell);
 }
 
-#[allow(clippy::too_many_arguments, reason = "modal pulls from many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "modal pulls from many subsystems"
+)]
 fn draw_craft_modal(
     mut contexts: EguiContexts,
     mut ui_state: ResMut<CraftStationUiState>,
@@ -161,7 +167,10 @@ fn draw_craft_modal(
     registry: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
     recipes: Res<RecipeRegistry>,
-    carry: Query<&Carrying, With<Avatar>>,
+    // `Predicted` filter matters in multiplayer: without it the query
+    // can return a *remote* player's interpolated avatar and the
+    // deposit button reads someone else's carry.
+    carry: Query<&Carrying, (With<Avatar>, With<Predicted>)>,
     mut queue_sender: Query<&mut MessageSender<QueueOrder>>,
     mut cancel_sender: Query<&mut MessageSender<CancelOrder>>,
     mut deposit_sender: Query<&mut MessageSender<DepositToStation>>,
@@ -399,9 +408,7 @@ fn draw_craft_modal(
 
     // Dispatch messages outside the closure to avoid holding any
     // resource borrows during the egui call.
-    if to_deposit
-        && let Ok(mut s) = deposit_sender.single_mut()
-    {
+    if to_deposit && let Ok(mut s) = deposit_sender.single_mut() {
         s.send::<WorldChannel>(DepositToStation { station_cell: cell });
     }
     if let Some(recipe_id) = to_cancel

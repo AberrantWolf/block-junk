@@ -54,10 +54,7 @@ pub fn parse_str(src: &str, source_name: &str) -> Result<TextureSetDoc, TexError
         Ok(Value::Nil) => DEFAULT_PIXELS_PER_BLOCK,
         Ok(Value::Number(n)) if n.fract() == 0.0 => n as u32,
         _ => {
-            return Err(TexError::invalid(
-                "pixels_per_block",
-                "must be an integer",
-            ));
+            return Err(TexError::invalid("pixels_per_block", "must be an integer"));
         }
     };
 
@@ -108,8 +105,7 @@ fn parse_texture(t: &Table, at: &str) -> Result<TextureDef, TexError> {
     let finish = match t.get::<Value>("finish") {
         Ok(Value::Table(ft)) => Some(FinishDef {
             scale: opt_f32(&ft, "scale", &at)?.unwrap_or(FinishDef::default().scale),
-            brightness: opt_f32(&ft, "brightness", &at)?
-                .unwrap_or(FinishDef::default().brightness),
+            brightness: opt_f32(&ft, "brightness", &at)?.unwrap_or(FinishDef::default().brightness),
             seed: opt_u32(&ft, "seed", &at)?.unwrap_or(0),
         }),
         Ok(Value::Nil) => None,
@@ -184,7 +180,11 @@ fn parse_step(t: &Table, at: &str) -> Result<Step, TexError> {
                         &at,
                         format!(
                             "unknown param \"{key}\" (valid: {})",
-                            spec.params.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")
+                            spec.params
+                                .iter()
+                                .map(|p| p.name)
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     ));
                 };
@@ -201,12 +201,7 @@ fn parse_step(t: &Table, at: &str) -> Result<Step, TexError> {
     Ok(step)
 }
 
-fn parse_param(
-    v: &Value,
-    ty: &ParamType,
-    key: &str,
-    at: &str,
-) -> Result<ParamValue, TexError> {
+fn parse_param(v: &Value, ty: &ParamType, key: &str, at: &str) -> Result<ParamValue, TexError> {
     let bad = |want: &str| {
         Err(TexError::invalid(
             at,

@@ -15,7 +15,6 @@
 //! verb matrix.
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::menu::AppState;
 use crate::protocol::GameSet;
@@ -51,11 +50,12 @@ impl PlayerMode {
 
     /// Short summary of the L/R verbs in this mode for the crosshair
     /// hint chip. Kept terse — the player learns it once and the chip
-    /// becomes a recall aid.
+    /// becomes a recall aid. Plan mode gets a second line for the
+    /// wheel verbs, which have no other in-world surface.
     pub fn verb_hint(self) -> &'static str {
         match self {
             PlayerMode::Normal => "L: mine · R: interact",
-            PlayerMode::Plan => "L: remove · R: build",
+            PlayerMode::Plan => "L: remove · R: build\nwheel: block · Ctrl+wheel: rotate",
         }
     }
 
@@ -123,8 +123,8 @@ fn spawn_mode_pill(
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.72)),
-            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.2)),
+            BackgroundColor(crate::ui_theme::CHIP_BG),
+            BorderColor::all(crate::ui_theme::CHIP_BORDER),
         ))
         .with_children(|pill| {
             pill.spawn((
@@ -142,7 +142,7 @@ fn spawn_mode_pill(
                     font_size: 18.0,
                     ..default()
                 },
-                TextColor(Color::WHITE),
+                TextColor(crate::ui_theme::TEXT),
                 ModePillLabel,
             ));
         });
@@ -181,8 +181,8 @@ fn spawn_verb_hint(commands: &mut Commands, mode: PlayerMode) {
                     align_items: AlignItems::Center,
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.55)),
-                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.18)),
+                BackgroundColor(crate::ui_theme::CHIP_BG),
+                BorderColor::all(crate::ui_theme::CHIP_BORDER),
             ))
             .with_children(|chip| {
                 chip.spawn((
@@ -191,7 +191,7 @@ fn spawn_verb_hint(commands: &mut Commands, mode: PlayerMode) {
                         font_size: 12.0,
                         ..default()
                     },
-                    TextColor(Color::srgba(0.92, 0.92, 0.88, 0.85)),
+                    TextColor(crate::ui_theme::TEXT_DIM),
                     VerbHintLabel,
                 ));
             });
@@ -255,8 +255,8 @@ fn spawn_key_cap(parent: &mut ChildSpawnerCommands<'_>, label: &str) {
                 border_radius: BorderRadius::all(Val::Px(3.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.72)),
-            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+            BackgroundColor(crate::ui_theme::CHIP_BG),
+            BorderColor::all(crate::ui_theme::CHIP_BORDER),
         ))
         .with_children(|cap| {
             cap.spawn((
@@ -265,7 +265,7 @@ fn spawn_key_cap(parent: &mut ChildSpawnerCommands<'_>, label: &str) {
                     font_size: 12.0,
                     ..default()
                 },
-                TextColor(Color::srgba(0.9, 0.9, 0.9, 1.0)),
+                TextColor(crate::ui_theme::TEXT),
             ));
         });
 }
@@ -281,16 +281,14 @@ struct VerbHintLabel;
 
 fn handle_mode_input(
     keys: Res<ButtonInput<KeyCode>>,
-    cursors: Query<&CursorOptions, With<PrimaryWindow>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
     mut mode: ResMut<PlayerMode>,
 ) {
-    // Same locked-cursor gate the rest of input uses: while the cursor is
-    // free (paused, alt-tabbed) the keys belong to the menu, not gameplay.
-    let locked = cursors
-        .single()
-        .map(|c| c.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !locked {
+    // SSOT input gate: while any overlay holds the cursor the keys
+    // belong to the UI, not gameplay. Gating on `CursorOptions.grab_mode`
+    // would read a *derived* value one frame late — captures is the
+    // source of truth.
+    if captures.is_captured() {
         return;
     }
 

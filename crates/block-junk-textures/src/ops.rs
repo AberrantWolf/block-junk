@@ -21,20 +21,37 @@ pub enum OpCategory {
 
 #[derive(Clone, Copy, Debug)]
 pub enum ParamType {
-    F32 { min: f32, max: f32, default: f32 },
-    U32 { min: u32, max: u32, default: u32 },
-    Enum { options: &'static [&'static str], default: &'static str },
+    F32 {
+        min: f32,
+        max: f32,
+        default: f32,
+    },
+    U32 {
+        min: u32,
+        max: u32,
+        default: u32,
+    },
+    Enum {
+        options: &'static [&'static str],
+        default: &'static str,
+    },
     /// RGBA, components 0..=1. Alpha scales paint coverage.
-    Color { default: [f32; 4] },
+    Color {
+        default: [f32; 4],
+    },
     /// Reference to a named grey output (`"name"` / `"name.channel"`).
     /// Non-required refs named `input`/`a` default to the previous grey
     /// step's primary output; a non-required `mask`/`b` defaults to "none".
-    Ref { required: bool },
+    Ref {
+        required: bool,
+    },
     /// Color-ramp stop list. Always required where it appears.
     Stops,
     /// u32, default 0. Split from U32 so the editor can show a 🎲 button.
     Seed,
-    Vec2 { default: [f32; 2] },
+    Vec2 {
+        default: [f32; 2],
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +89,11 @@ const BLEND: ParamSpec = p(
 );
 const OPACITY: ParamSpec = p(
     "opacity",
-    ParamType::F32 { min: 0.0, max: 1.0, default: 1.0 },
+    ParamType::F32 {
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+    },
     "Overall strength of this paint",
 );
 const MASK: ParamSpec = p(
@@ -93,12 +114,33 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::GreyGen,
         outputs: &["value"],
         params: &[
-            p("cells", ParamType::U32 { min: 1, max: 64, default: 4 },
-              "Base lattice cells per tile; higher = finer features"),
-            p("octaves", ParamType::U32 { min: 1, max: 8, default: 4 },
-              "Noise layers; each doubles frequency and halves amplitude by gain"),
-            p("gain", ParamType::F32 { min: 0.0, max: 1.0, default: 0.5 },
-              "Amplitude falloff per octave; higher = rougher"),
+            p(
+                "cells",
+                ParamType::U32 {
+                    min: 1,
+                    max: 64,
+                    default: 4,
+                },
+                "Base lattice cells per tile; higher = finer features",
+            ),
+            p(
+                "octaves",
+                ParamType::U32 {
+                    min: 1,
+                    max: 8,
+                    default: 4,
+                },
+                "Noise layers; each doubles frequency and halves amplitude by gain",
+            ),
+            p(
+                "gain",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                },
+                "Amplitude falloff per octave; higher = rougher",
+            ),
             p("seed", ParamType::Seed, "Noise variation"),
         ],
         doc: "Fractal Perlin noise, tileable. The everything-noise: dirt, clouds, grain.",
@@ -108,10 +150,24 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::GreyGen,
         outputs: &["edge", "f1", "cells"],
         params: &[
-            p("cells", ParamType::U32 { min: 1, max: 64, default: 6 },
-              "Feature points per tile side"),
-            p("jitter", ParamType::F32 { min: 0.0, max: 1.0, default: 1.0 },
-              "Point randomness; 0 = perfect grid"),
+            p(
+                "cells",
+                ParamType::U32 {
+                    min: 1,
+                    max: 64,
+                    default: 6,
+                },
+                "Feature points per tile side",
+            ),
+            p(
+                "jitter",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                },
+                "Point randomness; 0 = perfect grid",
+            ),
             p("seed", ParamType::Seed, "Point placement variation"),
         ],
         doc: "Cellular noise. edge = bright inside cells, dark at borders (stones!); \
@@ -130,7 +186,10 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[p(
             "dir",
-            ParamType::Enum { options: &["x", "y", "radial"], default: "y" },
+            ParamType::Enum {
+                options: &["x", "y", "radial"],
+                default: "y",
+            },
             "Ramp direction across the tile",
         )],
         doc: "0→1 ramp across the tile. Block-aligned (seam lands on the period edge).",
@@ -140,12 +199,32 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::GreyGen,
         outputs: &["value"],
         params: &[
-            p("kind", ParamType::Enum { options: &["circle", "box", "diamond"], default: "circle" },
-              "Shape function"),
-            p("size", ParamType::F32 { min: 0.0, max: 1.0, default: 0.6 },
-              "Extent, as a fraction of the tile"),
-            p("softness", ParamType::F32 { min: 0.0, max: 1.0, default: 0.05 },
-              "Edge falloff width"),
+            p(
+                "kind",
+                ParamType::Enum {
+                    options: &["circle", "box", "diamond"],
+                    default: "circle",
+                },
+                "Shape function",
+            ),
+            p(
+                "size",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.6,
+                },
+                "Extent, as a fraction of the tile",
+            ),
+            p(
+                "softness",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.05,
+                },
+                "Edge falloff width",
+            ),
         ],
         doc: "One centred SDF shape, 1 inside fading to 0 at the edge. Combine with \
               transform (scale) for grids of studs, bolts, tiles.",
@@ -155,14 +234,51 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::GreyGen,
         outputs: &["field", "cells"],
         params: &[
-            p("columns", ParamType::U32 { min: 1, max: 32, default: 4 }, "Bricks per row"),
-            p("rows", ParamType::U32 { min: 1, max: 32, default: 8 }, "Rows per tile"),
-            p("gap", ParamType::F32 { min: 0.0, max: 0.4, default: 0.06 },
-              "Mortar width, as a fraction of brick size"),
-            p("bevel", ParamType::F32 { min: 0.0, max: 0.5, default: 0.1 },
-              "Falloff from mortar (0) to brick face (1)"),
-            p("offset", ParamType::F32 { min: 0.0, max: 1.0, default: 0.5 },
-              "Alternate-row horizontal shift; 0.5 = classic running bond"),
+            p(
+                "columns",
+                ParamType::U32 {
+                    min: 1,
+                    max: 32,
+                    default: 4,
+                },
+                "Bricks per row",
+            ),
+            p(
+                "rows",
+                ParamType::U32 {
+                    min: 1,
+                    max: 32,
+                    default: 8,
+                },
+                "Rows per tile",
+            ),
+            p(
+                "gap",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 0.4,
+                    default: 0.06,
+                },
+                "Mortar width, as a fraction of brick size",
+            ),
+            p(
+                "bevel",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 0.5,
+                    default: 0.1,
+                },
+                "Falloff from mortar (0) to brick face (1)",
+            ),
+            p(
+                "offset",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                },
+                "Alternate-row horizontal shift; 0.5 = classic running bond",
+            ),
             p("seed", ParamType::Seed, "Per-brick random (cells output)"),
         ],
         doc: "Brick/plank grid. field = bevelled height (0 in mortar, 1 on faces); \
@@ -173,8 +289,15 @@ pub const OPS: &[OpSpec] = &[
         name: "checker",
         category: OpCategory::GreyGen,
         outputs: &["value"],
-        params: &[p("count", ParamType::U32 { min: 1, max: 32, default: 2 },
-                    "Squares per tile side")],
+        params: &[p(
+            "count",
+            ParamType::U32 {
+                min: 1,
+                max: 32,
+                default: 2,
+            },
+            "Squares per tile side",
+        )],
         doc: "Alternating 0/1 squares.",
     },
     OpSpec {
@@ -182,9 +305,24 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::GreyGen,
         outputs: &["value"],
         params: &[
-            p("count", ParamType::U32 { min: 1, max: 64, default: 4 }, "Stripes per tile"),
-            p("duty", ParamType::F32 { min: 0.0, max: 1.0, default: 0.5 },
-              "Fraction of each stripe that is 1"),
+            p(
+                "count",
+                ParamType::U32 {
+                    min: 1,
+                    max: 64,
+                    default: 4,
+                },
+                "Stripes per tile",
+            ),
+            p(
+                "duty",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                },
+                "Fraction of each stripe that is 1",
+            ),
         ],
         doc: "Horizontal stripes (rotate with transform for vertical). Planks seams, \
               pipes, hazard bands.",
@@ -194,11 +332,33 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::GreyGen,
         outputs: &["value"],
         params: &[
-            p("count", ParamType::U32 { min: 1, max: 64, default: 12 }, "Number of segments"),
-            p("length", ParamType::F32 { min: 0.01, max: 1.0, default: 0.3 },
-              "Segment length, tile fraction"),
-            p("width", ParamType::F32 { min: 0.001, max: 0.2, default: 0.01 },
-              "Stroke width, tile fraction"),
+            p(
+                "count",
+                ParamType::U32 {
+                    min: 1,
+                    max: 64,
+                    default: 12,
+                },
+                "Number of segments",
+            ),
+            p(
+                "length",
+                ParamType::F32 {
+                    min: 0.01,
+                    max: 1.0,
+                    default: 0.3,
+                },
+                "Segment length, tile fraction",
+            ),
+            p(
+                "width",
+                ParamType::F32 {
+                    min: 0.001,
+                    max: 0.2,
+                    default: 0.01,
+                },
+                "Stroke width, tile fraction",
+            ),
             p("seed", ParamType::Seed, "Placement variation"),
         ],
         doc: "Random thin line segments, wrapped at tile edges. Wear, wood grain \
@@ -211,12 +371,51 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[
             INPUT,
-            p("in_lo", ParamType::F32 { min: 0.0, max: 1.0, default: 0.0 }, "Input black point"),
-            p("in_hi", ParamType::F32 { min: 0.0, max: 1.0, default: 1.0 }, "Input white point"),
-            p("gamma", ParamType::F32 { min: 0.1, max: 8.0, default: 1.0 },
-              "Midtone curve; >1 darkens"),
-            p("out_lo", ParamType::F32 { min: 0.0, max: 1.0, default: 0.0 }, "Output black point"),
-            p("out_hi", ParamType::F32 { min: 0.0, max: 1.0, default: 1.0 }, "Output white point"),
+            p(
+                "in_lo",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
+                },
+                "Input black point",
+            ),
+            p(
+                "in_hi",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                },
+                "Input white point",
+            ),
+            p(
+                "gamma",
+                ParamType::F32 {
+                    min: 0.1,
+                    max: 8.0,
+                    default: 1.0,
+                },
+                "Midtone curve; >1 darkens",
+            ),
+            p(
+                "out_lo",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
+                },
+                "Output black point",
+            ),
+            p(
+                "out_hi",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                },
+                "Output white point",
+            ),
         ],
         doc: "Remap value range with a gamma curve. The contrast workhorse.",
     },
@@ -233,7 +432,15 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[
             INPUT,
-            p("steps", ParamType::U32 { min: 2, max: 32, default: 4 }, "Output levels"),
+            p(
+                "steps",
+                ParamType::U32 {
+                    min: 2,
+                    max: 32,
+                    default: 4,
+                },
+                "Output levels",
+            ),
         ],
         doc: "Posterize to N flat levels. Instant cartoon shading.",
     },
@@ -243,10 +450,24 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[
             INPUT,
-            p("threshold", ParamType::F32 { min: 0.0, max: 1.0, default: 0.5 },
-              "Smoothstep midpoint"),
-            p("softness", ParamType::F32 { min: 0.0, max: 0.5, default: 0.05 },
-              "Half-width; 0 = hard cartoon edge"),
+            p(
+                "threshold",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                },
+                "Smoothstep midpoint",
+            ),
+            p(
+                "softness",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 0.5,
+                    default: 0.05,
+                },
+                "Half-width; 0 = hard cartoon edge",
+            ),
         ],
         doc: "Soft cutoff: 0 below, 1 above. Turns any noise into a mask.",
     },
@@ -256,7 +477,15 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[
             INPUT,
-            p("radius", ParamType::F32 { min: 0.0, max: 16.0, default: 2.0 }, "Radius in pixels"),
+            p(
+                "radius",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 16.0,
+                    default: 2.0,
+                },
+                "Radius in pixels",
+            ),
         ],
         doc: "Box blur, wrapping at tile edges.",
     },
@@ -266,8 +495,15 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[
             INPUT,
-            p("strength", ParamType::F32 { min: 0.1, max: 16.0, default: 2.0 },
-              "Gradient magnitude multiplier"),
+            p(
+                "strength",
+                ParamType::F32 {
+                    min: 0.1,
+                    max: 16.0,
+                    default: 2.0,
+                },
+                "Gradient magnitude multiplier",
+            ),
         ],
         doc: "Sobel edge detect. Outlines brick mortar, cell borders, panel seams.",
     },
@@ -277,11 +513,30 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[
             INPUT,
-            p("scale", ParamType::U32 { min: 1, max: 16, default: 2 },
-              "Repeat the input N× across the tile (integer keeps it tileable)"),
-            p("rotate", ParamType::Enum { options: &["0", "90", "180", "270"], default: "0" },
-              "Rotation in 90° steps (arbitrary angles would break tiling)"),
-            p("offset", ParamType::Vec2 { default: [0.0, 0.0] }, "UV shift, wraps"),
+            p(
+                "scale",
+                ParamType::U32 {
+                    min: 1,
+                    max: 16,
+                    default: 2,
+                },
+                "Repeat the input N× across the tile (integer keeps it tileable)",
+            ),
+            p(
+                "rotate",
+                ParamType::Enum {
+                    options: &["0", "90", "180", "270"],
+                    default: "0",
+                },
+                "Rotation in 90° steps (arbitrary angles would break tiling)",
+            ),
+            p(
+                "offset",
+                ParamType::Vec2 {
+                    default: [0.0, 0.0],
+                },
+                "UV shift, wraps",
+            ),
         ],
         doc: "Tile/rotate/shift a grey field.",
     },
@@ -291,10 +546,20 @@ pub const OPS: &[OpSpec] = &[
         outputs: &["value"],
         params: &[
             INPUT,
-            p("by", ParamType::Ref { required: true },
-              "Grey field that drives the distortion"),
-            p("amount", ParamType::F32 { min: 0.0, max: 0.5, default: 0.1 },
-              "Max displacement, tile fraction"),
+            p(
+                "by",
+                ParamType::Ref { required: true },
+                "Grey field that drives the distortion",
+            ),
+            p(
+                "amount",
+                ParamType::F32 {
+                    min: 0.0,
+                    max: 0.5,
+                    default: 0.1,
+                },
+                "Max displacement, tile fraction",
+            ),
         ],
         doc: "Domain-warp input by another field. THE op that makes procedural \
               stop looking procedural — melts grids, gnarls noise.",
@@ -304,13 +569,28 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::GreyFilter,
         outputs: &["value"],
         params: &[
-            p("a", ParamType::Ref { required: false },
-              "First operand; defaults to the previous grey step"),
+            p(
+                "a",
+                ParamType::Ref { required: false },
+                "First operand; defaults to the previous grey step",
+            ),
             p("b", ParamType::Ref { required: true }, "Second operand"),
-            p("mode", ParamType::Enum {
-                options: &["add", "subtract", "multiply", "min", "max", "average", "difference"],
-                default: "multiply",
-            }, "Combine function (clamped to 0..1)"),
+            p(
+                "mode",
+                ParamType::Enum {
+                    options: &[
+                        "add",
+                        "subtract",
+                        "multiply",
+                        "min",
+                        "max",
+                        "average",
+                        "difference",
+                    ],
+                    default: "multiply",
+                },
+                "Combine function (clamped to 0..1)",
+            ),
         ],
         doc: "Combine two grey fields.",
     },
@@ -320,8 +600,13 @@ pub const OPS: &[OpSpec] = &[
         category: OpCategory::Paint,
         outputs: &[],
         params: &[
-            p("color", ParamType::Color { default: [0.5, 0.5, 0.5, 1.0] },
-              "Paint color; alpha scales coverage"),
+            p(
+                "color",
+                ParamType::Color {
+                    default: [0.5, 0.5, 0.5, 1.0],
+                },
+                "Paint color; alpha scales coverage",
+            ),
             BLEND,
             OPACITY,
             MASK,
@@ -334,8 +619,11 @@ pub const OPS: &[OpSpec] = &[
         outputs: &[],
         params: &[
             INPUT,
-            p("stops", ParamType::Stops,
-              "Grey → color mapping; piecewise-linear between stops"),
+            p(
+                "stops",
+                ParamType::Stops,
+                "Grey → color mapping; piecewise-linear between stops",
+            ),
             BLEND,
             OPACITY,
             MASK,
@@ -436,8 +724,14 @@ impl<'a> Params<'a> {
         // Stops are required by validation; an unreachable fallback that
         // still renders *something* beats a panic in the editor.
         vec![
-            RampStop { pos: 0.0, color: [0.0, 0.0, 0.0] },
-            RampStop { pos: 1.0, color: [1.0, 1.0, 1.0] },
+            RampStop {
+                pos: 0.0,
+                color: [0.0, 0.0, 0.0],
+            },
+            RampStop {
+                pos: 1.0,
+                color: [1.0, 1.0, 1.0],
+            },
         ]
     }
 }

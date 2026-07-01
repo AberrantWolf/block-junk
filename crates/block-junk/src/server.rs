@@ -12,25 +12,28 @@ use lightyear::input::native::prelude::*;
 
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::collision::{Aabb, WorldCollision};
+use crate::craft_stations::{ActiveWork, CraftOrder, CraftStations, StationState};
+use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::menu::{ServerSaveConfig, ServerSaveRequestFlag, ServerShutdownFlag};
+use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::physics::{
     EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, soft_separate_actors,
 };
 use crate::plans::Plans;
 use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
-    BlockManifest,
-    CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload,
-    DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet, INTERACT_REACH,
-    MovementIntent, MovementMode,
-    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanKind, REACH_SLACK, RejectReason,
-    RequestNpcDetails, WorldChannel, WorldClock, WorldClockSync, WorldItem,
+    BlockManifest, CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot,
+    ChunkUnload, DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet,
+    INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PickupRequest,
+    PlanEdit, PlanKind, REACH_SLACK, RejectReason, RequestNpcDetails, WorldChannel, WorldClock,
+    WorldClockSync, WorldItem,
 };
-use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
-use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
-use crate::craft_stations::{ActiveWork, CraftOrder, CraftStations, StationState};
-use crate::save::{SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save, remap_block_slots, write_save};
+use crate::save::{
+    SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk, SavedCraftOrder,
+    SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool,
+    SavedWorldItem, read_save, remap_block_slots, write_save,
+};
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
     world_to_chunk,
@@ -114,6 +117,7 @@ impl Plugin for ServerPlugin {
                 apply_npc_work,
                 auto_clear_stale_plans,
                 spawn_drops_on_destroy,
+                settle_items_on_cell_edit,
                 push_actors_out_of_new_blocks,
             )
                 .chain()
@@ -173,6 +177,13 @@ impl Plugin for ServerPlugin {
         app.add_systems(
             Update,
             rescue_embedded_actors_after_load.in_set(GameSet::Simulation),
+        );
+        // Same load-time edge case for loose items: settle any restored
+        // from a save onto solid ground once chunks have flushed in, so
+        // a saved item over since-edited terrain doesn't hang in the air.
+        app.add_systems(
+            Update,
+            settle_loaded_items_after_load.in_set(GameSet::Simulation),
         );
         app.add_systems(FixedUpdate, tick_world_clock);
         app.add_systems(Update, broadcast_world_clock);
@@ -238,7 +249,10 @@ const STARTER_TOOL_ID: &str = "vanilla:axe";
 /// But the failure arms [`SaveWriteGuard`], so nothing this session
 /// writes back over the file that failed to load — the empty world is
 /// throwaway, the original save is not.
-#[allow(clippy::too_many_arguments, reason = "load_from_save touches every persisted system")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "load_from_save touches every persisted system"
+)]
 fn load_from_save(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
@@ -670,7 +684,10 @@ fn spawn_loaded_npc(
 /// the world to disk and clear the flag. Unlike `save_then_shutdown` this
 /// is multi-shot (the user might "Save Now" several times per session) so
 /// no Local guard.
-#[allow(clippy::too_many_arguments, reason = "save_on_request touches every persisted system")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "save_on_request touches every persisted system"
+)]
 fn save_on_request(
     flag: Option<Res<ServerSaveRequestFlag>>,
     config: Option<Res<ServerSaveConfig>>,
@@ -839,10 +856,7 @@ fn first_avatar_state(
 /// persisted, so reloading gives the planner a fresh chance. A
 /// consistently broken planner will re-disable each NPC on its first
 /// tick after load (and log loudly each time).
-fn collect_saved_npcs(
-    npcs: &SavedNpcQuery,
-    item_registry: &ItemRegistry,
-) -> Vec<SavedNpc> {
+fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec<SavedNpc> {
     npcs.iter()
         .map(|(id, kind, pose, mode, needs, brain, carry, tool)| {
             let carrying = match (carry.item, carry.count) {
@@ -878,7 +892,10 @@ fn collect_saved_npcs(
 /// The `Local<bool>` guards against running the save loop more than once
 /// per session; the runner won't actually exit until the next tick reads
 /// the AppExit message.
-#[allow(clippy::too_many_arguments, reason = "save_then_shutdown touches every persisted system")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "save_then_shutdown touches every persisted system"
+)]
 fn save_then_shutdown(
     flag: Option<Res<ServerShutdownFlag>>,
     config: Option<Res<ServerSaveConfig>>,
@@ -1043,11 +1060,13 @@ const REPLICATION_INTERVAL: Duration = Duration::from_millis(50);
 /// the link appears (before the netcode handshake completes) so the sender is
 /// ready by the time we spawn an avatar in the `Connected` observer.
 fn install_replication_sender(trigger: On<Add, LinkOf>, mut commands: Commands) {
-    commands.entity(trigger.entity).insert(ReplicationSender::new(
-        REPLICATION_INTERVAL,
-        SendUpdatesMode::SinceLastAck,
-        false,
-    ));
+    commands
+        .entity(trigger.entity)
+        .insert(ReplicationSender::new(
+            REPLICATION_INTERVAL,
+            SendUpdatesMode::SinceLastAck,
+            false,
+        ));
 }
 
 /// On client connect: spawn an avatar entity carrying the authoritative
@@ -1228,7 +1247,15 @@ fn server_player_step(
             vel.0.x = 0.0;
             vel.0.z = 0.0;
         }
-        apply_walk_step(&mut pose, &mut vel, &mut on_ground, &mut mode, &input.0, dt, &world);
+        apply_walk_step(
+            &mut pose,
+            &mut vel,
+            &mut on_ground,
+            &mut mode,
+            &input.0,
+            dt,
+            &world,
+        );
     }
 }
 
@@ -1419,9 +1446,8 @@ fn world_to_chunk_coord(pos: Vec3) -> ChunkCoord {
 }
 
 fn aoi_around(centre: ChunkCoord) -> HashSet<ChunkCoord> {
-    let mut set = HashSet::with_capacity(
-        ((2 * AOI_RADIUS_XZ + 1).pow(2) * (2 * AOI_RADIUS_Y + 1)) as usize,
-    );
+    let mut set =
+        HashSet::with_capacity(((2 * AOI_RADIUS_XZ + 1).pow(2) * (2 * AOI_RADIUS_Y + 1)) as usize);
     for cy in -AOI_RADIUS_Y..=AOI_RADIUS_Y {
         for cz in -AOI_RADIUS_XZ..=AOI_RADIUS_XZ {
             for cx in -AOI_RADIUS_XZ..=AOI_RADIUS_XZ {
@@ -1455,7 +1481,10 @@ pub(crate) fn within_reach(pose: &AvatarPose, target: Vec3, reach: f32) -> bool 
     (pose.translation - target).length() <= reach + REACH_SLACK
 }
 
-#[allow(clippy::too_many_arguments, reason = "edit pipeline + reach gate + rejection reply")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "edit pipeline + reach gate + rejection reply"
+)]
 fn receive_block_edits(
     mut commands: Commands,
     mut receivers: Query<(Entity, &mut MessageReceiver<BlockEdit>)>,
@@ -1529,9 +1558,13 @@ pub(crate) fn apply_block_edit(
     bus: &mut MessageWriter<CellEdit>,
 ) {
     if edit.slot.is_empty() {
-        apply_break(edit, commands, chunks, map, registry, server, broadcast, bus);
+        apply_break(
+            edit, commands, chunks, map, registry, server, broadcast, bus,
+        );
     } else {
-        apply_place(edit, commands, chunks, map, registry, server, broadcast, bus);
+        apply_place(
+            edit, commands, chunks, map, registry, server, broadcast, bus,
+        );
     }
 }
 
@@ -1560,7 +1593,10 @@ fn apply_place(
     let mut cells_by_chunk: HashMap<ChunkCoord, Vec<(IVec3, IVec3)>> = HashMap::default();
     for cell in &cells {
         let (coord, local) = world_to_chunk(*cell);
-        cells_by_chunk.entry(coord).or_default().push((*cell, local));
+        cells_by_chunk
+            .entry(coord)
+            .or_default()
+            .push((*cell, local));
     }
     for coord in cells_by_chunk.keys() {
         if !map.0.contains_key(coord) {
@@ -1729,7 +1765,10 @@ fn apply_break(
     let mut cells_by_chunk: HashMap<ChunkCoord, Vec<(IVec3, IVec3)>> = HashMap::default();
     for cell in &cells {
         let (coord, local) = world_to_chunk(*cell);
-        cells_by_chunk.entry(coord).or_default().push((*cell, local));
+        cells_by_chunk
+            .entry(coord)
+            .or_default()
+            .push((*cell, local));
     }
 
     // Apply: clear each cell + drop the entry.
@@ -1757,8 +1796,10 @@ fn apply_break(
     }
     // Echo the cleared cells into loaded neighbours' padding rings
     // (separate pass for the same borrow reason as the place path).
-    let mirror_cells: Vec<(IVec3, BlockSlot)> =
-        cells.iter().map(|&world| (world, BlockSlot::EMPTY)).collect();
+    let mirror_cells: Vec<(IVec3, BlockSlot)> = cells
+        .iter()
+        .map(|&world| (world, BlockSlot::EMPTY))
+        .collect();
     crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
 
     // Broadcast the canonical applied break with the resolved anchor +
@@ -1789,7 +1830,10 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
 /// into `BlockEdit`s and feeds them through the same `apply_block_edit`
 /// path that handles client requests — so the world mutation, the
 /// broadcast, and the plan auto-clear all funnel through one code path.
-#[allow(clippy::too_many_arguments, reason = "block-edit application spans many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "block-edit application spans many subsystems"
+)]
 fn apply_npc_work(
     mut reader: MessageReader<NpcWorkCompleted>,
     mut commands: Commands,
@@ -1854,9 +1898,8 @@ fn receive_npc_inspection_requests(
     for (connection, mut receiver) in receivers.iter_mut() {
         let requests: Vec<RequestNpcDetails> = receiver.receive().collect();
         for req in requests {
-            let Some((id, kind, needs, brain, _pose)) = npcs
-                .iter()
-                .find(|(id, _, _, _, _)| id.0 == req.npc_id)
+            let Some((id, kind, needs, brain, _pose)) =
+                npcs.iter().find(|(id, _, _, _, _)| id.0 == req.npc_id)
             else {
                 // NPC despawned between client raycast and server
                 // receive. Silently drop — the requester will time
@@ -2044,10 +2087,7 @@ fn receive_drop_requests(
             let offset = Vec3::new(angle.cos() * 0.08, 0.0, angle.sin() * 0.08);
             let translation = centre + offset;
             commands.spawn((
-                WorldItem {
-                    item,
-                    translation,
-                },
+                WorldItem { item, translation },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
                 Replicate::to_clients(NetworkTarget::All),
@@ -2111,12 +2151,9 @@ fn receive_drop_tool_requests(
 /// empty, supporting cell solid) the items drop on top of it. Else
 /// fall back to the player's actual foot position. Items always
 /// spawn slightly above the floor so visual meshes don't sink in.
-fn drop_target_position(
-    pose: &AvatarPose,
-    world: &crate::npc::WorldWalk,
-) -> Vec3 {
-    let foot_pos = pose.translation
-        - Vec3::new(0.0, EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y, 0.0);
+fn drop_target_position(pose: &AvatarPose, world: &crate::npc::WorldWalk) -> Vec3 {
+    let foot_pos =
+        pose.translation - Vec3::new(0.0, EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y, 0.0);
     let foot_cell = IVec3::new(
         foot_pos.x.floor() as i32,
         foot_pos.y.floor() as i32,
@@ -2176,7 +2213,12 @@ fn receive_deposit_requests(
                 continue;
             };
             if !within_reach(pose, req.cell.as_vec3() + Vec3::splat(0.5), INTERACT_REACH) {
-                send_rejection(&mut rejections, connection, req.cell, RejectReason::OutOfReach);
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.cell,
+                    RejectReason::OutOfReach,
+                );
                 continue;
             }
             // Empty carry → nothing to deposit.
@@ -2219,9 +2261,7 @@ fn receive_deposit_requests(
 fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
     match goal {
         Goal::Idle => ("idle".into(), None),
-        Goal::Resting { remaining_secs } => {
-            (format!("resting ({remaining_secs:.1}s)"), None)
-        }
+        Goal::Resting { remaining_secs } => (format!("resting ({remaining_secs:.1}s)"), None),
         Goal::MoveTo { path, .. } => {
             let target = path.last().copied();
             (format!("moving ({} cells)", path.len()), target)
@@ -2248,14 +2288,9 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
                 PlanKind::Remove => "removing",
                 PlanKind::Build { .. } => "building",
             };
-            (
-                format!("{verb} ({remaining_secs:.1}s)"),
-                Some(*target_cell),
-            )
+            (format!("{verb} ({remaining_secs:.1}s)"), Some(*target_cell))
         }
-        Goal::CraftingAtStation { station_cell } => {
-            ("crafting".into(), Some(*station_cell))
-        }
+        Goal::CraftingAtStation { station_cell } => ("crafting".into(), Some(*station_cell)),
     }
 }
 
@@ -2292,14 +2327,35 @@ fn auto_clear_stale_plans(
             kind: None,
             materials: Vec::new(),
         };
-        if let Err(err) = broadcast.send::<PlanEdit, WorldChannel>(
-            &msg,
-            server,
-            &NetworkTarget::All,
-        ) {
+        if let Err(err) =
+            broadcast.send::<PlanEdit, WorldChannel>(&msg, server, &NetworkTarget::All)
+        {
             warn!("auto-clear PlanEdit broadcast failed: {err}");
         }
     }
+}
+
+/// Where a loose item at `translation` comes to rest against the live
+/// world. Items move along Y only — XZ is preserved so a settling pile
+/// stays put laterally and a falling drop reads as a vertical drop, not
+/// a slide. The resting Y is quantized to the base of the owning empty
+/// cell (`cell.y + ITEM_FLOOR_LIFT`), so `translation.floor()` always
+/// recovers that cell and items never hang at a partial-block height.
+///
+/// All the safety lives in [`settle_item_cell`]: it rises out of a cell
+/// that just became solid, falls to the first solid support, clamps
+/// (never deletes) when there is none, and — because unloaded chunks
+/// read as solid via [`WorldWalk`] — never drops an item through the
+/// loaded/unloaded boundary and out of the world.
+fn settled_translation(world: &impl crate::pathfinding::Walkability, translation: Vec3) -> Vec3 {
+    use crate::items::{ITEM_FLOOR_LIFT, MAX_ITEM_DROP, MAX_ITEM_RISE};
+    let from = translation.floor().as_ivec3();
+    let cell = crate::pathfinding::settle_item_cell(world, from, MAX_ITEM_RISE, MAX_ITEM_DROP);
+    Vec3::new(
+        translation.x,
+        cell.y as f32 + ITEM_FLOOR_LIFT,
+        translation.z,
+    )
 }
 
 /// Spawn drop items when a block is destroyed. Reads the same CellEdit
@@ -2308,6 +2364,13 @@ fn auto_clear_stale_plans(
 /// destroyed block's `BlockDef.drops`, and for each entry spawns
 /// `count` `WorldItem` entities at the destroyed cell's centre with a
 /// small per-unit XZ jitter so a multi-item pile doesn't z-fight.
+///
+/// Each drop is then settled down to solid ground via
+/// [`settled_translation`] — a block destroyed in mid-air (the floating
+/// block above the player's reach, or the last block of a column) leaves
+/// its drops resting on whatever is below instead of hanging where the
+/// block used to be. Drops don't support each other, so a whole pile
+/// settles onto the same floor cell.
 ///
 /// Server-authoritative spawn with `Replicate::to_clients(All)` — every
 /// client gets the new entity in their next replication tick, and the
@@ -2321,11 +2384,19 @@ fn auto_clear_stale_plans(
 fn spawn_drops_on_destroy(
     mut reader: MessageReader<CellEdit>,
     mut commands: Commands,
+    chunks: Query<&'static Chunk>,
+    chunk_map: Res<ChunkMap>,
     blocks: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
 ) {
-    use block_junk_mod_api::items::ItemId;
     use crate::items::drop_jitter as jitter;
+    use block_junk_mod_api::items::ItemId;
+
+    let world = crate::npc::WorldWalk {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &blocks,
+    };
 
     for edit in reader.read() {
         if !edit.slot.is_empty() || edit.prev_slot.is_empty() {
@@ -2335,9 +2406,11 @@ fn spawn_drops_on_destroy(
         if def.drops.is_empty() {
             continue;
         }
-        // Cell centre + a tiny lift off the floor so the mesh isn't
-        // bisected by the next-block-down's top face.
-        let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
+        // Cell centre. The +0.5 XZ centres the item in the cell (jitter
+        // then spreads a pile within it); Y here is unimportant because
+        // `settled_translation` re-quantizes it to the resting cell's
+        // base — we only need it to floor() back to `edit.world`.
+        let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
         for drop in &def.drops {
             let item_id: &ItemId = &drop.item;
             // boot validation guarantees this resolves; failing here
@@ -2351,7 +2424,7 @@ fn spawn_drops_on_destroy(
                 continue;
             };
             for unit in 0..drop.count {
-                let translation = centre + jitter(edit.world, unit);
+                let translation = settled_translation(&world, centre + jitter(edit.world, unit));
                 commands.spawn((
                     WorldItem {
                         item: slot,
@@ -2487,6 +2560,105 @@ fn push_actors_out_of_new_blocks(
                 }
             }
         }
+    }
+}
+
+/// Re-settle loose items when the block under them is mined out or a
+/// block is built into their cell. Reads the same `CellEdit` bus as
+/// `spawn_drops_on_destroy`, so it sees the authoritative chunk state
+/// *after* the edit is applied.
+///
+/// An item rests in an empty cell `C` sitting on a solid support `C - Y`.
+/// Two edits can break that invariant: the support `C - Y` is destroyed
+/// (item must fall), or `C` itself is filled (item must rise). Both map
+/// to a small set of "touched" owning cells per edit — the edited cell
+/// (filled) and the cell above it (support removed) — so we collect that
+/// set, then make a single pass over loose items and re-settle any whose
+/// owning cell (`translation.floor()`) was touched. `settled_translation`
+/// handles fall, rise, and clamp uniformly, so re-settling an item that
+/// doesn't actually need to move is a no-op; the `!=` guard then skips
+/// the redundant component write so lightyear replicates only real moves.
+///
+/// Items don't support items and re-settling never emits a `CellEdit`,
+/// so there is no cascade and no feedback loop — a tower of items above a
+/// mined block all fall straight to the same exposed floor in one pass.
+fn settle_items_on_cell_edit(
+    mut reader: MessageReader<CellEdit>,
+    chunks: Query<&'static Chunk>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut items: Query<&mut WorldItem>,
+) {
+    let mut touched: HashSet<IVec3> = HashSet::default();
+    for edit in reader.read() {
+        // The edited cell (a block may have filled an item's cell) and
+        // the cell directly above it (whose support this edit changed).
+        touched.insert(edit.world);
+        touched.insert(edit.world + IVec3::Y);
+    }
+    if touched.is_empty() {
+        return;
+    }
+
+    let world = crate::npc::WorldWalk {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    for mut wi in items.iter_mut() {
+        let owning = wi.translation.floor().as_ivec3();
+        if !touched.contains(&owning) {
+            continue;
+        }
+        let settled = settled_translation(&world, wi.translation);
+        if settled != wi.translation {
+            wi.translation = settled;
+        }
+    }
+}
+
+/// One-shot settle for loose items restored from a save. `load_from_save`
+/// spawns world items via `Commands` without driving the `CellEdit` bus,
+/// so `settle_items_on_cell_edit` never fires for them; an item saved at
+/// a stale position (the world below it was edited in a prior session, or
+/// the save predates the settle rules) would otherwise hang in the air.
+///
+/// Mirrors `rescue_embedded_actors_after_load`: the `Local<bool>` gates
+/// it to a single run, and the chunk-map guard defers that run until
+/// `load_from_save`'s spawned chunks have flushed into the ECS (otherwise
+/// the world looks empty and every item would "settle" by clamping into
+/// the void). On a fresh world with no saved items this settles nothing
+/// and simply marks itself done.
+fn settle_loaded_items_after_load(
+    mut ran: Local<bool>,
+    chunks: Query<&'static Chunk>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    mut items: Query<&mut WorldItem>,
+) {
+    if *ran {
+        return;
+    }
+    if chunk_map.0.is_empty() {
+        return;
+    }
+    *ran = true;
+
+    let world = crate::npc::WorldWalk {
+        chunks: &chunks,
+        chunk_map: &chunk_map,
+        registry: &registry,
+    };
+    let mut settled_count = 0usize;
+    for mut wi in items.iter_mut() {
+        let settled = settled_translation(&world, wi.translation);
+        if settled != wi.translation {
+            wi.translation = settled;
+            settled_count += 1;
+        }
+    }
+    if settled_count > 0 {
+        info!("settled {settled_count} loaded world items onto solid ground");
     }
 }
 

@@ -10,8 +10,8 @@
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 use block_junk_textures::doc::{
-    BlendMode, FinishDef, LayerDef, MAX_LAYERS_PER_TEXTURE, MAX_PERIOD, ParamValue, RampStop,
-    Step, TextureDef,
+    BlendMode, FinishDef, LayerDef, MAX_LAYERS_PER_TEXTURE, MAX_PERIOD, ParamValue, RampStop, Step,
+    TextureDef,
 };
 use block_junk_textures::eval::{ColorBuf, GreyBuf, StepTrace, eval_layer_traced};
 use block_junk_textures::ops::{OPS, OpCategory, ParamType, find_op};
@@ -141,13 +141,9 @@ fn texture_list(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCac
             });
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let ids: Vec<String> =
-                    studio.doc.textures.iter().map(|t| t.id.clone()).collect();
+                let ids: Vec<String> = studio.doc.textures.iter().map(|t| t.id.clone()).collect();
                 for (i, id) in ids.iter().enumerate() {
-                    if ui
-                        .selectable_label(studio.sel_tex == i, id)
-                        .clicked()
-                    {
+                    if ui.selectable_label(studio.sel_tex == i, id).clicked() {
                         studio.sel_tex = i;
                         studio.sel_layer = 0;
                         studio.sel_step = None;
@@ -168,7 +164,10 @@ fn texture_list(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCac
                     cache.rename_draft = None;
                 }
                 let has_sel = !studio.doc.textures.is_empty();
-                if ui.add_enabled(has_sel, egui::Button::new("duplicate")).clicked() {
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("duplicate"))
+                    .clicked()
+                {
                     let sel = studio.sel_tex;
                     let mut copy = studio.doc.textures[sel].clone();
                     copy.id = unique_id(&studio.doc.textures, &copy.id);
@@ -176,7 +175,10 @@ fn texture_list(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCac
                     studio.sel_tex = sel + 1;
                     cache.rename_draft = None;
                 }
-                if ui.add_enabled(has_sel, egui::Button::new("delete")).clicked() {
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("delete"))
+                    .clicked()
+                {
                     let sel = studio.sel_tex;
                     studio.edit_once(|doc| {
                         doc.textures.remove(sel);
@@ -220,7 +222,10 @@ fn inspector(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache,
                 ui.separator();
                 let finish = studio.doc.textures[t].finish;
                 let mut on = finish.is_some();
-                if ui.checkbox(&mut on, "finish (world-space brightness jitter)").changed() {
+                if ui
+                    .checkbox(&mut on, "finish (world-space brightness jitter)")
+                    .changed()
+                {
                     studio.edit_once(|doc| {
                         doc.textures[t].finish = on.then(FinishDef::default);
                     });
@@ -231,9 +236,7 @@ fn inspector(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache,
                     let mut seed = f.seed;
                     ui.horizontal(|ui| {
                         ui.label("scale");
-                        let c1 = ui
-                            .add(egui::Slider::new(&mut scale, 2.0..=32.0))
-                            .changed();
+                        let c1 = ui.add(egui::Slider::new(&mut scale, 2.0..=32.0)).changed();
                         ui.label("±");
                         let c2 = ui
                             .add(egui::Slider::new(&mut brightness, 0.0..=0.2))
@@ -241,8 +244,11 @@ fn inspector(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache,
                         let c3 = ui.add(egui::DragValue::new(&mut seed)).changed();
                         if c1 || c2 || c3 {
                             studio.edit("finish", now, |doc| {
-                                doc.textures[t].finish =
-                                    Some(FinishDef { scale, brightness, seed });
+                                doc.textures[t].finish = Some(FinishDef {
+                                    scale,
+                                    brightness,
+                                    seed,
+                                });
                             });
                         }
                     });
@@ -253,7 +259,10 @@ fn inspector(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache,
                 ui.horizontal(|ui| {
                     ui.heading("Layers");
                     let can_add = studio.doc.textures[t].layers.len() < MAX_LAYERS_PER_TEXTURE;
-                    if ui.add_enabled(can_add, egui::Button::new("+ layer")).clicked() {
+                    if ui
+                        .add_enabled(can_add, egui::Button::new("+ layer"))
+                        .clicked()
+                    {
                         studio.edit_once(|doc| {
                             doc.textures[t].layers.push(starter_layer());
                         });
@@ -268,7 +277,10 @@ fn inspector(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache,
                     let selected = studio.sel_layer == l;
                     ui.horizontal(|ui| {
                         if ui
-                            .selectable_label(selected, format!("layer {} · period {}", l + 1, period))
+                            .selectable_label(
+                                selected,
+                                format!("layer {} · period {}", l + 1, period),
+                            )
                             .clicked()
                         {
                             studio.sel_layer = l;
@@ -299,19 +311,13 @@ fn inspector(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache,
                             let mut o = opacity;
                             ui.horizontal(|ui| {
                                 ui.label("period");
-                                if ui
-                                    .add(egui::Slider::new(&mut p, 1..=MAX_PERIOD))
-                                    .changed()
-                                {
+                                if ui.add(egui::Slider::new(&mut p, 1..=MAX_PERIOD)).changed() {
                                     studio.edit("layer-period", now, |doc| {
                                         doc.textures[t].layers[l].period = p;
                                     });
                                 }
                                 ui.label("opacity");
-                                if ui
-                                    .add(egui::Slider::new(&mut o, 0.0..=1.0))
-                                    .changed()
-                                {
+                                if ui.add(egui::Slider::new(&mut o, 0.0..=1.0)).changed() {
                                     studio.edit("layer-opacity", now, |doc| {
                                         doc.textures[t].layers[l].opacity = o;
                                     });
@@ -503,7 +509,16 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                         _ => default,
                     };
                     if ui.add(egui::Slider::new(&mut v, min..=max)).changed() {
-                        set_param(studio, &key, Some(now), t, l, s, ps.name, ParamValue::F32(v));
+                        set_param(
+                            studio,
+                            &key,
+                            Some(now),
+                            t,
+                            l,
+                            s,
+                            ps.name,
+                            ParamValue::F32(v),
+                        );
                     }
                 }
                 ParamType::U32 { min, max, default } => {
@@ -512,7 +527,16 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                         _ => default,
                     };
                     if ui.add(egui::Slider::new(&mut v, min..=max)).changed() {
-                        set_param(studio, &key, Some(now), t, l, s, ps.name, ParamValue::U32(v));
+                        set_param(
+                            studio,
+                            &key,
+                            Some(now),
+                            t,
+                            l,
+                            s,
+                            ps.name,
+                            ParamValue::U32(v),
+                        );
                     }
                 }
                 ParamType::Seed => {
@@ -521,13 +545,31 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                         _ => 0,
                     };
                     if ui.add(egui::DragValue::new(&mut v)).changed() {
-                        set_param(studio, &key, Some(now), t, l, s, ps.name, ParamValue::U32(v));
+                        set_param(
+                            studio,
+                            &key,
+                            Some(now),
+                            t,
+                            l,
+                            s,
+                            ps.name,
+                            ParamValue::U32(v),
+                        );
                     }
                     // ⚄ (U+2684) not 🎲: DejaVu covers BMP die faces but
                     // not emoji-plane glyphs.
                     if ui.button("⚄").clicked() {
                         let r = (now * 1.0e6) as u64 as u32 ^ 0x9E37_79B9;
-                        set_param(studio, &key, None, t, l, s, ps.name, ParamValue::U32(r % 10_000));
+                        set_param(
+                            studio,
+                            &key,
+                            None,
+                            t,
+                            l,
+                            s,
+                            ps.name,
+                            ParamValue::U32(r % 10_000),
+                        );
                     }
                 }
                 ParamType::Enum { options, default } => {
@@ -601,7 +643,16 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                         _ => default,
                     };
                     if ui.color_edit_button_rgba_unmultiplied(&mut v).changed() {
-                        set_param(studio, &key, Some(now), t, l, s, ps.name, ParamValue::Color(v));
+                        set_param(
+                            studio,
+                            &key,
+                            Some(now),
+                            t,
+                            l,
+                            s,
+                            ps.name,
+                            ParamValue::Color(v),
+                        );
                     }
                 }
                 ParamType::Vec2 { default } => {
@@ -610,13 +661,30 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                         _ => default,
                     };
                     let c1 = ui
-                        .add(egui::DragValue::new(&mut v[0]).speed(0.01).range(-1.0..=1.0))
+                        .add(
+                            egui::DragValue::new(&mut v[0])
+                                .speed(0.01)
+                                .range(-1.0..=1.0),
+                        )
                         .changed();
                     let c2 = ui
-                        .add(egui::DragValue::new(&mut v[1]).speed(0.01).range(-1.0..=1.0))
+                        .add(
+                            egui::DragValue::new(&mut v[1])
+                                .speed(0.01)
+                                .range(-1.0..=1.0),
+                        )
                         .changed();
                     if c1 || c2 {
-                        set_param(studio, &key, Some(now), t, l, s, ps.name, ParamValue::Vec2(v));
+                        set_param(
+                            studio,
+                            &key,
+                            Some(now),
+                            t,
+                            l,
+                            s,
+                            ps.name,
+                            ParamValue::Vec2(v),
+                        );
                     }
                 }
                 ParamType::Stops => {
@@ -645,8 +713,14 @@ fn stops_editor(
     let mut stops = match step.params.get(name) {
         Some(ParamValue::Stops(v)) => v.clone(),
         _ => vec![
-            RampStop { pos: 0.0, color: [0.0; 3] },
-            RampStop { pos: 1.0, color: [1.0; 3] },
+            RampStop {
+                pos: 0.0,
+                color: [0.0; 3],
+            },
+            RampStop {
+                pos: 1.0,
+                color: [1.0; 3],
+            },
         ],
     };
     ui.vertical(|ui| {
@@ -655,7 +729,11 @@ fn stops_editor(
         for (i, stop) in stops.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 changed |= ui
-                    .add(egui::DragValue::new(&mut stop.pos).speed(0.01).range(0.0..=1.0))
+                    .add(
+                        egui::DragValue::new(&mut stop.pos)
+                            .speed(0.01)
+                            .range(0.0..=1.0),
+                    )
                     .changed();
                 changed |= ui.color_edit_button_rgb(&mut stop.color).changed();
                 if ui.small_button("✕").clicked() {
@@ -679,7 +757,16 @@ fn stops_editor(
         }
         if changed {
             stops.sort_by(|a, b| a.pos.total_cmp(&b.pos));
-            set_param(studio, key, Some(now), t, l, s, name, ParamValue::Stops(stops));
+            set_param(
+                studio,
+                key,
+                Some(now),
+                t,
+                l,
+                s,
+                name,
+                ParamValue::Stops(stops),
+            );
         }
     });
 }
@@ -712,9 +799,10 @@ fn flat_preview(
                 return;
             };
             // The bake set lags the doc while invalid; preview last good.
-            let baked_tex = baked.by_id(&tex.id).cloned().or_else(|| {
-                bake_texture(tex, studio.doc.pixels_per_block).ok()
-            });
+            let baked_tex = baked
+                .by_id(&tex.id)
+                .cloned()
+                .or_else(|| bake_texture(tex, studio.doc.pixels_per_block).ok());
             let Some(baked_tex) = baked_tex else { return };
 
             if export {
@@ -740,15 +828,10 @@ fn flat_preview(
             }
             if let Some(tex_handle) = &cache.flat {
                 let size = ui.available_height().min(FLAT_PX as f32).max(64.0);
-                let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(size, size),
-                    egui::Sense::drag(),
-                );
-                egui::Image::new(egui::load::SizedTexture::new(
-                    tex_handle.id(),
-                    rect.size(),
-                ))
-                .paint_at(ui, rect);
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::drag());
+                egui::Image::new(egui::load::SizedTexture::new(tex_handle.id(), rect.size()))
+                    .paint_at(ui, rect);
                 if resp.dragged() {
                     let d = resp.drag_delta();
                     flat.origin.x -= d.x / rect.width() * flat.span;
@@ -814,9 +897,7 @@ fn export_png(
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     let mut writer = enc.write_header().map_err(|e| e.to_string())?;
-    writer
-        .write_image_data(&rgba)
-        .map_err(|e| e.to_string())?;
+    writer.write_image_data(&rgba).map_err(|e| e.to_string())?;
     Ok(path.display().to_string())
 }
 
@@ -836,7 +917,9 @@ fn set_param(
 ) {
     let name = name.to_owned();
     let apply = move |doc: &mut block_junk_textures::TextureSetDoc| {
-        doc.textures[t].layers[l].steps[s].params.insert(name, value);
+        doc.textures[t].layers[l].steps[s]
+            .params
+            .insert(name, value);
     };
     match now {
         Some(now) => studio.edit(key, now, apply),
@@ -912,8 +995,14 @@ fn starter_layer() -> LayerDef {
     ramp.params.insert(
         "stops".into(),
         ParamValue::Stops(vec![
-            RampStop { pos: 0.0, color: [0.3, 0.3, 0.3] },
-            RampStop { pos: 1.0, color: [0.7, 0.7, 0.7] },
+            RampStop {
+                pos: 0.0,
+                color: [0.3, 0.3, 0.3],
+            },
+            RampStop {
+                pos: 1.0,
+                color: [0.7, 0.7, 0.7],
+            },
         ]),
     );
     LayerDef {
@@ -930,8 +1019,14 @@ fn starter_step(op: &str) -> Step {
                 step.params.insert(
                     ps.name.to_owned(),
                     ParamValue::Stops(vec![
-                        RampStop { pos: 0.0, color: [0.2, 0.2, 0.2] },
-                        RampStop { pos: 1.0, color: [0.8, 0.8, 0.8] },
+                        RampStop {
+                            pos: 0.0,
+                            color: [0.2, 0.2, 0.2],
+                        },
+                        RampStop {
+                            pos: 1.0,
+                            color: [0.8, 0.8, 0.8],
+                        },
                     ]),
                 );
             }
@@ -951,8 +1046,12 @@ fn category_name(cat: OpCategory) -> &'static str {
 fn preview_hash(generation: u64, sel: usize, flat: &FlatPreview) -> u64 {
     let mut h = generation.wrapping_mul(31).wrapping_add(sel as u64);
     h = h.wrapping_mul(31).wrapping_add(flat.span.to_bits() as u64);
-    h = h.wrapping_mul(31).wrapping_add(flat.origin.x.to_bits() as u64);
-    h = h.wrapping_mul(31).wrapping_add(flat.origin.y.to_bits() as u64);
+    h = h
+        .wrapping_mul(31)
+        .wrapping_add(flat.origin.x.to_bits() as u64);
+    h = h
+        .wrapping_mul(31)
+        .wrapping_add(flat.origin.y.to_bits() as u64);
     h.wrapping_mul(31).wrapping_add(flat.with_finish as u64)
 }
 
@@ -977,7 +1076,11 @@ fn canvas_image(buf: &ColorBuf, out: usize) -> egui::ColorImage {
             let sy = (y * size / out).min(size - 1);
             let px = buf.data[sy * size + sx];
             // Composite over a checkerboard so coverage reads at a glance.
-            let checker = if ((x / 8) + (y / 8)) % 2 == 0 { 0.25 } else { 0.35 };
+            let checker = if ((x / 8) + (y / 8)) % 2 == 0 {
+                0.25
+            } else {
+                0.35
+            };
             let a = px[3].clamp(0.0, 1.0);
             let c = |i: usize| ((px[i] * a + checker * (1.0 - a)).clamp(0.0, 1.0) * 255.0) as u8;
             img.pixels[y * out + x] = egui::Color32::from_rgb(c(0), c(1), c(2));

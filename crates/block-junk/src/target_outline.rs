@@ -37,9 +37,7 @@ use bevy::prelude::*;
 use lightyear::prelude::Predicted;
 
 use crate::blocks::{BlockRegistry, BlockSlot};
-use crate::client::{
-    PlaceablePalette, SelectedBlock, entity_aware_raycast, raycast_world_items,
-};
+use crate::client::{PlaceablePalette, SelectedBlock, entity_aware_raycast, raycast_world_items};
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans, raycast_plans};
@@ -99,7 +97,10 @@ fn draw_plan_outlines(plans: Res<Plans>, mut gizmos: Gizmos) {
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "outline pulls from many resources")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "outline pulls from many resources"
+)]
 fn draw_target_outline(
     mode: Res<PlayerMode>,
     drag: Res<PlanDragState>,
@@ -133,14 +134,33 @@ fn draw_target_outline(
 
     match *mode {
         PlayerMode::Plan => draw_plan_target(
-            origin, dir, &chunks, &chunk_map, &registry, &plans, &selected, &palette, &mut gizmos,
+            origin,
+            dir,
+            &chunks,
+            &chunk_map,
+            &registry,
+            &plans,
+            &selected,
+            &palette,
+            &mut gizmos,
         ),
         PlayerMode::Normal => {
             let carry = local_carry.single().copied().unwrap_or_default();
             let tool = local_tool.single().copied().unwrap_or_default();
             draw_normal_target(
-                origin, dir, &chunks, &chunk_map, &registry, &items, &recipes, &stations,
-                &plans, &world_items, carry, tool, &mut gizmos,
+                origin,
+                dir,
+                &chunks,
+                &chunk_map,
+                &registry,
+                &items,
+                &recipes,
+                &stations,
+                &plans,
+                &world_items,
+                carry,
+                tool,
+                &mut gizmos,
             );
         }
     }
@@ -215,7 +235,13 @@ fn draw_normal_target(
     // L-click resolves to (1) or (2) at the action input; R-click acts
     // on (3). Outline matches whichever the next click would commit.
     let world_hit = entity_aware_raycast(
-        origin, dir, INTERACT_REACH, chunks, chunk_map, registry, None,
+        origin,
+        dir,
+        INTERACT_REACH,
+        chunks,
+        chunk_map,
+        registry,
+        None,
     );
     let world_hit_dist = world_hit
         .as_ref()
@@ -269,9 +295,7 @@ fn draw_normal_target(
         //   - Plan pending materials, carry can't help → cyan (inspect)
         let colour = if let Some(state) = plans.get(cell) {
             match (&state.kind, carry.item) {
-                (PlanKind::Build { .. }, Some(slot))
-                    if state.remaining_for(slot) > 0 =>
-                {
+                (PlanKind::Build { .. }, Some(slot)) if state.remaining_for(slot) > 0 => {
                     Color::srgb(0.3, 1.0, 0.4) // deposit-ready green
                 }
                 _ if state.is_satisfied() => {

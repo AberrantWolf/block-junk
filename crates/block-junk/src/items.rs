@@ -33,6 +33,27 @@ pub struct ItemSlot(pub u16);
 /// ships.
 pub const PLAYER_CARRY_CAPACITY: u32 = 5;
 
+/// How far a loose item scans downward for solid support before giving
+/// up and clamping in place. Because unloaded chunks read as solid (see
+/// [`crate::pathfinding::Walkability`]), a real fall almost always stops
+/// at the loaded/unloaded boundary long before this; the cap only bounds
+/// a pathological tall fully-loaded empty column. An item that finds no
+/// support within the budget is clamped, never deleted — losing a
+/// resource to a bottomless scan is the one outcome we refuse.
+pub(crate) const MAX_ITEM_DROP: i32 = 512;
+
+/// How far a buried item rises to escape a cell that just became solid
+/// (a block built where the item sat). One chunk's worth of height — past
+/// that we leave it embedded and let a later destroy re-settle it, rather
+/// than teleporting it an unbounded distance.
+pub(crate) const MAX_ITEM_RISE: i32 = 32;
+
+/// Tiny lift off the support face so an item mesh isn't bisected by the
+/// top face of the block it rests on. The item's world Y is always
+/// `owning_cell.y + ITEM_FLOOR_LIFT`, which keeps `translation.floor()`
+/// recovering the owning cell.
+pub(crate) const ITEM_FLOOR_LIFT: f32 = 0.05;
+
 /// Deterministic-per-spawn lateral jitter for piles of dropped items, so
 /// siblings don't perfectly overlap and a pile reads as a heap. Doesn't
 /// need cross-session reproducibility — just spatial variety. Shared by
@@ -56,11 +77,15 @@ pub enum ItemBootstrapError {
     SlotOverflow { slots: usize },
     #[error("block {block} drops references unregistered item {item}")]
     DropItemUnknown { block: String, item: ItemId },
-    #[error("block {block} drops entry for item {item} has count = 0; remove the entry or set count > 0")]
+    #[error(
+        "block {block} drops entry for item {item} has count = 0; remove the entry or set count > 0"
+    )]
     DropCountZero { block: String, item: ItemId },
     #[error("block {block} materials references unregistered item {item}")]
     MaterialItemUnknown { block: String, item: ItemId },
-    #[error("block {block} materials entry for item {item} has count = 0; remove the entry or set count > 0")]
+    #[error(
+        "block {block} materials entry for item {item} has count = 0; remove the entry or set count > 0"
+    )]
     MaterialCountZero { block: String, item: ItemId },
 }
 
@@ -137,10 +162,7 @@ impl ItemRegistry {
     /// are built so neither side loads with a dangling reference.
     /// Empty-vec drops/materials are always valid; this only catches
     /// typos and stale ids.
-    pub fn validate_block_drops(
-        &self,
-        blocks: &[BlockDef],
-    ) -> Result<(), ItemBootstrapError> {
+    pub fn validate_block_drops(&self, blocks: &[BlockDef]) -> Result<(), ItemBootstrapError> {
         for def in blocks {
             for drop in &def.drops {
                 if self.slot_of(&drop.item).is_none() {

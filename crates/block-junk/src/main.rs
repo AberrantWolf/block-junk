@@ -19,6 +19,7 @@ mod npc_registry;
 mod pathfinding;
 mod physics;
 mod plan_claims;
+mod plan_ghosts;
 mod plans;
 mod player_mode;
 mod preview;
@@ -30,6 +31,7 @@ mod scripting;
 mod server;
 mod target_outline;
 mod ui_capture;
+mod ui_theme;
 mod voxel;
 mod worldspace_toast;
 
@@ -191,11 +193,7 @@ fn run_client(preset: Option<LaunchMode>) {
     // gameplay-y runs while the main menu is open.
     app.configure_sets(
         Update,
-        (
-            GameSet::Input,
-            GameSet::Simulation,
-            GameSet::PostSimulation,
-        )
+        (GameSet::Input, GameSet::Simulation, GameSet::PostSimulation)
             .chain()
             .run_if(in_state(AppState::InGame)),
     );
@@ -227,11 +225,6 @@ fn kick_to_ingame(mut next: ResMut<NextState<AppState>>) {
 fn configure_shared_schedule(app: &mut App) {
     app.configure_sets(
         Update,
-        (
-            GameSet::Input,
-            GameSet::Simulation,
-            GameSet::PostSimulation,
-        )
-            .chain(),
+        (GameSet::Input, GameSet::Simulation, GameSet::PostSimulation).chain(),
     );
 }

@@ -74,7 +74,10 @@ impl TextureRegistry {
                 if !ids.insert(tex.id.clone()) {
                     return Err(TexError::invalid(
                         path.display().to_string(),
-                        format!("texture id \"{}\" already defined by an earlier mod", tex.id),
+                        format!(
+                            "texture id \"{}\" already defined by an earlier mod",
+                            tex.id
+                        ),
                     ));
                 }
             }
@@ -152,13 +155,10 @@ impl Plugin for BlockTexturesPlugin {
 
                 // Icon: side texture reads most like the in-world block;
                 // fall back to top, then to the flat color.
-                let icon_id = def
-                    .texture
-                    .as_ref()
-                    .and_then(|t| {
-                        let [top, side, _] = t.faces();
-                        side.or(top).map(str::to_owned)
-                    });
+                let icon_id = def.texture.as_ref().and_then(|t| {
+                    let [top, side, _] = t.faces();
+                    side.or(top).map(str::to_owned)
+                });
                 let rgba = match icon_id.and_then(|id| baked.iter().find(|b| b.id == id)) {
                     Some(b) => flatten(b, ICON_SIZE, [0.0, 0.0], 1.0, def.color, false),
                     None => flat_icon(def.color),
@@ -179,10 +179,7 @@ impl Plugin for BlockTexturesPlugin {
         let (tiles, icons) = {
             let mut images = world.resource_mut::<Assets<Image>>();
             let tiles = images.add(gpu.tiles);
-            let icons = icon_images
-                .into_iter()
-                .map(|img| images.add(img))
-                .collect();
+            let icons = icon_images.into_iter().map(|img| images.add(img)).collect();
             (tiles, icons)
         };
         let (blocks, textures, layers) = {

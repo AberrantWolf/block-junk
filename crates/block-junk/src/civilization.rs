@@ -140,12 +140,7 @@ impl Civilization {
         cluster.bbox_max = bmax;
     }
 
-    fn add_matched_room(
-        &mut self,
-        room_id: RoomId,
-        rooms: &RoomMap,
-        params: &CivilizationParams,
-    ) {
+    fn add_matched_room(&mut self, room_id: RoomId, rooms: &RoomMap, params: &CivilizationParams) {
         if self.room_to_cluster.contains_key(&room_id) {
             // Already clustered — caller hit a Changed Some→Some;
             // refresh the cluster bbox in case the room's own bbox
@@ -229,13 +224,7 @@ impl Civilization {
 
 /// Chebyshev distance between two AABBs `<= max_dist`. Overlap reads as
 /// distance 0.
-fn bbox_within(
-    a_min: IVec3,
-    a_max: IVec3,
-    b_min: IVec3,
-    b_max: IVec3,
-    max_dist: i32,
-) -> bool {
+fn bbox_within(a_min: IVec3, a_max: IVec3, b_min: IVec3, b_max: IVec3, max_dist: i32) -> bool {
     let dx = (a_min.x - b_max.x).max(b_min.x - a_max.x).max(0);
     let dy = (a_min.y - b_max.y).max(b_min.y - a_max.y).max(0);
     let dz = (a_min.z - b_max.z).max(b_min.z - a_max.z).max(0);
@@ -243,12 +232,7 @@ fn bbox_within(
 }
 
 fn bbox_contains(min: IVec3, max: IVec3, p: IVec3) -> bool {
-    p.x >= min.x
-        && p.x <= max.x
-        && p.y >= min.y
-        && p.y <= max.y
-        && p.z >= min.z
-        && p.z <= max.z
+    p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y && p.z >= min.z && p.z <= max.z
 }
 
 /// Resource wrapper around the Lua-supplied params. Default values fall

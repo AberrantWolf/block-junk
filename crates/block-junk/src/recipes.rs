@@ -52,9 +52,7 @@ pub enum RecipeBootstrapError {
         "recipe {recipe} declares station tag {tag:?} but no registered block carries that station_tag"
     )]
     StationUnreachable { recipe: RecipeId, tag: TagId },
-    #[error(
-        "recipe {recipe} duration_secs {got} is out of bounds [{min}, {max}]"
-    )]
+    #[error("recipe {recipe} duration_secs {got} is out of bounds [{min}, {max}]")]
     DurationOutOfRange {
         recipe: RecipeId,
         got: f32,
@@ -125,7 +123,10 @@ impl RecipeRegistry {
                     item: def.output.item.clone(),
                 });
             }
-            by_station.entry(def.station.clone()).or_default().push(slot);
+            by_station
+                .entry(def.station.clone())
+                .or_default()
+                .push(slot);
         }
         Ok(Self {
             defs_by_slot: pending,
@@ -139,10 +140,7 @@ impl RecipeRegistry {
     /// with no matching station is a typo; flag it loudly at boot so
     /// the failure happens before the first crafting click rather
     /// than as "L-click did nothing."
-    pub fn validate_against_blocks(
-        &self,
-        blocks: &[BlockDef],
-    ) -> Result<(), RecipeBootstrapError> {
+    pub fn validate_against_blocks(&self, blocks: &[BlockDef]) -> Result<(), RecipeBootstrapError> {
         let mut all_station_tags: std::collections::HashSet<&TagId> =
             std::collections::HashSet::new();
         for b in blocks {
@@ -180,7 +178,10 @@ impl RecipeRegistry {
     /// [`Self::at_station_tier`] when you want recipes a specific
     /// station instance can actually perform.
     pub fn at_station(&self, tag: &TagId) -> &[RecipeSlot] {
-        self.by_station.get(tag).map(|v| v.as_slice()).unwrap_or(&[])
+        self.by_station
+            .get(tag)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Recipes available at a station with this tag whose `tier <=

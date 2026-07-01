@@ -29,8 +29,7 @@ use crate::npc::{Needs, Npc};
 use crate::npc_registry::NeedRegistry;
 use crate::protocol::{
     DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools,
-    DebugSpawnWorkbench, GameSet,
-    WorldChannel, WorldClock,
+    DebugSpawnWorkbench, GameSet, WorldChannel, WorldClock,
 };
 
 pub struct DebugClientPlugin;
@@ -134,7 +133,10 @@ const BUMPABLE_NEEDS: &[(&str, &str)] = &[
     ("work", "Purpose"),
 ];
 
-#[allow(clippy::too_many_arguments, reason = "debug panel queries several senders")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "debug panel queries several senders"
+)]
 fn debug_panel_ui(
     mut contexts: EguiContexts,
     mut instant_builds: ResMut<InstantPlayerBuilds>,
@@ -194,7 +196,9 @@ fn debug_panel_ui(
         .open(&mut show_open)
         .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-12.0, 12.0))
         .default_width(280.0)
+        .frame(crate::ui_theme::dev_frame())
         .show(ctx, |ui| {
+            crate::ui_theme::dev_skin(ui);
             ui.label("F3 toggles this panel.");
             ui.separator();
             ui.label(egui::RichText::new("Player").strong());
@@ -455,11 +459,7 @@ fn receive_debug_spawn_tools(
         // and fan a small horizontal gap so the three items don't
         // z-fight at one point.
         let foot = pose.translation
-            - bevy::math::Vec3::new(
-                0.0,
-                EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
-                0.0,
-            )
+            - bevy::math::Vec3::new(0.0, EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y, 0.0)
             + bevy::math::Vec3::new(0.0, 0.05, 0.0);
         let yaw = pose.yaw;
         let forward = bevy::math::Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
@@ -487,10 +487,7 @@ fn receive_debug_spawn_tools(
             ));
             spawned += 1;
         }
-        info!(
-            count = spawned,
-            "debug: spawned vanilla tools near player",
-        );
+        info!(count = spawned, "debug: spawned vanilla tools near player",);
     }
 }
 
@@ -505,16 +502,19 @@ fn receive_debug_spawn_tools(
 /// deliver a wire BlockEdit to its own receiver, so we call the
 /// place pipeline in-process. Gets the broadcast + sidecar +
 /// auto-clear-plan behaviour for free.
-#[allow(clippy::too_many_arguments, reason = "place pipeline reaches many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "place pipeline reaches many subsystems"
+)]
 fn receive_debug_spawn_workbench(
-    mut receivers: Query<(Entity, &mut MessageReceiver<crate::protocol::DebugSpawnWorkbench>)>,
+    mut receivers: Query<(
+        Entity,
+        &mut MessageReceiver<crate::protocol::DebugSpawnWorkbench>,
+    )>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     block_registry: Res<crate::blocks::BlockRegistry>,
-    mut chunks: Query<(
-        &mut crate::voxel::Chunk,
-        &mut crate::voxel::ChunkEntities,
-    )>,
+    mut chunks: Query<(&mut crate::voxel::Chunk, &mut crate::voxel::ChunkEntities)>,
     chunk_map: Res<crate::voxel::ChunkMap>,
     mut commands: Commands,
     mut broadcast: ServerMultiMessageSender,
@@ -550,18 +550,13 @@ fn receive_debug_spawn_workbench(
         // Foot cell + one tile ahead in the dominant cardinal — same
         // forward-snap pattern `drop_target_position` uses.
         let foot_pos = pose.translation
-            - bevy::math::Vec3::new(
-                0.0,
-                EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y,
-                0.0,
-            );
+            - bevy::math::Vec3::new(0.0, EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y, 0.0);
         let foot_cell = bevy::math::IVec3::new(
             foot_pos.x.floor() as i32,
             foot_pos.y.floor() as i32,
             foot_pos.z.floor() as i32,
         );
-        let forward =
-            bevy::math::Vec3::new(-pose.yaw.sin(), 0.0, -pose.yaw.cos());
+        let forward = bevy::math::Vec3::new(-pose.yaw.sin(), 0.0, -pose.yaw.cos());
         let cardinal = if forward.x.abs() > forward.z.abs() {
             bevy::math::IVec3::new(forward.x.signum() as i32, 0, 0)
         } else {

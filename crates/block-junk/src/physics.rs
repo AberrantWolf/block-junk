@@ -345,7 +345,9 @@ pub fn apply_walk_step(
     let wish_horizontal = right * wishdir_local.x + forward * (-wishdir_local.z);
 
     match *mode {
-        MovementMode::Walk => walk_step(pose, velocity, on_ground, wish_horizontal, input, dt, world),
+        MovementMode::Walk => {
+            walk_step(pose, velocity, on_ground, wish_horizontal, input, dt, world)
+        }
         MovementMode::Fly => fly_step(pose, velocity, wish_horizontal, wishdir_local.y, dt),
     }
 

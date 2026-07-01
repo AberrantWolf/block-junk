@@ -19,6 +19,9 @@ engine.on_room_event(function(event)
             "[hello/server] room_created: room=%d pattern=%s cells=%d",
             event.room, pat, event.signature.cell_count
         ))
+        -- engine.ui.toast(pos, text): worldspace toast anchored at a
+        -- cell. Server-side calls broadcast to every connected client.
+        engine.ui.toast(event.signature.bbox.min, "A room takes shape!")
     elseif event.kind == "changed" then
         local from = event.from or "(none)"
         local to = event.to or "(none)"

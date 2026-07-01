@@ -337,11 +337,7 @@ pub fn remap_block_slots(
 ) -> Result<(), SaveError> {
     use crate::blocks::BlockSlot;
 
-    let map: Vec<Option<BlockSlot>> = save
-        .block_slots
-        .iter()
-        .map(|id| lookup(id))
-        .collect();
+    let map: Vec<Option<BlockSlot>> = save.block_slots.iter().map(|id| lookup(id)).collect();
 
     let mut missing = std::collections::BTreeSet::new();
     let mut check = |slot: BlockSlot| -> Result<(), SaveError> {
@@ -659,8 +655,7 @@ mod tests {
             )],
         };
 
-        let bytes =
-            bincode::serde::encode_to_vec(&original, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&original, bincode::config::standard()).unwrap();
         let (decoded, _): (SaveFile, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
 
@@ -689,7 +684,10 @@ mod tests {
         assert_eq!(decoded.plans[1].1.materials[0].present, 1);
         assert_eq!(decoded.world_items.len(), 2);
         assert_eq!(decoded.world_items[0].item_id, "vanilla:wood_log");
-        assert_eq!(decoded.world_items[0].translation, Vec3::new(10.0, 8.5, -3.25));
+        assert_eq!(
+            decoded.world_items[0].translation,
+            Vec3::new(10.0, 8.5, -3.25)
+        );
         let carry = decoded.last_player_carry.unwrap();
         assert_eq!(carry.item_id, "vanilla:wood_log");
         assert_eq!(carry.count, 3);
@@ -771,8 +769,16 @@ mod tests {
         let mut save = remap_fixture(&["vanilla:empty", "a", "b"], &[(10, 1), (11, 2)], 2);
         remap_block_slots(&mut save, reordered_lookup).unwrap();
         let blocks = &save.edited_chunks[0].chunk.blocks;
-        assert_eq!(blocks[10], BlockSlot(2), "cell holding \"a\" follows its id");
-        assert_eq!(blocks[11], BlockSlot(1), "cell holding \"b\" follows its id");
+        assert_eq!(
+            blocks[10],
+            BlockSlot(2),
+            "cell holding \"a\" follows its id"
+        );
+        assert_eq!(
+            blocks[11],
+            BlockSlot(1),
+            "cell holding \"b\" follows its id"
+        );
         assert_eq!(blocks[0], BlockSlot::EMPTY);
         let PlanKind::Build { slot, .. } = save.plans[0].1.kind else {
             panic!("plan kind changed shape");
@@ -808,7 +814,13 @@ mod tests {
         let mut save = remap_fixture(&["vanilla:empty", "a"], &[(5, 9)], 1);
         let err = remap_block_slots(&mut save, reordered_lookup).unwrap_err();
         assert!(
-            matches!(err, SaveError::SlotOutOfRange { slot: 9, table_len: 2 }),
+            matches!(
+                err,
+                SaveError::SlotOutOfRange {
+                    slot: 9,
+                    table_len: 2
+                }
+            ),
             "got {err}"
         );
     }

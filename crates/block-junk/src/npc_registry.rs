@@ -270,8 +270,7 @@ mod tests {
 
     #[test]
     fn need_registry_returns_none_for_unknown_or_unset() {
-        let registry =
-            NeedRegistry::build(vec![need("hunger", 0.01, None, None)]).unwrap();
+        let registry = NeedRegistry::build(vec![need("hunger", 0.01, None, None)]).unwrap();
 
         // Unset on a known need ⇒ None (callers fall back to a default).
         assert_eq!(registry.urge_threshold("hunger"), None);

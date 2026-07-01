@@ -20,7 +20,7 @@ use bevy::render::storage::ShaderStorageBuffer;
 use bevy::window::{Window, WindowPlugin};
 use bevy_egui::{EguiContexts, EguiPlugin};
 use block_junk_textures::render::{
-    BlockTexGpu, ChunkMaterial, ChunkMaterialPlugin, BlockTextureExt, build_gpu_textures,
+    BlockTexGpu, BlockTextureExt, ChunkMaterial, ChunkMaterialPlugin, build_gpu_textures,
 };
 use block_junk_textures::{BakedTexture, TextureSetDoc, lua_io, validate_doc};
 
@@ -61,7 +61,12 @@ fn main() {
         .add_systems(Startup, setup_scene)
         .add_systems(
             Update,
-            (rebake_if_needed, upload_gpu, orbit_camera, keyboard_shortcuts),
+            (
+                rebake_if_needed,
+                upload_gpu,
+                orbit_camera,
+                keyboard_shortcuts,
+            ),
         )
         .add_systems(bevy_egui::EguiPrimaryContextPass, ui::studio_ui)
         .run();
@@ -284,7 +289,9 @@ fn setup_scene(
     let empty = build_gpu_textures(&[]);
     let tiles = images.add(empty.tiles);
     let blocks = buffers.add(ShaderStorageBuffer::from(vec![
-        BlockTexGpu::untextured([0.5, 0.5, 0.5]);
+        BlockTexGpu::untextured([
+            0.5, 0.5, 0.5
+        ]);
         terrain::SLOT_COUNT
     ]));
     let textures = buffers.add(ShaderStorageBuffer::from(vec![
@@ -378,7 +385,10 @@ fn upload_gpu(
     bands.dirty = false;
 
     let gpu = build_gpu_textures(&baked.set);
-    let resolve = |id: &str| gpu.index_of(id).unwrap_or(block_junk_textures::render::NO_TEXTURE);
+    let resolve = |id: &str| {
+        gpu.index_of(id)
+            .unwrap_or(block_junk_textures::render::NO_TEXTURE)
+    };
 
     let mut blocks = vec![BlockTexGpu::untextured([0.55, 0.55, 0.55]); terrain::SLOT_COUNT];
     blocks[terrain::SLOT_SURFACE as usize] = BlockTexGpu {

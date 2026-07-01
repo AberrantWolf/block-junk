@@ -57,7 +57,11 @@ pub enum BootstrapError {
     #[error(
         "block {block} interactable.duration_secs = {value}; must be ≥ {min} (exclusive interactions should feel substantive; non-exclusive ones still need long enough to register visually)"
     )]
-    InteractableDurationOutOfRange { block: BlockId, value: f32, min: f32 },
+    InteractableDurationOutOfRange {
+        block: BlockId,
+        value: f32,
+        min: f32,
+    },
     #[error("block {block} work_action.need_restore references unregistered need {need}")]
     WorkActionNeedUnknown { block: BlockId, need: String },
     #[error(
@@ -68,9 +72,7 @@ pub enum BootstrapError {
         "block {block} work_action.duration_secs = {value}; must be > 0 (use the engine default by omitting work_action)"
     )]
     WorkActionDurationOutOfRange { block: BlockId, value: f32 },
-    #[error(
-        "block {block} references texture \"{texture}\", which no mod's textures.lua defines"
-    )]
+    #[error("block {block} references texture \"{texture}\", which no mod's textures.lua defines")]
     BlockTextureUnknown { block: BlockId, texture: String },
     #[error(
         "block {block} use_slot.approach is empty — at least one standable cell is required, or omit use_slot to fall back to nearest-neighbour"
@@ -295,7 +297,9 @@ impl BlockRegistry {
     ) -> Result<(), BootstrapError> {
         for def in &self.defs_by_slot {
             let Some(slot) = &def.use_slot else { continue };
-            let Some(anim) = &slot.animation else { continue };
+            let Some(anim) = &slot.animation else {
+                continue;
+            };
             if !animations.contains(anim) {
                 return Err(BootstrapError::UseSlotAnimationUnknown {
                     block: def.id.clone(),
@@ -325,7 +329,6 @@ impl BlockRegistry {
         }
         Ok(())
     }
-
 }
 
 /// Slots the engine's terrain generator resolves once at startup so it

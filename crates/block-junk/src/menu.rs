@@ -148,6 +148,16 @@ impl ServerSession {
             flag.store(true, Ordering::SeqCst);
         }
     }
+
+    /// True while a requested save hasn't been written yet (the server
+    /// clears the flag after flushing to disk). Drives the pause menu's
+    /// "Saving… / Saved" feedback.
+    pub fn save_pending(&self) -> bool {
+        self.save_request
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
 }
 
 /// Inserted into the server App as a Resource so the shutdown-check system
@@ -180,16 +190,18 @@ impl Default for DebugNoSaveOnExit {
 #[derive(Component)]
 pub struct GameRoot;
 
-/// Register DejaVu Sans as an egui fallback font (once). egui's bundled
-/// fonts render arrows / triangles / die faces / ⌘ as tofu; any UI glyph
-/// outside plain ASCII needs this. Font bytes are compiled in — see
-/// `block_junk_textures::egui_fonts`.
-fn install_fallback_fonts(mut contexts: EguiContexts, mut done: Local<bool>) {
+/// One-time egui context setup: register DejaVu Sans as a fallback font
+/// (egui's bundled fonts render arrows / triangles / die faces / ⌘ as
+/// tofu) and apply the in-game skin from [`crate::ui_theme`]. Player-
+/// facing windows inherit the skin from the context; dev windows opt
+/// into the dev frame per-window.
+fn setup_egui_context(mut contexts: EguiContexts, mut done: Local<bool>) {
     if *done {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else { return };
     block_junk_textures::egui_fonts::install(ctx);
+    crate::ui_theme::apply_ingame_style(ctx);
     *done = true;
 }
 
@@ -219,7 +231,7 @@ impl Plugin for MenuPlugin {
         app.add_systems(
             bevy_egui::EguiPrimaryContextPass,
             (
-                install_fallback_fonts,
+                setup_egui_context,
                 main_menu_ui.run_if(in_state(AppState::MainMenu)),
                 // Pause menu rides on top of InGame — the world keeps
                 // simulating beneath it, the menu just releases the
@@ -295,6 +307,10 @@ fn main_menu_ui(
     mut listing: ResMut<SaveListing>,
     mut status: ResMut<SaveStatus>,
     mut exit: MessageWriter<AppExit>,
+    // World name awaiting delete confirmation. Delete is irreversible
+    // and sits one row away from Load — a single misclick must not
+    // destroy a world, so the first click only arms the confirm row.
+    mut confirm_delete: Local<Option<String>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -324,16 +340,33 @@ fn main_menu_ui(
                 .max_height(180.0)
                 .show(ui, |ui| {
                     for meta in &listing.0 {
+                        let confirming = confirm_delete.as_deref() == Some(meta.name.as_str());
                         ui.horizontal(|ui| {
+                            if confirming {
+                                ui.label(
+                                    egui::RichText::new(format!("Delete {:?}?", meta.name))
+                                        .strong(),
+                                );
+                                let danger = egui::Button::new(
+                                    egui::RichText::new("Delete")
+                                        .color(egui::Color32::from_rgb(255, 120, 110)),
+                                );
+                                if ui.add(danger).clicked() {
+                                    delete_request = Some(meta.name.clone());
+                                    *confirm_delete = None;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    *confirm_delete = None;
+                                }
+                                return;
+                            }
                             if ui.button("Load").clicked() {
                                 load_request = Some(meta.name.clone());
                             }
                             if ui.button("Delete").clicked() {
-                                delete_request = Some(meta.name.clone());
+                                *confirm_delete = Some(meta.name.clone());
                             }
-                            ui.label(
-                                egui::RichText::new(&meta.name).strong().monospace(),
-                            );
+                            ui.label(egui::RichText::new(&meta.name).strong().monospace());
                             ui.label(
                                 egui::RichText::new(format!(
                                     "({})",
@@ -477,11 +510,25 @@ fn relative_time(unix_seconds: u64) -> String {
     }
 }
 
+/// Tracks the in-flight Save Now request so the pause menu can show
+/// "Saving…" while the server flushes and "Saved" for a moment after.
+#[derive(Default)]
+struct SaveFeedback {
+    /// A Save Now click is outstanding (set on click, cleared when the
+    /// server's flag drops).
+    requested: bool,
+    /// `Time::elapsed_secs()` when the last save finished; drives the
+    /// transient "Saved ✓" label.
+    completed_at: Option<f32>,
+}
+
 fn pause_menu_ui(
     mut contexts: EguiContexts,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
     mut session: ResMut<ServerSession>,
     mut exit: MessageWriter<AppExit>,
+    time: Res<Time>,
+    mut save_feedback: Local<SaveFeedback>,
 ) {
     if !captures.contains(crate::ui_capture::UiCapture::PauseMenu) {
         return;
@@ -490,6 +537,13 @@ fn pause_menu_ui(
         return;
     };
     let hosting = session.is_hosting();
+    // Resolve the save round-trip: the server clears the flag once the
+    // file is on disk. Checked before drawing so the label flips in the
+    // same frame the flag drops.
+    if save_feedback.requested && !session.save_pending() {
+        save_feedback.requested = false;
+        save_feedback.completed_at = Some(time.elapsed_secs());
+    }
     let mut close_request = false;
     egui::Window::new("Paused")
         .collapsible(false)
@@ -508,8 +562,20 @@ fn pause_menu_ui(
                 ui.add_enabled_ui(hosting, |ui| {
                     if ui.button("Save Now").clicked() {
                         session.request_save();
+                        save_feedback.requested = true;
+                        save_feedback.completed_at = None;
                     }
                 });
+                if save_feedback.requested {
+                    ui.label(egui::RichText::new("Saving…").weak());
+                } else if let Some(done) = save_feedback.completed_at
+                    && time.elapsed_secs() - done < 3.0
+                {
+                    ui.label(
+                        egui::RichText::new("Saved ✓")
+                            .color(egui::Color32::from_rgb(180, 230, 150)),
+                    );
+                }
                 // Quit-to-menu is a stub: in-world state cleanup
                 // (despawning replicated entities, resetting resources)
                 // isn't built yet, so we exit the process the same way as
@@ -528,6 +594,39 @@ fn pause_menu_ui(
                     arm_quit_watchdog(Duration::from_secs(3));
                 }
             });
+            ui.add_space(8.0);
+            // The full keybind reference. Several binds (Q/T/F1/wheel)
+            // have no other discoverable surface — the HUD hints cover
+            // the moment-to-moment verbs, this covers everything.
+            ui.collapsing("Controls", |ui| {
+                egui::Grid::new("controls_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 2.0])
+                    .show(ui, |ui| {
+                        let mut row = |key: &str, what: &str| {
+                            ui.label(egui::RichText::new(key).monospace().strong());
+                            ui.label(egui::RichText::new(what).weak());
+                            ui.end_row();
+                        };
+                        row("W A S D", "move");
+                        row("Space", "jump / fly up");
+                        row("Shift", "fly down");
+                        row("F1", "toggle walk / fly");
+                        row("Tab", "cycle mode (Shift+Tab reverses)");
+                        row("1 / 2", "Normal / Plan mode");
+                        row("L-click", "Normal: mine, pick up, work · Plan: tag remove");
+                        row(
+                            "R-click",
+                            "Normal: interact, open station · Plan: tag build",
+                        );
+                        row("Q", "drop carried items");
+                        row("T", "drop held tool");
+                        row("Scroll", "Plan: cycle block palette");
+                        row("Ctrl+Scroll", "Plan: rotate placement");
+                        row("F3", "debug panel");
+                        row("Esc", "close topmost window / pause");
+                    });
+            });
         });
     if close_request {
         // Single state mutation handles everything: capture released
@@ -538,13 +637,11 @@ fn pause_menu_ui(
     }
 }
 
-/// Small in-game overlay in the top-left corner showing the local player's
+/// Small dev overlay in the top-left corner showing the local player's
 /// world position, the cell (block grid index) the camera is in, and the
 /// chunk coord of that cell. Useful for reporting bugs by location.
-fn debug_overlay_ui(
-    mut contexts: EguiContexts,
-    avatar: Query<&AvatarPose, With<Predicted>>,
-) {
+/// Dev-skinned (flat monospace) so it reads as a tool, not game UI.
+fn debug_overlay_ui(mut contexts: EguiContexts, avatar: Query<&AvatarPose, With<Predicted>>) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
@@ -558,13 +655,9 @@ fn debug_overlay_ui(
         .title_bar(false)
         .resizable(false)
         .anchor(egui::Align2::LEFT_TOP, egui::Vec2::new(8.0, 8.0))
-        .frame(
-            egui::Frame::default()
-                .fill(egui::Color32::from_black_alpha(160))
-                .inner_margin(egui::Margin::same(6)),
-        )
+        .frame(crate::ui_theme::dev_frame())
         .show(ctx, |ui| {
-            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            crate::ui_theme::dev_skin(ui);
             ui.label(format!("pos   {:>7.2} {:>7.2} {:>7.2}", p.x, p.y, p.z));
             ui.label(format!("cell  {:>7} {:>7} {:>7}", cell.x, cell.y, cell.z));
             ui.label(format!(

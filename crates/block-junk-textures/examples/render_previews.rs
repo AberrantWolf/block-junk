@@ -14,7 +14,10 @@ use block_junk_textures::{bake_texture, flatten, lua_io};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let doc_path = PathBuf::from(args.next().unwrap_or_else(|| "mods/vanilla/textures.lua".into()));
+    let doc_path = PathBuf::from(
+        args.next()
+            .unwrap_or_else(|| "mods/vanilla/textures.lua".into()),
+    );
     let out_dir = PathBuf::from(args.next().unwrap_or_else(|| "/tmp/tex-previews".into()));
     let span_override: Option<f32> = args.next().and_then(|s| s.parse().ok());
 

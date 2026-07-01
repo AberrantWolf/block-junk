@@ -104,8 +104,8 @@ fn drain_pending_toasts(
                     border_radius: BorderRadius::all(Val::Px(4.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.12, 0.10, 0.14, 0.92)),
-                BorderColor::all(Color::srgba(0.95, 0.85, 0.55, 0.45)),
+                BackgroundColor(crate::ui_theme::PANEL_BG),
+                BorderColor::all(crate::ui_theme::PANEL_BORDER),
                 Visibility::Hidden,
             ))
             .with_children(|root| {
@@ -116,7 +116,7 @@ fn drain_pending_toasts(
                         font_size: 14.0,
                         ..default()
                     },
-                    TextColor(Color::srgb(0.95, 0.92, 0.85)),
+                    TextColor(crate::ui_theme::TEXT),
                 ));
             });
     }
@@ -141,7 +141,8 @@ fn update_toasts(
         return;
     };
     let now = time.elapsed_secs();
-    for (entity, toast, mut node, mut visibility, mut bg, mut border, children) in toasts.iter_mut() {
+    for (entity, toast, mut node, mut visibility, mut bg, mut border, children) in toasts.iter_mut()
+    {
         let age = now - toast.spawned_at;
         if age >= TOAST_LIFETIME_SECS {
             commands.entity(entity).despawn();
@@ -175,11 +176,12 @@ fn update_toasts(
         } else {
             1.0 - ((age - fade_start) / TOAST_FADE_TAIL_SECS).clamp(0.0, 1.0)
         };
-        bg.0 = Color::srgba(0.12, 0.10, 0.14, 0.92 * alpha);
-        *border = BorderColor::all(Color::srgba(0.95, 0.85, 0.55, 0.45 * alpha));
+        let faded = |c: Color| c.with_alpha(c.alpha() * alpha);
+        bg.0 = faded(crate::ui_theme::PANEL_BG);
+        *border = BorderColor::all(faded(crate::ui_theme::PANEL_BORDER));
         for child in children.iter() {
             if let Ok(mut tc) = texts.get_mut(child) {
-                tc.0 = Color::srgba(0.95, 0.92, 0.85, alpha);
+                tc.0 = faded(crate::ui_theme::TEXT);
             }
         }
     }

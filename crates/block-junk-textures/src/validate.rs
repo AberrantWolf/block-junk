@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::doc::{
-    BlendMode, MAX_LAYERS_PER_TEXTURE, MAX_PERIOD, ParamValue, Step, TextureSetDoc,
-};
+use crate::doc::{BlendMode, MAX_LAYERS_PER_TEXTURE, MAX_PERIOD, ParamValue, Step, TextureSetDoc};
 use crate::error::TexError;
 use crate::ops::{OpCategory, ParamType, find_op};
 
@@ -20,7 +18,11 @@ pub fn validate_doc(doc: &TextureSetDoc) -> Result<(), TexError> {
     let mut seen = std::collections::HashSet::new();
     for tex in &doc.textures {
         let at_tex = format!("texture \"{}\"", tex.id);
-        if tex.id.split_once(':').is_none_or(|(ns, name)| ns.is_empty() || name.is_empty()) {
+        if tex
+            .id
+            .split_once(':')
+            .is_none_or(|(ns, name)| ns.is_empty() || name.is_empty())
+        {
             return Err(TexError::invalid(&at_tex, "id must be \"namespace:name\""));
         }
         if !seen.insert(tex.id.clone()) {
@@ -77,14 +79,20 @@ fn validate_steps(steps: &[Step], at_layer: &str) -> Result<(), TexError> {
     for (si, step) in steps.iter().enumerate() {
         let at = format!("{at_layer} / step {} ({})", si + 1, step.op);
         let Some(spec) = find_op(&step.op) else {
-            return Err(TexError::invalid(&at, format!("unknown op \"{}\"", step.op)));
+            return Err(TexError::invalid(
+                &at,
+                format!("unknown op \"{}\"", step.op),
+            ));
         };
         // Every supplied param must exist on the spec with the right type.
         for (key, value) in &step.params {
             let Some(ps) = spec.params.iter().find(|p| p.name == key.as_str()) else {
                 return Err(TexError::invalid(
                     &at,
-                    format!("unknown param \"{key}\" (valid: {})", param_names(spec.params)),
+                    format!(
+                        "unknown param \"{key}\" (valid: {})",
+                        param_names(spec.params)
+                    ),
                 ));
             };
             check_type_and_range(&at, key, value, &ps.ty)?;
@@ -260,11 +268,7 @@ fn check_type_and_range(
 }
 
 fn param_names(params: &[crate::ops::ParamSpec]) -> String {
-    params
-        .iter()
-        .map(|p| p.name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    params.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")
 }
 
 /// Blend mode names accepted in layer defs — shared with the parser.

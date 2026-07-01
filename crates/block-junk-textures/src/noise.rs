@@ -29,9 +29,7 @@ pub fn hash_u32(mut h: u32) -> u32 {
 #[inline]
 pub fn hash2(x: u32, y: u32, seed: u32) -> f32 {
     let h = hash_u32(
-        x.wrapping_mul(0x9E37_79B9)
-            ^ y.wrapping_mul(0x85EB_CA6B)
-            ^ seed.wrapping_mul(0xC2B2_AE35),
+        x.wrapping_mul(0x9E37_79B9) ^ y.wrapping_mul(0x85EB_CA6B) ^ seed.wrapping_mul(0xC2B2_AE35),
     );
     (h >> 8) as f32 / (1u32 << 24) as f32
 }
@@ -104,8 +102,13 @@ pub fn fbm_periodic(u: f32, v: f32, cells: u32, octaves: u32, gain: f32, seed: u
     let mut sum = 0.0_f32;
     let mut norm = 0.0_f32;
     for oct in 0..octaves {
-        sum += amp * perlin_periodic(u, v, cells.saturating_mul(freq).max(1), seed ^ (oct * 0x9E37))
-            ;
+        sum += amp
+            * perlin_periodic(
+                u,
+                v,
+                cells.saturating_mul(freq).max(1),
+                seed ^ (oct * 0x9E37),
+            );
         norm += amp;
         amp *= gain;
         freq = freq.saturating_mul(2);
@@ -189,7 +192,10 @@ mod tests {
         for &(u, v) in &[(0.13, 0.77), (0.5, 0.01), (0.999, 0.999)] {
             let a = perlin_periodic(u, v, 5, 42);
             let b = perlin_periodic(u + 1.0, v + 3.0, 5, 42);
-            assert!((a - b).abs() < 1e-5, "perlin not periodic at ({u},{v}): {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "perlin not periodic at ({u},{v}): {a} vs {b}"
+            );
         }
     }
 

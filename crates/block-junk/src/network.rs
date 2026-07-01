@@ -16,19 +16,18 @@ use bevy::prelude::*;
 use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
-use crate::menu::{AppState, JoinTarget};
 use crate::craft_stations::{
-    CancelOrder, DepositToStation, QueueOrder, StationUpdate, StationsFullSync, WorkStart,
-    WorkStop,
+    CancelOrder, DepositToStation, QueueOrder, StationUpdate, StationsFullSync, WorkStart, WorkStop,
 };
+use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
-    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest,
-    Carrying, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
-    DebugFillNearestPlan, DebugSpawnTools, DebugSpawnWorkbench, DepositRequest, DropRequest,
-    DropToolRequest, EquippedTool, MovementIntent, MovementMode,
-    NpcAnimOverride, NpcDetails, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync,
-    RequestNpcDetails, WorldChannel, WorldClockSync, WorldItem,
+    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, Carrying,
+    ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan,
+    DebugSpawnTools, DebugSpawnWorkbench, DepositRequest, DropRequest, DropToolRequest,
+    EquippedTool, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PickupRequest,
+    PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails, WorldChannel, WorldClockSync,
+    WorldItem,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +78,10 @@ impl Plugin for ProtocolPlugin {
         // Targeted reply to a refused request (reach gate etc.); feeds
         // the rejection-toast UI on the requesting client only.
         app.register_message::<crate::protocol::ActionRejected>()
+            .add_direction(NetworkDirection::ServerToClient);
+        // Mod-requested worldspace toasts (engine.ui.toast), broadcast
+        // to everyone.
+        app.register_message::<crate::protocol::WorldToast>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<PlanEdit>()
             .add_direction(NetworkDirection::Bidirectional);
@@ -152,11 +155,14 @@ impl Plugin for ProtocolPlugin {
         app.register_component::<NpcAnimOverride>();
         app.register_component::<NpcPath>();
         app.register_component::<crate::civilization::ClusterBboxReplica>();
-        // Loose items in the world. No prediction (items don't move
-        // server-side in Phase 1) and no interpolation (no per-tick
-        // updates to lerp between). Initial replicate carries the
-        // spawn position; that's all the client needs to render the
-        // pile.
+        // Loose items in the world. No prediction (clients never drive
+        // item motion) and no interpolation (movement is occasional
+        // settle snaps, not continuous per-tick motion worth lerping).
+        // The initial replicate carries the spawn position; later
+        // server-side settles (fall onto exposed ground, rise out of a
+        // newly-placed block) each replicate as one delta, which the
+        // client's `sync_world_item_transform` copies to the render
+        // Transform.
         app.register_component::<WorldItem>();
         // Actor carry stack. Replicated to every client so the owner
         // can read their own state for HUD; no prediction because

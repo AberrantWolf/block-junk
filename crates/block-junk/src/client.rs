@@ -12,10 +12,12 @@ use bevy::scene::SceneInstanceReady;
 use lightyear::frame_interpolation::prelude::*;
 use lightyear::input::native::prelude::*;
 
-use crate::block_textures::{BlockTextures, BlockTextureExt, BlockTexturesPlugin, ChunkMaterial};
+use crate::block_textures::{BlockTextureExt, BlockTextures, BlockTexturesPlugin, ChunkMaterial};
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::collision::WorldCollision;
+use crate::inspect_panel::InspectPanelPlugin;
+use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
 use crate::menu::AppState;
 use crate::npc::{Npc, NpcId, NpcKind, NpcPath};
 use crate::npc_registry::NpcKindRegistry;
@@ -23,21 +25,19 @@ use crate::physics::{
     EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_separation_push_swept, apply_walk_step,
     compute_actor_separation_pushes, rescue_embedded_actor,
 };
-use crate::inspect_panel::InspectPanelPlugin;
 use crate::plans::{Plans, PlansClientPlugin};
 use crate::player_mode::{PlayerMode, PlayerModePlugin};
-use crate::preview::{PreviewBack, PreviewFront, PreviewPlugin};
-use crate::target_outline::TargetOutlinePlugin;
-use crate::items::{ItemRegistry, ItemSlot, PLAYER_CARRY_CAPACITY};
+use crate::preview::{
+    PreviewBack, PreviewFront, PreviewMaterialPair, PreviewPlugin, PreviewSceneReady,
+};
 use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
-    BlockManifest,
-    Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest,
+    BlockManifest, Carrying, ChunkCoord, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest,
     DropRequest, DropToolRequest, EquippedTool, GameSet, INTERACT_REACH, MovementIntent,
-    MovementMode,
-    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, WorldChannel, WorldClock,
+    MovementMode, NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, WorldChannel, WorldClock,
     WorldClockSync, WorldItem,
 };
+use crate::target_outline::TargetOutlinePlugin;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
 pub struct ClientPlugin;
@@ -49,6 +49,7 @@ impl Plugin for ClientPlugin {
             .add_plugins(PlayerModePlugin)
             .add_plugins(TargetOutlinePlugin)
             .add_plugins(PlansClientPlugin)
+            .add_plugins(crate::plan_ghosts::PlanGhostsPlugin)
             .add_plugins(crate::craft_stations::CraftStationsClientPlugin)
             .add_plugins(crate::craft_ui::CraftUiPlugin)
             .add_plugins(crate::craft_progress_hud::CraftProgressHudPlugin)
@@ -103,10 +104,7 @@ impl Plugin for ClientPlugin {
             // has so many params that bundling it with four others overflows
             // Bevy's trait-resolution chain for system tuples (cap 3 in
             // bevy-018 skill).
-            .add_systems(
-                Update,
-                normal_mode_action_input.in_set(GameSet::Input),
-            )
+            .add_systems(Update, normal_mode_action_input.in_set(GameSet::Input))
             .add_systems(
                 Update,
                 (
@@ -165,9 +163,20 @@ impl Plugin for ClientPlugin {
                     receive_chunk_unloads,
                     receive_world_clock,
                     receive_action_rejections,
+                    receive_world_toasts,
                 )
                     .chain()
                     .in_set(GameSet::Simulation),
+            )
+            // Loose items can move after spawn now (settling onto ground
+            // when the block under them is mined, rising when a block is
+            // built into their cell). The spawn observer seeds the render
+            // Transform once; this propagates every later server-side
+            // `WorldItem.translation` change to it so the mesh actually
+            // moves instead of hanging at its spawn point.
+            .add_systems(
+                Update,
+                sync_world_item_transform.in_set(GameSet::Simulation),
             )
             .add_systems(
                 Update,
@@ -408,13 +417,9 @@ struct PreviewCubeRoot;
 #[derive(Component)]
 struct PreviewSceneRoot;
 
-/// Set on a `PreviewSceneRoot` after we've finished walking its
-/// descendants and replaced their materials with our preview pair. Until
-/// this marker is present the scene is kept hidden — we don't want the
-/// player to see one frame of the bed at full opacity with original
-/// materials before the swap completes.
-#[derive(Component)]
-struct PreviewSceneReady;
+// `PreviewSceneReady` + `PreviewMaterialPair` live in `preview.rs` —
+// shared with the plan-ghost system, which reuses the same material-
+// swap observer below with per-block handles.
 
 /// Shared material handles for every preview draw. Two materials
 /// (front, back) get re-tinted each frame from the selected block's
@@ -496,12 +501,10 @@ fn setup_scene(
     let clip_nodes: HashMap<String, AnimationNodeIndex> =
         clip_ids.into_iter().zip(node_indices.into_iter()).collect();
     commands.insert_resource(CharacterAssets {
-        knight_scene: asset_server
-            .load(GltfAssetLabel::Scene(0).from_asset(KAYKIT_KNIGHT_GLB)),
+        knight_scene: asset_server.load(GltfAssetLabel::Scene(0).from_asset(KAYKIT_KNIGHT_GLB)),
         anim_graph: anim_graphs.add(anim_graph),
         clip_nodes,
     });
-
 
     // Camera + a point "headlamp" so the player can read shapes in the
     // shadow of nearby geometry without needing to fly around to find
@@ -641,8 +644,8 @@ fn setup_scene(
                             border_radius: BorderRadius::all(Val::Px(3.0)),
                             ..default()
                         },
-                        BackgroundColor(Color::srgba(0.05, 0.05, 0.05, 0.72)),
-                        BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+                        BackgroundColor(crate::ui_theme::CHIP_BG),
+                        BorderColor::all(crate::ui_theme::CHIP_BORDER),
                     ))
                     .with_children(|cap| {
                         cap.spawn((
@@ -651,7 +654,7 @@ fn setup_scene(
                                 font_size: 12.0,
                                 ..default()
                             },
-                            TextColor(Color::srgba(0.9, 0.9, 0.9, 1.0)),
+                            TextColor(crate::ui_theme::TEXT),
                         ));
                     });
                 for (i, slot) in palette.0.iter().enumerate() {
@@ -833,8 +836,8 @@ fn spawn_carry_hud(commands: &mut Commands) {
                     border_radius: BorderRadius::all(Val::Px(6.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.78)),
-                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+                BackgroundColor(crate::ui_theme::CHIP_BG),
+                BorderColor::all(crate::ui_theme::CHIP_BORDER),
             ))
             .with_children(|chip| {
                 chip.spawn((
@@ -856,7 +859,18 @@ fn spawn_carry_hud(commands: &mut Commands) {
                         font_size: 16.0,
                         ..default()
                     },
-                    TextColor(Color::WHITE),
+                    TextColor(crate::ui_theme::TEXT),
+                ));
+                // Contextual keybind hint: only on screen while the
+                // player is actually carrying something — exactly the
+                // moment "how do I put this down?" comes up.
+                chip.spawn((
+                    Text::new("Q: drop"),
+                    TextFont {
+                        font_size: 12.0,
+                        ..default()
+                    },
+                    TextColor(crate::ui_theme::TEXT_DIM),
                 ));
             });
         });
@@ -899,8 +913,8 @@ fn spawn_tool_hud(commands: &mut Commands) {
                     border_radius: BorderRadius::all(Val::Px(6.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.78)),
-                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+                BackgroundColor(crate::ui_theme::CHIP_BG),
+                BorderColor::all(crate::ui_theme::CHIP_BORDER),
             ))
             .with_children(|chip| {
                 chip.spawn((
@@ -922,7 +936,16 @@ fn spawn_tool_hud(commands: &mut Commands) {
                         font_size: 16.0,
                         ..default()
                     },
-                    TextColor(Color::WHITE),
+                    TextColor(crate::ui_theme::TEXT),
+                ));
+                // Same contextual pattern as the carry chip's Q hint.
+                chip.spawn((
+                    Text::new("T: drop"),
+                    TextFont {
+                        font_size: 12.0,
+                        ..default()
+                    },
+                    TextColor(crate::ui_theme::TEXT_DIM),
                 ));
             });
         });
@@ -954,7 +977,11 @@ fn update_tool_hud(
                 def.display_name.clone(),
             )
         }
-        None => (Visibility::Hidden, Color::srgba(0.5, 0.5, 0.5, 1.0), String::new()),
+        None => (
+            Visibility::Hidden,
+            Color::srgba(0.5, 0.5, 0.5, 1.0),
+            String::new(),
+        ),
     };
     for mut v in roots.iter_mut() {
         *v = vis;
@@ -988,17 +1015,14 @@ fn update_carry_hud(
         (Some(slot), count) if count > 0 => {
             let def = items.def(slot);
             let [r, g, b] = def.color;
-            let label = format!(
-                "{}  {}/{}",
-                def.display_name, count, PLAYER_CARRY_CAPACITY
-            );
-            (
-                Visibility::Inherited,
-                Color::srgba(r, g, b, 1.0),
-                label,
-            )
+            let label = format!("{}  {}/{}", def.display_name, count, PLAYER_CARRY_CAPACITY);
+            (Visibility::Inherited, Color::srgba(r, g, b, 1.0), label)
         }
-        _ => (Visibility::Hidden, Color::srgba(0.5, 0.5, 0.5, 1.0), String::new()),
+        _ => (
+            Visibility::Hidden,
+            Color::srgba(0.5, 0.5, 0.5, 1.0),
+            String::new(),
+        ),
     };
     for mut v in roots.iter_mut() {
         *v = vis;
@@ -1176,7 +1200,11 @@ pub(crate) fn placement_orientation(player_yaw: f32, manual: Cardinal) -> Cardin
 /// Resolve a default-orientation footprint into world cells given an
 /// anchor cell and the current orientation. Single-cell footprints fall
 /// out trivially as `[anchor]`; multi-cell ones get rotated.
-fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardinal) -> Vec<IVec3> {
+pub(crate) fn world_footprint(
+    anchor: IVec3,
+    def_footprint: &[[i32; 3]],
+    orientation: Cardinal,
+) -> Vec<IVec3> {
     def_footprint
         .iter()
         .map(|&offset| anchor + IVec3::from_array(orientation.rotate_offset(offset)))
@@ -1206,7 +1234,10 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
 ///
 /// Plan mode doesn't run this system (mode gate); it has its own
 /// `plan_mode_input` for tagging.
-#[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "input system spans many subsystems"
+)]
 /// Senders + local-player reads for `normal_mode_action_input`,
 /// bundled to keep the system under Bevy 0.18's 16-SystemParam cap.
 /// Adding tool gating to the function pushed it over; consolidating
@@ -1268,7 +1299,10 @@ struct InputContext<'w, 's> {
 /// R-click is owned by `craft_ui::open_modal_on_right_click` (open
 /// craft modal) and reserved for future door / NPC interactables. It
 /// passes through this system without doing anything here.
-#[allow(clippy::too_many_arguments, reason = "input system spans many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "input system spans many subsystems"
+)]
 fn normal_mode_action_input(
     mouse: Res<ButtonInput<MouseButton>>,
     captures: Res<crate::ui_capture::UiCaptures>,
@@ -1292,9 +1326,7 @@ fn normal_mode_action_input(
             if let Some(cell) = work_cell.take()
                 && let Ok(mut s) = io.work_stop.single_mut()
             {
-                s.send::<WorldChannel>(crate::craft_stations::WorkStop {
-                    station_cell: cell,
-                });
+                s.send::<WorldChannel>(crate::craft_stations::WorkStop { station_cell: cell });
             }
         };
     }
@@ -1416,11 +1448,10 @@ fn normal_mode_action_input(
     if let Some(hit) = world_hit.as_ref()
         && is_station_block(hit.cell, &ctx.chunks, &ctx.chunk_map, &ctx.blocks)
     {
-        let work_ready = ctx.stations
+        let work_ready = ctx
+            .stations
             .get(hit.cell)
-            .map(|s| {
-                crate::craft_stations::station_has_work_ready(s, &ctx.recipes, &ctx.items)
-            })
+            .map(|s| crate::craft_stations::station_has_work_ready(s, &ctx.recipes, &ctx.items))
             .unwrap_or(false);
         if work_ready {
             // If cursor moved between work-ready stations, send Stop
@@ -1435,18 +1466,14 @@ fn normal_mode_action_input(
                 }
                 *work_cell = None;
             }
-            if *work_cell != Some(hit.cell)
-                && (l_just_pressed || work_cell.is_none())
-            {
+            if *work_cell != Some(hit.cell) && (l_just_pressed || work_cell.is_none()) {
                 // `work_cell.is_none()` covers the case where the
                 // player started a hold over a non-station cell and
                 // swept onto a station mid-hold — we don't have a
                 // just_pressed edge but should still register as
                 // worker. Press-edge required only for the disjoint
                 // "new press onto a station" case.
-                if l_just_pressed
-                    && let Ok(mut s) = io.work_start.single_mut()
-                {
+                if l_just_pressed && let Ok(mut s) = io.work_start.single_mut() {
                     s.send::<WorldChannel>(crate::craft_stations::WorkStart {
                         station_cell: hit.cell,
                     });
@@ -1489,21 +1516,14 @@ fn normal_mode_action_input(
     } else {
         Some(edit.slot)
     };
-    if !crate::target_outline::player_can_work_slot(
-        work_slot,
-        &ctx.blocks,
-        &ctx.items,
-        tool,
-    ) {
+    if !crate::target_outline::player_can_work_slot(work_slot, &ctx.blocks, &ctx.items, tool) {
         action.active = None;
         return;
     }
 
     // Instant-builds debug toggle: single send on the press edge.
     if instant_builds.0 {
-        if l_just_pressed
-            && let Ok(mut s) = io.edit.single_mut()
-        {
+        if l_just_pressed && let Ok(mut s) = io.edit.single_mut() {
             s.send::<WorldChannel>(edit);
         }
         action.active = None;
@@ -1647,14 +1667,12 @@ fn pick_deposit_target(
     world_hit: Option<&EntityAwareHit>,
     plan_hit: Option<(f32, IVec3)>,
 ) -> Option<IVec3> {
-    let world_tagged = world_hit
-        .filter(|h| plans.get(h.cell).is_some())
-        .map(|h| {
-            (
-                (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length(),
-                h.cell,
-            )
-        });
+    let world_tagged = world_hit.filter(|h| plans.get(h.cell).is_some()).map(|h| {
+        (
+            (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length(),
+            h.cell,
+        )
+    });
     match (world_tagged, plan_hit) {
         (Some(a), Some(b)) if a.0 <= b.0 => Some(a.1),
         (Some(_), Some((_, c))) => Some(c),
@@ -1813,8 +1831,7 @@ pub(crate) fn entity_aware_raycast(
     };
     let is_passable = |cell: IVec3, slot: BlockSlot| -> bool {
         slot.is_empty()
-            || skip_plan_remove
-                .is_some_and(|p| matches!(p.kind(cell), Some(PlanKind::Remove)))
+            || skip_plan_remove.is_some_and(|p| matches!(p.kind(cell), Some(PlanKind::Remove)))
     };
 
     // Two-pass: first find the nearest cell whose block-entity AABB
@@ -1847,11 +1864,7 @@ pub(crate) fn entity_aware_raycast(
 
     let step = dir.signum().as_ivec3();
     let next = cell.as_vec3() + dir.signum().max(Vec3::ZERO);
-    let mut t_max = Vec3::select(
-        dir.cmpeq(Vec3::ZERO),
-        Vec3::INFINITY,
-        (next - origin) / dir,
-    );
+    let mut t_max = Vec3::select(dir.cmpeq(Vec3::ZERO), Vec3::INFINITY, (next - origin) / dir);
     let t_delta = dir.abs().recip();
 
     loop {
@@ -1898,7 +1911,10 @@ pub(crate) fn entity_aware_raycast(
 /// Decide whether a non-empty cell counts as a hit. Plain solid blocks
 /// always do. Block-entity cells (anchor or ghost) defer to the entity's
 /// rotated AABB so the ray walks past airspace inside a partial mesh.
-#[allow(clippy::too_many_arguments, reason = "raycast helper is naturally chunky")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "raycast helper is naturally chunky"
+)]
 fn cell_passes_test(
     origin: Vec3,
     dir: Vec3,
@@ -2042,8 +2058,7 @@ fn hide_preview_on_mode_change(
     if !mode.is_changed() && !selected.is_changed() {
         return;
     }
-    let should_show =
-        *mode == PlayerMode::Plan && selected.current_block(&palette).is_some();
+    let should_show = *mode == PlayerMode::Plan && selected.current_block(&palette).is_some();
     if should_show {
         return;
     }
@@ -2112,13 +2127,7 @@ fn update_placement_preview(
     let visible_yaw = pose.yaw + fly.pending_dyaw;
 
     let Some(hit) = entity_aware_raycast(
-        cam_pos,
-        cam_dir,
-        PLAN_REACH,
-        &chunks,
-        &chunk_map,
-        &registry,
-        None,
+        cam_pos, cam_dir, PLAN_REACH, &chunks, &chunk_map, &registry, None,
     ) else {
         hide(state.cube_root, &mut roots);
         hide(state.scene_root, &mut roots);
@@ -2190,6 +2199,10 @@ fn update_placement_preview(
                 .spawn((
                     PreviewSceneRoot,
                     SceneRoot(scene),
+                    PreviewMaterialPair {
+                        front: materials_handles.front.clone(),
+                        back: materials_handles.back.clone(),
+                    },
                     Transform::default(),
                     Visibility::Hidden,
                     Name::new(format!("preview_scene:{}", def.id)),
@@ -2243,16 +2256,18 @@ fn update_placement_preview(
 /// the scene can finally be made visible.
 fn swap_preview_scene_materials(
     trigger: On<SceneInstanceReady>,
-    scene_roots: Query<(), With<PreviewSceneRoot>>,
+    pairs: Query<&PreviewMaterialPair>,
     children_q: Query<&Children>,
     meshes: Query<&Mesh3d>,
-    materials: Res<PreviewMaterials>,
     mut commands: Commands,
 ) {
     let root = trigger.event_target();
-    if !scene_roots.contains(root) {
+    // Any scene root carrying a material pair gets the treatment — the
+    // cursor preview (shared re-tinted pair) and plan ghosts (per-block
+    // fixed-tint pairs) both route through here.
+    let Ok(pair) = pairs.get(root) else {
         return;
-    }
+    };
     // BFS through descendants. For each Mesh3d we find: install our
     // front material (replacing whatever StandardMaterial the glTF
     // shipped with) and parent a back-pass twin underneath it.
@@ -2268,12 +2283,9 @@ fn swap_preview_scene_materials(
         commands
             .entity(entity)
             .remove::<MeshMaterial3d<StandardMaterial>>()
-            .insert(MeshMaterial3d(materials.front.clone()))
+            .insert(MeshMaterial3d(pair.front.clone()))
             .with_children(|parent| {
-                parent.spawn((
-                    Mesh3d(mesh_handle),
-                    MeshMaterial3d(materials.back.clone()),
-                ));
+                parent.spawn((Mesh3d(mesh_handle), MeshMaterial3d(pair.back.clone())));
             });
     }
     commands.entity(root).insert(PreviewSceneReady);
@@ -2385,12 +2397,24 @@ fn buffer_input(
     if active {
         let mut wd = [0i8; 3];
         // Convention: forward = -Z (matches Bevy yaw=0), right = +X, up = +Y.
-        if keys.pressed(KeyCode::KeyW) { wd[2] -= 1; }
-        if keys.pressed(KeyCode::KeyS) { wd[2] += 1; }
-        if keys.pressed(KeyCode::KeyA) { wd[0] -= 1; }
-        if keys.pressed(KeyCode::KeyD) { wd[0] += 1; }
-        if keys.pressed(KeyCode::Space) { wd[1] += 1; }
-        if keys.pressed(KeyCode::ShiftLeft) { wd[1] -= 1; }
+        if keys.pressed(KeyCode::KeyW) {
+            wd[2] -= 1;
+        }
+        if keys.pressed(KeyCode::KeyS) {
+            wd[2] += 1;
+        }
+        if keys.pressed(KeyCode::KeyA) {
+            wd[0] -= 1;
+        }
+        if keys.pressed(KeyCode::KeyD) {
+            wd[0] += 1;
+        }
+        if keys.pressed(KeyCode::Space) {
+            wd[1] += 1;
+        }
+        if keys.pressed(KeyCode::ShiftLeft) {
+            wd[1] -= 1;
+        }
         input.wishdir = wd;
         input.jump = keys.pressed(KeyCode::Space);
 
@@ -2490,7 +2514,15 @@ fn client_player_step(
             vel.0.x = 0.0;
             vel.0.z = 0.0;
         }
-        apply_walk_step(&mut pose, &mut vel, &mut on_ground, &mut mode, &input.0, dt, &world);
+        apply_walk_step(
+            &mut pose,
+            &mut vel,
+            &mut on_ground,
+            &mut mode,
+            &input.0,
+            dt,
+            &world,
+        );
     }
 }
 
@@ -2639,6 +2671,23 @@ fn receive_action_rejections(
     }
 }
 
+/// Mod-requested toast arrived from the server (`engine.ui.toast` on
+/// the server side) — hand it to the same worldspace-toast UI the
+/// rejection channel uses.
+fn receive_world_toasts(
+    mut receivers: Query<&mut MessageReceiver<crate::protocol::WorldToast>>,
+    mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
+) {
+    for mut receiver in receivers.iter_mut() {
+        for toast in receiver.receive() {
+            toasts.push(crate::worldspace_toast::SpawnToast {
+                cell: toast.cell,
+                text: toast.text,
+            });
+        }
+    }
+}
+
 fn receive_block_edit_broadcasts(
     mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
@@ -2673,11 +2722,7 @@ fn apply_broadcast_edit(
             // ghosts are missed here — acceptable: the owner chunk
             // ships correct padding whenever it enters AoI, and the
             // single-cell case (the common one) is covered.
-            crate::voxel::apply_padding_mirrors(
-                &[(edit.anchor, BlockSlot::EMPTY)],
-                map,
-                chunks,
-            );
+            crate::voxel::apply_padding_mirrors(&[(edit.anchor, BlockSlot::EMPTY)], map, chunks);
             return;
         };
         let Ok((chunk, _)) = chunks.get(anchor_entity) else {
@@ -2820,7 +2865,11 @@ fn attach_npc_visuals(
         // Without this flip the knight walks backwards along his path.
         commands
             .entity(entity)
-            .insert((NpcVisuals::default(), Transform::default(), Visibility::default()))
+            .insert((
+                NpcVisuals::default(),
+                Transform::default(),
+                Visibility::default(),
+            ))
             .with_child((
                 NpcSceneRoot,
                 SceneRoot(assets.knight_scene.clone()),
@@ -2883,10 +2932,7 @@ fn attach_npc_carry_icons(
 /// avoids the change-detection bookkeeping for sub-frame correctness.
 fn update_npc_carry_icons(
     npcs: Query<(&Carrying, &Children), With<Npc>>,
-    mut icons: Query<
-        (&MeshMaterial3d<StandardMaterial>, &mut Visibility),
-        With<NpcCarryIcon>,
-    >,
+    mut icons: Query<(&MeshMaterial3d<StandardMaterial>, &mut Visibility), With<NpcCarryIcon>>,
     items: Res<ItemRegistry>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -2946,6 +2992,27 @@ fn attach_world_item_visuals(
     ));
 }
 
+/// Propagate post-spawn `WorldItem.translation` changes to the render
+/// `Transform`. The server re-settles loose items (a drop falling onto
+/// the ground exposed when the block under it is mined, an item rising
+/// out of a cell a block was built into); lightyear replicates the new
+/// `WorldItem` value and marks it `Changed`, but `Transform` is not
+/// replicated (networking-design: events for the grid, derived render
+/// state stays local), so without this the mesh would stay frozen at its
+/// spawn position while the authoritative item is somewhere else.
+///
+/// The `Changed` filter also fires on the spawn tick, redundantly with
+/// `attach_world_item_visuals`; the `!=` guard makes that a no-op and
+/// avoids needlessly dirtying `Transform` for the transform-propagation
+/// pass.
+fn sync_world_item_transform(mut items: Query<(&WorldItem, &mut Transform), Changed<WorldItem>>) {
+    for (world_item, mut transform) in items.iter_mut() {
+        if transform.translation != world_item.translation {
+            transform.translation = world_item.translation;
+        }
+    }
+}
+
 /// Manually replay Bevy's animation-rigging pass when the Knight's
 /// scene instance is ready. Bevy's glTF loader normally inserts an
 /// `AnimationPlayer` on each "animation root" node and tags every
@@ -2986,7 +3053,10 @@ fn setup_npc_skeleton_anim(
         warn!("npc scene ready but no 'Rig_Medium' descendant: {scene_bearer:?}");
         return;
     };
-    let rig_name = names.get(rig_root).map(|n| n.as_str()).unwrap_or("<unnamed>");
+    let rig_name = names
+        .get(rig_root)
+        .map(|n| n.as_str())
+        .unwrap_or("<unnamed>");
     // Walk the rig hierarchy, tagging every named entity with the same
     // (AnimationTargetId, AnimatedBy) pair the glTF loader would have
     // assigned if Knight.glb had its own animations.
@@ -3159,15 +3229,7 @@ fn find_npc_ancestor(
 /// (mod typo, unloaded asset), the NPC keeps whatever it was
 /// already playing.
 fn drive_npc_animation(
-    mut npcs: Query<
-        (
-            &AvatarVelocity,
-            &NpcAnimOverride,
-            &NpcKind,
-            &mut NpcVisuals,
-        ),
-        With<Npc>,
-    >,
+    mut npcs: Query<(&AvatarVelocity, &NpcAnimOverride, &NpcKind, &mut NpcVisuals), With<Npc>>,
     mut players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
     assets: Res<CharacterAssets>,
     kinds: Res<NpcKindRegistry>,
@@ -3262,10 +3324,7 @@ fn draw_civilization_clusters(
         let max = bbox.max.as_vec3() + Vec3::ONE;
         let centre = (min + max) * 0.5;
         let size = max - min;
-        gizmos.cube(
-            Transform::from_translation(centre).with_scale(size),
-            color,
-        );
+        gizmos.cube(Transform::from_translation(centre).with_scale(size), color);
     }
 }
 

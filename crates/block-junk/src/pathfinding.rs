@@ -42,9 +42,7 @@ pub trait Walkability {
 /// True when an actor with a 1×2-cell body can stand at `foot_cell`:
 /// foot cell empty, head cell empty, supporting cell solid.
 pub fn standable<W: Walkability>(world: &W, foot: IVec3) -> bool {
-    !world.is_solid(foot)
-        && !world.is_solid(foot + IVec3::Y)
-        && world.is_solid(foot - IVec3::Y)
+    !world.is_solid(foot) && !world.is_solid(foot + IVec3::Y) && world.is_solid(foot - IVec3::Y)
 }
 
 /// String-pulling smoother. Given an A* path that zig-zags through
@@ -110,8 +108,20 @@ fn line_of_sight<W: Walkability>(a: IVec3, b: IVec3, world: &W) -> bool {
     let mut cell = IVec3::new(ax.floor() as i32, y, az.floor() as i32);
     let end = IVec3::new(bx.floor() as i32, y, bz.floor() as i32);
 
-    let step_x = if dx > 0.0 { 1 } else if dx < 0.0 { -1 } else { 0 };
-    let step_z = if dz > 0.0 { 1 } else if dz < 0.0 { -1 } else { 0 };
+    let step_x = if dx > 0.0 {
+        1
+    } else if dx < 0.0 {
+        -1
+    } else {
+        0
+    };
+    let step_z = if dz > 0.0 {
+        1
+    } else if dz < 0.0 {
+        -1
+    } else {
+        0
+    };
 
     // Distance (in t) to the next X / Z grid line. With cells aligned
     // to integer coords and centres at `+0.5`, the next boundary in
@@ -158,10 +168,7 @@ fn line_of_sight<W: Walkability>(a: IVec3, b: IVec3, world: &W) -> bool {
         // either being solid must invalidate the line. Without this,
         // smoothing would happily route through a 1-cell-wide opening
         // between two walls.
-        if (t_max_x - t_max_z).abs() < f32::EPSILON
-            && t_max_x.is_finite()
-            && t_max_z.is_finite()
-        {
+        if (t_max_x - t_max_z).abs() < f32::EPSILON && t_max_x.is_finite() && t_max_z.is_finite() {
             let flank_x = IVec3::new(cell.x + step_x, y, cell.z);
             let flank_z = IVec3::new(cell.x, y, cell.z + step_z);
             if !standable(world, flank_x) || !standable(world, flank_z) {
@@ -201,6 +208,52 @@ pub fn nearest_standable_below<W: Walkability>(
         }
     }
     None
+}
+
+/// Resolve the cell a loose item settles in, starting from `from`.
+///
+/// Unlike [`standable`], head clearance is **not** required — a loose
+/// item is small enough to rest under a 1-cell overhang, so the only
+/// rule is "empty cell sitting directly on a solid support." Two clamped
+/// phases:
+///
+/// 1. **Rise** — if `from` is solid (a block was built into the item's
+///    cell), move up to the first empty cell, at most `max_rise` cells.
+/// 2. **Fall** — from that empty cell, drop to the highest cell whose
+///    cell directly below is solid, at most `max_drop` cells.
+///
+/// Both phases clamp instead of failing: if the rise can't escape solid
+/// within `max_rise` it returns the topmost cell reached (item stays
+/// embedded, a later destroy re-settles it); if the fall finds no
+/// support within `max_drop` it returns the lowest cell reached. The
+/// caller keeps the item at the returned cell either way — an item is
+/// never deleted for lack of ground.
+///
+/// Because [`Walkability::is_solid`] reports unloaded chunks as solid, a
+/// fall stops on top of the loaded/unloaded boundary rather than
+/// dropping an item into unknown territory (and out of the world). That
+/// is the network-safe behaviour: worst case an item rests too high
+/// until the chunk below streams in, never too low and never lost.
+pub fn settle_item_cell<W: Walkability>(
+    world: &W,
+    from: IVec3,
+    max_rise: i32,
+    max_drop: i32,
+) -> IVec3 {
+    let mut cell = from;
+    // Phase 1: rise out of any solid the item is buried in.
+    let mut risen = 0;
+    while risen < max_rise && world.is_solid(cell) {
+        cell += IVec3::Y;
+        risen += 1;
+    }
+    // Phase 2: fall until the cell directly below is solid support.
+    let mut dropped = 0;
+    while dropped < max_drop && !world.is_solid(cell - IVec3::Y) {
+        cell -= IVec3::Y;
+        dropped += 1;
+    }
+    cell
 }
 
 /// Find a path of foot cells from `start` to `goal`. Returns the path
@@ -418,7 +471,11 @@ mod tests {
         }
         // Manhattan distance is 5; with a 5-tall wall to skirt, we walk
         // out, around, back. Should be longer than 6.
-        assert!(path.len() > 6, "path should detour, got {} cells", path.len());
+        assert!(
+            path.len() > 6,
+            "path should detour, got {} cells",
+            path.len()
+        );
     }
 
     #[test]
@@ -453,7 +510,10 @@ mod tests {
         // a tiny budget the search bails.
         let world = GridWorld::floor_at(0);
         let path = find_path(IVec3::new(0, 1, 0), IVec3::new(40, 1, 0), &world, 8, 200);
-        assert!(path.is_none(), "8-node budget too small for 40-cell distance");
+        assert!(
+            path.is_none(),
+            "8-node budget too small for 40-cell distance"
+        );
     }
 
     #[test]
@@ -516,5 +576,68 @@ mod tests {
         let cell = nearest_standable_below(&world, IVec3::new(0, 20, 0), 30)
             .expect("ground reachable within drop budget");
         assert_eq!(cell, IVec3::new(0, 6, 0));
+    }
+
+    #[test]
+    fn settle_item_falls_to_floor() {
+        let world = GridWorld::floor_at(5);
+        // An item spawned high in the air falls to rest in the cell
+        // directly on the floor (y=6, floor top at y=5).
+        let cell = settle_item_cell(&world, IVec3::new(0, 20, 0), 32, 64);
+        assert_eq!(cell, IVec3::new(0, 6, 0));
+    }
+
+    #[test]
+    fn settle_item_rests_under_overhang() {
+        // Floor at y=0, a roof slab at y=2. An item starting at y=2
+        // (inside the roof) rises out, then there is nowhere to rise to
+        // that is clear *and* leaves it falling — it settles at y=1,
+        // resting on the floor under the 1-cell gap. Head clearance is
+        // not required, unlike `standable`.
+        let mut world = GridWorld::floor_at(0);
+        world.add_wall(IVec3::new(0, 2, 0), IVec3::new(0, 2, 0));
+        let cell = settle_item_cell(&world, IVec3::new(0, 1, 0), 32, 64);
+        assert_eq!(cell, IVec3::new(0, 1, 0));
+        assert!(
+            !standable(&world, cell),
+            "the rest cell has no head clearance"
+        );
+    }
+
+    #[test]
+    fn settle_item_rises_out_of_new_block() {
+        // A block was built into the item's cell (y=1 now solid). The
+        // item rises to the first empty cell that rests on support —
+        // y=2, sitting on the newly-solid y=1.
+        let mut world = GridWorld::floor_at(0);
+        world.add_wall(IVec3::new(0, 1, 0), IVec3::new(0, 1, 0));
+        let cell = settle_item_cell(&world, IVec3::new(0, 1, 0), 32, 64);
+        assert_eq!(cell, IVec3::new(0, 2, 0));
+    }
+
+    #[test]
+    fn settle_item_clamps_when_no_support() {
+        // No floor anywhere within budget: the item must NOT be lost.
+        // It clamps at the lowest scanned cell rather than falling
+        // forever (or being deleted).
+        let world = GridWorld {
+            solid: bevy::platform::collections::HashSet::default(),
+        };
+        let cell = settle_item_cell(&world, IVec3::new(0, 100, 0), 32, 10);
+        assert_eq!(cell, IVec3::new(0, 90, 0));
+    }
+
+    #[test]
+    fn settle_item_unloaded_is_solid_stops_fall() {
+        // `GridWorld` here reports a single solid cell far below; a true
+        // unloaded chunk would report solid the same way. The fall stops
+        // on top of it rather than passing through — the property that
+        // keeps items from dropping out of the world at chunk edges.
+        let mut world = GridWorld {
+            solid: bevy::platform::collections::HashSet::default(),
+        };
+        world.solid.insert(IVec3::new(0, 0, 0));
+        let cell = settle_item_cell(&world, IVec3::new(0, 50, 0), 32, 128);
+        assert_eq!(cell, IVec3::new(0, 1, 0));
     }
 }

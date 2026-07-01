@@ -277,7 +277,10 @@ const MAX_HAUL_ITEM_RADIUS_M: f32 = 64.0;
 ///
 /// Greedy. No global optimisation — the goal is "every NPC has
 /// something useful to do," not "minimise total haul distance."
-#[allow(clippy::too_many_arguments, reason = "scheduler reaches into many subsystems")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "scheduler reaches into many subsystems"
+)]
 pub fn try_schedule_haul_for_npc(
     npc_id: NpcId,
     npc_kind: &str,
@@ -393,10 +396,8 @@ pub fn try_schedule_haul_for_npc(
     // Index every loose item by ItemSlot once per call. The pool is
     // shared across this NPC's plan scan + final reservation pass;
     // per-NPC rebuild is O(items) and items are sparse.
-    let mut items_by_slot: std::collections::HashMap<
-        crate::items::ItemSlot,
-        Vec<(Entity, Vec3)>,
-    > = std::collections::HashMap::new();
+    let mut items_by_slot: std::collections::HashMap<crate::items::ItemSlot, Vec<(Entity, Vec3)>> =
+        std::collections::HashMap::new();
     for (entity, wi) in world_items.iter() {
         items_by_slot
             .entry(wi.item)
@@ -430,7 +431,10 @@ pub fn try_schedule_haul_for_npc(
             continue;
         }
         let chosen = pick_haul_kind(
-            state.materials.iter().map(|m| (m.item, m.needed.saturating_sub(m.present))),
+            state
+                .materials
+                .iter()
+                .map(|m| (m.item, m.needed.saturating_sub(m.present))),
             &items_by_slot,
             pose,
             npc_id,
@@ -442,13 +446,8 @@ pub fn try_schedule_haul_for_npc(
         // Tool gate: either no tool needed, NPC has it, or one is
         // available to fetch. `required_tool_for_plan` reads the
         // live block for Remove plans, the planned block for Build.
-        let required = required_tool_for_plan(
-            *cell,
-            &state.kind,
-            block_registry,
-            chunks,
-            chunk_map,
-        );
+        let required =
+            required_tool_for_plan(*cell, &state.kind, block_registry, chunks, chunk_map);
         if let Some(tag) = &required {
             let npc_satisfies = item_registry.tool_has_tag(equipped_tool.item, tag);
             if !npc_satisfies
@@ -513,13 +512,8 @@ pub fn try_schedule_haul_for_npc(
         let Some(state) = plans.get(plan_cell) else {
             return false;
         };
-        let required_tool_tag = required_tool_for_plan(
-            plan_cell,
-            &state.kind,
-            block_registry,
-            chunks,
-            chunk_map,
-        );
+        let required_tool_tag =
+            required_tool_for_plan(plan_cell, &state.kind, block_registry, chunks, chunk_map);
         if let Some(tag) = &required_tool_tag {
             if item_registry.tool_has_tag(equipped_tool.item, tag) {
                 None
@@ -615,7 +609,10 @@ pub fn try_schedule_haul_for_npc(
 /// Chebyshev (chessboard) distance between two cells. Same metric
 /// used everywhere else in the scheduler for "is this within radius."
 fn chebyshev(a: IVec3, b: IVec3) -> i32 {
-    (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs())
+    (a.x - b.x)
+        .abs()
+        .max((a.y - b.y).abs())
+        .max((a.z - b.z).abs())
 }
 
 /// Pick which kind to fetch for a haul target with multiple unmet
@@ -630,10 +627,7 @@ fn chebyshev(a: IVec3, b: IVec3) -> i32 {
 /// dead-end pickup leg.
 fn pick_haul_kind(
     demands: impl IntoIterator<Item = (crate::items::ItemSlot, u32)>,
-    items_by_slot: &std::collections::HashMap<
-        crate::items::ItemSlot,
-        Vec<(Entity, Vec3)>,
-    >,
+    items_by_slot: &std::collections::HashMap<crate::items::ItemSlot, Vec<(Entity, Vec3)>>,
     pose: Vec3,
     npc_id: NpcId,
     store: &HaulStore,
