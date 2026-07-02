@@ -3,6 +3,7 @@ mod blocks;
 mod camera;
 mod civilization;
 mod client;
+mod client_chunks;
 mod collision;
 mod craft_progress_hud;
 mod craft_stations;

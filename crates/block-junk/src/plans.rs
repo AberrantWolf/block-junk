@@ -638,7 +638,6 @@ fn build_initial_materials(
 /// apply to the authoritative `Plans`, broadcast the canonical applied
 /// edit. Reject (silently) edits that don't make sense against the
 /// world (tag-remove on empty, tag-build on solid).
-#[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::too_many_arguments,
     reason = "wire handler + reach gate + rejection reply"

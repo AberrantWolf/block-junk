@@ -874,6 +874,62 @@ struct WorldAnchorsCtx<'w> {
     civ_params: Res<'w, crate::civilization::CivilizationParamsRes>,
 }
 
+/// Read-only world state the brain tick needs for pathing, reachability,
+/// and validating that targets still exist. Kept together so gameplay
+/// additions can grow this context without pushing `npc_brain_tick` back
+/// toward Bevy's 16-SystemParam ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+struct BrainWorldCtx<'w, 's> {
+    time: Res<'w, Time>,
+    chunks: Query<'w, 's, &'static Chunk>,
+    chunk_entities: Query<'w, 's, &'static ChunkEntities>,
+    chunk_map: Res<'w, ChunkMap>,
+    block_registry: Res<'w, BlockRegistry>,
+    clock: Res<'w, WorldClock>,
+}
+
+impl<'w, 's> BrainWorldCtx<'w, 's> {
+    fn walk<'a>(&'a self) -> WorldWalk<'a, 'w, 's> {
+        WorldWalk {
+            chunks: &self.chunks,
+            chunk_map: &self.chunk_map,
+            registry: &self.block_registry,
+        }
+    }
+}
+
+type BrainNpcQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static NpcId,
+        &'static mut AvatarPose,
+        &'static mut Needs,
+        &'static mut Brain,
+        &'static mut MovementIntent,
+        &'static mut NpcPath,
+        &'static mut Carrying,
+        &'static mut EquippedTool,
+        &'static NpcKind,
+        Has<KinematicLock>,
+    ),
+    (With<Npc>, Without<BrainDisabled>),
+>;
+
+type PhysicsNpcQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut AvatarPose,
+        &'static mut AvatarVelocity,
+        &'static mut AvatarOnGround,
+        &'static NpcKind,
+        &'static MovementIntent,
+    ),
+    (With<Npc>, Without<KinematicLock>),
+>;
+
 /// Goals the preempt check considers abortable. Goals the Lua planner
 /// itself picks under critical need (Interact, Wander, Goto, Rest) are
 /// excluded — preempting Interact would yank the NPC off the action
@@ -1044,11 +1100,7 @@ fn preempt_current_goal(
     reason = "brain tick spans many subsystems"
 )]
 fn npc_brain_tick(
-    time: Res<Time>,
-    chunks: Query<&'static Chunk>,
-    chunk_entities_q: Query<&'static ChunkEntities>,
-    chunk_map: Res<ChunkMap>,
-    block_registry: Res<BlockRegistry>,
+    world_ctx: BrainWorldCtx,
     mods: Res<ServerMods>,
     need_registry: Res<NeedRegistry>,
     work_defaults: Res<WorkDefaultsRes>,
@@ -1057,32 +1109,17 @@ fn npc_brain_tick(
     mut interaction_claims: ResMut<InteractionClaims>,
     mut haul: HaulCtx,
     mut craft: CraftCtx,
-    world_clock: Res<WorldClock>,
     mut commands: Commands,
-    mut npcs: Query<
-        (
-            Entity,
-            &NpcId,
-            &mut AvatarPose,
-            &mut Needs,
-            &mut Brain,
-            &mut MovementIntent,
-            &mut NpcPath,
-            &mut Carrying,
-            &mut EquippedTool,
-            &NpcKind,
-            Has<KinematicLock>,
-        ),
-        (With<Npc>, Without<BrainDisabled>),
-    >,
+    mut npcs: BrainNpcQuery,
 ) {
-    let dt = time.delta_secs();
-    let now_secs = time.elapsed_secs();
-    let world = WorldWalk {
-        chunks: &chunks,
-        chunk_map: &chunk_map,
-        registry: &block_registry,
-    };
+    let dt = world_ctx.time.delta_secs();
+    let now_secs = world_ctx.time.elapsed_secs();
+    let world = world_ctx.walk();
+    let chunks = &world_ctx.chunks;
+    let chunk_entities_q = &world_ctx.chunk_entities;
+    let chunk_map = &world_ctx.chunk_map;
+    let block_registry = &world_ctx.block_registry;
+    let world_clock = *world_ctx.clock;
 
     let server = haul.servers.single().ok();
 
@@ -1164,10 +1201,10 @@ fn npc_brain_tick(
                     &mut haul.store,
                     &mut commands,
                     &world,
-                    &chunks,
-                    &chunk_entities_q,
-                    &chunk_map,
-                    &block_registry,
+                    chunks,
+                    chunk_entities_q,
+                    chunk_map,
+                    block_registry,
                 );
                 if let Some(_cell) = craft_station_cell {
                     // Atomic cleanup: drops the NPC's booking AND
@@ -1577,9 +1614,9 @@ fn npc_brain_tick(
                     // the next Idle entry.
                     let station_ok = crate::craft_stations::lookup_station_def(
                         station_cell,
-                        &chunks,
-                        &chunk_map,
-                        &block_registry,
+                        chunks,
+                        chunk_map,
+                        block_registry,
                     )
                     .is_some();
                     if !station_ok {
@@ -1766,9 +1803,9 @@ fn npc_brain_tick(
                     // through to haul.
                     let station_def = crate::craft_stations::lookup_station_def(
                         station_cell,
-                        &chunks,
-                        &chunk_map,
-                        &block_registry,
+                        chunks,
+                        chunk_map,
+                        block_registry,
                     );
                     // A worker-less in-progress craft is a resume: register as
                     // the worker and let the ticker continue from the saved
@@ -2024,9 +2061,9 @@ fn npc_brain_tick(
         // position rather than an embedded one.
         if let Some(target_cell) = interact_done {
             if is_locked {
-                let slot = slot_at_cell(target_cell, &chunks, &chunk_map, &block_registry);
+                let slot = slot_at_cell(target_cell, chunks, chunk_map, block_registry);
                 let (anchor_cell, orientation) =
-                    resolve_anchor_with_orientation(target_cell, &chunk_entities_q, &chunk_map);
+                    resolve_anchor_with_orientation(target_cell, chunk_entities_q, chunk_map);
                 if !try_eject_to_cells(
                     &mut pose,
                     eject_candidates_for_slot(slot.as_ref(), anchor_cell, orientation),
@@ -2113,11 +2150,11 @@ fn npc_brain_tick(
                     &equipped_tool,
                     &craft.stations,
                     &mut craft.bookings,
-                    &block_registry,
+                    block_registry,
                     &craft.recipes,
                     &haul.item_registry,
-                    &chunks,
-                    &chunk_map,
+                    chunks,
+                    chunk_map,
                 )
             {
                 // Walk to a standable neighbour of the station block.
@@ -2215,11 +2252,11 @@ fn npc_brain_tick(
                     &haul.kind_registry,
                     &haul.plans,
                     &craft.stations,
-                    &block_registry,
+                    block_registry,
                     &haul.item_registry,
                     &craft.recipes,
-                    &chunks,
-                    &chunk_map,
+                    chunks,
+                    chunk_map,
                     &haul.world_items,
                     &mut haul.store,
                     now_secs,
@@ -2270,13 +2307,13 @@ fn npc_brain_tick(
                 &haul.plans,
                 &haul.plan_claims,
                 &haul.store,
-                &chunks,
-                &chunk_entities_q,
-                &chunk_map,
-                &block_registry,
+                chunks,
+                chunk_entities_q,
+                chunk_map,
+                block_registry,
                 &haul.item_registry,
                 &work_defaults.0,
-                *world_clock,
+                world_clock,
             );
             // One-line per-NPC trace at every planner call so a
             // session log shows what each NPC saw on each decision.
@@ -2529,9 +2566,9 @@ fn npc_brain_tick(
                     // duration, and need delta.
                     let Some((interactable, slot, def_id)) = interactable_with_slot_at_cell(
                         target_cell,
-                        &chunks,
-                        &chunk_map,
-                        &block_registry,
+                        chunks,
+                        chunk_map,
+                        block_registry,
                     ) else {
                         info!(
                             npc = npc_id.0,
@@ -2549,7 +2586,7 @@ fn npc_brain_tick(
                     // Orientation rotates both `use_slot.approach`
                     // and `use_slot.pose` into world space.
                     let (anchor_cell, orientation) =
-                        resolve_anchor_with_orientation(target_cell, &chunk_entities_q, &chunk_map);
+                        resolve_anchor_with_orientation(target_cell, chunk_entities_q, chunk_map);
                     // Atomic claim — only attempted for exclusive
                     // blocks. Non-exclusive interactions (food on a
                     // shelf, water at a well) don't contend; a
@@ -2798,9 +2835,9 @@ fn npc_brain_tick(
                     let (work_duration_secs, work_need_restore) = resolve_work_action(
                         plan_kind,
                         target_cell,
-                        &chunks,
-                        &chunk_map,
-                        &block_registry,
+                        chunks,
+                        chunk_map,
+                        block_registry,
                         &work_defaults.0,
                     );
                     let foot = pose_to_standable_foot(&pose, &world)
@@ -3446,10 +3483,6 @@ fn build_snapshot(
 /// `work_action` (Build: block being placed; Remove: live block at
 /// cell) with `WorkDefaults` as the fallback. Planners use these to
 /// pick the highest-payoff nearby plan when several are equidistant.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "snapshot collector mirrors live brain lookups"
-)]
 #[allow(
     clippy::too_many_arguments,
     reason = "snapshot collector mirrors live brain lookups"
@@ -4318,16 +4351,7 @@ pub(crate) fn npc_physics_step(
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
     kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
-    mut npcs: Query<
-        (
-            &mut AvatarPose,
-            &mut AvatarVelocity,
-            &mut AvatarOnGround,
-            &NpcKind,
-            &MovementIntent,
-        ),
-        (With<Npc>, Without<KinematicLock>),
-    >,
+    mut npcs: PhysicsNpcQuery,
 ) {
     let dt = time.delta_secs();
     let world = WorldCollision {

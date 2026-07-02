@@ -71,7 +71,7 @@ pub struct ActiveWork {
 
 /// Full server-side state of one station cell. Replicated to clients
 /// via [`StationUpdate`] / [`StationsFullSync`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StationState {
     pub orders: Vec<CraftOrder>,
     /// Items deposited at the station, by slot. Shared across all
@@ -83,16 +83,6 @@ pub struct StationState {
     /// orders' Work buttons disable while this is `Some`.
     #[serde(default)]
     pub active_work: Option<ActiveWork>,
-}
-
-impl Default for StationState {
-    fn default() -> Self {
-        Self {
-            orders: Vec::new(),
-            inventory: HashMap::new(),
-            active_work: None,
-        }
-    }
 }
 
 impl StationState {
@@ -1226,7 +1216,6 @@ const WORK_PROGRESS_BROADCAST_INTERVAL_SECS: f32 = 0.25;
 /// Mid-work broadcasts fire at most every
 /// `WORK_PROGRESS_BROADCAST_INTERVAL_SECS` so the modal's progress
 /// label can advance. The completion broadcast happens regardless.
-#[allow(clippy::too_many_arguments, reason = "tick joins many subsystems")]
 #[allow(
     clippy::too_many_arguments,
     reason = "completion path joins many subsystems"
