@@ -63,15 +63,20 @@ This rule extends to other replicated identities later: prefer stable IDs (Playe
 
 ## Channel choices
 
-| Data | Channel mode | Reliability | Frequency |
+Four lanes as implemented (`protocol.rs`, registered in `network.rs::ProtocolPlugin` — one shared registration for both sides, so client/server mismatch is impossible):
+
+| Channel | Mode | Carries | Why this lane |
 |---|---|---|---|
-| `BlockEdit` (place/break) | `OrderedReliable` | reliable, in order | sparse (per click) |
-| `ChunkSnapshot` (initial load) | `UnorderedReliable` | reliable | rare (on join, on chunk-stream-in) |
-| Player/NPC transforms | `SequencedUnreliable` | unreliable, latest wins | every tick |
-| Building-detection events | `OrderedReliable` | reliable | rare |
-| Water-sim cell deltas (later) | `UnorderedUnreliable` (delta-batched) | unreliable | frequent — see "water" below |
+| `WorldChannel` | `OrderedReliable` | client→server edit/pickup/drop/deposit *requests*, `ActionRejected`, `BlockManifest`, NPC detail responses, dev commands | click-latency UX; must not queue behind bulk transfers |
+| `ChunkChannel` | `OrderedReliable` | `ChunkSnapshot`, `ChunkUnload`, **and server→client `BlockEdit` broadcasts** | the client skips edits for unloaded chunks trusting the snapshot to carry final state — snapshot, unload, and edit MUST share one ordered stream or a small edit overtakes a fragmented snapshot and is silently lost |
+| `StateSyncChannel` | `OrderedReliable` | `PlanEdit`/`PlanEditBatch`/`PlanFullSync`, station updates/full syncs | isolates 4096-cell plan batches and connect-time full syncs from the click-critical lane; preserves full-sync-before-delta |
+| `PeriodicSyncChannel` | `SequencedUnreliable` | `WorldClockSync` | latest sample wins; a drop is superseded by the next tick |
+
+Player/NPC transforms ride lightyear's `Replicate` machinery (`SequencedUnreliable` underneath), not a hand-rolled channel.
 
 **Decision rule**: if dropping the message *causes incorrect state when later messages arrive*, it's reliable. If a newer message *supersedes* the lost one, it's unreliable.
+
+**Ordering rule**: reliability alone isn't enough when one message's handler assumes another already applied — "snapshot before edit," "full sync before delta." Cross-*channel* ordering does not exist; anything with an apply-order dependency must share a channel (see `ChunkChannel` above, and the client chains `receive_snapshots` before `receive_block_edit_broadcasts` for the same-frame case).
 
 `BlockEdit` is reliable because dropping one means the client never agrees the block changed — all subsequent edits assume a wrong base. Player position is unreliable because dropping tick 100's snapshot is fine when tick 101's lands a frame later.
 

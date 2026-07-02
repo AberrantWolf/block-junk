@@ -16,7 +16,7 @@
 //! into; this module's job is the "executable lifecycle" prerequisite.
 
 use core::net::SocketAddr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -118,8 +118,16 @@ pub struct ServerSession {
     handle: Option<JoinHandle<()>>,
     shutdown: Option<Arc<AtomicBool>>,
     save_request: Option<Arc<AtomicBool>>,
+    save_result: Option<Arc<AtomicU8>>,
     shutdown_requested: bool,
 }
+
+/// Outcome of the most recent requested save, published by the server
+/// *before* it clears the request flag (so a client that observes the
+/// flag drop always reads a fresh outcome, never a stale one).
+pub const SAVE_RESULT_NONE: u8 = 0;
+pub const SAVE_RESULT_OK: u8 = 1;
+pub const SAVE_RESULT_FAILED: u8 = 2;
 
 impl ServerSession {
     pub fn is_hosting(&self) -> bool {
@@ -161,30 +169,44 @@ impl ServerSession {
         }
         self.shutdown = None;
         self.save_request = None;
+        self.save_result = None;
         self.shutdown_requested = false;
         true
     }
 
     /// Request a mid-session save. Server clears the flag once it has
-    /// written to disk; spamming the button is harmless (extra requests
-    /// during the same tick just collapse).
+    /// resolved the save (written or refused); spamming the button is
+    /// harmless (extra requests during the same tick just collapse).
     pub fn request_save(&self) {
         if self.shutdown_requested {
             return;
+        }
+        if let Some(result) = self.save_result.as_ref() {
+            result.store(SAVE_RESULT_NONE, Ordering::SeqCst);
         }
         if let Some(flag) = self.save_request.as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
     }
 
-    /// True while a requested save hasn't been written yet (the server
-    /// clears the flag after flushing to disk). Drives the pause menu's
-    /// "Saving… / Saved" feedback.
+    /// True while a requested save hasn't been resolved yet (the server
+    /// clears the flag after publishing the outcome). Drives the pause
+    /// menu's "Saving… / Saved / failed" feedback.
     pub fn save_pending(&self) -> bool {
         self.save_request
             .as_ref()
             .map(|flag| flag.load(Ordering::SeqCst))
             .unwrap_or(false)
+    }
+
+    /// Outcome of the last resolved save request. Only meaningful once
+    /// [`save_pending`] has dropped; `SAVE_RESULT_NONE` means no request
+    /// has resolved since the last [`request_save`].
+    pub fn last_save_result(&self) -> u8 {
+        self.save_result
+            .as_ref()
+            .map(|result| result.load(Ordering::SeqCst))
+            .unwrap_or(SAVE_RESULT_NONE)
     }
 }
 
@@ -194,9 +216,16 @@ impl ServerSession {
 pub struct ServerShutdownFlag(pub Arc<AtomicBool>);
 
 /// Mid-session save request. Set true to make the server flush to disk
-/// without exiting; the server clears it once the save is written.
+/// without exiting; the server clears it once the save is resolved.
 #[derive(Resource, Clone)]
 pub struct ServerSaveRequestFlag(pub Arc<AtomicBool>);
+
+/// Where the server publishes the outcome of a requested save (one of
+/// the `SAVE_RESULT_*` codes), written *before* it clears the request
+/// flag. Without this the pause menu could only infer "flag dropped ⇒
+/// saved" — which reads a refused or failed write as success.
+#[derive(Resource, Clone)]
+pub struct ServerSaveResultFlag(pub Arc<AtomicU8>);
 
 /// Debug override for skipping the hosted-server quit-save. Normal play
 /// saves on quit by default; tests/dev tooling can insert `Self(true)` when
@@ -292,7 +321,9 @@ impl Plugin for MenuPlugin {
         // InGame ↔ Paused. Pausing must not tear down the server; only
         // explicit quit (to menu or desktop) does.
         app.add_systems(OnEnter(AppState::InGame), spawn_server_if_hosting);
-        app.add_systems(Update, drive_pending_quit);
+        // Chained so a ✕ press and the (fast-path) exit resolve in the
+        // same frame when nothing needs saving.
+        app.add_systems(Update, (quit_on_window_close, drive_pending_quit).chain());
     }
 }
 
@@ -560,6 +591,10 @@ struct SaveFeedback {
     /// `Time::elapsed_secs()` when the last save finished; drives the
     /// transient "Saved ✓" label.
     completed_at: Option<f32>,
+    /// The last resolved save was refused or its write failed. Sticky
+    /// until the next Save Now click — a failure must not quietly age
+    /// out the way the success label does.
+    failed: bool,
 }
 
 fn pause_menu_ui(
@@ -579,12 +614,20 @@ fn pause_menu_ui(
     };
     let hosting = session.is_hosting();
     let quit_pending = session.shutdown_requested();
-    // Resolve the save round-trip: the server clears the flag once the
-    // file is on disk. Checked before drawing so the label flips in the
-    // same frame the flag drops.
+    // Resolve the save round-trip: the server publishes the outcome and
+    // then clears the flag. Checked before drawing so the label flips in
+    // the same frame the flag drops. Anything other than an explicit OK
+    // renders as failure — "flag dropped" alone proves the server looked
+    // at the request, not that a file reached disk.
     if save_feedback.requested && !session.save_pending() {
         save_feedback.requested = false;
-        save_feedback.completed_at = Some(time.elapsed_secs());
+        if session.last_save_result() == SAVE_RESULT_OK {
+            save_feedback.completed_at = Some(time.elapsed_secs());
+            save_feedback.failed = false;
+        } else {
+            save_feedback.completed_at = None;
+            save_feedback.failed = true;
+        }
     }
     let mut close_request = false;
     let mut quit_request = false;
@@ -616,10 +659,16 @@ fn pause_menu_ui(
                             session.request_save();
                             save_feedback.requested = true;
                             save_feedback.completed_at = None;
+                            save_feedback.failed = false;
                         }
                     });
                     if save_feedback.requested {
                         ui.label(egui::RichText::new("Saving...").weak());
+                    } else if save_feedback.failed {
+                        ui.label(
+                            egui::RichText::new("Save failed — see log")
+                                .color(egui::Color32::from_rgb(230, 150, 150)),
+                        );
                     } else if let Some(done) = save_feedback.completed_at
                         && time.elapsed_secs() - done < 3.0
                     {
@@ -689,6 +738,16 @@ fn pause_menu_ui(
     }
 }
 
+/// How long `drive_pending_quit` waits on the hosted server before
+/// giving up and exiting anyway. Generous on purpose: a local quit-save
+/// is an atomic temp-file write that finishes in well under a second,
+/// so anything that outlives this is a *hung* shutdown (winit / wgpu /
+/// lightyear — see `arm_quit_watchdog`), not a slow one. Without the
+/// deadline a hung server wedges the app on "Saving and shutting
+/// down..." with every button disabled, and the user's only move is a
+/// force-kill — which loses the save anyway, plus their patience.
+const QUIT_FORCE_EXIT_SECS: f32 = 20.0;
+
 fn drive_pending_quit(
     mut commands: Commands,
     mut session: ResMut<ServerSession>,
@@ -708,9 +767,53 @@ fn drive_pending_quit(
         return;
     }
 
-    if !pending.warned_slow && time.elapsed_secs() - pending.requested_at > 5.0 {
+    let waited = time.elapsed_secs() - pending.requested_at;
+    if !pending.warned_slow && waited > 5.0 {
         pending.warned_slow = true;
         warn!("waiting for hosted server to save and shut down before exiting");
+    }
+    if waited > QUIT_FORCE_EXIT_SECS {
+        error!(
+            "hosted server did not shut down within {QUIT_FORCE_EXIT_SECS}s — exiting anyway; \
+             the quit-save may not have been written"
+        );
+        commands.remove_resource::<PendingQuit>();
+        exit.write(AppExit::error());
+        arm_quit_watchdog(Duration::from_secs(3));
+    }
+}
+
+/// Route the OS window-close request (titlebar ✕, Cmd-Q) through the
+/// same save-then-exit path as the pause menu's quit buttons. Without
+/// this — Bevy's default `close_when_requested` — the ✕ despawns the
+/// window, `exit_on_all_closed` fires, and the process dies with the
+/// hosted server mid-state: the quit-save never happens. `WindowPlugin`
+/// is configured with `close_when_requested: false` in main.rs so this
+/// system is the only consumer of the request.
+fn quit_on_window_close(
+    mut close_requests: MessageReader<bevy::window::WindowCloseRequested>,
+    state: Res<State<AppState>>,
+    mut captures: ResMut<crate::ui_capture::UiCaptures>,
+    mut session: ResMut<ServerSession>,
+    pending: Option<Res<PendingQuit>>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    if close_requests.is_empty() {
+        return;
+    }
+    close_requests.clear();
+    // Already draining — a second ✕ while the save runs changes nothing.
+    if pending.is_some() {
+        return;
+    }
+    session.request_shutdown();
+    commands.insert_resource(PendingQuit::new(time.elapsed_secs()));
+    // Bring up the pause menu so the player sees "Saving and shutting
+    // down..." instead of a game that ignores the ✕, and so world input
+    // is blocked while the server snapshots.
+    if *state.get() == AppState::InGame {
+        captures.acquire(crate::ui_capture::UiCapture::PauseMenu);
     }
 }
 
@@ -765,10 +868,7 @@ fn spawn_server_if_hosting(
             load_existing: false,
             no_save_on_exit,
         };
-        let (handle, shutdown, save_request) = spawn_server_thread(cfg);
-        session.handle = Some(handle);
-        session.shutdown = Some(shutdown);
-        session.save_request = Some(save_request);
+        spawn_server_thread(cfg, &mut session);
         return;
     };
     let cfg = match &*launch {
@@ -787,26 +887,31 @@ fn spawn_server_if_hosting(
             return;
         }
     };
-    let (handle, shutdown, save_request) = spawn_server_thread(cfg);
-    session.handle = Some(handle);
-    session.shutdown = Some(shutdown);
-    session.save_request = Some(save_request);
+    spawn_server_thread(cfg, &mut session);
 }
 
-fn spawn_server_thread(
-    config: ServerSaveConfig,
-) -> (JoinHandle<()>, Arc<AtomicBool>, Arc<AtomicBool>) {
+fn spawn_server_thread(config: ServerSaveConfig, session: &mut ServerSession) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let save_request = Arc::new(AtomicBool::new(false));
+    let save_result = Arc::new(AtomicU8::new(SAVE_RESULT_NONE));
     let shutdown_for_thread = shutdown.clone();
     let save_for_thread = save_request.clone();
+    let result_for_thread = save_result.clone();
     let handle = std::thread::Builder::new()
         .name("block-junk-server".into())
         .spawn(move || {
-            crate::run_server_with_shutdown(shutdown_for_thread, save_for_thread, config);
+            crate::run_server_with_shutdown(
+                shutdown_for_thread,
+                save_for_thread,
+                result_for_thread,
+                config,
+            );
         })
         .expect("spawn server thread");
-    (handle, shutdown, save_request)
+    session.handle = Some(handle);
+    session.shutdown = Some(shutdown);
+    session.save_request = Some(save_request);
+    session.save_result = Some(save_result);
 }
 
 /// Visible from tests / dev tooling that want to drive the server App without
@@ -850,6 +955,7 @@ mod tests {
             handle: Some(handle),
             shutdown: Some(shutdown),
             save_request: None,
+            save_result: None,
             shutdown_requested: false,
         };
 

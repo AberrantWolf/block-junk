@@ -560,14 +560,18 @@ pub struct DepositRequest {
 /// cells — at that size we split into two messages.
 pub const PLAN_EDIT_BATCH_MAX: usize = 4096;
 
-/// Small critical world-command lane. Ordered reliable so direct edits,
+/// Small critical world-command lane. Ordered reliable so edit *requests*,
 /// targeted rejections, request/response UX, and dev commands preserve
 /// the order a player expects without waiting behind bulk state sync.
 pub struct WorldChannel;
 
-/// Chunk stream lane. Kept ordered reliable for now so a snapshot and a
-/// later unload for the same coord cannot arrive reversed; move this to
-/// unordered reliable once chunk generations/version guards exist.
+/// Chunk stream lane: snapshots, unloads, AND applied [`BlockEdit`]
+/// broadcasts. All three must share one ordered-reliable stream — the
+/// client skips edits for unloaded chunks on the promise that the
+/// chunk's snapshot carries the post-edit state, and a snapshot and a
+/// later unload for the same coord cannot arrive reversed. Splitting
+/// any of them onto another channel reopens the lost-edit race; a move
+/// to unordered reliable needs chunk generations/version guards first.
 pub struct ChunkChannel;
 
 /// Reliable mirror-state lane for plan/craft state. This isolates large

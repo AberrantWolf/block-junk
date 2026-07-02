@@ -36,17 +36,18 @@ mod ui_theme;
 mod voxel;
 mod worldspace_toast;
 
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU8};
 use core::time::Duration;
 use std::sync::Arc;
 
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::log::{DEFAULT_FILTER, LogPlugin};
 use bevy::prelude::*;
+use bevy::window::WindowPlugin;
 
 use crate::menu::{
     AppState, JoinTarget, LaunchMode, MenuPlugin, ServerSaveConfig, ServerSaveRequestFlag,
-    ServerShutdownFlag,
+    ServerSaveResultFlag, ServerShutdownFlag,
 };
 use crate::network::{NetMode, NetworkPlugin};
 use crate::protocol::GameSet;
@@ -113,11 +114,12 @@ fn main() {
 pub fn run_server_with_shutdown(
     shutdown: Arc<AtomicBool>,
     save_request: Arc<AtomicBool>,
+    save_result: Arc<AtomicU8>,
     config: ServerSaveConfig,
 ) {
     run_server_inner(
         Some(shutdown),
-        Some(save_request),
+        Some((save_request, save_result)),
         config,
         /*install_log_plugin*/ false,
     );
@@ -125,7 +127,7 @@ pub fn run_server_with_shutdown(
 
 fn run_server_inner(
     shutdown: Option<Arc<AtomicBool>>,
-    save_request: Option<Arc<AtomicBool>>,
+    save_request: Option<(Arc<AtomicBool>, Arc<AtomicU8>)>,
     save_config: ServerSaveConfig,
     install_log_plugin: bool,
 ) {
@@ -158,8 +160,9 @@ fn run_server_inner(
     if let Some(flag) = shutdown {
         app.insert_resource(ServerShutdownFlag(flag));
     }
-    if let Some(flag) = save_request {
-        app.insert_resource(ServerSaveRequestFlag(flag));
+    if let Some((request, result)) = save_request {
+        app.insert_resource(ServerSaveRequestFlag(request));
+        app.insert_resource(ServerSaveResultFlag(result));
     }
     app.insert_resource(save_config);
 
@@ -178,13 +181,26 @@ fn run_client(preset: Option<LaunchMode>) {
         bevy::asset::io::AssetSourceBuilder::platform_default("mods", None),
     );
 
-    app.add_plugins(DefaultPlugins.set(LogPlugin {
-        // gilrs_core spams "Failed to find device" on macOS — IOKit reports
-        // device IDs that aren't real controllers. Silence the whole module
-        // until we wire up gamepad support and care what it has to say.
-        filter: format!("{DEFAULT_FILTER}gilrs_core=off,"),
-        ..default()
-    }));
+    app.add_plugins(
+        DefaultPlugins
+            .set(LogPlugin {
+                // gilrs_core spams "Failed to find device" on macOS — IOKit
+                // reports device IDs that aren't real controllers. Silence the
+                // whole module until we wire up gamepad support and care what
+                // it has to say.
+                filter: format!("{DEFAULT_FILTER}gilrs_core=off,"),
+                ..default()
+            })
+            .set(WindowPlugin {
+                // The titlebar ✕ / Cmd-Q must not despawn the window directly
+                // — that exits the process out from under the hosted server
+                // thread before it can quit-save. menu.rs::quit_on_window_close
+                // reads the request and routes it through the same
+                // save-then-exit path as the pause menu's quit buttons.
+                close_when_requested: false,
+                ..default()
+            }),
+    );
     app.add_plugins(avian3d::PhysicsPlugins::default());
 
     app.add_plugins(lightyear::prelude::client::ClientPlugins {

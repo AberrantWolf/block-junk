@@ -1229,7 +1229,7 @@ fn tick_station_work(
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut commands: Commands,
-    chunks: Query<&crate::voxel::Chunk>,
+    chunks: Query<&'static crate::voxel::Chunk>,
     chunk_map: Res<crate::voxel::ChunkMap>,
     block_registry: Res<crate::blocks::BlockRegistry>,
     npc_q: Query<(), With<crate::npc::Npc>>,
@@ -1302,8 +1302,10 @@ fn tick_station_work(
         // Spawn output(s) in the first EMPTY cell around the station —
         // straight above first, then that cell's horizontal
         // neighbours, then beside the station itself. Spawning blind
-        // into a solid cell swallows the output invisibly (WorldItems
-        // don't settle, and pickup needs a 0.5 m click match).
+        // into a solid cell would bury the output; an empty pick can
+        // still be an unsupported ledge cell, so the final position is
+        // settled like every other item spawn (a floating output never
+        // gets a CellEdit to rescue it and is unreachable to haulers).
         let above = cell + IVec3::Y;
         let candidates = [
             above,
@@ -1336,10 +1338,15 @@ fn tick_station_work(
                 above
             });
         let spawn_base = spawn_cell.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
+        let walk = crate::npc::WorldWalk {
+            chunks: &chunks,
+            chunk_map: &chunk_map,
+            registry: &block_registry,
+        };
         for unit in 0..recipe.output.count {
             let angle = (unit as f32) * std::f32::consts::TAU / recipe.output.count.max(1) as f32;
             let offset = Vec3::new(angle.cos() * 0.12, 0.0, angle.sin() * 0.12);
-            let translation = spawn_base + offset;
+            let translation = crate::server::settled_translation(&walk, spawn_base + offset);
             commands.spawn((
                 crate::protocol::WorldItem {
                     item: output_slot,

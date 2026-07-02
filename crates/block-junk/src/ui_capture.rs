@@ -183,8 +183,17 @@ fn handle_escape(
     mut captures: ResMut<UiCaptures>,
     mut craft_ui: ResMut<crate::craft_stations::CraftStationUiState>,
     mut drag: ResMut<crate::plans::PlanDragState>,
+    session: Res<crate::menu::ServerSession>,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    // A pending quit owns the UI. Releasing the pause menu here would
+    // relock the cursor and re-enable world edits *after* the server has
+    // snapshotted for the quit-save — those edits would silently miss
+    // the save — and it would hide the "Saving and shutting down..."
+    // line, the only feedback that a drain is in progress.
+    if session.shutdown_requested() {
         return;
     }
     if drag.active.is_some() {

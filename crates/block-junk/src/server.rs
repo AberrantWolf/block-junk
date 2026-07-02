@@ -14,7 +14,10 @@ use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::collision::{Aabb, WorldCollision};
 use crate::craft_stations::{ActiveWork, CraftOrder, CraftStations, StationState};
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
-use crate::menu::{ServerSaveConfig, ServerSaveRequestFlag, ServerShutdownFlag};
+use crate::menu::{
+    SAVE_RESULT_FAILED, SAVE_RESULT_OK, ServerSaveConfig, ServerSaveRequestFlag,
+    ServerSaveResultFlag, ServerShutdownFlag,
+};
 use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
 use crate::physics::{
     EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, soft_separate_actors,
@@ -681,15 +684,19 @@ fn spawn_loaded_npc(
 }
 
 /// Polled each tick. When the client flips the save-request atomic, write
-/// the world to disk and clear the flag. Unlike `save_then_shutdown` this
-/// is multi-shot (the user might "Save Now" several times per session) so
-/// no Local guard.
+/// the world to disk, publish the outcome, then clear the flag — in that
+/// order, because the client treats the flag dropping as "the outcome is
+/// readable". Clearing first (the old `swap`) made every refusal and
+/// write error render as "Saved ✓" in the pause menu. Unlike
+/// `save_then_shutdown` this is multi-shot (the user might "Save Now"
+/// several times per session) so no Local guard.
 #[allow(
     clippy::too_many_arguments,
     reason = "save_on_request touches every persisted system"
 )]
 fn save_on_request(
     flag: Option<Res<ServerSaveRequestFlag>>,
+    result: Option<Res<ServerSaveResultFlag>>,
     config: Option<Res<ServerSaveConfig>>,
     clock: Res<WorldClock>,
     plans: Res<Plans>,
@@ -702,37 +709,55 @@ fn save_on_request(
     block_registry: Res<BlockRegistry>,
     guard: Res<SaveWriteGuard>,
 ) {
+    use core::sync::atomic::Ordering;
     let Some(flag) = flag else {
         return;
     };
-    if !flag.0.swap(false, core::sync::atomic::Ordering::SeqCst) {
+    if !flag.0.load(Ordering::SeqCst) {
         return;
     }
-    let Some(config) = config else {
-        return;
-    };
-    let Some(name) = &config.save_name else {
-        return;
-    };
-    if let Some(reason) = &guard.reason {
-        error!(
-            "NOT saving to {name:?}: this session's load failed ({reason}); \
-             the original save file is preserved untouched"
+    let ok = 'save: {
+        let Some(config) = config else {
+            error!("save requested but no ServerSaveConfig; nothing written");
+            break 'save false;
+        };
+        let Some(name) = &config.save_name else {
+            error!("save requested but no save name configured; nothing written");
+            break 'save false;
+        };
+        if let Some(reason) = &guard.reason {
+            error!(
+                "NOT saving to {name:?}: this session's load failed ({reason}); \
+                 the original save file is preserved untouched"
+            );
+            break 'save false;
+        }
+        let save = assemble_save_file(
+            &clock,
+            &plans,
+            &stations,
+            &chunks,
+            &avatars,
+            &npcs,
+            &world_items,
+            &item_registry,
+            &block_registry,
         );
-        return;
+        write_save_logged(name, &save)
+    };
+    if let Some(result) = result {
+        result.0.store(
+            if ok {
+                SAVE_RESULT_OK
+            } else {
+                SAVE_RESULT_FAILED
+            },
+            Ordering::SeqCst,
+        );
     }
-    let save = assemble_save_file(
-        &clock,
-        &plans,
-        &stations,
-        &chunks,
-        &avatars,
-        &npcs,
-        &world_items,
-        &item_registry,
-        &block_registry,
-    );
-    write_save_logged(name, &save);
+    // A request that arrived mid-save is satisfied by the write that just
+    // finished; clearing unconditionally can't lose meaningful work.
+    flag.0.store(false, Ordering::SeqCst);
 }
 
 /// Convert the engine-side `CraftStations` snapshot to the on-disk
@@ -1013,18 +1038,25 @@ fn assemble_save_file(
     }
 }
 
-/// `write_save` + the standard outcome log line.
-fn write_save_logged(name: &str, save: &SaveFile) {
+/// `write_save` + the standard outcome log line. Returns whether the
+/// file actually reached disk so callers can report honestly.
+fn write_save_logged(name: &str, save: &SaveFile) -> bool {
     match write_save(name, save) {
-        Ok(()) => info!(
-            "saved {} chunks + {} NPCs + {} plans + {} items + {} stations to {name:?}",
-            save.edited_chunks.len(),
-            save.npcs.len(),
-            save.plans.len(),
-            save.world_items.len(),
-            save.craft_stations.len(),
-        ),
-        Err(e) => error!("save to {name:?} failed: {e}"),
+        Ok(()) => {
+            info!(
+                "saved {} chunks + {} NPCs + {} plans + {} items + {} stations to {name:?}",
+                save.edited_chunks.len(),
+                save.npcs.len(),
+                save.plans.len(),
+                save.world_items.len(),
+                save.craft_stations.len(),
+            );
+            true
+        }
+        Err(e) => {
+            error!("save to {name:?} failed: {e}");
+            false
+        }
     }
 }
 
@@ -1684,7 +1716,12 @@ fn apply_place(
         cells.iter().map(|&world| (world, edit.slot)).collect();
     crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
 
-    if let Err(err) = broadcast.send::<BlockEdit, WorldChannel>(&edit, server, &NetworkTarget::All)
+    // ChunkChannel, not WorldChannel: the client drops edits for chunks it
+    // hasn't loaded, trusting the eventual ChunkSnapshot to carry the final
+    // state. That only holds if snapshot and edit share one ordered stream —
+    // on separate channels a small edit can overtake a fragmented snapshot
+    // cut *after* it and be lost until the chunk re-enters AoI.
+    if let Err(err) = broadcast.send::<BlockEdit, ChunkChannel>(&edit, server, &NetworkTarget::All)
     {
         warn!("BlockEdit broadcast failed: {err}");
     }
@@ -1804,13 +1841,14 @@ fn apply_break(
 
     // Broadcast the canonical applied break with the resolved anchor +
     // orientation, so other clients can compute the footprint themselves.
+    // ChunkChannel for snapshot/edit ordering — see apply_place.
     let applied = BlockEdit {
         anchor,
         slot: BlockSlot::EMPTY,
         orientation,
     };
     if let Err(err) =
-        broadcast.send::<BlockEdit, WorldChannel>(&applied, server, &NetworkTarget::All)
+        broadcast.send::<BlockEdit, ChunkChannel>(&applied, server, &NetworkTarget::All)
     {
         warn!("BlockEdit broadcast failed: {err}");
     }
@@ -2081,11 +2119,15 @@ fn receive_drop_requests(
         };
         let centre = drop_target_position(pose, &world);
         // Tight ring (0.08 m) so a 5-stack reads as "here," not "spread
-        // across half a tile."
+        // across half a tile." Each unit settles like a destroy-drop —
+        // the fallback branch of `drop_target_position` is the flying
+        // player's foot position, which can be any height above ground,
+        // and an unsettled spawn there floats forever (no CellEdit ever
+        // re-settles a cell nothing was built in).
         for unit in 0..count {
             let angle = (unit as f32) * std::f32::consts::TAU / count.max(1) as f32;
             let offset = Vec3::new(angle.cos() * 0.08, 0.0, angle.sin() * 0.08);
-            let translation = centre + offset;
+            let translation = settled_translation(&world, centre + offset);
             commands.spawn((
                 WorldItem { item, translation },
                 Transform::from_translation(translation),
@@ -2131,7 +2173,9 @@ fn receive_drop_tool_requests(
         let Some(slot) = tool.item.take() else {
             continue;
         };
-        let target = drop_target_position(pose, &world);
+        // Settled for the same reason as receive_drop_requests: the
+        // foot-position fallback can be mid-air.
+        let target = settled_translation(&world, drop_target_position(pose, &world));
         commands.spawn((
             WorldItem {
                 item: slot,
@@ -2349,7 +2393,10 @@ fn auto_clear_stale_plans(
 /// (never deletes) when there is none, and — because unloaded chunks
 /// read as solid via [`WorldWalk`] — never drops an item through the
 /// loaded/unloaded boundary and out of the world.
-fn settled_translation(world: &impl crate::pathfinding::Walkability, translation: Vec3) -> Vec3 {
+pub(crate) fn settled_translation(
+    world: &impl crate::pathfinding::Walkability,
+    translation: Vec3,
+) -> Vec3 {
     use crate::items::{ITEM_FLOOR_LIFT, MAX_ITEM_DROP, MAX_ITEM_RISE};
     let from = translation.floor().as_ivec3();
     let cell = crate::pathfinding::settle_item_cell(world, from, MAX_ITEM_RISE, MAX_ITEM_DROP);

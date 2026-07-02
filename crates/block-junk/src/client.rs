@@ -35,8 +35,8 @@ use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
     BlockManifest, Carrying, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
     DropToolRequest, EquippedTool, GameSet, INTERACT_REACH, MovementIntent, MovementMode,
-    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, StateSyncChannel, WorldChannel,
-    WorldClock, WorldClockSync, WorldItem,
+    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync,
+    WorldItem,
 };
 use crate::target_outline::TargetOutlinePlugin;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
@@ -1424,8 +1424,13 @@ fn normal_mode_action_input(
                 && let Some(state) = ctx.plans.get(cell)
                 && state.remaining_for(carry_item) > 0
             {
+                // WorldChannel: this is click-latency UX, and it must not
+                // queue behind a 4096-cell PlanEditBatch on the state-sync
+                // lane. Safe because the plan mirror is server-authoritative
+                // — a cell only shows as depositable after the server's own
+                // broadcast, so the request can't outrun the plan's creation.
                 if let Ok(mut s) = io.deposit.single_mut() {
-                    s.send::<StateSyncChannel>(DepositRequest { cell });
+                    s.send::<WorldChannel>(DepositRequest { cell });
                 }
                 stop_work!();
                 action.active = None;
@@ -2642,7 +2647,10 @@ fn receive_chunk_unloads(
 /// know which footprint to expand (the broadcast doesn't include it —
 /// the client is expected to read it from local state). Cells that fall
 /// in unloaded chunks are silently skipped; their sidecar will arrive
-/// via `ChunkSnapshot` whenever the chunk enters AoI.
+/// via `ChunkSnapshot` whenever the chunk enters AoI. That skip is only
+/// sound because edits and snapshots share `ChunkChannel` (ordered
+/// reliable), so an edit can never overtake the snapshot of the chunk
+/// it lands in — see the `ChunkChannel` doc in protocol.rs.
 /// Server told us a request of ours was refused — surface the reason as
 /// a worldspace toast at the cell the player targeted. This is the
 /// client half of the `ActionRejected` contract: the player sees *why*
