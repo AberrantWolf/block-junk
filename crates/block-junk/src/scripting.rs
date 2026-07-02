@@ -218,7 +218,15 @@ fn load_side(side: Side) -> LoadResult {
         Err(e) => panic!("{} mod load failed: {e}", side.as_str()),
     };
     warn_if_empty(&mods);
-    let pending_blocks = ctx.take_blocks();
+    let mut pending_blocks = ctx.take_blocks();
+    // Resolve the drops contract before anything reads the defs:
+    // unspecified drops default to materials × the (mod-configurable)
+    // multiplier. Must happen after ALL mods have run — the multiplier
+    // may be set by a later mod than the blocks it applies to.
+    let drop_multiplier = ctx.take_material_drop_multiplier().unwrap_or(1.0);
+    for def in &mut pending_blocks {
+        def.resolve_drops(drop_multiplier);
+    }
     let (blocks, slots) = match BlockRegistry::build(pending_blocks.clone()) {
         Ok(pair) => pair,
         Err(e) => panic!("{} block registry build failed: {e}", side.as_str()),

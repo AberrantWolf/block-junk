@@ -91,6 +91,11 @@ pub struct LoadContext {
     /// rule as work-defaults — two mods can't silently disagree on how
     /// rooms group into clusters.
     pub pending_civilization_params: Arc<Mutex<Option<CivilizationParams>>>,
+    /// At most one material-drop multiplier across all mods (same
+    /// single-writer rule). Scales `materials` counts when a block
+    /// leaves `drops` unspecified; the engine applies it once after
+    /// load via `BlockDef::resolve_drops`. `None` ⇒ 1.0.
+    pub pending_material_drop_multiplier: Arc<Mutex<Option<f32>>>,
     /// Unlike the `pending_*` buffers above (drained once after load),
     /// this is a **runtime** queue: `engine.ui.toast` pushes into it for
     /// the lifetime of the session and the engine drains it every tick.
@@ -151,6 +156,13 @@ impl LoadContext {
     /// [`CivilizationParams::default`].
     pub fn take_civilization_params(&self) -> Option<CivilizationParams> {
         std::mem::take(&mut *self.pending_civilization_params.lock().unwrap())
+    }
+
+    /// Take the optional material-drop multiplier. `None` ⇒ no mod
+    /// called `engine.blocks.set_material_drop_multiplier`; the engine
+    /// uses 1.0 (unspecified drops refund build cost exactly).
+    pub fn take_material_drop_multiplier(&self) -> Option<f32> {
+        std::mem::take(&mut *self.pending_material_drop_multiplier.lock().unwrap())
     }
 
     /// Clone the live `engine.ui.toast` queue handle. The engine stores
@@ -453,6 +465,30 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
         Ok(())
     })?;
     blocks_table.set("register", register_block)?;
+
+    // engine.blocks.set_material_drop_multiplier(x) — both sides, so the
+    // resolved drop lists agree across the wire. Scales `materials` when a
+    // block leaves `drops` unspecified (see BlockDef::resolve_drops).
+    // Single-writer, like set_work_defaults: a second caller fails loudly
+    // instead of the winner depending on mod load order.
+    let pending_mult = ctx.pending_material_drop_multiplier.clone();
+    let set_material_drop_multiplier = lua.create_function(move |_, mult: f32| {
+        if !mult.is_finite() || mult < 0.0 {
+            return Err(mlua::Error::external(format!(
+                "material drop multiplier must be finite and >= 0, got {mult}"
+            )));
+        }
+        let mut slot = pending_mult.lock().unwrap();
+        if let Some(existing) = *slot {
+            return Err(mlua::Error::external(format!(
+                "material drop multiplier already set to {existing}; \
+                 only one mod may call set_material_drop_multiplier"
+            )));
+        }
+        *slot = Some(mult);
+        Ok(())
+    })?;
+    blocks_table.set("set_material_drop_multiplier", set_material_drop_multiplier)?;
     engine.set("blocks", blocks_table)?;
 
     // engine.items.register(def) — both sides accumulate identical item
@@ -772,4 +808,97 @@ fn call_npc_planner(
     let returned: Value = handler.call(snapshot_value)?;
     let goal: PlannerGoal = lua.from_value(returned)?;
     Ok(Some(goal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Lua state with the engine table installed, plus the context its
+    /// registrations land in — the same wiring `load_mod` gives real mods.
+    fn engine_fixture() -> (Lua, LoadContext) {
+        let ctx = LoadContext::new();
+        let lua = Lua::new();
+        install_engine_table(&lua, Side::Server, &ctx).expect("install engine table");
+        (lua, ctx)
+    }
+
+    fn register_test_block(lua: &Lua, extra_fields: &str) {
+        lua.load(format!(
+            "engine.blocks.register {{
+                 id = 'test:block',
+                 display_name = 'Test',
+                 flags = {{ solid = true }},
+                 color = {{ 0.5, 0.5, 0.5 }},
+                 {extra_fields}
+             }}"
+        ))
+        .exec()
+        .expect("register block");
+    }
+
+    /// The three drops spellings must survive the Lua→serde boundary
+    /// distinctly: omitted = None (defaults to materials at resolve),
+    /// `{}` = Some(empty) (yields nothing), a list = Some(list).
+    #[test]
+    fn lua_drops_spellings_map_to_option_shapes() {
+        let (lua, ctx) = engine_fixture();
+        register_test_block(&lua, "materials = { { item = 'test:log', count = 2 } },");
+        let blocks = ctx.take_blocks();
+        assert!(
+            blocks[0].drops.is_none(),
+            "omitted drops must parse as None"
+        );
+
+        let (lua, ctx) = engine_fixture();
+        register_test_block(
+            &lua,
+            "materials = { { item = 'test:log', count = 2 } }, drops = {},",
+        );
+        let blocks = ctx.take_blocks();
+        assert_eq!(
+            blocks[0].drops.as_deref(),
+            Some(&[][..]),
+            "explicit empty table must parse as Some(empty), not None"
+        );
+
+        let (lua, ctx) = engine_fixture();
+        register_test_block(&lua, "drops = { { item = 'test:log', count = 5 } },");
+        let blocks = ctx.take_blocks();
+        assert_eq!(blocks[0].drops.as_ref().map(Vec::len), Some(1));
+        assert_eq!(blocks[0].drops.as_ref().unwrap()[0].count, 5);
+    }
+
+    /// Multiplier setter: value lands in the context; a second caller
+    /// fails loudly (single-writer, like set_work_defaults).
+    #[test]
+    fn material_drop_multiplier_is_single_writer() {
+        let (lua, ctx) = engine_fixture();
+        lua.load("engine.blocks.set_material_drop_multiplier(0.5)")
+            .exec()
+            .expect("first set succeeds");
+        assert!(
+            lua.load("engine.blocks.set_material_drop_multiplier(2.0)")
+                .exec()
+                .is_err(),
+            "second set must error"
+        );
+        assert_eq!(ctx.take_material_drop_multiplier(), Some(0.5));
+    }
+
+    /// NaN, infinity, and negatives are rejected at the API edge so a
+    /// bad value can't silently zero (or explode) every default drop.
+    #[test]
+    fn material_drop_multiplier_rejects_garbage() {
+        let (lua, ctx) = engine_fixture();
+        for bad in ["-1.0", "0/0", "math.huge"] {
+            assert!(
+                lua.load(format!("engine.blocks.set_material_drop_multiplier({bad})"))
+                    .exec()
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert_eq!(ctx.take_material_drop_multiplier(), None);
+    }
 }

@@ -190,13 +190,26 @@ pub struct BlockDef {
     /// Items spawned when this block is destroyed (by any path — NPC
     /// Remove plan, player direct-destroy, future explosion). Each
     /// entry names an [`ItemId`](crate::items::ItemId) and a `count`;
-    /// `count` [`WorldItem`] entities spawn at the destroyed cell. An
-    /// empty vec means destroying the block yields nothing (today: air,
-    /// leaves — saplings might land here later). Cross-validated at
-    /// boot against the item registry — references to unknown item ids
-    /// fail loudly rather than silently spawn nothing.
+    /// `count` [`WorldItem`] entities spawn at the destroyed block's
+    /// anchor cell. This is a per-*block* contract like
+    /// [`materials`](Self::materials) — footprint size never multiplies
+    /// it. Cross-validated at boot against the item registry —
+    /// references to unknown item ids fail loudly rather than silently
+    /// spawn nothing.
+    ///
+    /// Three spellings, resolved once at load by
+    /// [`resolve_drops`](Self::resolve_drops):
+    ///   - **omitted** (`None`) — defaults to `materials`, each count
+    ///     scaled by the global material-drop multiplier
+    ///     (`engine.blocks.set_material_drop_multiplier`, default 1.0)
+    ///     and *rounded* (not floored); entries that round to 0 are
+    ///     dropped. "Destroy refunds build cost" is the default economy.
+    ///   - **explicit empty** (`drops = {}`) — destroying yields nothing
+    ///     (air, leaves), even if the block costs materials.
+    ///   - **explicit list** — used exactly as written; the multiplier
+    ///     does NOT apply.
     #[serde(default)]
-    pub drops: Vec<ItemDrop>,
+    pub drops: Option<Vec<ItemDrop>>,
     /// Marks this block as a craft station. When `Some(tag)`, recipes
     /// whose `station` matches `tag` AND `tier <= station_tier` can
     /// be performed at this block. L-click on a station opens the
@@ -236,9 +249,51 @@ pub struct BlockDef {
     /// without requiring them to build (e.g. grass dropping a dirt
     /// clod when the block itself is free terrain), or vice versa
     /// (a recipe-only block that costs ingredients but yields
-    /// nothing on destroy).
+    /// nothing on destroy — spelled `drops = {}`). Left unspecified,
+    /// `drops` *defaults* to this list (see [`drops`](Self::drops)).
     #[serde(default)]
     pub materials: Vec<ItemDrop>,
+}
+
+impl BlockDef {
+    /// Finalise the [`drops`](Self::drops) contract. Called exactly once
+    /// per def by the engine after every mod has loaded (the multiplier
+    /// isn't knowable earlier — a later mod may still set it). Unset
+    /// drops become `materials` with each count scaled by
+    /// `material_drop_multiplier` and rounded half-away-from-zero;
+    /// entries that round to 0 are removed (the boot validator rejects
+    /// explicit zero counts, so none may survive here either).
+    /// Explicit drops — including an explicit empty list — pass through
+    /// untouched: the multiplier is a default-economy knob, not a
+    /// global loot scalar.
+    pub fn resolve_drops(&mut self, material_drop_multiplier: f32) {
+        if self.drops.is_some() {
+            return;
+        }
+        self.drops = Some(scale_drops(&self.materials, material_drop_multiplier));
+    }
+
+    /// The drop list as resolved by [`resolve_drops`](Self::resolve_drops).
+    /// Reads as empty if resolution hasn't run (engine code only sees
+    /// post-resolution defs, so that case is tests-only).
+    pub fn resolved_drops(&self) -> &[ItemDrop] {
+        self.drops.as_deref().unwrap_or(&[])
+    }
+}
+
+/// Scale each entry's count by `multiplier`, rounding half-away-from-zero
+/// (a 3-log bed at ×0.5 refunds 2, not 1 — the player-favouring half).
+/// Entries that round to 0 disappear rather than survive as zero-count
+/// drops the boot validator would reject.
+fn scale_drops(materials: &[ItemDrop], multiplier: f32) -> Vec<ItemDrop> {
+    materials
+        .iter()
+        .map(|m| ItemDrop {
+            item: m.item.clone(),
+            count: (f64::from(m.count) * f64::from(multiplier)).round() as u32,
+        })
+        .filter(|d| d.count > 0)
+        .collect()
 }
 
 /// Reference(s) from a block to procedural texture ids defined in a
@@ -628,6 +683,44 @@ mod tests {
             Cardinal::from_yaw_facing(std::f32::consts::PI),
             Cardinal::South,
         );
+    }
+
+    fn drop(id: &str, count: u32) -> ItemDrop {
+        ItemDrop {
+            item: crate::items::ItemId::new(id),
+            count,
+        }
+    }
+
+    /// The default multiplier is an exact pass-through: unspecified
+    /// drops refund build cost 1:1.
+    #[test]
+    fn scale_drops_identity_at_one() {
+        let materials = vec![drop("m:wood", 3), drop("m:stone", 1)];
+        let scaled = scale_drops(&materials, 1.0);
+        assert_eq!(scaled.len(), 2);
+        assert_eq!(scaled[0].count, 3);
+        assert_eq!(scaled[1].count, 1);
+    }
+
+    /// Counts round half-away-from-zero, never floor: 3×0.5 → 2 (not 1)
+    /// and 1×0.5 → 1 (not 0).
+    #[test]
+    fn scale_drops_rounds_not_floors() {
+        let scaled = scale_drops(&[drop("m:wood", 3), drop("m:wood2", 1)], 0.5);
+        assert_eq!(scaled[0].count, 2);
+        assert_eq!(scaled[1].count, 1);
+    }
+
+    /// Entries rounding to 0 vanish instead of surviving as zero-count
+    /// drops (which the boot validator rejects).
+    #[test]
+    fn scale_drops_filters_rounded_to_zero() {
+        let scaled = scale_drops(&[drop("m:wood", 1), drop("m:stone", 2)], 0.4);
+        // 1×0.4 = 0.4 → 0 → removed; 2×0.4 = 0.8 → 1 → kept.
+        assert_eq!(scaled.len(), 1);
+        assert_eq!(scaled[0].item.as_str(), "m:stone");
+        assert_eq!(scaled[0].count, 1);
     }
 
     /// AABB rotation flips min/max as expected. A bed-shaped AABB

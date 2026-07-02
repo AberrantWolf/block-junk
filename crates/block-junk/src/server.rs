@@ -1704,6 +1704,7 @@ fn apply_place(
                 // Place validation rejects any non-empty footprint cell,
                 // so the prior occupant is always EMPTY.
                 prev_slot: BlockSlot::EMPTY,
+                is_anchor: world == edit.anchor,
             });
         }
         commands.entity(chunk_entity).insert(ChunkEdited);
@@ -1827,6 +1828,7 @@ fn apply_break(
                 // (drops, sidecar cleanup) read this to learn *what*
                 // was destroyed without re-querying the now-empty cell.
                 prev_slot: slot,
+                is_anchor: world == anchor,
             });
         }
         commands.entity(chunk_entity).insert(ChunkEdited);
@@ -2408,11 +2410,19 @@ pub(crate) fn settled_translation(
 }
 
 /// Spawn drop items when a block is destroyed. Reads the same CellEdit
-/// bus as `auto_clear_stale_plans`; for every edit whose `prev_slot` is
-/// non-empty and whose `slot` is empty (i.e. a destroy), looks up the
-/// destroyed block's `BlockDef.drops`, and for each entry spawns
-/// `count` `WorldItem` entities at the destroyed cell's centre with a
-/// small per-unit XZ jitter so a multi-item pile doesn't z-fight.
+/// bus as `auto_clear_stale_plans`; for each destroyed *block* (the
+/// destroy-edit with `is_anchor` set — exactly one per block, however
+/// many footprint cells it covered), looks up the destroyed block's
+/// `BlockDef.drops`, and for each entry spawns `count` `WorldItem`
+/// entities at the anchor cell's centre with a small per-unit XZ jitter
+/// so a multi-item pile doesn't z-fight.
+///
+/// `drops` is a per-block contract, like `materials`: a 2-cell bed with
+/// `{wood, count=3}` yields 3 wood, exactly, whatever its footprint.
+/// (An earlier version spawned the list once per footprint *cell*,
+/// which minted resources against build cost and made non-divisible
+/// totals unrepresentable — destruction is atomic per block, so cell
+/// granularity corresponded to nothing.)
 ///
 /// Each drop is then settled down to solid ground via
 /// [`settled_translation`] — a block destroyed in mid-air (the floating
@@ -2423,13 +2433,7 @@ pub(crate) fn settled_translation(
 ///
 /// Server-authoritative spawn with `Replicate::to_clients(All)` — every
 /// client gets the new entity in their next replication tick, and the
-/// client-side observer attaches the visible glTF scene. Multi-cell
-/// block destroys emit one CellEdit per footprint cell, all with the
-/// same `prev_slot`; we deliberately spawn drops per cell so a 2-cell
-/// bed dropping `{count=1}` of wood lands two logs (one per cell)
-/// rather than one — mod authors who want exact totals set counts
-/// against the number of cells the block occupies, or future stack
-/// merging dedupes piles.
+/// client-side observer attaches the visible glTF scene.
 fn spawn_drops_on_destroy(
     mut reader: MessageReader<CellEdit>,
     mut commands: Commands,
@@ -2448,11 +2452,11 @@ fn spawn_drops_on_destroy(
     };
 
     for edit in reader.read() {
-        if !edit.slot.is_empty() || edit.prev_slot.is_empty() {
+        if !edit.slot.is_empty() || edit.prev_slot.is_empty() || !edit.is_anchor {
             continue;
         }
         let def = blocks.def(edit.prev_slot);
-        if def.drops.is_empty() {
+        if def.resolved_drops().is_empty() {
             continue;
         }
         // Cell centre. The +0.5 XZ centres the item in the cell (jitter
@@ -2460,7 +2464,7 @@ fn spawn_drops_on_destroy(
         // `settled_translation` re-quantizes it to the resting cell's
         // base — we only need it to floor() back to `edit.world`.
         let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
-        for drop in &def.drops {
+        for drop in def.resolved_drops() {
             let item_id: &ItemId = &drop.item;
             // boot validation guarantees this resolves; failing here
             // would be an engine bug.

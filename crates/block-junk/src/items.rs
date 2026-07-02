@@ -158,13 +158,14 @@ impl ItemRegistry {
     }
 
     /// Cross-check every `BlockDef.drops` and `BlockDef.materials`
-    /// entry against this registry. Runs at boot after both registries
-    /// are built so neither side loads with a dangling reference.
-    /// Empty-vec drops/materials are always valid; this only catches
-    /// typos and stale ids.
+    /// entry against this registry. Runs at boot, after `resolve_drops`
+    /// has finalised each def, so defaulted drop lists get the same
+    /// scrutiny as explicit ones (redundant with the materials check
+    /// when defaulted — harmless). Empty drops/materials are always
+    /// valid; this only catches typos and stale ids.
     pub fn validate_block_drops(&self, blocks: &[BlockDef]) -> Result<(), ItemBootstrapError> {
         for def in blocks {
-            for drop in &def.drops {
+            for drop in def.resolved_drops() {
                 if self.slot_of(&drop.item).is_none() {
                     return Err(ItemBootstrapError::DropItemUnknown {
                         block: def.id.to_string(),

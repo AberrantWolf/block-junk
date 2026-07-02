@@ -110,11 +110,18 @@ pub struct WorldToast {
 /// construction (the edit is rejected if the cell was occupied). For a
 /// break: `prev_slot` is whatever was destroyed, which is what drops /
 /// post-destroy effects need to look up in the registry.
+///
+/// `is_anchor` is true on exactly one edit per placed/destroyed block —
+/// the anchor cell's (trivially true for single-cell blocks). Per-cell
+/// subscribers (room dirtying, plan clearing, settling) ignore it;
+/// per-*block* subscribers (drop spawning) key on it so a multi-cell
+/// footprint doesn't multiply a once-per-block effect.
 #[derive(Message, Clone, Copy, Debug)]
 pub struct CellEdit {
     pub world: IVec3,
     pub slot: BlockSlot,
     pub prev_slot: BlockSlot,
+    pub is_anchor: bool,
 }
 
 /// Server → client on connect: the slot ↔ id table the server is using.
