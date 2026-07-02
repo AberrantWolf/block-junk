@@ -25,7 +25,7 @@ use crate::menu::AppState;
 use crate::player_mode::PlayerMode;
 use crate::protocol::{
     ActionRejected, Avatar, AvatarPose, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX, PLAN_REACH,
-    PlanEdit, PlanEditBatch, PlanFullSync, PlanKind, PlanState, RejectReason, WorldChannel,
+    PlanEdit, PlanEditBatch, PlanFullSync, PlanKind, PlanState, RejectReason, StateSyncChannel,
 };
 use crate::server::{send_rejection, within_reach};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
@@ -476,7 +476,7 @@ fn commit_batch(
         return;
     };
     // Client request: materials is server-set. Empty on the wire here.
-    sender.send::<WorldChannel>(PlanEditBatch {
+    sender.send::<StateSyncChannel>(PlanEditBatch {
         kind,
         cells,
         materials: Vec::new(),
@@ -710,7 +710,7 @@ fn receive_plan_edits(
                 materials: materials_for_broadcast,
             };
             if let Err(err) =
-                broadcast.send::<PlanEdit, WorldChannel>(&reply, server, &NetworkTarget::All)
+                broadcast.send::<PlanEdit, StateSyncChannel>(&reply, server, &NetworkTarget::All)
             {
                 warn!("PlanEdit broadcast failed: {err}");
             }
@@ -809,9 +809,11 @@ fn receive_plan_edit_batches(
                 cells: accepted,
                 materials: shared_materials,
             };
-            if let Err(err) =
-                broadcast.send::<PlanEditBatch, WorldChannel>(&reply, server, &NetworkTarget::All)
-            {
+            if let Err(err) = broadcast.send::<PlanEditBatch, StateSyncChannel>(
+                &reply,
+                server,
+                &NetworkTarget::All,
+            ) {
                 warn!("PlanEditBatch broadcast failed: {err}");
             }
         }
@@ -844,7 +846,7 @@ fn send_plan_full_sync_on_connect(
     let sync = PlanFullSync {
         entries: plans.snapshot(),
     };
-    sender.send::<WorldChannel>(sync);
+    sender.send::<StateSyncChannel>(sync);
 }
 
 /// Client: apply a broadcast edit to the local mirror. The server has

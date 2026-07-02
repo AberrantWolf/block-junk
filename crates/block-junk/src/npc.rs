@@ -48,8 +48,8 @@ use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
     Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, EquippedTool, KinematicLock,
-    MovementIntent, MovementMode, NpcAnimOverride, PlanEdit, PlanKind, WorldChannel, WorldClock,
-    WorldItem,
+    MovementIntent, MovementMode, NpcAnimOverride, PlanEdit, PlanKind, StateSyncChannel,
+    WorldClock, WorldItem,
 };
 use crate::rooms::RoomMap;
 use crate::scripting::ServerMods;
@@ -1576,7 +1576,7 @@ fn npc_brain_tick(
                                 kind: Some(state.kind),
                                 materials: state.materials,
                             };
-                            if let Err(err) = haul.broadcast.send::<PlanEdit, WorldChannel>(
+                            if let Err(err) = haul.broadcast.send::<PlanEdit, StateSyncChannel>(
                                 &reply,
                                 server,
                                 &NetworkTarget::All,

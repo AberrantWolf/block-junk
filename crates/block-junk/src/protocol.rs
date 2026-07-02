@@ -560,10 +560,24 @@ pub struct DepositRequest {
 /// cells — at that size we split into two messages.
 pub const PLAN_EDIT_BATCH_MAX: usize = 4096;
 
-/// Channel marker. One ordered-reliable channel for all world events
-/// (BlockEdit, ChunkSnapshot, building events…). Future work may split
-/// priorities; for now KISS.
+/// Small critical world-command lane. Ordered reliable so direct edits,
+/// targeted rejections, request/response UX, and dev commands preserve
+/// the order a player expects without waiting behind bulk state sync.
 pub struct WorldChannel;
+
+/// Chunk stream lane. Kept ordered reliable for now so a snapshot and a
+/// later unload for the same coord cannot arrive reversed; move this to
+/// unordered reliable once chunk generations/version guards exist.
+pub struct ChunkChannel;
+
+/// Reliable mirror-state lane for plan/craft state. This isolates large
+/// plan batches and connect-time full syncs from the critical world lane
+/// while preserving full-sync-before-delta ordering.
+pub struct StateSyncChannel;
+
+/// Low-priority latest-wins periodic sync lane. Dropping an older sample
+/// is acceptable because the next one supersedes it.
+pub struct PeriodicSyncChannel;
 
 /// Per-tick movement intent. The unified input vocabulary for *anything*
 /// with a body — players via lightyear's input pipeline (`input_native`,
@@ -670,10 +684,8 @@ impl WorldClock {
 
 /// Server → client periodic sync of the world clock. Tiny (5 bytes)
 /// and sent at low cadence — the client extrapolates locally between
-/// messages. Lives on `WorldChannel` so it benefits from ordered-
-/// reliable delivery (we don't want clocks to skip backwards from
-/// out-of-order delivery; ordering pins each sync as monotonically
-/// progressing).
+/// messages. Lives on [`PeriodicSyncChannel`]: newer samples supersede
+/// older ones, so dropping or skipping an old sample is acceptable.
 #[derive(Message, Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct WorldClockSync {
     pub day: u32,

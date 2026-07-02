@@ -29,7 +29,7 @@ use crate::npc::{Needs, Npc};
 use crate::npc_registry::NeedRegistry;
 use crate::protocol::{
     DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools,
-    DebugSpawnWorkbench, GameSet, WorldChannel, WorldClock,
+    DebugSpawnWorkbench, GameSet, StateSyncChannel, WorldChannel, WorldClock,
 };
 
 pub struct DebugClientPlugin;
@@ -409,7 +409,7 @@ fn receive_debug_fill_nearest_plan(
                 kind: Some(state.kind),
                 materials: state.materials,
             };
-            if let Err(err) = broadcast.send::<crate::protocol::PlanEdit, WorldChannel>(
+            if let Err(err) = broadcast.send::<crate::protocol::PlanEdit, StateSyncChannel>(
                 &reply,
                 server,
                 &NetworkTarget::All,

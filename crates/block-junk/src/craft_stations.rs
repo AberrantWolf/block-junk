@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::items::ItemSlot;
 use crate::menu::AppState;
-use crate::protocol::{ActionRejected, GameSet, INTERACT_REACH, RejectReason, WorldChannel};
+use crate::protocol::{ActionRejected, GameSet, INTERACT_REACH, RejectReason, StateSyncChannel};
 use crate::server::{send_rejection, within_reach};
 
 /// One queued craft at a station. `total` is what the player asked
@@ -697,7 +697,7 @@ fn send_stations_full_sync_on_connect(
     let sync = StationsFullSync {
         entries: stations.snapshot(),
     };
-    sender.send::<WorldChannel>(sync);
+    sender.send::<StateSyncChannel>(sync);
 }
 
 fn receive_stations_full_sync(
@@ -1564,7 +1564,7 @@ pub(crate) fn broadcast_station(
 ) {
     let msg = StationUpdate { cell, state };
     if let Err(err) =
-        broadcast.send::<StationUpdate, WorldChannel>(&msg, server, &NetworkTarget::All)
+        broadcast.send::<StationUpdate, StateSyncChannel>(&msg, server, &NetworkTarget::All)
     {
         warn!("station update broadcast failed: {err}");
     }

@@ -22,11 +22,11 @@ use crate::physics::{
 use crate::plans::Plans;
 use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
-    BlockManifest, CHUNK_PADDED, Carrying, CellEdit, ChunkCoord, ChunkData, ChunkSnapshot,
-    ChunkUnload, DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameSet,
-    INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PickupRequest,
-    PlanEdit, PlanKind, REACH_SLACK, RejectReason, RequestNpcDetails, WorldChannel, WorldClock,
-    WorldClockSync, WorldItem,
+    BlockManifest, CHUNK_PADDED, Carrying, CellEdit, ChunkChannel, ChunkCoord, ChunkData,
+    ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest, DropToolRequest, EquippedTool,
+    GameSet, INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
+    PeriodicSyncChannel, PickupRequest, PlanEdit, PlanKind, REACH_SLACK, RejectReason,
+    RequestNpcDetails, StateSyncChannel, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{
@@ -1211,7 +1211,7 @@ fn broadcast_world_clock(
         time_of_day: clock.time_of_day,
     };
     for mut sender in senders.iter_mut() {
-        sender.send::<WorldChannel>(msg);
+        sender.send::<PeriodicSyncChannel>(msg);
     }
 }
 
@@ -1418,7 +1418,7 @@ fn update_aoi(
                 continue; // still generating; try again next tick
             };
             if let Ok(mut sender) = snapshots.get_mut(client_entity) {
-                sender.send::<WorldChannel>(ChunkSnapshot {
+                sender.send::<ChunkChannel>(ChunkSnapshot {
                     coord: *coord,
                     data,
                     entities,
@@ -1429,7 +1429,7 @@ fn update_aoi(
 
         for coord in &removed {
             if let Ok(mut sender) = unloads.get_mut(client_entity) {
-                sender.send::<WorldChannel>(ChunkUnload { coord: *coord });
+                sender.send::<ChunkChannel>(ChunkUnload { coord: *coord });
             }
             current.remove(coord);
         }
@@ -2244,9 +2244,11 @@ fn receive_deposit_requests(
                     kind: Some(state.kind),
                     materials: state.materials,
                 };
-                if let Err(err) =
-                    broadcast.send::<PlanEdit, WorldChannel>(&reply, server, &NetworkTarget::All)
-                {
+                if let Err(err) = broadcast.send::<PlanEdit, StateSyncChannel>(
+                    &reply,
+                    server,
+                    &NetworkTarget::All,
+                ) {
                     warn!("deposit PlanEdit broadcast failed: {err}");
                 }
             }
@@ -2328,7 +2330,7 @@ fn auto_clear_stale_plans(
             materials: Vec::new(),
         };
         if let Err(err) =
-            broadcast.send::<PlanEdit, WorldChannel>(&msg, server, &NetworkTarget::All)
+            broadcast.send::<PlanEdit, StateSyncChannel>(&msg, server, &NetworkTarget::All)
         {
             warn!("auto-clear PlanEdit broadcast failed: {err}");
         }

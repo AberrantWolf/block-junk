@@ -35,8 +35,8 @@ use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
     BlockManifest, Carrying, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
     DropToolRequest, EquippedTool, GameSet, INTERACT_REACH, MovementIntent, MovementMode,
-    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync,
-    WorldItem,
+    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, StateSyncChannel, WorldChannel,
+    WorldClock, WorldClockSync, WorldItem,
 };
 use crate::target_outline::TargetOutlinePlugin;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
@@ -1100,10 +1100,9 @@ struct SunLight;
 
 /// Receive replicated clock samples from the server. Snaps the local
 /// `WorldClock` to the latest sample so any drift accumulated in
-/// `advance_local_clock` is corrected each second. Out-of-order
-/// delivery would cause the clock to step backwards, but the message
-/// rides `WorldChannel` (ordered-reliable), so we only ever see
-/// monotonically newer samples.
+/// `advance_local_clock` is corrected each second. The message rides
+/// the sequenced-unreliable periodic lane, so stale samples are dropped
+/// in favour of the newest one.
 fn receive_world_clock(
     mut receivers: Query<&mut MessageReceiver<WorldClockSync>>,
     mut clock: ResMut<WorldClock>,
@@ -1426,7 +1425,7 @@ fn normal_mode_action_input(
                 && state.remaining_for(carry_item) > 0
             {
                 if let Ok(mut s) = io.deposit.single_mut() {
-                    s.send::<WorldChannel>(DepositRequest { cell });
+                    s.send::<StateSyncChannel>(DepositRequest { cell });
                 }
                 stop_work!();
                 action.active = None;

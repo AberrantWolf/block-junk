@@ -23,11 +23,11 @@ use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
     Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, Carrying,
-    ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan,
-    DebugSpawnTools, DebugSpawnWorkbench, DepositRequest, DropRequest, DropToolRequest,
-    EquippedTool, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PickupRequest,
-    PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails, WorldChannel, WorldClockSync,
-    WorldItem,
+    ChunkChannel, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
+    DebugFillNearestPlan, DebugSpawnTools, DebugSpawnWorkbench, DepositRequest, DropRequest,
+    DropToolRequest, EquippedTool, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
+    PeriodicSyncChannel, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails,
+    StateSyncChannel, WorldChannel, WorldClockSync, WorldItem,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +72,24 @@ impl Plugin for ProtocolPlugin {
             ..default()
         })
         .add_direction(NetworkDirection::Bidirectional);
+
+        app.add_channel::<ChunkChannel>(ChannelSettings {
+            mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
+            ..default()
+        })
+        .add_direction(NetworkDirection::ServerToClient);
+
+        app.add_channel::<StateSyncChannel>(ChannelSettings {
+            mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
+            ..default()
+        })
+        .add_direction(NetworkDirection::Bidirectional);
+
+        app.add_channel::<PeriodicSyncChannel>(ChannelSettings {
+            mode: ChannelMode::SequencedUnreliable,
+            ..default()
+        })
+        .add_direction(NetworkDirection::ServerToClient);
 
         app.register_message::<BlockEdit>()
             .add_direction(NetworkDirection::Bidirectional);
