@@ -1,3 +1,6 @@
 /target
 /saves
+# Per-install client identity (see crates/block-junk/src/identity.rs) —
+# committing it would make every checkout "the same player."
+/client_id.txt
 .claude/settings.local.json

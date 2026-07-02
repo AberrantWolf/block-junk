@@ -47,6 +47,9 @@ pub enum UiCapture {
     CraftModal,
     /// F3 dev panel.
     DebugPanel,
+    /// Blocking fatal-error modal (mod-set mismatch etc.). Esc does
+    /// not release it — the only way out is the modal's Quit button.
+    FatalError,
 }
 
 /// The set of overlays currently holding the cursor. Non-empty ⇒
@@ -194,6 +197,11 @@ fn handle_escape(
     // the save — and it would hide the "Saving and shutting down..."
     // line, the only feedback that a drain is in progress.
     if session.shutdown_requested() {
+        return;
+    }
+    // A fatal error owns the session; there is nothing to Esc back to.
+    // Consume the key so it can't open the pause menu underneath.
+    if captures.contains(UiCapture::FatalError) {
         return;
     }
     if drag.active.is_some() {

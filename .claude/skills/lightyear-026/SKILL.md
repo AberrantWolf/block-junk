@@ -386,6 +386,10 @@ For frame-smooth render of the owner camera (60 Hz physics → variable render r
 - **`#[derive(Component)]` on a replicated type but no `Serialize/Deserialize`**: register_component fails to compile. All replicated types need both.
 - **Writing input handling on `Update` instead of `FixedUpdate`**: prediction needs deterministic input timing. Move input → state changes into `FixedUpdate`.
 - **Server in `host` mode adds two `Connected` observers (one local, one for real clients)**: be aware the same observer fires for the local client too.
+- **`ControlledBy { lifetime: Lifetime::SessionBased }` (the default) despawns controlled entities BEFORE your `On<Remove, ClientOf>` observer runs** (verified 0.26.4): if a disconnect observer needs to read the controlled entity's components (e.g. to persist a departing player's state), the query silently fails — the entity is already gone. Use `Lifetime::Persistent` and despawn manually in your observer. block-junk's `register_new_client`/`forget_disconnected_client` pair does exactly this.
+- **Extracting the netcode client id from a connection**: `Query<&RemoteId>` on the connection entity; `RemoteId.0` is a `PeerId` enum — match `PeerId::Netcode(u64)` for the id the client authenticated with. `RemoteId` is still readable inside `On<Remove, ClientOf>` observers (unlike the controlled entity, see above).
+- **Disconnecting a client programmatically**: `commands.trigger(Disconnect { entity })` on the `Client` entity (top-level prelude, same shape as `Connect`). block-junk uses this to refuse sessions on mod-set mismatch.
+- **`Authentication::Manual { protocol_id, .. }` must match the server's `NetcodeConfig.protocol_id`** or the handshake is rejected before any app code runs. Useful as a cheap wire-version gate — block-junk keys both to `network::NETCODE_PROTOCOL_ID`.
 
 ## Where to look when stuck
 

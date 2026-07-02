@@ -68,7 +68,20 @@ use crate::voxel::{Chunk, ChunkEntities};
 ///                  longer registered. Closes the last raw-slot hole
 ///                  (items/recipes already stored ids). Writes also
 ///                  became atomic (tmp + rename) in the same pass.
-pub const SAVE_VERSION: u32 = 12;
+/// v13 (2026-07-02): `last_player_pose`/`carry`/`tool` (the single
+///                  "first reconnect wins" slot) replaced by `players`
+///                  — pose + carry + tool *per netcode client id*, now
+///                  that ids are stable per install (identity.rs).
+///                  v12 saves migrate on load: the legacy slot becomes
+///                  a `players` entry under [`UNCLAIMED_PLAYER_ID`],
+///                  claimed by the first client id that connects
+///                  without an entry of its own.
+pub const SAVE_VERSION: u32 = 13;
+
+/// Sentinel `SavedPlayer::client_id` for state not yet bound to a real
+/// client id: v12-migrated legacy state. Real ids are never 0 (see
+/// `identity::random_id`).
+pub const UNCLAIMED_PLAYER_ID: u64 = 0;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -137,11 +150,13 @@ pub struct SaveFile {
     #[serde(default)]
     pub block_slots: Vec<String>,
     pub edited_chunks: Vec<SavedChunk>,
-    /// Position + yaw of the player at save time. For solo play this is
-    /// where the next-connecting client respawns. For multi-host this is
-    /// "the first player to reconnect lands here"; per-player persistence
-    /// needs a stable client identity we don't have yet.
-    pub last_player_pose: Option<AvatarPose>,
+    /// Pose + carry + tool per client id — everyone connected at save
+    /// time plus everyone the server remembered from earlier
+    /// disconnects this session. Sorted by id for deterministic bytes.
+    /// An entry under [`UNCLAIMED_PLAYER_ID`] is v12-migrated legacy
+    /// state waiting for its first claimant.
+    #[serde(default)]
+    pub players: Vec<SavedPlayer>,
     /// Every NPC alive at save time. Empty for a save made before NPCs
     /// existed (those saves are v2 and won't load anyway, but the field
     /// is `default` for forward compat — adding a new NPC system off
@@ -166,25 +181,82 @@ pub struct SaveFile {
     /// deserialize cleanly via `serde(default)`.
     #[serde(default)]
     pub world_items: Vec<SavedWorldItem>,
-    /// Carry stack of the spawning player at save time (the same
-    /// "first reconnecting player wins" convention `last_player_pose`
-    /// uses). `None` ⇒ empty-handed save, or a save predating v6.
-    /// Per-player carries persistence needs a stable client identity
-    /// we don't have yet.
-    #[serde(default)]
-    pub last_player_carry: Option<SavedCarry>,
-    /// Tool slot of the spawning player at save time. Same
-    /// first-reconnect convention as `last_player_carry`. `None` ⇒
-    /// empty tool slot at save time, OR a save predating v9 (the
-    /// load path falls back to the engine starter-axe via
-    /// `STARTER_TOOL_ID`).
-    #[serde(default)]
-    pub last_player_tool: Option<SavedTool>,
     /// Craft-station state at save time — queued orders + deposited
     /// inventory, per station cell. Empty vec for sessions with no
     /// active stations OR for saves predating v10 (serde-default).
     #[serde(default)]
     pub craft_stations: Vec<(IVec3, SavedStationState)>,
+}
+
+/// One player's persisted state, keyed by their netcode client id (a
+/// stable per-install random u64 — see `identity.rs`). Carry/tool use
+/// the same id-not-slot stability convention as everything else.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedPlayer {
+    pub client_id: u64,
+    pub pose: AvatarPose,
+    pub carry: Option<SavedCarry>,
+    pub tool: Option<SavedTool>,
+}
+
+/// The v12 `SaveFile` layout, kept verbatim (field order is the bincode
+/// wire order) so v12 saves can be decoded and migrated instead of
+/// refused. Only the fields that differ from v13 carry comments.
+/// Serialize exists only so tests can author v12 bytes.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct SaveFileV12 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    block_slots: Vec<String>,
+    edited_chunks: Vec<SavedChunk>,
+    /// v13 folds this + carry + tool into a `players` entry under
+    /// [`UNCLAIMED_PLAYER_ID`].
+    last_player_pose: Option<AvatarPose>,
+    #[serde(default)]
+    npcs: Vec<SavedNpc>,
+    #[serde(default)]
+    world_clock: Option<WorldClock>,
+    #[serde(default)]
+    plans: Vec<(IVec3, SavedPlanState)>,
+    #[serde(default)]
+    world_items: Vec<SavedWorldItem>,
+    #[serde(default)]
+    last_player_carry: Option<SavedCarry>,
+    #[serde(default)]
+    last_player_tool: Option<SavedTool>,
+    #[serde(default)]
+    craft_stations: Vec<(IVec3, SavedStationState)>,
+}
+
+impl From<SaveFileV12> for SaveFile {
+    fn from(old: SaveFileV12) -> Self {
+        // The legacy single-player slot becomes an unclaimed entry; the
+        // first client id to connect without one of its own inherits
+        // it. A v12 save with no recorded pose (headless world nobody
+        // joined) has nothing worth claiming.
+        let players = match old.last_player_pose {
+            Some(pose) => vec![SavedPlayer {
+                client_id: UNCLAIMED_PLAYER_ID,
+                pose,
+                carry: old.last_player_carry,
+                tool: old.last_player_tool,
+            }],
+            None => Vec::new(),
+        };
+        SaveFile {
+            version: SAVE_VERSION,
+            block_slots: old.block_slots,
+            edited_chunks: old.edited_chunks,
+            players,
+            npcs: old.npcs,
+            world_clock: old.world_clock,
+            plans: old.plans,
+            world_items: old.world_items,
+            craft_stations: old.craft_stations,
+        }
+    }
 }
 
 /// On-disk shape of a [`WorldItem`](crate::protocol::WorldItem) entity.
@@ -201,7 +273,7 @@ pub struct SavedWorldItem {
 /// [`Carrying`](crate::protocol::Carrying) stack. Same id-not-slot
 /// stability rule as [`SavedWorldItem`]. `count == 0` is canonical
 /// "empty-handed" — but in practice we serialise `None` for that
-/// case at the `SaveFile::last_player_carry` layer.
+/// case at the [`SavedPlayer::carry`] / `SavedNpc::carrying` layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedCarry {
     pub item_id: String,
@@ -485,7 +557,7 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         });
     }
     let meta = read_metadata(&dir)?;
-    if meta.version != SAVE_VERSION {
+    if meta.version != SAVE_VERSION && meta.version != 12 {
         return Err(SaveError::VersionMismatch {
             name: name.to_string(),
             found: meta.version,
@@ -497,6 +569,14 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         path: blob,
         source: e,
     })?;
+    if meta.version == 12 {
+        // In-memory migration only; the file upgrades on the next
+        // write, so a failed session never rewrites a good v12 save.
+        let (old, _): (SaveFileV12, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+        bevy::log::info!("migrated save {name:?} from v12 (single-player slot → players table)");
+        return Ok(old.into());
+    }
     let (save, _): (SaveFile, usize) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
     Ok(save)
@@ -556,8 +636,8 @@ mod tests {
 
     /// Round-trip a SaveFile through bincode to catch serde regressions
     /// at the shape level. Covers every field the current version
-    /// carries: v3 npcs, v4 world_clock, v5/v7 plans, v6 world_items +
-    /// last_player_carry, v7 plan materials.
+    /// carries: v3 npcs, v4 world_clock, v5/v7 plans, v6 world_items,
+    /// v13 per-player entries.
     #[test]
     fn savefile_round_trips_all_fields() {
         let mut needs = HashMap::new();
@@ -599,10 +679,20 @@ mod tests {
             version: SAVE_VERSION,
             block_slots: vec!["vanilla:empty".to_owned(), "vanilla:stone".to_owned()],
             edited_chunks: vec![],
-            last_player_pose: Some(AvatarPose {
-                translation: Vec3::new(1.0, 2.0, 3.0),
-                yaw: 0.5,
-            }),
+            players: vec![SavedPlayer {
+                client_id: 0xFEED_F00D,
+                pose: AvatarPose {
+                    translation: Vec3::new(1.0, 2.0, 3.0),
+                    yaw: 0.5,
+                },
+                carry: Some(SavedCarry {
+                    item_id: "vanilla:wood_log".to_owned(),
+                    count: 3,
+                }),
+                tool: Some(SavedTool {
+                    item_id: "vanilla:axe".to_owned(),
+                }),
+            }],
             npcs: vec![SavedNpc {
                 id: 7,
                 kind: "vanilla:wanderer".to_owned(),
@@ -627,13 +717,6 @@ mod tests {
             }),
             plans: plans.clone(),
             world_items: world_items.clone(),
-            last_player_carry: Some(SavedCarry {
-                item_id: "vanilla:wood_log".to_owned(),
-                count: 3,
-            }),
-            last_player_tool: Some(SavedTool {
-                item_id: "vanilla:axe".to_owned(),
-            }),
             craft_stations: vec![(
                 IVec3::new(2, 32, 60),
                 SavedStationState {
@@ -671,9 +754,11 @@ mod tests {
         let npc_carry = np.carrying.as_ref().unwrap();
         assert_eq!(npc_carry.item_id, "vanilla:stone_chunk");
         assert_eq!(npc_carry.count, 2);
-        let pose = decoded.last_player_pose.unwrap();
-        assert_eq!(pose.translation, Vec3::new(1.0, 2.0, 3.0));
-        assert_eq!(pose.yaw, 0.5);
+        assert_eq!(decoded.players.len(), 1);
+        let player = &decoded.players[0];
+        assert_eq!(player.client_id, 0xFEED_F00D);
+        assert_eq!(player.pose.translation, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(player.pose.yaw, 0.5);
         let clock = decoded.world_clock.unwrap();
         assert_eq!(clock.day, 3);
         assert_eq!(clock.time_of_day, 0.625);
@@ -688,10 +773,10 @@ mod tests {
             decoded.world_items[0].translation,
             Vec3::new(10.0, 8.5, -3.25)
         );
-        let carry = decoded.last_player_carry.unwrap();
+        let carry = player.carry.as_ref().unwrap();
         assert_eq!(carry.item_id, "vanilla:wood_log");
         assert_eq!(carry.count, 3);
-        let tool = decoded.last_player_tool.unwrap();
+        let tool = player.tool.as_ref().unwrap();
         assert_eq!(tool.item_id, "vanilla:axe");
         let npc_tool = decoded.npcs[0].tool.as_ref().unwrap();
         assert_eq!(npc_tool.item_id, "vanilla:pickaxe");
@@ -709,6 +794,65 @@ mod tests {
         assert_eq!(active.recipe_id, "vanilla:planks_from_log");
         assert_eq!(active.total_secs, 4.0);
         assert_eq!(active.elapsed_secs, 1.25);
+    }
+
+    /// A v12 blob (single last-player slot) must decode and land its
+    /// legacy state as the unclaimed `players` entry, byte-compatibly
+    /// with what a real v12 session wrote.
+    #[test]
+    fn v12_savefile_migrates_to_players_table() {
+        let old = SaveFileV12 {
+            version: 12,
+            block_slots: vec!["vanilla:empty".to_owned()],
+            edited_chunks: vec![],
+            last_player_pose: Some(AvatarPose {
+                translation: Vec3::new(9.0, 8.0, 7.0),
+                yaw: 1.5,
+            }),
+            npcs: vec![],
+            world_clock: None,
+            plans: vec![],
+            world_items: vec![],
+            last_player_carry: Some(SavedCarry {
+                item_id: "vanilla:stone_chunk".to_owned(),
+                count: 2,
+            }),
+            last_player_tool: None,
+            craft_stations: vec![],
+        };
+        let bytes = bincode::serde::encode_to_vec(&old, bincode::config::standard()).unwrap();
+        let (decoded, _): (SaveFileV12, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let migrated: SaveFile = decoded.into();
+        assert_eq!(migrated.version, SAVE_VERSION);
+        assert_eq!(migrated.block_slots, vec!["vanilla:empty".to_owned()]);
+        assert_eq!(migrated.players.len(), 1);
+        let p = &migrated.players[0];
+        assert_eq!(p.client_id, UNCLAIMED_PLAYER_ID);
+        assert_eq!(p.pose.translation, Vec3::new(9.0, 8.0, 7.0));
+        assert_eq!(p.carry.as_ref().unwrap().item_id, "vanilla:stone_chunk");
+        assert!(p.tool.is_none());
+    }
+
+    /// A v12 world nobody ever joined has no pose — and therefore
+    /// nothing worth claiming after migration.
+    #[test]
+    fn poseless_v12_migrates_to_empty_players() {
+        let old = SaveFileV12 {
+            version: 12,
+            block_slots: vec![],
+            edited_chunks: vec![],
+            last_player_pose: None,
+            npcs: vec![],
+            world_clock: None,
+            plans: vec![],
+            world_items: vec![],
+            last_player_carry: None,
+            last_player_tool: None,
+            craft_stations: vec![],
+        };
+        let migrated: SaveFile = old.into();
+        assert!(migrated.players.is_empty());
     }
 
     /// Minimal SaveFile carrying one chunk + one Build plan, written
@@ -730,7 +874,7 @@ mod tests {
                 chunk: Chunk { blocks },
                 entities: ChunkEntities::default(),
             }],
-            last_player_pose: None,
+            players: vec![],
             npcs: vec![],
             world_clock: None,
             plans: vec![(
@@ -744,8 +888,6 @@ mod tests {
                 },
             )],
             world_items: vec![],
-            last_player_carry: None,
-            last_player_tool: None,
             craft_stations: vec![],
         }
     }

@@ -1,7 +1,10 @@
 //! Lightyear network setup. Two modes only:
 //!
-//! - `Server` spawns a netcode-UDP listener on `SERVER_ADDR`.
-//! - `Client` connects to `SERVER_ADDR` over UDP.
+//! - `Server` spawns a netcode-UDP listener on [`ServerBindAddr`]
+//!   (default: all interfaces, port 5050 — every hosted world is
+//!   LAN-joinable by design; there is no private "solo bind").
+//! - `Client` connects to [`JoinTarget`] over UDP (localhost when this
+//!   process is also hosting).
 //!
 //! Solo play (the `cargo run` default) is "spawn a server thread + run a
 //! client App that connects to localhost." Same wire format as friends-mode;
@@ -22,7 +25,7 @@ use crate::craft_stations::{
 use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
-    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockManifest, Carrying,
+    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, ModSetManifest, Carrying,
     ChunkChannel, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
     DebugFillNearestPlan, DebugSpawnTools, DebugSpawnWorkbench, DepositRequest, DropRequest,
     DropToolRequest, EquippedTool, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
@@ -36,8 +39,46 @@ pub enum NetMode {
     Client,
 }
 
-pub const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5050);
+/// Default port for both hosted-thread and dedicated servers.
+pub const SERVER_PORT: u16 = 5050;
+
+/// Where a server binds unless overridden: all interfaces. Binding
+/// loopback would make hosted worlds unreachable from other machines,
+/// which contradicts the always-client architecture's whole point.
+pub const DEFAULT_BIND_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SERVER_PORT);
+
+/// Where the local client connects when this process is also hosting,
+/// and the default the join-address field starts from.
+pub const LOCAL_CONNECT_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SERVER_PORT);
+
 pub const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+
+/// Netcode protocol discriminator, checked during the handshake before
+/// any app code runs. Both sides must present the same value; a client
+/// built with a different id is rejected at the transport layer. Bump
+/// the low byte whenever the wire protocol changes incompatibly
+/// (message shapes, channel set, replication registrations) — cheaper
+/// than a desync hunt when someone joins with a stale build. The
+/// registry-level mod-set check is a separate, later gate.
+pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0001;
+
+/// Which address the server socket binds. Inserted by
+/// `run_server_inner`; the dedicated CLI can override the default.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct ServerBindAddr(pub SocketAddr);
+
+/// Best-effort local LAN address, for "friends can join at ..." UI.
+/// A UDP socket "connected" to a public address reveals which
+/// interface the OS would route through — no packet is actually sent
+/// (UDP connect only sets the default destination). `None` when
+/// offline or sandboxed.
+pub fn local_lan_ip() -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
 
 pub struct NetworkPlugin {
     pub mode: NetMode,
@@ -53,8 +94,11 @@ impl Plugin for NetworkPlugin {
                 app.add_systems(Startup, start_netcode_server);
             }
             // Client App outlives a session and shows a menu first. Defer
-            // the netcode connect until the user starts a game.
+            // the netcode connect until the user starts a game. Identity
+            // loads at build time (main thread, before any UI) so a
+            // locked-id fallback is decided before the menu even shows.
             NetMode::Client => {
+                app.insert_resource(crate::identity::load_or_create());
                 app.add_systems(OnEnter(AppState::InGame), start_netcode_client);
             }
         };
@@ -111,7 +155,7 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ChunkUnload>()
             .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<BlockManifest>()
+        app.register_message::<ModSetManifest>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<WorldClockSync>()
             .add_direction(NetworkDirection::ServerToClient);
@@ -212,23 +256,28 @@ impl Plugin for ProtocolPlugin {
     }
 }
 
-fn start_netcode_server(mut commands: Commands) {
+fn start_netcode_server(mut commands: Commands, bind: Option<Res<ServerBindAddr>>) {
     use lightyear::prelude::server::{NetcodeConfig, NetcodeServer, ServerUdpIo};
 
+    let addr = bind.map(|b| b.0).unwrap_or(DEFAULT_BIND_ADDR);
     let server = commands
         .spawn((
-            NetcodeServer::new(NetcodeConfig::default()),
-            LocalAddr(SERVER_ADDR),
+            NetcodeServer::new(NetcodeConfig {
+                protocol_id: NETCODE_PROTOCOL_ID,
+                ..default()
+            }),
+            LocalAddr(addr),
             ServerUdpIo::default(),
         ))
         .id();
     commands.trigger(Start { entity: server });
-    info!("netcode server listening on {SERVER_ADDR}");
+    info!("netcode server listening on {addr}");
 }
 
 fn start_netcode_client(
     mut commands: Commands,
     target: Res<JoinTarget>,
+    identity: Res<crate::identity::ClientIdentity>,
     existing: Query<(), With<Client>>,
 ) {
     use lightyear::netcode::Key;
@@ -246,16 +295,16 @@ fn start_netcode_client(
 
     let server_addr = target.0;
 
-    // Process-unique client ID. Hardcoding 0 means a second client trying
-    // to connect to the same server gets `ClientIdInUse` — fine for unit
-    // tests, fatal for actually playing together. A real auth flow lands
-    // when we add accounts; PID is enough until then.
-    let client_id: u64 = std::process::id() as u64;
+    // Persistent per-install id (see `identity.rs`): collision-proof
+    // across machines AND stable across launches, which is what keys
+    // per-player persistence on the server. A second instance in the
+    // same directory gets an ephemeral id via the identity module's
+    // file-lock fallback.
     let auth = Authentication::Manual {
         server_addr,
-        client_id,
+        client_id: identity.0,
         private_key: Key::default(),
-        protocol_id: 0,
+        protocol_id: NETCODE_PROTOCOL_ID,
     };
     let client = match NetcodeClient::new(auth, NetcodeConfig::default()) {
         Ok(c) => c,

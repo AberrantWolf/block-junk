@@ -33,7 +33,7 @@ use crate::preview::{
 };
 use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
-    BlockManifest, Carrying, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
+    ModSetManifest, Carrying, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
     DropToolRequest, EquippedTool, GameSet, INTERACT_REACH, MovementIntent, MovementMode,
     NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync,
     WorldItem,
@@ -158,7 +158,7 @@ impl Plugin for ClientPlugin {
             .add_systems(
                 Update,
                 (
-                    receive_block_manifest,
+                    receive_modset_manifest,
                     receive_snapshots,
                     receive_block_edit_broadcasts,
                     receive_chunk_unloads,
@@ -2574,48 +2574,55 @@ fn handle_predicted_spawn(
     ));
 }
 
-/// Server's slot ↔ id table arrives once on connect. Compare against our
-/// local `BlockRegistry`; any mismatch indicates a divergent mod set and
-/// is logged loudly. We don't disconnect today (until saves exist there's
-/// no real harm), but the loud log makes the failure obvious in dev.
-fn receive_block_manifest(
-    mut receivers: Query<&mut MessageReceiver<BlockManifest>>,
+/// Server's mod-set fingerprint arrives once on connect. Any
+/// disagreement is fatal: log it, surface the blocking error modal,
+/// and disconnect. A divergent mod set desyncs *silently* — wrong
+/// meshes, wrong drops, wrong recipes — long after connect, which is
+/// strictly worse than failing loudly at the door.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "diffs every registry the wire references"
+)]
+fn receive_modset_manifest(
+    mut commands: Commands,
+    mut receivers: Query<&mut MessageReceiver<ModSetManifest>>,
     registry: Res<BlockRegistry>,
+    item_registry: Res<ItemRegistry>,
+    recipe_registry: Res<crate::recipes::RecipeRegistry>,
+    npc_kind_registry: Res<NpcKindRegistry>,
+    mut captures: ResMut<crate::ui_capture::UiCaptures>,
+    clients: Query<Entity, With<Client>>,
 ) {
     for mut receiver in receivers.iter_mut() {
         for manifest in receiver.receive() {
-            let mut mismatches = 0usize;
-            for (i, server_id) in manifest.slots.iter().enumerate() {
-                let slot = BlockSlot(i as u16);
-                if i >= registry.slot_count() {
-                    error!(slot = i, id = %server_id, "server has block id we don't");
-                    mismatches += 1;
-                    continue;
-                }
-                let local_id = registry.id_of(slot);
-                if local_id != server_id {
-                    error!(
-                        slot = i,
-                        server_id = %server_id,
-                        client_id = %local_id,
-                        "block manifest mismatch",
-                    );
-                    mismatches += 1;
-                }
-            }
-            if manifest.slots.len() < registry.slot_count() {
-                error!(
-                    server_count = manifest.slots.len(),
-                    client_count = registry.slot_count(),
-                    "client registered more blocks than server",
-                );
-                mismatches += 1;
-            }
-            if mismatches == 0 {
+            let local = crate::modset::local_manifest(
+                &registry,
+                &item_registry,
+                &recipe_registry,
+                &npc_kind_registry,
+            );
+            let mismatches = crate::modset::diff(&manifest, &local);
+            if mismatches.is_empty() {
                 info!(
-                    "block manifest OK ({} slot(s) agreed)",
-                    manifest.slots.len()
+                    "mod-set manifest OK ({} block(s), {} item(s), {} recipe(s), {} npc kind(s))",
+                    manifest.blocks.len(),
+                    manifest.items.len(),
+                    manifest.recipes.len(),
+                    manifest.npc_kinds.len(),
                 );
+                continue;
+            }
+            for line in &mismatches {
+                error!("mod-set mismatch: {line}");
+            }
+            commands.insert_resource(crate::menu::ConnectionFatal {
+                title: "Your mods don't match the server's".to_string(),
+                details: mismatches,
+            });
+            captures.acquire(crate::ui_capture::UiCapture::FatalError);
+            // Stop streaming a world we can't correctly represent.
+            for entity in clients.iter() {
+                commands.trigger(Disconnect { entity });
             }
         }
     }

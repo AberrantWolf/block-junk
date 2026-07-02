@@ -124,13 +124,26 @@ pub struct CellEdit {
     pub is_anchor: bool,
 }
 
-/// Server → client on connect: the slot ↔ id table the server is using.
-/// Client validates against its own registry; mismatched slot/id pairs
-/// indicate a divergent mod set and the connection is rejected.
+/// Server → client on connect: the full mod-set fingerprint — slot ↔ id
+/// tables for every registry the wire references, plus a content hash
+/// over the serialized defs. The client diffs it against its own
+/// registries and refuses the session on any disagreement (a divergent
+/// mod set desyncs silently long after connect, which is strictly worse
+/// than failing loudly at the door). Construction and comparison live
+/// in `modset.rs`.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct BlockManifest {
+pub struct ModSetManifest {
     /// Slot index = position in this Vec. Slot 0 is always `vanilla:empty`.
-    pub slots: Vec<BlockId>,
+    pub blocks: Vec<BlockId>,
+    /// Slot index = position, same convention as `blocks`.
+    pub items: Vec<block_junk_mod_api::items::ItemId>,
+    /// Recipe ids in slot order.
+    pub recipes: Vec<String>,
+    /// NPC kind ids, sorted (the registry is keyed by string, not slot).
+    pub npc_kinds: Vec<String>,
+    /// Stable FNV-1a over the serialized block/item/recipe defs in slot
+    /// order. Catches same-ids-but-different-definitions.
+    pub defs_hash: u64,
 }
 
 /// Server → client only: tells a client what to put in a chunk it just

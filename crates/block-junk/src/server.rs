@@ -25,7 +25,7 @@ use crate::physics::{
 use crate::plans::Plans;
 use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
-    BlockManifest, CHUNK_PADDED, Carrying, CellEdit, ChunkChannel, ChunkCoord, ChunkData,
+    ModSetManifest, CHUNK_PADDED, Carrying, CellEdit, ChunkChannel, ChunkCoord, ChunkData,
     ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest, DropToolRequest, EquippedTool,
     GameSet, INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
     PeriodicSyncChannel, PickupRequest, PlanEdit, PlanKind, REACH_SLACK, RejectReason,
@@ -34,8 +34,8 @@ use crate::protocol::{
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{
     SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk, SavedCraftOrder,
-    SavedMaterialEntry, SavedNpc, SavedPlanState, SavedStationItem, SavedStationState, SavedTool,
-    SavedWorldItem, read_save, remap_block_slots, write_save,
+    SavedMaterialEntry, SavedNpc, SavedPlanState, SavedPlayer, SavedStationItem, SavedStationState,
+    SavedTool, SavedWorldItem, UNCLAIMED_PLAYER_ID, read_save, remap_block_slots, write_save,
 };
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
@@ -68,9 +68,7 @@ impl Plugin for ServerPlugin {
         app.init_resource::<ClientAvatars>();
         app.init_resource::<ClientChunks>();
         app.init_resource::<PendingChunks>();
-        app.init_resource::<PendingSpawnPose>();
-        app.init_resource::<PendingSpawnCarry>();
-        app.init_resource::<PendingSpawnTool>();
+        app.init_resource::<PlayerStates>();
         app.init_resource::<SaveWriteGuard>();
         app.init_resource::<RoomMap>();
         app.init_resource::<DetectionDirty>();
@@ -202,27 +200,36 @@ impl Plugin for ServerPlugin {
     }
 }
 
-/// Held on the server App after a successful load. Consumed once by the
-/// first `register_new_client` invocation, so the client that triggered
-/// the load lands back where they left off. Subsequent connections (in a
-/// multi-host scenario) get the default spawn. Per-player persistence
-/// requires a stable client identity we don't have yet — tracked as
-/// follow-up.
-#[derive(Resource, Default)]
-pub struct PendingSpawnPose(pub Option<AvatarPose>);
+/// One player's persisted state in runtime types (slots resolved).
+#[derive(Clone, Debug)]
+pub struct PlayerState {
+    pub pose: AvatarPose,
+    pub carry: Carrying,
+    pub tool: EquippedTool,
+}
 
-/// Companion to [`PendingSpawnPose`] for the player's carry stack.
-/// Consumed at the same point so the reloading player lands with the
-/// same item in hand they had at save.
+/// Per-client-id player persistence, server-side. Filled from the save
+/// on load and by disconnects during the session; an entry is *removed*
+/// when its player connects (their live avatar is authoritative until
+/// they disconnect again — the save assembler reads connected players
+/// straight from their avatars). The [`save::UNCLAIMED_PLAYER_ID`]
+/// entry is v12-migrated legacy state; the first client id connecting
+/// without an entry of its own claims it.
 #[derive(Resource, Default)]
-pub struct PendingSpawnCarry(pub Option<Carrying>);
+pub struct PlayerStates(pub HashMap<u64, PlayerState>);
 
-/// Same shape as [`PendingSpawnCarry`] for the player's tool slot.
-/// Hand-off lane between save-load (or the starter-loadout fallback)
-/// and the avatar spawn observer. `None` ⇒ "use the starter axe if
-/// the item is registered, otherwise spawn empty-handed."
-#[derive(Resource, Default)]
-pub struct PendingSpawnTool(pub Option<EquippedTool>);
+/// The u64 the wire actually authenticated. `None` for peer kinds our
+/// transports never produce — callers should skip persistence for
+/// those rather than corrupt the table.
+fn client_id_u64(remote: &RemoteId) -> Option<u64> {
+    match remote.0 {
+        PeerId::Netcode(id) => Some(id),
+        other => {
+            warn!(?other, "connection has a non-netcode peer id; not persisting it");
+            None
+        }
+    }
+}
 
 /// Set by `load_from_save` when a load was attempted and failed (corrupt
 /// blob, version mismatch, missing block ids). The session then runs on
@@ -259,9 +266,7 @@ const STARTER_TOOL_ID: &str = "vanilla:axe";
 fn load_from_save(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
-    mut pending_pose: ResMut<PendingSpawnPose>,
-    mut pending_carry: ResMut<PendingSpawnCarry>,
-    mut pending_tool: ResMut<PendingSpawnTool>,
+    mut player_states: ResMut<PlayerStates>,
     mut dirty: ResMut<DetectionDirty>,
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
@@ -411,7 +416,6 @@ fn load_from_save(
             .collect();
         stations.replace_all(restored);
     }
-    pending_pose.0 = save.last_player_pose;
     // Restore the world clock if the save carries one. Saves predating
     // v4 don't (Option::None); fall back to the resource's default
     // sunrise position rather than zeroing it to midnight.
@@ -528,50 +532,57 @@ fn load_from_save(
     if loaded_items > 0 {
         info!("spawned {loaded_items} loose world items from save");
     }
-    // Carry: resolve item id → slot, hand off via PendingSpawnCarry so
-    // register_new_client can apply it to the spawning avatar.
-    if let Some(saved_carry) = save.last_player_carry {
-        let id = block_junk_mod_api::items::ItemId::new(saved_carry.item_id.clone());
-        match item_registry.slot_of(&id) {
-            Some(slot) => {
-                pending_carry.0 = Some(Carrying {
-                    item: Some(slot),
-                    count: saved_carry.count,
-                });
-                info!(
-                    item = %saved_carry.item_id,
-                    count = saved_carry.count,
-                    "restored player carry from save",
-                );
-            }
-            None => warn!(
-                item = %saved_carry.item_id,
-                "saved player carry references unknown item id; spawning empty-handed",
-            ),
-        }
+    // Players table: resolve each entry's item ids → slots (unknown ids
+    // — a mod removed between sessions — degrade that field to empty
+    // with a warning, not the whole entry). Entries sit here until
+    // their client id connects; `register_new_client` consumes them.
+    for saved in save.players {
+        let state = resolve_saved_player(&saved, &item_registry);
+        player_states.0.insert(saved.client_id, state);
     }
-    // Tool: same lookup-or-warn pattern as carry. Distinct from the
-    // carry restore in one way — we ALWAYS set Pending to Some, even
-    // for a save that recorded an empty tool slot. The
-    // `register_new_client` starter-axe fallback only fires when
-    // Pending was left untouched (no save loaded); reaching this
-    // branch means a save loaded, so its intent (whether empty or a
-    // specific tool) is what should land.
-    let pending = match save.last_player_tool {
-        Some(saved_tool) => {
-            let id = block_junk_mod_api::items::ItemId::new(saved_tool.item_id.clone());
+    if !player_states.0.is_empty() {
+        info!(
+            "restored {} player state entr{} from save",
+            player_states.0.len(),
+            if player_states.0.len() == 1 { "y" } else { "ies" },
+        );
+    }
+}
+
+/// On-disk player entry → runtime types. Carry/tool item ids that no
+/// longer resolve (mod uninstalled between sessions) degrade to empty
+/// with a warning — same policy as world items and NPC carry.
+fn resolve_saved_player(saved: &SavedPlayer, item_registry: &ItemRegistry) -> PlayerState {
+    let carry = match &saved.carry {
+        Some(sc) => {
+            let id = block_junk_mod_api::items::ItemId::new(sc.item_id.clone());
             match item_registry.slot_of(&id) {
-                Some(slot) => {
-                    info!(
-                        item = %saved_tool.item_id,
-                        "restored player tool from save",
-                    );
-                    EquippedTool { item: Some(slot) }
-                }
+                Some(slot) => Carrying {
+                    item: Some(slot),
+                    count: sc.count,
+                },
                 None => {
                     warn!(
-                        item = %saved_tool.item_id,
-                        "saved player tool references unknown item id; spawning empty-handed",
+                        client_id = saved.client_id,
+                        item = %sc.item_id,
+                        "saved player carry references unknown item id; restoring empty-handed",
+                    );
+                    Carrying::default()
+                }
+            }
+        }
+        None => Carrying::default(),
+    };
+    let tool = match &saved.tool {
+        Some(st) => {
+            let id = block_junk_mod_api::items::ItemId::new(st.item_id.clone());
+            match item_registry.slot_of(&id) {
+                Some(slot) => EquippedTool { item: Some(slot) },
+                None => {
+                    warn!(
+                        client_id = saved.client_id,
+                        item = %st.item_id,
+                        "saved player tool references unknown item id; restoring empty slot",
                     );
                     EquippedTool::default()
                 }
@@ -579,7 +590,11 @@ fn load_from_save(
         }
         None => EquippedTool::default(),
     };
-    pending_tool.0 = Some(pending);
+    PlayerState {
+        pose: saved.pose,
+        carry,
+        tool,
+    }
 }
 
 /// Spawn an NPC entity restored from a save. Mirrors the cluster-spawn
@@ -690,24 +705,11 @@ fn spawn_loaded_npc(
 /// write error render as "Saved ✓" in the pause menu. Unlike
 /// `save_then_shutdown` this is multi-shot (the user might "Save Now"
 /// several times per session) so no Local guard.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "save_on_request touches every persisted system"
-)]
 fn save_on_request(
     flag: Option<Res<ServerSaveRequestFlag>>,
     result: Option<Res<ServerSaveResultFlag>>,
     config: Option<Res<ServerSaveConfig>>,
-    clock: Res<WorldClock>,
-    plans: Res<Plans>,
-    stations: Res<CraftStations>,
-    chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
-    avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
-    npcs: SavedNpcQuery,
-    world_items: Query<&WorldItem>,
-    item_registry: Res<ItemRegistry>,
-    block_registry: Res<BlockRegistry>,
-    guard: Res<SaveWriteGuard>,
+    ctx: SaveCtx,
 ) {
     use core::sync::atomic::Ordering;
     let Some(flag) = flag else {
@@ -725,24 +727,14 @@ fn save_on_request(
             error!("save requested but no save name configured; nothing written");
             break 'save false;
         };
-        if let Some(reason) = &guard.reason {
+        if let Some(reason) = &ctx.guard.reason {
             error!(
                 "NOT saving to {name:?}: this session's load failed ({reason}); \
                  the original save file is preserved untouched"
             );
             break 'save false;
         }
-        let save = assemble_save_file(
-            &clock,
-            &plans,
-            &stations,
-            &chunks,
-            &avatars,
-            &npcs,
-            &world_items,
-            &item_registry,
-            &block_registry,
-        );
+        let save = assemble_save_file(&ctx);
         write_save_logged(name, &save)
     };
     if let Some(result) = result {
@@ -852,28 +844,57 @@ fn collect_saved_world_items(
         .collect()
 }
 
-/// Pull the first connected avatar's pose + (non-empty) carry + tool,
-/// mirroring the "first reconnect wins" convention `last_player_pose`
-/// already uses. Each of carry/tool serialises as `None` when its slot
-/// is empty.
-fn first_avatar_state(
-    avatars: &Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
-    item_registry: &ItemRegistry,
-) -> (Option<AvatarPose>, Option<SavedCarry>, Option<SavedTool>) {
-    let Some((pose, carry, tool)) = avatars.iter().next() else {
-        return (None, None, None);
-    };
-    let saved_carry = match (carry.item, carry.count) {
+/// Carry stack → on-disk shape. Empty (or zero-count) serialises as
+/// `None`, matching the load path's `Option` semantics.
+fn saved_carry_of(carry: &Carrying, item_registry: &ItemRegistry) -> Option<SavedCarry> {
+    match (carry.item, carry.count) {
         (Some(slot), count) if count > 0 => Some(SavedCarry {
             item_id: item_registry.id_of(slot).to_string(),
             count,
         }),
         _ => None,
-    };
-    let saved_tool = tool.item.map(|slot| SavedTool {
+    }
+}
+
+/// Tool slot → on-disk shape. Empty slot serialises as `None`.
+fn saved_tool_of(tool: &EquippedTool, item_registry: &ItemRegistry) -> Option<SavedTool> {
+    tool.item.map(|slot| SavedTool {
         item_id: item_registry.id_of(slot).to_string(),
-    });
-    (Some(*pose), saved_carry, saved_tool)
+    })
+}
+
+/// Every player the save should remember: connected clients read live
+/// from their avatars (via `ClientAvatars` + each connection's
+/// `RemoteId`), everyone else from the offline [`PlayerStates`] table
+/// (disconnects this session + not-yet-claimed loaded entries — the two
+/// sets are disjoint because connecting removes the table entry).
+/// Sorted by id so identical state produces identical bytes.
+fn collect_saved_players(ctx: &SaveCtx) -> Vec<SavedPlayer> {
+    let mut players: Vec<SavedPlayer> = Vec::new();
+    for (conn, avatar) in ctx.client_avatars.0.iter() {
+        let Some(id) = ctx.remote_ids.get(*conn).ok().and_then(client_id_u64) else {
+            continue;
+        };
+        let Ok((pose, carry, tool)) = ctx.avatar_states.get(*avatar) else {
+            continue;
+        };
+        players.push(SavedPlayer {
+            client_id: id,
+            pose: *pose,
+            carry: saved_carry_of(carry, &ctx.item_registry),
+            tool: saved_tool_of(tool, &ctx.item_registry),
+        });
+    }
+    for (id, state) in ctx.player_states.0.iter() {
+        players.push(SavedPlayer {
+            client_id: *id,
+            pose: state.pose,
+            carry: saved_carry_of(&state.carry, &ctx.item_registry),
+            tool: saved_tool_of(&state.tool, &ctx.item_registry),
+        });
+    }
+    players.sort_by_key(|p| p.client_id);
+    players
 }
 
 /// Snapshot every NPC's persistent state. `BrainDisabled` NPCs are
@@ -883,27 +904,15 @@ fn first_avatar_state(
 /// tick after load (and log loudly each time).
 fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec<SavedNpc> {
     npcs.iter()
-        .map(|(id, kind, pose, mode, needs, brain, carry, tool)| {
-            let carrying = match (carry.item, carry.count) {
-                (Some(slot), count) if count > 0 => Some(SavedCarry {
-                    item_id: item_registry.id_of(slot).to_string(),
-                    count,
-                }),
-                _ => None,
-            };
-            let saved_tool = tool.item.map(|slot| SavedTool {
-                item_id: item_registry.id_of(slot).to_string(),
-            });
-            SavedNpc {
-                id: id.0,
-                kind: kind.0.clone(),
-                pose: *pose,
-                movement_mode: *mode,
-                needs: needs.0.clone(),
-                rng: brain.rng,
-                carrying,
-                tool: saved_tool,
-            }
+        .map(|(id, kind, pose, mode, needs, brain, carry, tool)| SavedNpc {
+            id: id.0,
+            kind: kind.0.clone(),
+            pose: *pose,
+            movement_mode: *mode,
+            needs: needs.0.clone(),
+            rng: brain.rng,
+            carrying: saved_carry_of(carry, item_registry),
+            tool: saved_tool_of(tool, item_registry),
         })
         .collect()
 }
@@ -917,23 +926,10 @@ fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec
 /// The `Local<bool>` guards against running the save loop more than once
 /// per session; the runner won't actually exit until the next tick reads
 /// the AppExit message.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "save_then_shutdown touches every persisted system"
-)]
 fn save_then_shutdown(
     flag: Option<Res<ServerShutdownFlag>>,
     config: Option<Res<ServerSaveConfig>>,
-    clock: Res<WorldClock>,
-    plans: Res<Plans>,
-    stations: Res<CraftStations>,
-    chunks: Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
-    avatars: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
-    npcs: SavedNpcQuery,
-    world_items: Query<&WorldItem>,
-    item_registry: Res<ItemRegistry>,
-    block_registry: Res<BlockRegistry>,
-    guard: Res<SaveWriteGuard>,
+    ctx: SaveCtx,
     mut exit: MessageWriter<AppExit>,
     mut handled: Local<bool>,
 ) {
@@ -951,23 +947,13 @@ fn save_then_shutdown(
     if let Some(config) = config {
         match (&config.save_name, config.no_save_on_exit) {
             (Some(name), false) => {
-                if let Some(reason) = &guard.reason {
+                if let Some(reason) = &ctx.guard.reason {
                     error!(
                         "NOT saving to {name:?}: this session's load failed ({reason}); \
                          the original save file is preserved untouched"
                     );
                 } else {
-                    let save = assemble_save_file(
-                        &clock,
-                        &plans,
-                        &stations,
-                        &chunks,
-                        &avatars,
-                        &npcs,
-                        &world_items,
-                        &item_registry,
-                        &block_registry,
-                    );
+                    let save = assemble_save_file(&ctx);
                     write_save_logged(name, &save);
                 }
             }
@@ -999,22 +985,43 @@ type SavedNpcQuery<'w, 's> = Query<
     With<Npc>,
 >;
 
+/// Everything the save assembler reads, bundled into one SystemParam so
+/// the two save systems stay under Bevy 0.18's 16-param ceiling (same
+/// pattern as `HaulCtx` in npc.rs) and can't drift on what gets
+/// persisted.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct SaveCtx<'w, 's> {
+    clock: Res<'w, WorldClock>,
+    plans: Res<'w, Plans>,
+    stations: Res<'w, CraftStations>,
+    chunks: Query<
+        'w,
+        's,
+        (&'static ChunkCoord, &'static Chunk, &'static ChunkEntities),
+        With<ChunkEdited>,
+    >,
+    npcs: SavedNpcQuery<'w, 's>,
+    world_items: Query<'w, 's, &'static WorldItem>,
+    item_registry: Res<'w, ItemRegistry>,
+    block_registry: Res<'w, BlockRegistry>,
+    client_avatars: Res<'w, ClientAvatars>,
+    remote_ids: Query<'w, 's, &'static RemoteId>,
+    avatar_states: Query<
+        'w,
+        's,
+        (&'static AvatarPose, &'static Carrying, &'static EquippedTool),
+        With<Avatar>,
+    >,
+    player_states: Res<'w, PlayerStates>,
+    guard: Res<'w, SaveWriteGuard>,
+}
+
 /// Snapshot every persisted system into a `SaveFile`. Shared by the
 /// quit-save and Save Now paths so the two can't drift on what gets
 /// persisted.
-#[allow(clippy::too_many_arguments, reason = "touches every persisted system")]
-fn assemble_save_file(
-    clock: &WorldClock,
-    plans: &Plans,
-    stations: &CraftStations,
-    chunks: &Query<(&ChunkCoord, &Chunk, &ChunkEntities), With<ChunkEdited>>,
-    avatars: &Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
-    npcs: &SavedNpcQuery,
-    world_items: &Query<&WorldItem>,
-    item_registry: &ItemRegistry,
-    block_registry: &BlockRegistry,
-) -> SaveFile {
-    let edited: Vec<SavedChunk> = chunks
+fn assemble_save_file(ctx: &SaveCtx) -> SaveFile {
+    let edited: Vec<SavedChunk> = ctx
+        .chunks
         .iter()
         .map(|(coord, ch, ce)| SavedChunk {
             coord: *coord,
@@ -1022,19 +1029,16 @@ fn assemble_save_file(
             entities: ce.clone(),
         })
         .collect();
-    let (saved_pose, saved_carry, saved_player_tool) = first_avatar_state(avatars, item_registry);
     SaveFile {
         version: SAVE_VERSION,
-        block_slots: block_registry.slot_table(),
+        block_slots: ctx.block_registry.slot_table(),
         edited_chunks: edited,
-        last_player_pose: saved_pose,
-        npcs: collect_saved_npcs(npcs, item_registry),
-        world_clock: Some(*clock),
-        plans: convert_saved_plans(plans, item_registry),
-        world_items: collect_saved_world_items(world_items, item_registry),
-        last_player_carry: saved_carry,
-        last_player_tool: saved_player_tool,
-        craft_stations: convert_saved_stations(stations, item_registry),
+        players: collect_saved_players(ctx),
+        npcs: collect_saved_npcs(&ctx.npcs, &ctx.item_registry),
+        world_clock: Some(*ctx.clock),
+        plans: convert_saved_plans(&ctx.plans, &ctx.item_registry),
+        world_items: collect_saved_world_items(&ctx.world_items, &ctx.item_registry),
+        craft_stations: convert_saved_stations(&ctx.stations, &ctx.item_registry),
     }
 }
 
@@ -1044,12 +1048,13 @@ fn write_save_logged(name: &str, save: &SaveFile) -> bool {
     match write_save(name, save) {
         Ok(()) => {
             info!(
-                "saved {} chunks + {} NPCs + {} plans + {} items + {} stations to {name:?}",
+                "saved {} chunks + {} NPCs + {} plans + {} items + {} stations + {} player(s) to {name:?}",
                 save.edited_chunks.len(),
                 save.npcs.len(),
                 save.plans.len(),
                 save.world_items.len(),
                 save.craft_stations.len(),
+                save.players.len(),
             );
             true
         }
@@ -1115,12 +1120,12 @@ fn register_new_client(
     mut commands: Commands,
     mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
-    mut pending_pose: ResMut<PendingSpawnPose>,
-    mut pending_carry: ResMut<PendingSpawnCarry>,
-    mut pending_tool: ResMut<PendingSpawnTool>,
+    mut player_states: ResMut<PlayerStates>,
     registry: Res<BlockRegistry>,
     item_registry: Res<ItemRegistry>,
-    mut manifests: Query<&mut MessageSender<BlockManifest>>,
+    recipe_registry: Res<crate::recipes::RecipeRegistry>,
+    npc_kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
+    mut manifests: Query<&mut MessageSender<ModSetManifest>>,
 ) {
     let connection = trigger.entity;
     let Ok(remote) = remote_ids.get(connection) else {
@@ -1133,36 +1138,56 @@ fn register_new_client(
     // owner's client gets `Predicted` on its copy; remote clients get
     // `Interpolated`. ControlledBy ties the entity back to its
     // connection so input replication knows where to deliver the inputs.
-    // Spawn position: if the save provided a persisted pose, consume it
-    // (one-shot — see `PendingSpawnPose`). Otherwise spawn above the
-    // sine-wave terrain (peaks ~y=16) so the first physics tick lands
-    // the player on the surface rather than inside it. Eye height =
-    // AvatarPose.translation by convention.
-    let spawn_pose = pending_pose.0.take().unwrap_or(AvatarPose {
-        translation: Vec3::new(0.0, 32.0, 60.0),
-        yaw: 0.0,
-    });
-    // Restore the saved carry stack if one was provided (single-player
-    // "first reconnect wins" convention, same as `PendingSpawnPose`).
-    // Otherwise start empty-handed.
-    let spawn_carry = pending_carry.0.take().unwrap_or_default();
-    // Tool slot: save override wins; if unset, hand the player a
-    // starter axe by looking up STARTER_TOOL_ID in the item registry.
-    // Missing tool id (mod removed) → empty slot + a warning, same
-    // degradation as the carry path.
-    let spawn_tool = pending_tool.0.take().unwrap_or_else(|| {
-        let id = block_junk_mod_api::items::ItemId::new(STARTER_TOOL_ID);
-        match item_registry.slot_of(&id) {
-            Some(slot) => EquippedTool { item: Some(slot) },
-            None => {
-                warn!(
-                    starter = STARTER_TOOL_ID,
-                    "starter tool id missing from item registry; spawning tool slot empty",
+    //
+    // Spawn state, in priority order:
+    //   1. This client id's own persisted entry (returning player).
+    //   2. The save's unclaimed pre-identity entry, if any (first
+    //      claimant wins — the v12 single-slot convention).
+    //   3. Fresh defaults: spawn above the sine-wave terrain (peaks
+    //      ~y=16) so the first physics tick lands the player on the
+    //      surface, empty carry, starter axe. Eye height =
+    //      AvatarPose.translation by convention.
+    // Entries are removed on claim: while connected, the live avatar is
+    // authoritative and the disconnect observer writes it back.
+    let persisted = client_id_u64(remote).and_then(|id| {
+        player_states.0.remove(&id).or_else(|| {
+            let legacy = player_states.0.remove(&UNCLAIMED_PLAYER_ID);
+            if legacy.is_some() {
+                info!(
+                    client_id = id,
+                    "claimed the save's pre-identity player state"
                 );
-                EquippedTool::default()
             }
-        }
+            legacy
+        })
     });
+    let (spawn_pose, spawn_carry, spawn_tool) = match persisted {
+        Some(state) => (state.pose, state.carry, state.tool),
+        None => {
+            // Starter axe for a brand-new identity. Missing tool id
+            // (mod removed) → empty slot + a warning, same degradation
+            // as the carry path.
+            let id = block_junk_mod_api::items::ItemId::new(STARTER_TOOL_ID);
+            let tool = match item_registry.slot_of(&id) {
+                Some(slot) => EquippedTool { item: Some(slot) },
+                None => {
+                    warn!(
+                        starter = STARTER_TOOL_ID,
+                        "starter tool id missing from item registry; spawning tool slot empty",
+                    );
+                    EquippedTool::default()
+                }
+            };
+            (
+                AvatarPose {
+                    translation: Vec3::new(0.0, 32.0, 60.0),
+                    yaw: 0.0,
+                },
+                Carrying::default(),
+                tool,
+            )
+        }
+    };
     let avatar = commands
         .spawn((
             Actor,
@@ -1179,7 +1204,12 @@ fn register_new_client(
             InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
             ControlledBy {
                 owner: connection,
-                lifetime: Default::default(),
+                // Persistent: lightyear's SessionBased default despawns
+                // the avatar on disconnect BEFORE our On<Remove,
+                // ClientOf> observer can read its pose/carry/tool to
+                // bank them — the state would silently vanish. We own
+                // the despawn in `forget_disconnected_client` instead.
+                lifetime: lightyear::prelude::Lifetime::Persistent,
             },
             Name::new(format!("avatar:{}", remote.0)),
         ))
@@ -1187,12 +1217,16 @@ fn register_new_client(
     avatars.0.insert(connection, avatar);
     sent.0.entry(connection).or_default();
 
-    // Send the slot table once so the client can sanity-check it against
-    // its own. Mismatches indicate a divergent mod set; logged client-side.
+    // Send the mod-set fingerprint once so the client can validate its
+    // registries against ours. The client refuses the session on any
+    // disagreement — see `receive_modset_manifest` in client.rs.
     if let Ok(mut sender) = manifests.get_mut(connection) {
-        let manifest = BlockManifest {
-            slots: registry.iter().map(|(_, def)| def.id.clone()).collect(),
-        };
+        let manifest = crate::modset::local_manifest(
+            &registry,
+            &item_registry,
+            &recipe_registry,
+            &npc_kind_registry,
+        );
         sender.send::<WorldChannel>(manifest);
     }
 }
@@ -1296,43 +1330,61 @@ fn forget_disconnected_client(
     mut commands: Commands,
     mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<ClientChunks>,
+    mut player_states: ResMut<PlayerStates>,
+    remote_ids: Query<&RemoteId>,
     states: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
 ) {
     if let Some(avatar) = avatars.0.remove(&trigger.entity) {
-        // Spill the carry stack + equipped tool as world items where
-        // the player stood — despawning them with the avatar silently
-        // destroyed resources on every disconnect, and the reconnect
-        // starter-axe fallback then minted a fresh axe on top. With
-        // the drop, a rejoining player walks back and picks their
-        // things up. (Per-client persistence needs the stable client
-        // identity we don't have yet.)
+        // Bank the departing player's pose + carry + tool under their
+        // client id so the next save persists it and a reconnect
+        // restores it. (Pre-identity, this spilled the items as world
+        // drops instead; now they stay "in the player's hands.")
         if let Ok((pose, carry, tool)) = states.get(avatar) {
-            let cell = pose.translation.floor().as_ivec3();
-            let base = pose.translation + Vec3::new(0.0, 0.05, 0.0);
-            let mut units: Vec<crate::items::ItemSlot> = Vec::new();
-            if let Some(item) = carry.item {
-                units.extend(std::iter::repeat_n(item, carry.count as usize));
-            }
-            units.extend(tool.item);
-            for (i, slot) in units.iter().enumerate() {
-                let translation = base + crate::items::drop_jitter(cell, i as u32);
-                commands.spawn((
-                    WorldItem {
-                        item: *slot,
-                        translation,
-                    },
-                    Transform::from_translation(translation),
-                    GlobalTransform::default(),
-                    Replicate::to_clients(NetworkTarget::All),
-                    Name::new(format!("WorldItem(disconnect:{})", slot.0)),
-                ));
-            }
-            if !units.is_empty() {
-                info!(
-                    count = units.len(),
-                    at = ?cell.to_array(),
-                    "disconnect: dropped carried items into the world",
-                );
+            match remote_ids.get(trigger.entity).ok().and_then(client_id_u64) {
+                Some(id) => {
+                    player_states.0.insert(
+                        id,
+                        PlayerState {
+                            pose: *pose,
+                            carry: *carry,
+                            tool: *tool,
+                        },
+                    );
+                    info!(client_id = id, "stored disconnecting player's state");
+                }
+                None => {
+                    // No stable identity to bank under (peer kind our
+                    // transports shouldn't produce). Spill the items so
+                    // they at least survive in the world — never
+                    // silently destroy resources.
+                    let cell = pose.translation.floor().as_ivec3();
+                    let base = pose.translation + Vec3::new(0.0, 0.05, 0.0);
+                    let mut units: Vec<crate::items::ItemSlot> = Vec::new();
+                    if let Some(item) = carry.item {
+                        units.extend(std::iter::repeat_n(item, carry.count as usize));
+                    }
+                    units.extend(tool.item);
+                    for (i, slot) in units.iter().enumerate() {
+                        let translation = base + crate::items::drop_jitter(cell, i as u32);
+                        commands.spawn((
+                            WorldItem {
+                                item: *slot,
+                                translation,
+                            },
+                            Transform::from_translation(translation),
+                            GlobalTransform::default(),
+                            Replicate::to_clients(NetworkTarget::All),
+                            Name::new(format!("WorldItem(disconnect:{})", slot.0)),
+                        ));
+                    }
+                    if !units.is_empty() {
+                        warn!(
+                            count = units.len(),
+                            at = ?cell.to_array(),
+                            "disconnect without stable id: dropped carried items into the world",
+                        );
+                    }
+                }
             }
         }
         commands.entity(avatar).despawn();

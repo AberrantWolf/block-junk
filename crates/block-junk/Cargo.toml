@@ -23,6 +23,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 thiserror = "2"
+# Both already in the tree transitively (bevy/lightyear); direct deps for
+# the persistent client identity (entropy) and the dedicated server's
+# Ctrl-C → quit-save path.
+getrandom = "0.3"
+ctrlc = "3"
 
 block-junk-mod-api = { path = "../block-junk-mod-api" }
 block-junk-scripting = { path = "../block-junk-scripting" }

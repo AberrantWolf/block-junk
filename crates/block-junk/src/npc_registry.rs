@@ -53,6 +53,15 @@ pub struct NpcKindRegistry {
 }
 
 impl NpcKindRegistry {
+    /// Sorted kind ids, for the connect-time mod-set manifest. Sorted
+    /// because the backing map has no stable order and both sides must
+    /// produce identical lists to compare.
+    pub fn ids_sorted(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.defs.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     /// Validate the pending kinds against the finished [`NeedRegistry`] and
     /// build the live resource. Kinds that reference a need that isn't
     /// registered are a load-time error — fail loudly per the project's

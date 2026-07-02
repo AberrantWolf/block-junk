@@ -10,10 +10,12 @@ mod craft_stations;
 mod craft_ui;
 mod debug;
 mod haul;
+mod identity;
 mod inspect_panel;
 mod interactables;
 mod items;
 mod menu;
+mod modset;
 mod network;
 mod npc;
 mod npc_registry;
@@ -60,13 +62,21 @@ fn tick_duration() -> Duration {
 }
 
 enum CliMode {
-    /// Dedicated headless server. No UI; lives until SIGINT.
-    DedicatedServer,
+    /// Dedicated headless server: `server [save_name] [--bind ip:port]`.
+    /// Loads `save_name` if it exists (creates it otherwise) and
+    /// quit-saves on Ctrl-C. No UI; lives until SIGINT.
+    DedicatedServer {
+        save_name: String,
+        bind: core::net::SocketAddr,
+    },
     /// Pure client connecting to `addr`. Skips the main menu.
     Client { addr: Option<core::net::SocketAddr> },
     /// Default: client with the main menu.
     Solo,
 }
+
+/// Fallback world name for a dedicated server started without one.
+const DEDICATED_DEFAULT_SAVE: &str = "dedicated";
 
 fn parse_cli() -> CliMode {
     let mut args = std::env::args().skip(1);
@@ -74,7 +84,24 @@ fn parse_cli() -> CliMode {
         return CliMode::Solo;
     };
     match first.trim_start_matches('-') {
-        "server" | "s" => CliMode::DedicatedServer,
+        "server" | "s" => {
+            let mut save_name = DEDICATED_DEFAULT_SAVE.to_string();
+            let mut bind = crate::network::DEFAULT_BIND_ADDR;
+            while let Some(arg) = args.next() {
+                if arg == "--bind" {
+                    match args.next().map(|raw| (raw.parse(), raw)) {
+                        Some((Ok(addr), _)) => bind = addr,
+                        Some((Err(e), raw)) => {
+                            eprintln!("invalid --bind addr {raw:?}: {e}; using {bind}");
+                        }
+                        None => eprintln!("--bind needs an ip:port argument; using {bind}"),
+                    }
+                } else {
+                    save_name = arg;
+                }
+            }
+            CliMode::DedicatedServer { save_name, bind }
+        }
         "client" | "c" => {
             let addr = args.next().and_then(|raw| match raw.parse() {
                 Ok(a) => Some(a),
@@ -91,18 +118,45 @@ fn parse_cli() -> CliMode {
 
 fn main() {
     match parse_cli() {
-        CliMode::DedicatedServer => run_server_inner(
-            None,
-            None,
-            ServerSaveConfig::dedicated(),
-            /*install_log_plugin*/ true,
-        ),
+        CliMode::DedicatedServer { save_name, bind } => run_dedicated_server(save_name, bind),
         CliMode::Client { addr } => {
-            let target = addr.unwrap_or(crate::network::SERVER_ADDR);
+            let target = addr.unwrap_or(crate::network::LOCAL_CONNECT_ADDR);
             run_client(Some(LaunchMode::JoinRemote { addr: target }));
         }
         CliMode::Solo => run_client(None),
     }
+}
+
+/// Dedicated server: same save lifecycle as a hosted session, with
+/// Ctrl-C standing in for the quit button. The signal handler sets the
+/// shutdown flag; `save_then_shutdown` (server.rs) does the rest.
+fn run_dedicated_server(save_name: String, bind: core::net::SocketAddr) {
+    let load_existing = crate::save::save_exists(&save_name);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handler_flag = shutdown.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        if handler_flag.swap(true, core::sync::atomic::Ordering::SeqCst) {
+            // Second Ctrl-C: the quit-save is either done or hung.
+            // 130 = conventional SIGINT exit code.
+            eprintln!("second Ctrl-C — force-quitting; the save may not have been written");
+            std::process::exit(130);
+        }
+        eprintln!("Ctrl-C: saving and shutting down (press again to force-quit)");
+    }) {
+        eprintln!("WARNING: cannot install Ctrl-C handler ({e}); kill will skip the quit-save");
+    }
+    let config = ServerSaveConfig {
+        save_name: Some(save_name),
+        load_existing,
+        no_save_on_exit: false,
+    };
+    run_server_inner(
+        Some(shutdown),
+        None,
+        config,
+        /*install_log_plugin*/ true,
+        bind,
+    );
 }
 
 /// Public entrypoint for the menu module to spawn a hosted server on a
@@ -122,6 +176,8 @@ pub fn run_server_with_shutdown(
         Some((save_request, save_result)),
         config,
         /*install_log_plugin*/ false,
+        // Hosted worlds are always LAN-joinable — no private solo bind.
+        crate::network::DEFAULT_BIND_ADDR,
     );
 }
 
@@ -130,6 +186,7 @@ fn run_server_inner(
     save_request: Option<(Arc<AtomicBool>, Arc<AtomicU8>)>,
     save_config: ServerSaveConfig,
     install_log_plugin: bool,
+    bind: core::net::SocketAddr,
 ) {
     let tick = tick_duration();
     let mut app = App::new();
@@ -165,6 +222,7 @@ fn run_server_inner(
         app.insert_resource(ServerSaveResultFlag(result));
     }
     app.insert_resource(save_config);
+    app.insert_resource(crate::network::ServerBindAddr(bind));
 
     app.run();
 }

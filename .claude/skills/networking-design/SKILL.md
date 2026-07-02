@@ -18,11 +18,20 @@ The three modes:
 
 | Command | What runs |
 |---|---|
-| `cargo run` (default = solo) | Server thread + client App on main thread, connected via UDP-localhost. |
-| `cargo run -- server` | Just the server, headless. Listens on `SERVER_ADDR` (currently `127.0.0.1:5050`; configurable later). |
-| `cargo run -- client` | Just the client. Connects to `SERVER_ADDR`. (Eventually take an `--addr` arg for friends-join.) |
+| `cargo run` (default = solo) | Server thread + client App on main thread, connected via UDP-localhost. The server thread binds `0.0.0.0:5050` — every hosted world is LAN-joinable, no private solo bind. |
+| `cargo run -- server [save] [--bind ip:port]` | Dedicated headless server. Loads `save` if it exists (default name `dedicated`), binds `0.0.0.0:5050` unless overridden, quit-saves on Ctrl-C. |
+| `cargo run -- client [ip:port]` | Just the client. Connects to the given address (default `127.0.0.1:5050`), skipping the menu. The menu's "Connect" field is the windowed equivalent. |
 
-Friends-host = run the server somewhere reachable (your machine with port-forwarded `5050`, or a small dedicated VM). Friends connect via `cargo run -- client --addr <host>`. Identical code path to your own local client.
+Friends-host = host from the menu (pause menu shows "Friends can join at <lan-ip>:5050") or run the dedicated server somewhere reachable. Friends connect via the menu's address field or `cargo run -- client <host>:5050`. Identical code path to your own local client.
+
+## Connect-time gates (both must pass before play)
+
+1. **Netcode `protocol_id`** (`network::NETCODE_PROTOCOL_ID`): transport-level; bump it on incompatible wire changes (message shapes, channels, replication set). Mismatch = handshake rejected before any app code.
+2. **Mod-set manifest** (`modset.rs`, sent once on connect): slot↔id tables for blocks/items/recipes + sorted NPC-kind ids + a stable FNV-1a hash over serialized defs. Client diffs against its registries; any disagreement = blocking fatal modal + disconnect. Extend `ModSetManifest` when a new registry's content starts crossing the wire.
+
+## Client identity
+
+Each install has a persistent random u64 (`identity.rs`, `./client_id.txt`, advisory-locked; a second local instance falls back to an ephemeral id so two-client smoke tests work). The id is the netcode `client_id` AND the key for per-player persistence (`SaveFile.players`). It is a claim, not a proof — TOFU pubkey binding is the planned upgrade path if spoofing ever matters; the u64 stays the key, so no migration.
 
 This rule is load-bearing — adding a "shortcut for local play that bypasses serialisation" because it seems faster is exactly the kind of choice that sneaks divergence in. Don't.
 

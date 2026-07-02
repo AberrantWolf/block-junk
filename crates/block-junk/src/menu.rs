@@ -43,7 +43,7 @@ use bevy_egui::{EguiContexts, EguiPlugin, egui};
 
 use lightyear::prelude::Predicted;
 
-use crate::network::SERVER_ADDR;
+use crate::network::LOCAL_CONNECT_ADDR;
 use crate::protocol::AvatarPose;
 use crate::save::{SaveMetadata, delete_save, list_saves, save_exists, validate_name};
 use crate::voxel::world_to_chunk;
@@ -85,16 +85,6 @@ pub struct ServerSaveConfig {
     pub no_save_on_exit: bool,
 }
 
-impl ServerSaveConfig {
-    pub fn dedicated() -> Self {
-        Self {
-            save_name: None,
-            load_existing: false,
-            no_save_on_exit: true,
-        }
-    }
-}
-
 /// The address the lightyear client should connect to once `OnEnter(InGame)`
 /// fires. Host mode points at localhost; JoinRemote points at the menu input.
 #[derive(Resource, Clone, Copy, Debug)]
@@ -102,7 +92,7 @@ pub struct JoinTarget(pub SocketAddr);
 
 impl Default for JoinTarget {
     fn default() -> Self {
-        Self(SERVER_ADDR)
+        Self(LOCAL_CONNECT_ADDR)
     }
 }
 
@@ -251,6 +241,18 @@ impl PendingQuit {
     }
 }
 
+/// A connection-level failure the session cannot recover from (mod-set
+/// mismatch, future auth failures). Inserting this resource — paired
+/// with acquiring [`crate::ui_capture::UiCapture::FatalError`] — locks
+/// the session behind a blocking modal whose only exit is quitting.
+/// Esc is deliberately inert while it's up (see `handle_escape`).
+#[derive(Resource, Debug)]
+pub struct ConnectionFatal {
+    pub title: String,
+    /// Human-readable mismatch lines, already truncated by the producer.
+    pub details: Vec<String>,
+}
+
 /// Marker for entities spawned during a game session that should be cleaned
 /// up on quit-to-menu. Phase A doesn't actually exercise the cleanup path
 /// (no quit-to-menu yet — see module docs), but tagging now means the cleanup
@@ -309,6 +311,8 @@ impl Plugin for MenuPlugin {
                 // it's opened (no one-frame gap before it renders).
                 pause_menu_ui.run_if(in_state(AppState::InGame)),
                 debug_overlay_ui.run_if(in_state(AppState::InGame)),
+                // Last so it draws over whatever else is open.
+                fatal_error_ui.run_if(resource_exists::<ConnectionFatal>),
             ),
         );
 
@@ -387,7 +391,7 @@ fn main_menu_ui(
         return;
     };
     if addr_input.0.is_empty() {
-        addr_input.0 = SERVER_ADDR.to_string();
+        addr_input.0 = LOCAL_CONNECT_ADDR.to_string();
     }
 
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -452,7 +456,7 @@ fn main_menu_ui(
                 commands.insert_resource(LaunchMode::HostLoad {
                     save_name: name.clone(),
                 });
-                *join_target = JoinTarget(SERVER_ADDR);
+                *join_target = JoinTarget(LOCAL_CONNECT_ADDR);
                 status.0 = None;
                 next_state.set(AppState::InGame);
             }
@@ -490,7 +494,7 @@ fn main_menu_ui(
                             commands.insert_resource(LaunchMode::HostNew {
                                 save_name: trimmed.clone(),
                             });
-                            *join_target = JoinTarget(SERVER_ADDR);
+                            *join_target = JoinTarget(LOCAL_CONNECT_ADDR);
                             status.0 = None;
                             next_state.set(AppState::InGame);
                         }
@@ -605,6 +609,9 @@ fn pause_menu_ui(
     debug_no_save: Res<DebugNoSaveOnExit>,
     time: Res<Time>,
     mut save_feedback: Local<SaveFeedback>,
+    // Computed on first open, cached for the session: the interface-
+    // route lookup is a syscall pair, not worth repeating per frame.
+    mut lan_addr: Local<Option<Option<core::net::IpAddr>>>,
 ) {
     if !captures.contains(crate::ui_capture::UiCapture::PauseMenu) {
         return;
@@ -637,6 +644,18 @@ fn pause_menu_ui(
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.label("The world is still running.");
+            // Hosted worlds always bind all interfaces, so the only
+            // thing a friend needs is this machine's LAN address.
+            if hosting {
+                let addr = *lan_addr.get_or_insert_with(crate::network::local_lan_ip);
+                let text = match addr {
+                    Some(ip) => {
+                        format!("Friends can join at {ip}:{}", crate::network::SERVER_PORT)
+                    }
+                    None => "LAN address unavailable (offline?)".to_string(),
+                };
+                ui.label(egui::RichText::new(text).weak());
+            }
             ui.add_space(4.0);
             ui.vertical_centered(|ui| {
                 if quit_pending {
@@ -736,6 +755,48 @@ fn pause_menu_ui(
         save_feedback.completed_at = None;
         commands.insert_resource(PendingQuit::new(time.elapsed_secs()));
     }
+}
+
+/// Blocking modal for [`ConnectionFatal`]. The capture was acquired by
+/// whoever inserted the resource, so the cursor is already free and
+/// in-world input already suppressed; this system just renders and
+/// offers the one exit. Quit routes through the same `PendingQuit`
+/// drain as the pause menu, so a hosting player still gets their
+/// quit-save (a JoinRemote client has no hosted server and exits
+/// immediately).
+fn fatal_error_ui(
+    mut contexts: EguiContexts,
+    fatal: Res<ConnectionFatal>,
+    mut session: ResMut<ServerSession>,
+    time: Res<Time>,
+    pending: Option<Res<PendingQuit>>,
+    mut commands: Commands,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    egui::Window::new("Connection failed")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new(&fatal.title).strong());
+            ui.add_space(6.0);
+            for line in &fatal.details {
+                ui.label(egui::RichText::new(line).monospace().weak());
+            }
+            ui.add_space(6.0);
+            ui.label("Make sure both sides run the same mods and versions, then reconnect.");
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                if pending.is_some() {
+                    ui.label(egui::RichText::new("Shutting down...").weak());
+                } else if ui.button("Quit to Desktop").clicked() {
+                    session.request_shutdown();
+                    commands.insert_resource(PendingQuit::new(time.elapsed_secs()));
+                }
+            });
+        });
 }
 
 /// How long `drive_pending_quit` waits on the hosted server before
