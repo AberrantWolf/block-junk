@@ -331,10 +331,6 @@ pub struct Carrying {
 }
 
 impl Carrying {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.count == 0 || self.item.is_none()
     }
@@ -398,12 +394,6 @@ impl Carrying {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EquippedTool {
     pub item: Option<ItemSlot>,
-}
-
-impl EquippedTool {
-    pub fn is_empty(&self) -> bool {
-        self.item.is_none()
-    }
 }
 
 /// A loose item sitting in the world — what a destroyed block leaves

@@ -258,6 +258,7 @@ pub struct ConnectionFatal {
 /// (no quit-to-menu yet — see module docs), but tagging now means the cleanup
 /// system in phase A.7 just queries for this marker.
 #[derive(Component)]
+#[allow(dead_code)] // forward wiring for the A.7 quit-to-menu cleanup
 pub struct GameRoot;
 
 /// One-time egui context setup: register DejaVu Sans as a fallback font
@@ -394,7 +395,8 @@ fn main_menu_ui(
         addr_input.0 = LOCAL_CONNECT_ADDR.to_string();
     }
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    let mut root = crate::ui_theme::root_ui(ctx, "main_menu_root");
+    egui::CentralPanel::default().show_inside(&mut root, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
             ui.heading("block-junk");

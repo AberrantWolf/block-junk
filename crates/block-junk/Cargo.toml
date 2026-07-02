@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 # Bevy 0.18 made input sources opt-in features; "default" is just 2d/3d/ui rendering.
-bevy = { version = "0.18", features = ["mouse", "keyboard"] }
+bevy = { version = "0.19", features = ["mouse", "keyboard"] }
 block-mesh = "0.2"
 ndshape = "0.3"
 # Features:
@@ -15,10 +15,11 @@ ndshape = "0.3"
 #   (sequence-numbered input replay for prediction rollback)
 # - Note we do NOT enable crossbeam: solo play runs a server thread +
 #   client App talking via UDP-localhost (always-client architecture).
-lightyear = { version = "0.26", features = ["netcode", "udp", "input_native", "frame_interpolation"] }
-avian3d = "0.6"
-bevy_egui = "0.39"
-bevy-inspector-egui = "0.36"
+lightyear = { version = "0.28", features = ["netcode", "udp", "input_native", "frame_interpolation"] }
+avian3d = "0.7"
+# bevy_egui 0.40 = egui 0.34. 0.41 (egui 0.35) is available — taking it
+# is a small migration pass of its own, deferred until something needs it.
+bevy_egui = "0.40"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }

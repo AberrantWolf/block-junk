@@ -195,6 +195,9 @@ fn run_server_inner(
     // Throttle the run loop to the tick rate so we don't peg a core spinning.
     app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(tick)));
     app.add_plugins(TransformPlugin);
+    // Bevy 0.19 panics on init_state without this; MinimalPlugins
+    // doesn't bring it and DefaultPlugins (which does) is client-only.
+    app.add_plugins(bevy::state::app::StatesPlugin);
     if install_log_plugin {
         app.add_plugins(LogPlugin {
             filter: format!("{DEFAULT_FILTER}gilrs_core=off,"),

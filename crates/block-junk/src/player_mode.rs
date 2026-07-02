@@ -139,7 +139,7 @@ fn spawn_mode_pill(
             pill.spawn((
                 Text::new(mode.label()),
                 TextFont {
-                    font_size: 18.0,
+                    font_size: FontSize::Px(18.0),
                     ..default()
                 },
                 TextColor(crate::ui_theme::TEXT),
@@ -188,7 +188,7 @@ fn spawn_verb_hint(commands: &mut Commands, mode: PlayerMode) {
                 chip.spawn((
                     Text::new(mode.verb_hint()),
                     TextFont {
-                        font_size: 12.0,
+                        font_size: FontSize::Px(12.0),
                         ..default()
                     },
                     TextColor(crate::ui_theme::TEXT_DIM),
@@ -262,7 +262,7 @@ fn spawn_key_cap(parent: &mut ChildSpawnerCommands<'_>, label: &str) {
             cap.spawn((
                 Text::new(label),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: FontSize::Px(12.0),
                     ..default()
                 },
                 TextColor(crate::ui_theme::TEXT),

@@ -172,14 +172,14 @@ fn sync_plan_ghosts(
 
         let entity = if let Some(mesh_path) = def.mesh.as_ref() {
             // Mesh block: the actual glTF scene, materials swapped to
-            // the ghost pair by the shared SceneInstanceReady observer.
+            // the ghost pair by the shared WorldInstanceReady observer.
             // Hidden until the swap lands (PreviewSceneReady), then
             // revealed by `reveal_ready_ghost_scenes`.
-            let scene: Handle<Scene> = asset_server.load(format!("{mesh_path}#Scene0"));
+            let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh_path}#Scene0"));
             commands
                 .spawn((
                     PlanGhost,
-                    SceneRoot(scene),
+                    WorldAssetRoot(scene),
                     PreviewMaterialPair {
                         front: front.clone(),
                         back: back.clone(),

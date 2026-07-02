@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::*;
 
-use bevy::scene::SceneInstanceReady;
+use bevy::world_serialization::WorldInstanceReady;
 
 use lightyear::frame_interpolation::prelude::*;
 use lightyear::input::native::prelude::*;
@@ -272,7 +272,7 @@ struct AvatarAssets {
 /// field alongside the animation set.
 #[derive(Resource)]
 struct CharacterAssets {
-    knight_scene: Handle<Scene>,
+    knight_scene: Handle<WorldAsset>,
     anim_graph: Handle<AnimationGraph>,
     /// Resolved clip → graph-node index for every registered
     /// [`AnimationId`](block_junk_mod_api::animations::AnimationId).
@@ -402,11 +402,11 @@ struct ActionProgressFill;
 #[derive(Component)]
 struct PreviewCubeRoot;
 
-/// Marker on the SceneRoot entity used when the selected block has a
+/// Marker on the WorldAssetRoot entity used when the selected block has a
 /// glTF mesh. Spawned lazily when a mesh block is selected; despawned
 /// when the slot changes back to non-mesh or to a different mesh slot.
 #[derive(Component)]
-struct PreviewSceneRoot;
+struct PreviewWorldAssetRoot;
 
 // `PreviewSceneReady` + `PreviewMaterialPair` live in `preview.rs` —
 // shared with the plan-ghost system, which reuses the same material-
@@ -514,7 +514,7 @@ fn setup_scene(
         DirectionalLight {
             color: Color::WHITE,
             illuminance: 10_000.0,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(
@@ -532,7 +532,7 @@ fn setup_scene(
         DirectionalLight {
             color: Color::srgb(0.75, 0.85, 1.0),
             illuminance: 3_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, 0.5, 2.6, 0.0)),
@@ -642,7 +642,7 @@ fn setup_scene(
                         cap.spawn((
                             Text::new("scroll"),
                             TextFont {
-                                font_size: 12.0,
+                                font_size: FontSize::Px(12.0),
                                 ..default()
                             },
                             TextColor(crate::ui_theme::TEXT),
@@ -704,7 +704,7 @@ fn setup_scene(
                                         inner.spawn((
                                             Text::new(text),
                                             TextFont {
-                                                font_size: 14.0,
+                                                font_size: FontSize::Px(14.0),
                                                 ..default()
                                             },
                                             TextColor(Color::srgb(0.12, 0.12, 0.12)),
@@ -847,7 +847,7 @@ fn spawn_carry_hud(commands: &mut Commands) {
                     CarryHudLabel,
                     Text::new(""),
                     TextFont {
-                        font_size: 16.0,
+                        font_size: FontSize::Px(16.0),
                         ..default()
                     },
                     TextColor(crate::ui_theme::TEXT),
@@ -858,7 +858,7 @@ fn spawn_carry_hud(commands: &mut Commands) {
                 chip.spawn((
                     Text::new("Q: drop"),
                     TextFont {
-                        font_size: 12.0,
+                        font_size: FontSize::Px(12.0),
                         ..default()
                     },
                     TextColor(crate::ui_theme::TEXT_DIM),
@@ -924,7 +924,7 @@ fn spawn_tool_hud(commands: &mut Commands) {
                     ToolHudLabel,
                     Text::new(""),
                     TextFont {
-                        font_size: 16.0,
+                        font_size: FontSize::Px(16.0),
                         ..default()
                     },
                     TextColor(crate::ui_theme::TEXT),
@@ -933,7 +933,7 @@ fn spawn_tool_hud(commands: &mut Commands) {
                 chip.spawn((
                     Text::new("T: drop"),
                     TextFont {
-                        font_size: 12.0,
+                        font_size: FontSize::Px(12.0),
                         ..default()
                     },
                     TextColor(crate::ui_theme::TEXT_DIM),
@@ -1159,7 +1159,7 @@ fn update_day_night_lighting(
         // benefit of shadows is small anyway (everything's dim),
         // so just drop them until the sun is well clear of the
         // horizon. Threshold 0.18 ≈ sin(10°).
-        light.shadows_enabled = daylight > 0.18;
+        light.shadow_maps_enabled = daylight > 0.18;
     }
 
     // Ambient floor at moonlight (30 lx) — pitch black is unplayable.
@@ -2068,7 +2068,7 @@ fn hide_preview_on_mode_change(
 /// paths based on the selected block:
 ///   - Voxel block (no `def.mesh`) → the pre-built cube preview, scaled
 ///     to span the rotated footprint.
-///   - Mesh block (e.g. the bed) → a `PreviewSceneRoot` with the actual
+///   - Mesh block (e.g. the bed) → a `PreviewWorldAssetRoot` with the actual
 ///     glTF; its materials are swapped to the front+back preview pair
 ///     by `swap_preview_scene_materials` once the scene populates.
 ///
@@ -2172,28 +2172,28 @@ fn update_placement_preview(
     } else {
         LinearRgba::new(0.7, 0.4, 0.4, 1.0)
     };
-    if let Some(m) = front_mats.get_mut(&materials_handles.front) {
+    if let Some(mut m) = front_mats.get_mut(&materials_handles.front) {
         m.color = front_color;
     }
-    if let Some(m) = back_mats.get_mut(&materials_handles.back) {
+    if let Some(mut m) = back_mats.get_mut(&materials_handles.back) {
         m.color = back_color;
     }
 
     if def.mesh.is_some() {
-        // Mesh path. Spawn / replace the SceneRoot if we don't already
+        // Mesh path. Spawn / replace the WorldAssetRoot if we don't already
         // have one for this slot. Spawning is cheap on the second hit
-        // (asset cache); the SceneInstanceReady observer handles the
+        // (asset cache); the WorldInstanceReady observer handles the
         // material swap a frame or two later.
         if state.scene_slot != Some(slot) {
             if let Some(old) = state.scene_root.take() {
                 commands.entity(old).despawn();
             }
             let mesh_path = def.mesh.as_ref().unwrap();
-            let scene: Handle<Scene> = asset_server.load(format!("{mesh_path}#Scene0"));
+            let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh_path}#Scene0"));
             let entity = commands
                 .spawn((
-                    PreviewSceneRoot,
-                    SceneRoot(scene),
+                    PreviewWorldAssetRoot,
+                    WorldAssetRoot(scene),
                     PreviewMaterialPair {
                         front: materials_handles.front.clone(),
                         back: materials_handles.back.clone(),
@@ -2243,14 +2243,14 @@ fn update_placement_preview(
     }
 }
 
-/// Walk a freshly-spawned preview SceneRoot's descendants and replace
+/// Walk a freshly-spawned preview WorldAssetRoot's descendants and replace
 /// every `Mesh3d` entity's material with our `PreviewFront` handle, plus
 /// add a sibling-as-child carrying `PreviewBack` for the depth-flipped
 /// X-ray pass. Marker swap completes by inserting `PreviewSceneReady`
 /// on the root, which `update_placement_preview` reads to decide when
 /// the scene can finally be made visible.
 fn swap_preview_scene_materials(
-    trigger: On<SceneInstanceReady>,
+    trigger: On<WorldInstanceReady>,
     pairs: Query<&PreviewMaterialPair>,
     children_q: Query<&Children>,
     meshes: Query<&Mesh3d>,
@@ -2568,7 +2568,7 @@ fn handle_predicted_spawn(
         PointLight {
             intensity: 750_000.0,
             range: 60.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
     ));
@@ -2808,15 +2808,15 @@ fn attach_avatar_visuals(
     }
 }
 
-/// Marker on the SceneRoot-bearing child entity that holds the NPC's
+/// Marker on the WorldAssetRoot-bearing child entity that holds the NPC's
 /// glTF body. Lets `setup_npc_skeleton_anim` filter the global
-/// `SceneInstanceReady` stream to just our NPC scenes (the world also
+/// `WorldInstanceReady` stream to just our NPC scenes (the world also
 /// has block-entity scenes like the bed, and the placement preview).
 #[derive(Component)]
-struct NpcSceneRoot;
+struct NpcWorldAssetRoot;
 
 /// Marker on the NPC root entity once we've spawned its visual rig
-/// (SceneRoot child + future animation hookup). `attach_npc_visuals`
+/// (WorldAssetRoot child + future animation hookup). `attach_npc_visuals`
 /// adds this to gate the once-only attach; `setup_npc_anim_once_loaded`
 /// later fills `player` with the Entity carrying the auto-inserted
 /// `AnimationPlayer` so the per-frame state driver can find it without
@@ -2858,10 +2858,10 @@ fn attach_npc_visuals(
         info!("npc entered view: {entity:?}");
         // Transform + Visibility on the NPC root: `sync_avatar_transforms`
         // queries for `&mut Transform`, and without it (and the propagation
-        // siblings Visibility brings in) the child SceneRoot inherits from
+        // siblings Visibility brings in) the child WorldAssetRoot inherits from
         // a missing parent transform and renders the entire skeleton at
         // world origin. The old cuboid path got these for free via
-        // `Mesh3d`'s required components; the SceneRoot now lives on the
+        // `Mesh3d`'s required components; the WorldAssetRoot now lives on the
         // child entity so the parent has to opt in explicitly.
         //
         // 180° Y rotation on the child: KayKit characters are authored
@@ -2876,8 +2876,8 @@ fn attach_npc_visuals(
                 Visibility::default(),
             ))
             .with_child((
-                NpcSceneRoot,
-                SceneRoot(assets.knight_scene.clone()),
+                NpcWorldAssetRoot,
+                WorldAssetRoot(assets.knight_scene.clone()),
                 Transform::from_xyz(0.0, foot_offset, 0.0)
                     .with_rotation(Quat::from_rotation_y(core::f32::consts::PI)),
             ));
@@ -2949,7 +2949,7 @@ fn update_npc_carry_icons(
             match (carry.item, carry.count) {
                 (Some(slot), c) if c > 0 => {
                     *vis = Visibility::Inherited;
-                    if let Some(material) = materials.get_mut(&mat_handle.0) {
+                    if let Some(mut material) = materials.get_mut(&mat_handle.0) {
                         let [r, g, b] = items.def(slot).color;
                         material.base_color = Color::srgba(r, g, b, 1.0);
                     }
@@ -2968,7 +2968,7 @@ fn update_npc_carry_icons(
 /// translation — `Transform` is never replicated (the
 /// networking-design rule), so we derive it from the component.
 ///
-/// Idempotent against re-adds; if the entity already has a SceneRoot
+/// Idempotent against re-adds; if the entity already has a WorldAssetRoot
 /// we no-op, since multi-add only fires when an observer is registered
 /// after the entity exists, not on duplicate inserts.
 fn attach_world_item_visuals(
@@ -2976,7 +2976,7 @@ fn attach_world_item_visuals(
     items: Res<ItemRegistry>,
     asset_server: Res<AssetServer>,
     world_items: Query<&WorldItem>,
-    existing: Query<(), With<SceneRoot>>,
+    existing: Query<(), With<WorldAssetRoot>>,
     mut commands: Commands,
 ) {
     let entity = trigger.event_target();
@@ -2987,9 +2987,9 @@ fn attach_world_item_visuals(
         return;
     };
     let def = items.def(world_item.item);
-    let scene: Handle<Scene> = asset_server.load(format!("{}#Scene0", def.mesh));
+    let scene: Handle<WorldAsset> = asset_server.load(format!("{}#Scene0", def.mesh));
     commands.entity(entity).insert((
-        SceneRoot(scene),
+        WorldAssetRoot(scene),
         Transform::from_translation(world_item.translation),
         GlobalTransform::default(),
         Visibility::default(),
@@ -3031,14 +3031,14 @@ fn sync_world_item_transform(mut items: Query<(&WorldItem, &mut Transform), Chan
 /// "hips", …]`) matches between the character and animation glbs, the
 /// IDs collide and the rig clip drives the Knight's bones.
 ///
-/// We treat the entity that bears `SceneRoot` as a "virtual scene root"
+/// We treat the entity that bears `WorldAssetRoot` as a "virtual scene root"
 /// — its direct child is node[32] "Rig_Medium" in the glb, which gets
 /// the `AnimationPlayer`. The follow-up system `start_npc_anim_idle`
 /// watches `Added<AnimationPlayer>` to attach `AnimationTransitions`
 /// and start the idle clip.
 fn setup_npc_skeleton_anim(
-    trigger: On<SceneInstanceReady>,
-    npc_scene_roots: Query<(), With<NpcSceneRoot>>,
+    trigger: On<WorldInstanceReady>,
+    npc_scene_roots: Query<(), With<NpcWorldAssetRoot>>,
     children_q: Query<&Children>,
     names: Query<&Name>,
     assets: Res<CharacterAssets>,
@@ -3051,7 +3051,7 @@ fn setup_npc_skeleton_anim(
     // Bevy's glTF loader wraps the scene's top-level nodes in an
     // unnamed entity that carries the coordinate-system conversion
     // transform (see bevy_gltf loader.rs::world_root_id), so the named
-    // "Rig_Medium" node from the glb is a *grandchild* of the SceneRoot
+    // "Rig_Medium" node from the glb is a *grandchild* of the WorldAssetRoot
     // bearer, not a direct child. Search by name to be wrapper-agnostic.
     let Some(rig_root) = find_named_descendant(scene_bearer, "Rig_Medium", &children_q, &names)
     else {

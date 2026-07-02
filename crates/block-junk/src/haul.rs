@@ -127,13 +127,6 @@ impl HaulStore {
         self.assignments.contains_key(&npc)
     }
 
-    /// Iterate every active assignment. Used by `build_snapshot` to
-    /// surface the assignment to the Lua planner (currently ignored
-    /// by the planner, but the shape is wired forward).
-    pub fn iter_assignments(&self) -> impl Iterator<Item = (&NpcId, &HaulAssignment)> {
-        self.assignments.iter()
-    }
-
     /// True if `entity` is currently reserved by anyone other than
     /// `npc`. Used by the scheduler + arrival handlers to detect
     /// races against another NPC.
@@ -180,20 +173,6 @@ impl HaulStore {
             }
             None => false,
         }
-    }
-
-    /// Pop the front of `npc`'s pickup queue, releasing its
-    /// reservation atomically. Called from the PickupForPlan arrival
-    /// handler once the brain has consumed the item. Returns the
-    /// popped entry for diagnostic logging.
-    pub fn pop_queue_front(&mut self, npc: NpcId) -> Option<ReservedItem> {
-        let assignment = self.assignments.get_mut(&npc)?;
-        if assignment.queue.is_empty() {
-            return None;
-        }
-        let front = assignment.queue.remove(0);
-        self.release_reservation_internal(front.entity, npc);
-        Some(front)
     }
 
     /// Remove the queued reservation matching `entity` (NPC may
@@ -923,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn pop_queue_front_releases_its_reservation() {
+    fn drop_queue_entry_releases_its_reservation() {
         let mut s = HaulStore::default();
         let a = entity(1);
         let b = entity(2);
@@ -931,11 +910,11 @@ mod tests {
         s.try_reserve_internal(b, NPC_1);
         s.commit_assignment(NPC_1, assignment_with_queue(&[a, b]));
 
-        let popped = s.pop_queue_front(NPC_1).unwrap();
-        assert_eq!(popped.entity, a);
-        // a is free; b is still reserved.
+        s.drop_queue_entry(NPC_1, a);
+        // a is free; b is still queued and reserved.
         assert!(s.try_reserve_internal(a, NPC_2));
         assert!(!s.try_reserve_internal(b, NPC_2));
+        assert_eq!(s.assignment_of(NPC_1).unwrap().queue.len(), 1);
     }
 
     #[test]

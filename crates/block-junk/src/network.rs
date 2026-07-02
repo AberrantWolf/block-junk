@@ -209,14 +209,14 @@ impl Plugin for ProtocolPlugin {
         // per-tick state. We deliberately don't replicate `Transform` — the
         // 40-byte rotation+scale baggage isn't used.
         // See networking-design: state for entities, events for the grid.
-        app.register_component::<Actor>();
-        app.register_component::<Avatar>();
-        app.register_component::<Npc>();
-        app.register_component::<NpcId>();
-        app.register_component::<crate::npc::NpcKind>();
-        app.register_component::<NpcAnimOverride>();
-        app.register_component::<NpcPath>();
-        app.register_component::<crate::civilization::ClusterBboxReplica>();
+        app.component::<Actor>().replicate();
+        app.component::<Avatar>().replicate();
+        app.component::<Npc>().replicate();
+        app.component::<NpcId>().replicate();
+        app.component::<crate::npc::NpcKind>().replicate();
+        app.component::<NpcAnimOverride>().replicate();
+        app.component::<NpcPath>().replicate();
+        app.component::<crate::civilization::ClusterBboxReplica>().replicate();
         // Loose items in the world. No prediction (clients never drive
         // item motion) and no interpolation (movement is occasional
         // settle snaps, not continuous per-tick motion worth lerping).
@@ -225,29 +225,30 @@ impl Plugin for ProtocolPlugin {
         // newly-placed block) each replicate as one delta, which the
         // client's `sync_world_item_transform` copies to the render
         // Transform.
-        app.register_component::<WorldItem>();
+        app.component::<WorldItem>().replicate();
         // Actor carry stack. Replicated to every client so the owner
         // can read their own state for HUD; no prediction because
         // pickup/drop are discrete server-authoritative events, not
         // continuous-per-frame updates worth rolling back.
-        app.register_component::<Carrying>();
+        app.component::<Carrying>().replicate();
         // Actor tool slot. Separate from carry — tools enable actions,
         // resources get hauled. Same no-prediction reasoning as
         // Carrying (pickup/swap are discrete server events).
-        app.register_component::<EquippedTool>();
+        app.component::<EquippedTool>().replicate();
         // AvatarPose participates in both prediction (owner rolls back when
         // server disagrees) and interpolation (remote viewers lerp between
         // server samples instead of snapping every 50 ms).
-        app.register_component::<AvatarPose>()
-            .add_prediction()
+        app.component::<AvatarPose>()
+            .replicate()
+            .predict()
             .add_linear_interpolation();
         // Velocity, ground state, and movement mode are simulation-only —
         // remote viewers don't need them, but the predicted owner does
         // (rollback restarts the controller from these values, so they
         // must be in the prediction history).
-        app.register_component::<AvatarVelocity>().add_prediction();
-        app.register_component::<AvatarOnGround>().add_prediction();
-        app.register_component::<MovementMode>().add_prediction();
+        app.component::<AvatarVelocity>().replicate().predict();
+        app.component::<AvatarOnGround>().replicate().predict();
+        app.component::<MovementMode>().replicate().predict();
 
         // Per-tick input replication. Adds `ActionState<MovementIntent>` and
         // the buffering machinery on both sides. Phase 2.4 hangs the
@@ -320,6 +321,11 @@ fn start_netcode_client(
             PeerAddr(server_addr),
             Link::new(None),
             ReplicationReceiver::default(),
+            // lightyear 0.28: prediction is only wired for links that carry
+            // a PredictionManager (its on_insert registers the
+            // PredictionResource the rollback systems unwrap — without it
+            // the first predicted entity panics the app).
+            PredictionManager::default(),
             client,
             UdpIo::default(),
         ))

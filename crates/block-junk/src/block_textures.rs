@@ -21,7 +21,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::render::storage::ShaderStorageBuffer;
+use bevy::render::storage::ShaderBuffer;
 use block_junk_textures::render::{BlockTexGpu, build_gpu_textures};
 use block_junk_textures::{BakedTexture, TexError, TextureSetDoc, bake_set, flatten, lua_io};
 
@@ -109,9 +109,9 @@ impl TextureRegistry {
 #[derive(Resource, Clone)]
 pub struct BlockTextures {
     pub tiles: Handle<Image>,
-    pub blocks: Handle<ShaderStorageBuffer>,
-    pub textures: Handle<ShaderStorageBuffer>,
-    pub layers: Handle<ShaderStorageBuffer>,
+    pub blocks: Handle<ShaderBuffer>,
+    pub textures: Handle<ShaderBuffer>,
+    pub layers: Handle<ShaderBuffer>,
     /// Per block slot, indexed by `BlockSlot.0 as usize`. Flat-color
     /// swatch for untextured blocks.
     pub icons: Vec<Handle<Image>>,
@@ -183,7 +183,7 @@ impl Plugin for BlockTexturesPlugin {
             (tiles, icons)
         };
         let (blocks, textures, layers) = {
-            let mut buffers = world.resource_mut::<Assets<ShaderStorageBuffer>>();
+            let mut buffers = world.resource_mut::<Assets<ShaderBuffer>>();
             // Storage buffers must be non-empty for the bindings to build.
             let mut textures_gpu = gpu.textures;
             if textures_gpu.is_empty() {
@@ -200,9 +200,9 @@ impl Plugin for BlockTexturesPlugin {
                 });
             }
             (
-                buffers.add(ShaderStorageBuffer::from(blocks_gpu)),
-                buffers.add(ShaderStorageBuffer::from(textures_gpu)),
-                buffers.add(ShaderStorageBuffer::from(layers_gpu)),
+                buffers.add(ShaderBuffer::from(blocks_gpu)),
+                buffers.add(ShaderBuffer::from(textures_gpu)),
+                buffers.add(ShaderBuffer::from(layers_gpu)),
             )
         };
         world.insert_resource(BlockTextures {

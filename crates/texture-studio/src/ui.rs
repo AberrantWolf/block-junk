@@ -73,15 +73,24 @@ pub fn studio_ui(
     let now = time.elapsed_secs_f64();
     studio.clamp_selection();
 
-    top_bar(&ctx, &mut studio);
-    texture_list(&ctx, &mut studio, &mut cache, now);
-    inspector(&ctx, &mut studio, &mut cache, now);
-    flat_preview(&ctx, &mut studio, &baked, &mut flat, &mut cache);
+    // egui 0.34: top-level panels hang off a root `Ui` over the
+    // background layer instead of the bare Context.
+    let mut root = egui::Ui::new(
+        ctx.clone(),
+        "studio_root".into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+    top_bar(&mut root, &mut studio);
+    texture_list(&mut root, &mut studio, &mut cache, now);
+    inspector(&mut root, &ctx, &mut studio, &mut cache, now);
+    flat_preview(&mut root, &ctx, &mut studio, &baked, &mut flat, &mut cache);
     bands_window(&ctx, &studio, &mut bands);
 }
 
-fn top_bar(ctx: &egui::Context, studio: &mut Studio) {
-    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+fn top_bar(root: &mut egui::Ui, studio: &mut Studio) {
+    egui::Panel::top("toolbar").show_inside(root, |ui| {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!(
@@ -124,10 +133,15 @@ fn top_bar(ctx: &egui::Context, studio: &mut Studio) {
     });
 }
 
-fn texture_list(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache, now: f64) {
-    egui::SidePanel::left("textures")
-        .default_width(210.0)
-        .show(ctx, |ui| {
+fn texture_list(
+    root: &mut egui::Ui,
+    studio: &mut Studio,
+    cache: &mut PreviewCache,
+    now: f64,
+) {
+    egui::Panel::left("textures")
+        .default_size(210.0)
+        .show_inside(root, |ui| {
             ui.heading("Textures");
             ui.horizontal(|ui| {
                 ui.label("pixels/block");
@@ -190,10 +204,16 @@ fn texture_list(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCac
         });
 }
 
-fn inspector(ctx: &egui::Context, studio: &mut Studio, cache: &mut PreviewCache, now: f64) {
-    egui::SidePanel::right("inspector")
-        .default_width(360.0)
-        .show(ctx, |ui| {
+fn inspector(
+    root: &mut egui::Ui,
+    ctx: &egui::Context,
+    studio: &mut Studio,
+    cache: &mut PreviewCache,
+    now: f64,
+) {
+    egui::Panel::right("inspector")
+        .default_size(360.0)
+        .show_inside(root, |ui| {
             if studio.doc.textures.is_empty() {
                 ui.label("No textures — add one on the left.");
                 return;
@@ -772,16 +792,17 @@ fn stops_editor(
 }
 
 fn flat_preview(
+    root: &mut egui::Ui,
     ctx: &egui::Context,
     studio: &mut Studio,
     baked: &Baked,
     flat: &mut FlatPreview,
     cache: &mut PreviewCache,
 ) {
-    egui::TopBottomPanel::bottom("flat")
-        .default_height(FLAT_PX as f32 + 56.0)
+    egui::Panel::bottom("flat")
+        .default_size(FLAT_PX as f32 + 56.0)
         .resizable(true)
-        .show(ctx, |ui| {
+        .show_inside(root, |ui| {
             let mut export = false;
             ui.horizontal(|ui| {
                 ui.heading("Tiling preview");

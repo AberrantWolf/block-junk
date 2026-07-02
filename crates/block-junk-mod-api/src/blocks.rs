@@ -597,7 +597,7 @@ impl Cardinal {
         }
     }
 
-    /// Yaw in radians for rendering: rotate the model's `SceneRoot` by
+    /// Yaw in radians for rendering: rotate the model's `WorldAssetRoot` by
     /// `Quat::from_rotation_y(self.yaw())`. Composes with the modeling
     /// guide's default-east convention so rotating produces the right
     /// visual orientation in world space.

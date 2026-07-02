@@ -117,6 +117,8 @@ impl Civilization {
 
     /// `true` if the cluster id still exists. Brains use this to lazy-
     /// clear a `home_cluster` that's been pruned out from under them.
+    /// (Forward wiring — the home_cluster brain work hasn't landed.)
+    #[allow(dead_code)]
     pub fn is_live(&self, id: ClusterId) -> bool {
         self.clusters.contains_key(&id)
     }

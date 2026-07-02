@@ -11,11 +11,11 @@ thiserror = "2"
 
 # Only for the `render` feature (chunk material + atlas upload). Default
 # features match the game binary so feature unification is a no-op.
-bevy = { version = "0.18", optional = true }
+bevy = { version = "0.19", optional = true }
 
 # Only for the `egui-fonts` feature. Must track bevy_egui's egui version
-# (0.39 → egui 0.33) or the Context types won't unify.
-egui = { version = "0.33", default-features = false, optional = true }
+# (0.40 → egui 0.34) or the Context types won't unify.
+egui = { version = "0.34", default-features = false, optional = true }
 
 [dev-dependencies]
 # Only for the render_previews example (flatten textures.lua → PNGs).

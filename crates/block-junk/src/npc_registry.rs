@@ -146,6 +146,8 @@ impl NeedRegistry {
     /// to decide whether the NPC should pivot from idle rhythm to the
     /// matching interactable. `None` ⇒ no threshold registered;
     /// callers fall back to their own default.
+    /// (Forward wiring — the Idle-pivot planner surface hasn't landed.)
+    #[allow(dead_code)]
     pub fn urge_threshold(&self, id: &str) -> Option<f32> {
         self.defs.get(id).and_then(|d| d.urge_threshold)
     }
@@ -158,10 +160,6 @@ impl NeedRegistry {
 
     pub fn need_count(&self) -> usize {
         self.defs.len()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &NeedDef)> {
-        self.defs.iter().map(|(k, v)| (k.as_str(), v))
     }
 }
 
@@ -227,10 +225,6 @@ impl AnimationRegistry {
 
     pub fn contains(&self, id: &str) -> bool {
         self.defs.contains_key(id)
-    }
-
-    pub fn get(&self, id: &str) -> Option<&AnimationDef> {
-        self.defs.get(id)
     }
 
     /// Registered ids in insertion order. The client's AnimationGraph

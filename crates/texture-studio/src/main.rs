@@ -16,7 +16,7 @@ use bevy::camera::Camera3d;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::DirectionalLight;
 use bevy::prelude::*;
-use bevy::render::storage::ShaderStorageBuffer;
+use bevy::render::storage::ShaderBuffer;
 use bevy::window::{Window, WindowPlugin};
 use bevy_egui::{EguiContexts, EguiPlugin};
 use block_junk_textures::render::{
@@ -280,7 +280,7 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ChunkMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut ambient: ResMut<GlobalAmbientLight>,
 ) {
     ambient.brightness = 300.0;
@@ -288,16 +288,16 @@ fn setup_scene(
     // Placeholder GPU data; the first `upload_gpu` run replaces it.
     let empty = build_gpu_textures(&[]);
     let tiles = images.add(empty.tiles);
-    let blocks = buffers.add(ShaderStorageBuffer::from(vec![
+    let blocks = buffers.add(ShaderBuffer::from(vec![
         BlockTexGpu::untextured([
             0.5, 0.5, 0.5
         ]);
         terrain::SLOT_COUNT
     ]));
-    let textures = buffers.add(ShaderStorageBuffer::from(vec![
+    let textures = buffers.add(ShaderBuffer::from(vec![
         block_junk_textures::render::TexInfoGpu::default(),
     ]));
-    let layers = buffers.add(ShaderStorageBuffer::from(vec![
+    let layers = buffers.add(ShaderBuffer::from(vec![
         block_junk_textures::render::LayerGpu {
             array_index: 0,
             size_px: 1,
@@ -330,7 +330,7 @@ fn setup_scene(
     commands.spawn((
         DirectionalLight {
             illuminance: 9_000.0,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.6, 0.0)),
@@ -376,7 +376,7 @@ fn upload_gpu(
     scene_mat: Res<SceneMaterial>,
     mut materials: ResMut<Assets<ChunkMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     if !baked.gpu_dirty && !bands.dirty {
         return;
@@ -435,13 +435,13 @@ fn upload_gpu(
         });
     }
 
-    let Some(mat) = materials.get_mut(&scene_mat.0) else {
+    let Some(mut mat) = materials.get_mut(&scene_mat.0) else {
         return;
     };
     mat.extension.tiles = images.add(gpu.tiles);
-    mat.extension.blocks = buffers.add(ShaderStorageBuffer::from(blocks));
-    mat.extension.textures = buffers.add(ShaderStorageBuffer::from(textures_gpu));
-    mat.extension.layers = buffers.add(ShaderStorageBuffer::from(layers_gpu));
+    mat.extension.blocks = buffers.add(ShaderBuffer::from(blocks));
+    mat.extension.textures = buffers.add(ShaderBuffer::from(textures_gpu));
+    mat.extension.layers = buffers.add(ShaderBuffer::from(layers_gpu));
 }
 
 /// Right-drag orbits, scroll zooms — only when egui isn't using the
@@ -456,7 +456,7 @@ fn orbit_camera(
 ) {
     let egui_wants_pointer = contexts
         .ctx_mut()
-        .map(|ctx| ctx.wants_pointer_input())
+        .map(|ctx| ctx.egui_wants_pointer_input())
         .unwrap_or(false);
 
     if !egui_wants_pointer {
@@ -482,7 +482,7 @@ fn keyboard_shortcuts(
 ) {
     let egui_wants_kb = contexts
         .ctx_mut()
-        .map(|ctx| ctx.wants_keyboard_input())
+        .map(|ctx| ctx.egui_wants_keyboard_input())
         .unwrap_or(false);
     if egui_wants_kb {
         return;

@@ -120,16 +120,16 @@ impl Material for PreviewBack {
         // with depth-write off, the back pass leaves no trace in the
         // depth buffer.
         if let Some(ds) = descriptor.depth_stencil.as_mut() {
-            ds.depth_compare = CompareFunction::Less;
-            ds.depth_write_enabled = false;
+            ds.depth_compare = Some(CompareFunction::Less);
+            ds.depth_write_enabled = Some(false);
         }
         Ok(())
     }
 }
 
-/// On a `SceneRoot` entity whose glTF materials should be replaced by
+/// On a `WorldAssetRoot` entity whose glTF materials should be replaced by
 /// the preview front/back pair. The material-swap observer (in
-/// `client.rs`) fires on `SceneInstanceReady` for any root carrying
+/// `client.rs`) fires on `WorldInstanceReady` for any root carrying
 /// this component — the cursor placement preview installs the shared
 /// re-tinted pair, plan ghosts install per-block fixed-tint handles.
 #[derive(Component)]

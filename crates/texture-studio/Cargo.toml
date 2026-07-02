@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-bevy = { version = "0.18", features = ["mouse", "keyboard"] }
-bevy_egui = "0.39"
+bevy = { version = "0.19", features = ["mouse", "keyboard"] }
+bevy_egui = "0.40"
 block-junk-textures = { path = "../block-junk-textures", features = ["render", "egui-fonts"] }
 # "Export PNG" in the tiling preview.
 png = "0.18"

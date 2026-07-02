@@ -30,7 +30,7 @@ use bevy::render::render_resource::{
     AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat, TextureViewDescriptor,
     TextureViewDimension,
 };
-use bevy::render::storage::ShaderStorageBuffer;
+use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 
 use crate::bake::BakedTexture;
@@ -91,7 +91,7 @@ pub struct LayerGpu {
 }
 
 /// Everything [`build_gpu_textures`] produces. The `tiles` Image is ready
-/// to add to `Assets<Image>`; the tables go into `ShaderStorageBuffer`s.
+/// to add to `Assets<Image>`; the tables go into `ShaderBuffer`s.
 pub struct GpuTextureSet {
     pub tiles: Image,
     pub textures: Vec<TexInfoGpu>,
@@ -197,11 +197,11 @@ pub struct BlockTextureExt {
     #[texture(100, dimension = "2d_array")]
     pub tiles: Handle<Image>,
     #[storage(101, read_only)]
-    pub blocks: Handle<ShaderStorageBuffer>,
+    pub blocks: Handle<ShaderBuffer>,
     #[storage(102, read_only)]
-    pub textures: Handle<ShaderStorageBuffer>,
+    pub textures: Handle<ShaderBuffer>,
     #[storage(103, read_only)]
-    pub layers: Handle<ShaderStorageBuffer>,
+    pub layers: Handle<ShaderBuffer>,
 }
 
 impl MaterialExtension for BlockTextureExt {

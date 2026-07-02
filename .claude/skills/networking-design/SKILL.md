@@ -1,6 +1,6 @@
 ---
 name: networking-design
-description: Design rules for block-junk's networking — what gets replicated and how, channel choices, bandwidth budget, and area-of-interest strategy. Use when adding any feature that crosses the client/server boundary, or when reviewing a change that adds replicated state. The transport mechanics (which lightyear API to call) live in the lightyear-026 skill; this is about *what to send and why*.
+description: Design rules for block-junk's networking — what gets replicated and how, channel choices, bandwidth budget, and area-of-interest strategy. Use when adding any feature that crosses the client/server boundary, or when reviewing a change that adds replicated state. The transport mechanics (which lightyear API to call) live in the lightyear-028 skill; this is about *what to send and why*.
 user-invocable: false
 ---
 

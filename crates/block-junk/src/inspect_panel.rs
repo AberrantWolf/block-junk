@@ -129,7 +129,7 @@ fn spawn_inspect_panel(mut commands: Commands, existing: Query<(), With<InspectP
             panel.spawn((
                 Text::new(""),
                 TextFont {
-                    font_size: 14.0,
+                    font_size: FontSize::Px(14.0),
                     ..default()
                 },
                 TextColor(crate::ui_theme::TEXT),

@@ -64,6 +64,10 @@ impl Plugin for ServerPlugin {
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
         app.insert_resource(terrain_slots);
+        // lightyear 0.28: the replication send rate is app-wide, not
+        // per-sender. Overrides the Default (send every tick) the
+        // lightyear plugins insert.
+        app.insert_resource(ReplicationMetadata::new(REPLICATION_INTERVAL));
         app.init_resource::<ChunkMap>();
         app.init_resource::<ClientAvatars>();
         app.init_resource::<ClientChunks>();
@@ -1096,14 +1100,11 @@ const REPLICATION_INTERVAL: Duration = Duration::from_millis(50);
 /// component on a server-side entity can be pushed to it. Insert as soon as
 /// the link appears (before the netcode handshake completes) so the sender is
 /// ready by the time we spawn an avatar in the `Connected` observer.
+///
+/// Since lightyear 0.28 the sender is a plain marker; the send interval
+/// lives in the app-wide `ReplicationMetadata` resource instead.
 fn install_replication_sender(trigger: On<Add, LinkOf>, mut commands: Commands) {
-    commands
-        .entity(trigger.entity)
-        .insert(ReplicationSender::new(
-            REPLICATION_INTERVAL,
-            SendUpdatesMode::SinceLastAck,
-            false,
-        ));
+    commands.entity(trigger.entity).insert(ReplicationSender);
 }
 
 /// On client connect: spawn an avatar entity carrying the authoritative

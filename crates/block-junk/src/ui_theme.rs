@@ -60,7 +60,7 @@ pub fn egui_color(c: Color) -> egui::Color32 {
 /// at startup (alongside the fallback-font install). Player-facing
 /// windows then need zero styling code; dev windows override locally.
 pub fn apply_ingame_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     let v = &mut style.visuals;
 
     let panel = egui::Color32::from_rgba_unmultiplied(26, 20, 18, 245);
@@ -91,7 +91,20 @@ pub fn apply_ingame_style(ctx: &egui::Context) {
         w.corner_radius = egui::CornerRadius::same(4);
     }
 
-    ctx.set_style(style);
+    ctx.set_global_style(style);
+}
+
+/// Root `Ui` over the background layer, covering the whole viewport.
+/// egui 0.34 deprecated showing panels directly on a `Context`; fullscreen
+/// surfaces (main menu, studio chrome) build this and `show_inside` it.
+pub fn root_ui(ctx: &egui::Context, id: &'static str) -> egui::Ui {
+    egui::Ui::new(
+        ctx.clone(),
+        id.into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    )
 }
 
 /// Window frame for dev/debug surfaces: flat near-black, square-ish

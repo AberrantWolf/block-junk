@@ -153,12 +153,12 @@ pub(crate) fn refresh_block_entities(
                 Some(EntryKind::Anchor { orientation }) => orientation,
                 _ => Cardinal::default(),
             };
-            let scene: Handle<Scene> = asset_server.load(format!("{mesh_path}#Scene0"));
+            let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh_path}#Scene0"));
             let translation = cell.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
             let rotation = Quat::from_rotation_y(orientation.yaw());
             let entity = commands
                 .spawn((
-                    SceneRoot(scene),
+                    WorldAssetRoot(scene),
                     Transform {
                         translation,
                         rotation,
