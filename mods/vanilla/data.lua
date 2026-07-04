@@ -157,7 +157,14 @@ register {
         support_below = true,
     },
     color = { 0.55, 0.40, 0.22 },
-    texture = "vanilla:wood",
+    -- Per-face: bark streaks on the sides, growth rings on the cut
+    -- ends — a tree trunk, not the plank grid (that texture is
+    -- reserved for a future vanilla:planks block).
+    texture = {
+        top = "vanilla:wood_rings",
+        side = "vanilla:wood_bark",
+        bottom = "vanilla:wood_rings",
+    },
     -- Phase 1: destroying a wood block drops one Wood Log item.
     -- Trees in terrain are stamped from this same block, so chopping
     -- a tree trunk yields wood the same way breaking a placed wood
@@ -237,12 +244,21 @@ register {
         solid = true,
         support_below = true,
     },
+    -- Room-typing tag: one unit of "vanilla:bed" per placed bed (the
+    -- detector normalises the 2-cell footprint). Drives the bedroom
+    -- pattern and, later, the settlement bed-vacancy census.
+    tags = { "vanilla:bed" },
     color = { 0.40, 0.18, 0.05 },
     mesh = "mods://vanilla/models/bed_single_A.gltf",
     footprint = { {0, 0, 0}, {1, 0, 0} },
+    -- Collision shaved 5 cm inside the cell faces (was flush at
+    -- ±0.5/1.5). A cell-flush box makes the aisle between two beds
+    -- exactly 1.0 m — an NPC (0.6 m wide) steering through wedges on
+    -- the bed corner and starves in the bedroom. 5 cm per side is
+    -- visually imperceptible and widens furniture gaps to 1.1 m.
     entity_aabb = {
-        min = { -0.5, 0.0, -0.5 },
-        max = {  1.5, 1.0,  0.5 },
+        min = { -0.45, 0.0, -0.45 },
+        max = {  1.45, 1.0,  0.45 },
     },
     -- The first exclusive interactable. `restores = 0.7` means a
     -- full sleep brings a tiredness deficit down by 70% — bedtime
@@ -346,7 +362,12 @@ engine.rooms.register {
     parent = "vanilla:enclosed_space",
     domain = "volumetric",
     constraints = {
-        { kind = "has_roof", required = false },
+        -- "Mostly open to sky", not "has_roof = false": a yard keeps its
+        -- identity with a small shed roof or awning over up to half the
+        -- floor, and a half-roofed house shell matches NEITHER yard nor
+        -- house (falls back to enclosed_space) instead of flapping
+        -- between the two while the builder works.
+        { kind = "roof_fraction", max = 0.5 },
         { kind = "floor_fraction", surface = "solid", min = 0.6 },
     },
 }
@@ -362,6 +383,34 @@ engine.rooms.register {
         { kind = "enclosure_height", min = 2 },
         { kind = "floor_area", max = 50 },
         { kind = "floor_fraction", surface = "solid", min = 0.8 },
+    },
+}
+
+-- Furniture-typed rooms. Both extend small_house, so they inherit the
+-- roof + headroom + size gates and deepest-match beats the plain house.
+-- The tag counts read placement units (a 2-cell bed = 1 bed), scanned
+-- across the room's interior including furniture sitting ON the floor.
+engine.rooms.register {
+    id = "vanilla:bedroom",
+    display_name = "Bedroom",
+    parent = "vanilla:small_house",
+    domain = "volumetric",
+    -- A house with both a bed and a crafting station reads as a bedroom
+    -- first (priority over workshop): where you sleep defines home.
+    priority = 2,
+    constraints = {
+        { kind = "tag_count", tag = "vanilla:bed", min = 1 },
+    },
+}
+
+engine.rooms.register {
+    id = "vanilla:workshop",
+    display_name = "Workshop",
+    parent = "vanilla:small_house",
+    domain = "volumetric",
+    priority = 1,
+    constraints = {
+        { kind = "tag_count", tag = "vanilla:crafting", min = 1 },
     },
 }
 
@@ -425,9 +474,13 @@ register {
     display_name = "Workbench",
     flags = {
         solid = true,
-        room_boundary = true,
+        -- No room_boundary: furniture, not a wall. `solid` already stops
+        -- the room flood-fill; room_boundary would additionally let the
+        -- workbench flank a virtual doorway, so placing it one cell from
+        -- a wall would split the room. Same reasoning on the anvil + bed.
         support_below = true,
     },
+    tags = { "vanilla:crafting" },
     color = { 0.55, 0.42, 0.25 },
     mesh = "mods://vanilla/models/Toy_Workbench.gltf",
     footprint = { {0, 0, 0}, {1, 0, 0} },
@@ -463,9 +516,9 @@ register {
     display_name = "Anvil",
     flags = {
         solid = true,
-        room_boundary = true,
         support_below = true,
     },
+    tags = { "vanilla:crafting" },
     color = { 0.38, 0.36, 0.40 },
     mesh = "mods://vanilla/models/anvil.gltf",
     entity_aabb = {
@@ -660,6 +713,14 @@ engine.animations.register {
 engine.npcs.register {
     id = "vanilla:wanderer",
     display_name = "Wanderer",
+    -- Per-NPC personality rolls, fixed at spawn. `laziness` multiplies
+    -- the planner's post-action breather (events.lua): midpoint 1.0
+    -- keeps the average exactly at the tuned 3-8 s, so the range only
+    -- adds variance — an eager 0.6 chains work with short breaths, a
+    -- lazy 1.4 lingers.
+    stats = {
+        { id = "laziness", min = 0.6, max = 1.4 },
+    },
     default_needs = {
         hunger = 0.2,
         -- Spawn slightly tired so the first night triggers visible bed

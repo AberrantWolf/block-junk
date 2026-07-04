@@ -330,16 +330,19 @@ fn refresh_inspect_panel(
     recipes: Res<crate::recipes::RecipeRegistry>,
     plans: Res<Plans>,
     stations: Res<CraftStations>,
+    rooms: Res<crate::room_sync::ClientRooms>,
+    room_patterns: Res<crate::rooms::RoomPatternRegistry>,
     mut mods: ResMut<crate::scripting::ClientMods>,
     mut roots: Query<&mut Visibility, With<InspectPanelRoot>>,
     mut texts: Query<&mut Text, With<InspectPanelText>>,
 ) {
-    // Re-render on target change *or* plans/stations mutation. Deposits
-    // land as `Plans` mutations and station updates land as
-    // `CraftStations` mutations — neither touches `target` directly,
-    // so without these branches a hovered panel would freeze at the
-    // initial state.
-    if !target.is_changed() && !plans.is_changed() && !stations.is_changed() {
+    // Re-render on target change *or* plans/stations/rooms mutation.
+    // Deposits land as `Plans` mutations, station updates as
+    // `CraftStations` mutations, room recognition as `ClientRooms`
+    // mutations — none touches `target` directly, so without these
+    // branches a hovered panel would freeze at the initial state.
+    if !target.is_changed() && !plans.is_changed() && !stations.is_changed() && !rooms.is_changed()
+    {
         return;
     }
     let mut body = render_body(
@@ -349,6 +352,8 @@ fn refresh_inspect_panel(
         &recipes,
         &plans,
         &stations,
+        &rooms,
+        &room_patterns,
     );
     // Mod contributions (`engine.ui.on_inspect`) append below the
     // engine-rendered body. Only consulted on actual re-render — Lua
@@ -428,6 +433,10 @@ fn mod_inspect_target(
 }
 
 /// Format the panel's text content. `None` ⇒ panel hidden.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pure formatter over every inspectable subsystem"
+)]
 fn render_body(
     state: &InspectState,
     registry: &BlockRegistry,
@@ -435,7 +444,25 @@ fn render_body(
     recipes: &crate::recipes::RecipeRegistry,
     plans: &Plans,
     stations: &CraftStations,
+    rooms: &crate::room_sync::ClientRooms,
+    room_patterns: &crate::rooms::RoomPatternRegistry,
 ) -> Option<String> {
+    // Room membership line, appended to any cell-anchored inspection:
+    // the mirrored bboxes are the only client-side room knowledge, and
+    // surfacing the room's type on hover is half the point of
+    // replicating them.
+    let room_line = |cell: IVec3| -> String {
+        match rooms.room_at(cell) {
+            Some(room) => {
+                let name = room_patterns
+                    .get(&room.pattern.as_str().into())
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| room.pattern.clone());
+                format!("\nRoom: {} ({} floor)\n", name, room.floor_area)
+            }
+            None => String::new(),
+        }
+    };
     match state {
         InspectState::None => None,
         InspectState::PendingNpc {
@@ -474,6 +501,7 @@ fn render_body(
                 out.push('\n');
                 out.push_str(&format_plan_inner(plan_state, registry, items));
             }
+            out.push_str(&room_line(*cell));
             Some(out)
         }
         InspectState::Plan { cell } => {
@@ -482,7 +510,7 @@ fn render_body(
                 Some(state) => format_plan_inner(state, registry, items),
                 None => "(tag cleared)".to_owned(),
             };
-            Some(format!("{header}{body}"))
+            Some(format!("{header}{body}{}", room_line(*cell)))
         }
         InspectState::Item { slot } => Some(format_item(*slot, items)),
     }
@@ -609,6 +637,14 @@ fn format_npc(details: &NpcDetails, stale: bool) -> String {
     if !details.needs.is_empty() {
         out.push_str("\nneeds:\n");
         let mut entries: Vec<(&String, &f32)> = details.needs.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (id, value) in entries {
+            out.push_str(&format!("  {:<10} {:.2}\n", id, value));
+        }
+    }
+    if !details.stats.is_empty() {
+        out.push_str("\nstats:\n");
+        let mut entries: Vec<(&String, &f32)> = details.stats.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (id, value) in entries {
             out.push_str(&format!("  {:<10} {:.2}\n", id, value));

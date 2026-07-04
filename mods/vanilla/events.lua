@@ -162,6 +162,9 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- Keeps the NPC from looking frantic and stops "complete goal,
     -- immediately repeat" loops. Sleep + work included so an NPC that
     -- just finished one takes a breath before deciding the next thing.
+    -- The breather scales by the NPC's rolled `laziness` stat (see
+    -- data.lua): stat midpoint 1.0 == the tuned 3-8 s baseline, so the
+    -- roll adds personality variance without moving the average.
     if prev == "wander"
         or prev == "visit"
         or prev == "consume"
@@ -169,7 +172,8 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
         or prev == "work"
     then
         last_action[snapshot.id] = "rest"
-        return { kind = "rest", duration_secs = 3.0 + math.random() * 5.0 }
+        local lazy = (snapshot.stats and snapshot.stats.laziness) or 1.0
+        return { kind = "rest", duration_secs = (3.0 + math.random() * 5.0) * lazy }
     end
 
     -- After resting, pick a fresh motion: visit a known room or

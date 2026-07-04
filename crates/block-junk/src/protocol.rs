@@ -141,8 +141,12 @@ pub struct ModSetManifest {
     pub recipes: Vec<String>,
     /// NPC kind ids, sorted (the registry is keyed by string, not slot).
     pub npc_kinds: Vec<String>,
-    /// Stable FNV-1a over the serialized block/item/recipe defs in slot
-    /// order. Catches same-ids-but-different-definitions.
+    /// Room pattern ids in registration order. Pattern ids cross the
+    /// wire in [`RoomSummary`] and the client resolves display names /
+    /// constraints locally, so disagreement here desyncs the room UI.
+    pub room_patterns: Vec<String>,
+    /// Stable FNV-1a over the serialized block/item/recipe/room-pattern
+    /// defs in slot order. Catches same-ids-but-different-definitions.
     pub defs_hash: u64,
 }
 
@@ -443,6 +447,19 @@ pub enum PlanKind {
     },
 }
 
+impl PlanKind {
+    /// The [`WorkVerb`] this plan's work runs under — Build plans place
+    /// a block, Remove plans break one. Tool gates are per-verb
+    /// ([`WorkAction::tool_for`](block_junk_mod_api::blocks::WorkAction::tool_for));
+    /// every gate site derives the verb through here.
+    pub fn work_verb(&self) -> block_junk_mod_api::blocks::WorkVerb {
+        match self {
+            PlanKind::Build { .. } => block_junk_mod_api::blocks::WorkVerb::Build,
+            PlanKind::Remove => block_junk_mod_api::blocks::WorkVerb::Destroy,
+        }
+    }
+}
+
 /// Full state of one tagged cell: what it should become *plus* the
 /// progress of material delivery for Build plans. Remove plans have an
 /// empty `materials` vec (nothing needs to be delivered to break a
@@ -524,6 +541,46 @@ pub struct PlanEdit {
 #[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PlanFullSync {
     pub entries: Vec<(IVec3, PlanState)>,
+}
+
+/// Wire snapshot of one *matched* room. Detection stays server-side;
+/// clients mirror just enough to surface feedback: the toast on
+/// recognition, the inspect-panel "Room: …" line, debug outlines.
+/// `pattern` is the pattern id — the client resolves the display name
+/// through its own `RoomPatternRegistry` (the mod-set gate guarantees
+/// both sides registered identical patterns).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoomSummary {
+    pub room_id: u32,
+    pub pattern: String,
+    /// Floor cell nearest the room's centroid — walkable by
+    /// construction; where recognition toasts anchor.
+    pub anchor: IVec3,
+    pub bbox_min: IVec3,
+    pub bbox_max: IVec3,
+    pub floor_area: u32,
+}
+
+/// Server → clients when a room gains or changes a matched pattern
+/// (upsert by `room_id`). Rooms that lose their match arrive as
+/// [`RoomRemove`] instead.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct RoomSync {
+    pub room: RoomSummary,
+}
+
+/// Server → clients when a matched room is destroyed or stops matching.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct RoomRemove {
+    pub room_id: u32,
+}
+
+/// Server → client on connect: every currently matched room. Shares
+/// [`StateSyncChannel`] with the deltas so full-sync-before-delta
+/// ordering holds (same rule as plans / stations).
+#[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RoomsFullSync {
+    pub rooms: Vec<RoomSummary>,
 }
 
 /// Bulk version of [`PlanEdit`]. All cells in `cells` are tagged with
@@ -818,6 +875,10 @@ pub struct NpcDetails {
     pub npc_id: u64,
     pub kind: String,
     pub needs: std::collections::HashMap<String, f32>,
+    /// Rolled per-NPC stats (laziness etc.) — fixed at spawn, shown in
+    /// the inspect panel alongside the live needs.
+    #[serde(default)]
+    pub stats: std::collections::HashMap<String, f32>,
     pub current_goal: String,
     pub target_cell: Option<IVec3>,
 }

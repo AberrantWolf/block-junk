@@ -18,7 +18,7 @@ use crate::menu::{
     SAVE_RESULT_FAILED, SAVE_RESULT_OK, ServerSaveConfig, ServerSaveRequestFlag,
     ServerSaveResultFlag, ServerShutdownFlag,
 };
-use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcWorkCompleted};
+use crate::npc::{Brain, Goal, Needs, Npc, NpcId, NpcKind, NpcPath, NpcStats, NpcWorkCompleted};
 use crate::physics::{
     EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, apply_walk_step, soft_separate_actors,
 };
@@ -30,6 +30,7 @@ use crate::protocol::{
     GameSet, INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
     PeriodicSyncChannel, PickupRequest, PlanEdit, PlanKind, REACH_SLACK, RejectReason,
     RequestNpcDetails, StateSyncChannel, WorldChannel, WorldClock, WorldClockSync, WorldItem,
+    WorldToast,
 };
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{
@@ -57,6 +58,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::debug::DebugServerPlugin);
         app.add_plugins(crate::npc::NpcServerPlugin);
         app.add_plugins(crate::plans::PlansServerPlugin);
+        app.add_plugins(crate::room_sync::RoomSyncServerPlugin);
         app.add_plugins(crate::plan_claims::PlanClaimsPlugin);
         app.add_plugins(crate::haul::HaulPlugin);
         app.add_plugins(crate::craft_stations::CraftStationsServerPlugin);
@@ -625,6 +627,20 @@ fn spawn_loaded_npc(
             needs.entry(need_id.clone()).or_insert(*default_value);
         }
     }
+    // Stats: saved values win; anything the registry declares that the
+    // save lacks (pre-stats save, or a mod added a stat since) is
+    // rolled now from the persisted rng — mirrors the needs merge
+    // above. The advanced rng goes into Brain so the roll isn't
+    // repeatable, and the rolled value persists on the next save.
+    let mut rng = npc.rng;
+    let mut stats = npc.stats;
+    if let Some(def) = kind_registry.get(&npc.kind) {
+        for stat in &def.stats {
+            stats.entry(stat.id.clone()).or_insert_with(|| {
+                stat.min + crate::npc::rand_unit(&mut rng) * (stat.max - stat.min)
+            });
+        }
+    }
     // Reconstruct the carry stack. Missing item ids (mod uninstalled
     // between sessions) drop the carry silently — same degradation
     // pattern `load_from_save` uses for world items.
@@ -680,9 +696,10 @@ fn spawn_loaded_npc(
             NpcId(npc.id),
             NpcKind(npc.kind),
             Needs(needs),
+            NpcStats(stats),
             Brain {
                 goal: Goal::Idle,
-                rng: npc.rng,
+                rng,
                 home_cluster: None,
                 preempt_cooldown_secs: 0.0,
             },
@@ -908,7 +925,7 @@ fn collect_saved_players(ctx: &SaveCtx) -> Vec<SavedPlayer> {
 /// tick after load (and log loudly each time).
 fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec<SavedNpc> {
     npcs.iter()
-        .map(|(id, kind, pose, mode, needs, brain, carry, tool)| SavedNpc {
+        .map(|(id, kind, pose, mode, needs, brain, carry, tool, stats)| SavedNpc {
             id: id.0,
             kind: kind.0.clone(),
             pose: *pose,
@@ -917,6 +934,7 @@ fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec
             rng: brain.rng,
             carrying: saved_carry_of(carry, item_registry),
             tool: saved_tool_of(tool, item_registry),
+            stats: stats.0.clone(),
         })
         .collect()
 }
@@ -985,6 +1003,7 @@ type SavedNpcQuery<'w, 's> = Query<
         &'static Brain,
         &'static Carrying,
         &'static EquippedTool,
+        &'static NpcStats,
     ),
     With<Npc>,
 >;
@@ -1126,6 +1145,7 @@ fn register_new_client(
     item_registry: Res<ItemRegistry>,
     recipe_registry: Res<crate::recipes::RecipeRegistry>,
     npc_kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
+    room_pattern_registry: Res<crate::rooms::RoomPatternRegistry>,
     mut manifests: Query<&mut MessageSender<ModSetManifest>>,
 ) {
     let connection = trigger.entity;
@@ -1227,6 +1247,7 @@ fn register_new_client(
             &item_registry,
             &recipe_registry,
             &npc_kind_registry,
+            &room_pattern_registry,
         );
         sender.send::<WorldChannel>(manifest);
     }
@@ -1985,14 +2006,14 @@ fn apply_npc_work(
 /// traffic.
 fn receive_npc_inspection_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<RequestNpcDetails>)>,
-    npcs: Query<(&NpcId, &NpcKind, &Needs, &Brain, &AvatarPose), With<Npc>>,
+    npcs: Query<(&NpcId, &NpcKind, &Needs, &NpcStats, &Brain, &AvatarPose), With<Npc>>,
     mut senders: Query<&mut MessageSender<NpcDetails>>,
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
         let requests: Vec<RequestNpcDetails> = receiver.receive().collect();
         for req in requests {
-            let Some((id, kind, needs, brain, _pose)) =
-                npcs.iter().find(|(id, _, _, _, _)| id.0 == req.npc_id)
+            let Some((id, kind, needs, stats, brain, _pose)) =
+                npcs.iter().find(|(id, _, _, _, _, _)| id.0 == req.npc_id)
             else {
                 // NPC despawned between client raycast and server
                 // receive. Silently drop — the requester will time
@@ -2004,6 +2025,7 @@ fn receive_npc_inspection_requests(
                 npc_id: id.0,
                 kind: kind.0.clone(),
                 needs: needs.0.clone(),
+                stats: stats.0.clone(),
                 current_goal,
                 target_cell,
             };
@@ -2295,7 +2317,9 @@ fn receive_deposit_requests(
     avatars: Res<ClientAvatars>,
     mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
     mut plans: ResMut<Plans>,
+    item_registry: Res<ItemRegistry>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
+    mut toast_senders: Query<&mut MessageSender<WorldToast>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
 ) {
@@ -2338,6 +2362,24 @@ fn receive_deposit_requests(
             // the new materials.present + outline re-renders.
             let updated_state = plans.get(req.cell).cloned();
             if let Some(state) = updated_state {
+                // Targeted deposit receipt — the depositor sees
+                // "Wood Log 2/4" at the plan cell (there's no audio
+                // yet, and the ghost re-tint alone is easy to miss).
+                // Other clients learn the same from the PlanEdit
+                // broadcast below.
+                if let Some(entry) = state.materials.iter().find(|m| m.item == carry_item)
+                    && let Ok(mut sender) = toast_senders.get_mut(connection)
+                {
+                    sender.send::<WorldChannel>(WorldToast {
+                        cell: req.cell,
+                        text: format!(
+                            "{} {}/{}",
+                            item_registry.def(entry.item).display_name,
+                            entry.present,
+                            entry.needed
+                        ),
+                    });
+                }
                 let reply = PlanEdit {
                     cell: req.cell,
                     kind: Some(state.kind),

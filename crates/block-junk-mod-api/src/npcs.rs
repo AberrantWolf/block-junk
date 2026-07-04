@@ -149,6 +149,22 @@ pub struct NeedDef {
     pub preempt_threshold: Option<f32>,
 }
 
+/// One per-NPC rolled stat a kind declares: every NPC of the kind
+/// rolls a value uniformly in `[min, max]` at spawn (from its own
+/// persisted rng, so the roll is deterministic per NPC), keeps it for
+/// life, and exposes it to planners via [`NpcSnapshot::stats`].
+///
+/// Stats are personality knobs, not needs — they never decay and the
+/// engine attaches no behavior to them; planners (and future engine
+/// systems) decide what a stat means. Vanilla's first: `laziness`,
+/// scaling the post-work breather.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NpcStatDef {
+    pub id: String,
+    pub min: f32,
+    pub max: f32,
+}
+
 /// Registered NPC kind. Mods construct these and pass them to
 /// `engine.npcs.register`; the engine builds a parallel kind registry on
 /// each side, agreeing on slot ordering for any future wire-friendly
@@ -157,6 +173,11 @@ pub struct NeedDef {
 pub struct NpcKindDef {
     pub id: NpcKindId,
     pub display_name: String,
+    /// Per-NPC rolled stats this kind declares. See [`NpcStatDef`].
+    /// Registration order is the roll order (determinism across
+    /// spawns), validated at boot (min ≤ max, unique non-empty ids).
+    #[serde(default)]
+    pub stats: Vec<NpcStatDef>,
     /// Initial value for each need this kind cares about. Keys are
     /// [`NeedId`] strings; values are clamped to `[0, 1]` on spawn. A
     /// kind that doesn't list a need simply doesn't carry it — the
@@ -239,6 +260,11 @@ pub struct NpcSnapshot {
     /// once landmarks exist. For now the planner mostly ignores this.
     pub foot: BlockPos,
     pub needs: HashMap<String, f32>,
+    /// This NPC's rolled stat values, keyed by [`NpcStatDef::id`].
+    /// Fixed at spawn (never decay); absent keys mean the kind doesn't
+    /// declare the stat — planners should `or`-default their reads.
+    #[serde(default)]
+    pub stats: HashMap<String, f32>,
     /// Up to K nearest detected rooms with a matched pattern, sorted by
     /// distance from `foot` (closest first). Empty when no matched
     /// rooms exist (early game, or the world detector hasn't run yet).

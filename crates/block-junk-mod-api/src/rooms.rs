@@ -100,22 +100,43 @@ pub enum Constraint {
         #[serde(default)]
         max: Option<u32>,
     },
-    /// Min/max number of bounded layers above the floor plane. A layer is
-    /// "bounded" when the wall (or roof) extends to that Y — bottom-up
-    /// from the floor, the room grows by one layer per Y where every
-    /// perimeter cell is solid, and stops when the walls give out.
-    /// Replaces the older "headroom" framing, which conflated walled-yard
-    /// (no roof, infinite headroom by air-column probe) with great-hall
-    /// (no roof, but the player perceives intentional height).
+    /// Min/max interior height of the room in layers.
+    ///
+    /// For roofed regions (see [`RoomSignature::roof_fraction`]) this is
+    /// the *median clear headroom* under the ceiling across roofed floor
+    /// columns — median, not min, so one low doorway beam or a single
+    /// vaulted shaft doesn't swing the room's classification. For
+    /// unroofed regions it's the minimum wall run height along the
+    /// external perimeter (a walled yard with 1-high walls reads 1).
+    ///
+    /// (Pre-2026-07 this was a single bottom-up "every perimeter cell
+    /// solid per layer" walk, which meant any wall opening — the air gap
+    /// above a door block, a window — capped the height at that layer
+    /// and usually voided the roof too.)
     EnclosureHeight {
         #[serde(default)]
         min: Option<u32>,
         #[serde(default)]
         max: Option<u32>,
     },
-    /// Whether the region must have a contiguous block ceiling (volumetric).
-    /// `false` matches "open to sky" enclosures (walled yards). Omit for "any".
+    /// Whether the region must read as roofed (volumetric). Roofing is
+    /// per-column: `has_roof` is true when at least
+    /// `HAS_ROOF_MIN_FRACTION` (0.85) of floor columns find a ceiling
+    /// block overhead — so pitched roofs, skylights, and chimney holes
+    /// don't void it. `required = false` matches only *mostly open*
+    /// regions; for finer control use [`Constraint::RoofFraction`].
+    /// Omit for "any".
     HasRoof { required: bool },
+    /// Min/max fraction (0..=1) of floor columns that find a ceiling
+    /// block overhead. `{ max = 0.5 }` reads "at most half covered" —
+    /// the walled-yard shape; `{ min = 0.85 }` is equivalent to
+    /// `HasRoof { required = true }`.
+    RoofFraction {
+        #[serde(default)]
+        min: Option<f32>,
+        #[serde(default)]
+        max: Option<f32>,
+    },
     /// Fraction of floor cells supported by the named [`FloorKind`].
     /// Sum of all kinds is ≤ 1.0.
     FloorFraction { surface: FloorKind, min: f32 },
@@ -139,10 +160,13 @@ pub enum Constraint {
         #[serde(default)]
         max: Option<u32>,
     },
-    /// Required count of `walkable_boundary` cells in the room's wall ring
-    /// (volumetric only). Use with `min = 1` to require an explicit access
-    /// point — keeps the detector from registering accidental enclosures
-    /// players never intended (a hole dug in terrain, a divot under a tree).
+    /// Required count of access points in the room's wall ring
+    /// (volumetric only): `walkable_boundary` blocks (door blocks) plus
+    /// *virtual doorways* — 1-wide wall openings with walkable headroom
+    /// that the detector treats as boundaries instead of leaks. Use with
+    /// `min = 1` to require an explicit access point — keeps the detector
+    /// from registering accidental enclosures players never intended
+    /// (a hole dug in terrain, a divot under a tree).
     DoorCount {
         #[serde(default)]
         min: u32,
@@ -217,14 +241,20 @@ pub struct RoomSignature {
     /// asking "minimum room size" want walkable size, not geometric.
     #[serde(default)]
     pub walkable_count: Option<u32>,
-    /// Number of layers (Y planes) above the floor that the walls extend
-    /// to bound, computed bottom-up. Walled yard with 1-high walls has
-    /// `enclosure_height = 1`; 2-high walls = 2; small house with 2-high
-    /// walls and a roof = 2 (the roof closes the volume above layer 2).
+    /// Interior height in layers: median clear headroom under the
+    /// ceiling (roofed regions) or minimum external wall run height
+    /// (unroofed). See [`Constraint::EnclosureHeight`] for the full
+    /// semantics. Walled yard with 1-high walls = 1; house with a
+    /// ceiling two layers above the floor = 2.
     #[serde(default)]
     pub enclosure_height: Option<u32>,
+    /// `Some(roof_fraction >= 0.85)` — see [`Constraint::HasRoof`].
     #[serde(default)]
     pub has_roof: Option<bool>,
+    /// Fraction (0..=1) of floor columns with a ceiling block overhead
+    /// within the roof scan cap. Pitched roofs count per column.
+    #[serde(default)]
+    pub roof_fraction: Option<f32>,
     #[serde(default)]
     pub door_count: Option<u32>,
     #[serde(default)]

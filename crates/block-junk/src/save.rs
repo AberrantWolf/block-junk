@@ -76,7 +76,7 @@ use crate::voxel::{Chunk, ChunkEntities};
 ///                  a `players` entry under [`UNCLAIMED_PLAYER_ID`],
 ///                  claimed by the first client id that connects
 ///                  without an entry of its own.
-pub const SAVE_VERSION: u32 = 13;
+pub const SAVE_VERSION: u32 = 14;
 
 /// Sentinel `SavedPlayer::client_id` for state not yet bound to a real
 /// client id: v12-migrated legacy state. Real ids are never 0 (see
@@ -199,6 +199,83 @@ pub struct SavedPlayer {
     pub tool: Option<SavedTool>,
 }
 
+/// The v12/v13 `SavedNpc` layout (pre-stats), kept verbatim — bincode
+/// decodes positionally, so the old byte order must be preserved for
+/// migration. Stats default empty; the load path rolls whatever the
+/// kind's registry declares (see `spawn_loaded_npc`).
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Clone, Deserialize)]
+struct SavedNpcV13 {
+    id: u64,
+    kind: String,
+    pose: AvatarPose,
+    movement_mode: MovementMode,
+    needs: HashMap<String, f32>,
+    rng: u64,
+    #[serde(default)]
+    carrying: Option<SavedCarry>,
+    #[serde(default)]
+    tool: Option<SavedTool>,
+}
+
+impl From<SavedNpcV13> for SavedNpc {
+    fn from(old: SavedNpcV13) -> Self {
+        SavedNpc {
+            id: old.id,
+            kind: old.kind,
+            pose: old.pose,
+            movement_mode: old.movement_mode,
+            needs: old.needs,
+            rng: old.rng,
+            carrying: old.carrying,
+            tool: old.tool,
+            stats: HashMap::new(),
+        }
+    }
+}
+
+/// The v13 `SaveFile` layout, kept verbatim (field order is the bincode
+/// wire order) so v13 saves can be decoded and migrated instead of
+/// refused. Identical to v14 except NPCs lack rolled stats.
+/// Serialize exists only so tests can author v13 bytes.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct SaveFileV13 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    block_slots: Vec<String>,
+    edited_chunks: Vec<SavedChunk>,
+    #[serde(default)]
+    players: Vec<SavedPlayer>,
+    #[serde(default)]
+    npcs: Vec<SavedNpcV13>,
+    #[serde(default)]
+    world_clock: Option<WorldClock>,
+    #[serde(default)]
+    plans: Vec<(IVec3, SavedPlanState)>,
+    #[serde(default)]
+    world_items: Vec<SavedWorldItem>,
+    #[serde(default)]
+    craft_stations: Vec<(IVec3, SavedStationState)>,
+}
+
+impl From<SaveFileV13> for SaveFile {
+    fn from(old: SaveFileV13) -> Self {
+        SaveFile {
+            version: SAVE_VERSION,
+            block_slots: old.block_slots,
+            edited_chunks: old.edited_chunks,
+            players: old.players,
+            npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
+            world_clock: old.world_clock,
+            plans: old.plans,
+            world_items: old.world_items,
+            craft_stations: old.craft_stations,
+        }
+    }
+}
+
 /// The v12 `SaveFile` layout, kept verbatim (field order is the bincode
 /// wire order) so v12 saves can be decoded and migrated instead of
 /// refused. Only the fields that differ from v13 carry comments.
@@ -215,7 +292,7 @@ struct SaveFileV12 {
     /// [`UNCLAIMED_PLAYER_ID`].
     last_player_pose: Option<AvatarPose>,
     #[serde(default)]
-    npcs: Vec<SavedNpc>,
+    npcs: Vec<SavedNpcV13>,
     #[serde(default)]
     world_clock: Option<WorldClock>,
     #[serde(default)]
@@ -250,7 +327,7 @@ impl From<SaveFileV12> for SaveFile {
             block_slots: old.block_slots,
             edited_chunks: old.edited_chunks,
             players,
-            npcs: old.npcs,
+            npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
             world_clock: old.world_clock,
             plans: old.plans,
             world_items: old.world_items,
@@ -391,6 +468,12 @@ pub struct SavedNpc {
     /// pure runtime change.
     #[serde(default)]
     pub tool: Option<SavedTool>,
+    /// Rolled per-NPC stat values (laziness etc.). Empty for saves
+    /// predating stats (serde-default) — the loader rolls any stat the
+    /// kind's registry declares but the map lacks, then persists the
+    /// result, so old saves upgrade once and stay stable.
+    #[serde(default)]
+    pub stats: HashMap<String, f32>,
 }
 
 /// Rewrite every saved [`BlockSlot`] (chunk cells — padding included,
@@ -557,7 +640,7 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         });
     }
     let meta = read_metadata(&dir)?;
-    if meta.version != SAVE_VERSION && meta.version != 12 {
+    if meta.version != SAVE_VERSION && meta.version != 13 && meta.version != 12 {
         return Err(SaveError::VersionMismatch {
             name: name.to_string(),
             found: meta.version,
@@ -569,6 +652,14 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         path: blob,
         source: e,
     })?;
+    if meta.version == 13 {
+        // In-memory migration only; the file upgrades on the next
+        // write, so a failed session never rewrites a good v13 save.
+        let (old, _): (SaveFileV13, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+        bevy::log::info!("migrated save {name:?} from v13 (NPCs gained rolled stats)");
+        return Ok(old.into());
+    }
     if meta.version == 12 {
         // In-memory migration only; the file upgrades on the next
         // write, so a failed session never rewrites a good v12 save.
@@ -710,6 +801,7 @@ mod tests {
                 tool: Some(SavedTool {
                     item_id: "vanilla:pickaxe".to_owned(),
                 }),
+                stats: HashMap::from([("laziness".to_owned(), 0.87)]),
             }],
             world_clock: Some(WorldClock {
                 day: 3,
@@ -982,3 +1074,4 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+

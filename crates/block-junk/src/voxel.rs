@@ -431,7 +431,7 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
     }
     // Air above the surface — check whether any nearby tree's stamp
     // claims this cell. STAMP_RADIUS bounds the (x, z) search; bigger
-    // radius = more lookups per cell. 2 covers a 3-wide canopy.
+    // radius = more lookups per cell. 2 covers the 5-wide canopy.
     const STAMP_RADIUS: i32 = 2;
     for dx in -STAMP_RADIUS..=STAMP_RADIUS {
         for dz in -STAMP_RADIUS..=STAMP_RADIUS {
@@ -442,21 +442,31 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
             }
             let root_h = surface_height(rx, rz);
             let local_y = world.y - root_h;
-            // Trunk: 3-tall column of wood, centred on the root.
-            if dx == 0 && dz == 0 && (0..3).contains(&local_y) {
+            let trunk_h = tree_height(rx, rz);
+            // Trunk: 4-5-tall column of wood, centred on the root.
+            if dx == 0 && dz == 0 && (0..trunk_h).contains(&local_y) {
                 return slots.wood;
             }
-            // Canopy: 3x3 leaves at top of trunk.
-            if local_y == 3 && dx.abs() <= 1 && dz.abs() <= 1 {
+            // Canopy layer 1: 5x5 minus the four corners, wrapping the
+            // trunk top — the corner cut is what rounds the silhouette.
+            if local_y == trunk_h && !(dx.abs() == 2 && dz.abs() == 2) {
                 return slots.leaves;
             }
-            // Single leaf cap on top.
-            if local_y == 4 && dx == 0 && dz == 0 {
+            // Canopy layer 2: 3x3 crown one above.
+            if local_y == trunk_h + 1 && dx.abs() <= 1 && dz.abs() <= 1 {
                 return slots.leaves;
             }
         }
     }
     slots.empty
+}
+
+/// Trunk height (wood cells) for the tree rooted at `(x, z)`: 4 or 5,
+/// picked from high bits of the same hash `is_tree_root` masks low bits
+/// of, so height varies independently of placement. Pure — chunk
+/// regeneration must agree on both sides of the wire.
+fn tree_height(x: i32, z: i32) -> i32 {
+    4 + ((tree_hash(x, z) >> 8) & 1) as i32
 }
 
 /// Floor of the sine-wave heightmap at column `(x, z)`. Pulled out so
@@ -472,19 +482,24 @@ fn surface_height(x: i32, z: i32) -> i32 {
 /// is roughly one tree per 32 columns on average; tune by tightening or
 /// loosening the mask.
 fn is_tree_root(x: i32, z: i32) -> bool {
-    // Integer hash mixing (large primes, xorshift-style finalizer). The
-    // specific constants are arbitrary; the only requirement is good
-    // bit dispersion so neighbouring columns don't cluster.
+    // ~1 in 32 columns: dense enough to recognise as "a forest" along a
+    // path, sparse enough that flat-grass-with-occasional-tree still
+    // reads as the dominant terrain.
+    (tree_hash(x, z) & 0x1F) == 0
+}
+
+/// Integer hash mixing (large primes, xorshift-style finalizer) shared
+/// by tree placement (low bits) and per-tree variation (higher bits).
+/// The specific constants are arbitrary; the only requirement is good
+/// bit dispersion so neighbouring columns don't cluster.
+fn tree_hash(x: i32, z: i32) -> u32 {
     let mut h = (x as u32)
         .wrapping_mul(73_856_093)
         .wrapping_add((z as u32).wrapping_mul(19_349_663));
     h ^= h >> 13;
     h = h.wrapping_mul(0x5bd1_e995);
     h ^= h >> 15;
-    // ~1 in 32 columns: dense enough to recognise as "a forest" along a
-    // path, sparse enough that flat-grass-with-occasional-tree still
-    // reads as the dominant terrain.
-    (h & 0x1F) == 0
+    h
 }
 
 #[cfg(test)]

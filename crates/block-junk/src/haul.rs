@@ -162,6 +162,15 @@ impl HaulStore {
         self.unreachable_until.insert(target, retry_at);
     }
 
+    /// Read-only variant of [`Self::is_unreachable`] for snapshot
+    /// building, which only holds `&HaulStore`. Skips the lazy prune —
+    /// the scheduler's mutable checks keep the table from growing.
+    pub fn is_unreachable_peek(&self, target: HaulTarget, now: f32) -> bool {
+        self.unreachable_until
+            .get(&target)
+            .is_some_and(|&retry_at| now < retry_at)
+    }
+
     /// True while `target` is memoized as unreachable. Expired entries
     /// are pruned on check.
     pub fn is_unreachable(&mut self, target: HaulTarget, now: f32) -> bool {
@@ -704,10 +713,11 @@ pub fn compute_station_demand(
 }
 
 /// What tool tag (if any) the plan at `cell` requires its worker to
-/// hold. Build plans gate on the *block being placed*, Remove plans
-/// on the *live block being destroyed* — same convention the click
-/// resolver uses on the client. `None` ⇒ no tool required for this
-/// plan.
+/// hold. Build plans gate on the *block being placed*'s
+/// `build_required_tool` (vanilla: always `None` — building is
+/// free-handed), Remove plans on the *live block being destroyed*'s
+/// `required_tool` — same per-verb convention the click resolver uses
+/// on the client. `None` ⇒ no tool required for this plan.
 fn required_tool_for_plan(
     cell: IVec3,
     kind: &crate::protocol::PlanKind,
@@ -733,8 +743,8 @@ fn required_tool_for_plan(
         .def(slot)
         .work_action
         .as_ref()?
-        .required_tool
-        .clone()
+        .tool_for(kind.work_verb())
+        .cloned()
 }
 
 /// Find the nearest unreserved [`WorldItem`] whose def carries

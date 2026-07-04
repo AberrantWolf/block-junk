@@ -405,17 +405,50 @@ pub struct WorkAction {
     #[serde(default)]
     pub need_restore: Option<NeedRestore>,
     pub duration_secs: f32,
-    /// Tool requirement for this work action. When `Some`, an actor
-    /// attempting the action (player or NPC) must hold an item in their
-    /// tool slot whose [`ItemDef::tool_tags`](crate::items::ItemDef::tool_tags)
+    /// Tool requirement for *destroying* this block (mining, chopping).
+    /// When `Some`, an actor attempting the action (player or NPC) must
+    /// hold an item in their tool slot whose
+    /// [`ItemDef::tool_tags`](crate::items::ItemDef::tool_tags)
     /// contains this tag. Match is byte-exact (same convention room
     /// patterns use). `None` ⇒ no tool required, anyone can do it.
     /// Engine doesn't validate the tag exists in any registry — mods
     /// are trusted to spell it right; a typo silently means "no item
     /// can satisfy this," which surfaces as "the action is always
     /// blocked" in play and is quick to diagnose.
+    ///
+    /// Building is gated separately by [`Self::build_required_tool`];
+    /// resolve either through [`Self::tool_for`].
     #[serde(default)]
     pub required_tool: Option<TagId>,
+    /// Tool requirement for *building* this block from a satisfied
+    /// plan. Separate from [`Self::required_tool`] because placing a
+    /// block is usually free-handed even when tearing it down needs
+    /// the tool (you fell a tree with an axe; you stack the log with
+    /// your hands). `None` — the default, and what all vanilla content
+    /// uses — means anyone can build it.
+    #[serde(default)]
+    pub build_required_tool: Option<TagId>,
+}
+
+impl WorkAction {
+    /// The tool tag gating `verb` on this block, if any. Single accessor
+    /// so every gate site (player click, NPC plan filter, haul
+    /// scheduler, server validation) reads the same split.
+    pub fn tool_for(&self, verb: WorkVerb) -> Option<&TagId> {
+        match verb {
+            WorkVerb::Build => self.build_required_tool.as_ref(),
+            WorkVerb::Destroy => self.required_tool.as_ref(),
+        }
+    }
+}
+
+/// Which direction a work action runs: materialising a Build plan vs
+/// breaking a live block (direct mine or Remove plan). Tool gates are
+/// per-verb — see [`WorkAction::tool_for`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkVerb {
+    Build,
+    Destroy,
 }
 
 /// Need + magnitude pair shared by [`Interactable::need_restore`] and

@@ -27,6 +27,7 @@ use crate::items::ItemRegistry;
 use crate::npc_registry::NpcKindRegistry;
 use crate::protocol::ModSetManifest;
 use crate::recipes::RecipeRegistry;
+use crate::rooms::RoomPatternRegistry;
 
 /// Snapshot the local registries into the wire manifest. Called by the
 /// server once per connect, and by the client to diff against what the
@@ -36,6 +37,7 @@ pub fn local_manifest(
     items: &ItemRegistry,
     recipes: &RecipeRegistry,
     npc_kinds: &NpcKindRegistry,
+    rooms: &RoomPatternRegistry,
 ) -> ModSetManifest {
     let mut hash = FNV_OFFSET;
     for (_, def) in blocks.iter() {
@@ -47,6 +49,12 @@ pub fn local_manifest(
     for (_, def) in recipes.iter() {
         fnv1a_json(def, &mut hash);
     }
+    // Room patterns joined the wire surface with room replication
+    // (pattern ids in RoomSummary; the client resolves them locally).
+    // RoomPattern is HashMap-free, so it hashes deterministically.
+    for def in rooms.iter() {
+        fnv1a_json(def, &mut hash);
+    }
     ModSetManifest {
         blocks: blocks.iter().map(|(_, def)| def.id.clone()).collect(),
         items: items.iter().map(|(_, def)| def.id.clone()).collect(),
@@ -55,6 +63,7 @@ pub fn local_manifest(
             .map(|(_, def)| def.id.0.clone())
             .collect(),
         npc_kinds: npc_kinds.ids_sorted(),
+        room_patterns: rooms.iter().map(|p| p.id.as_str().to_owned()).collect(),
         defs_hash: hash,
     }
 }
@@ -79,6 +88,12 @@ pub fn diff(server: &ModSetManifest, local: &ModSetManifest) -> Vec<String> {
     );
     diff_table("recipe", &server.recipes, &local.recipes, &mut lines);
     diff_table("npc kind", &server.npc_kinds, &local.npc_kinds, &mut lines);
+    diff_table(
+        "room pattern",
+        &server.room_patterns,
+        &local.room_patterns,
+        &mut lines,
+    );
     if lines.is_empty() && server.defs_hash != local.defs_hash {
         lines.push(
             "registries list the same ids but their definitions differ — \
@@ -146,8 +161,19 @@ mod tests {
             items: items.into_iter().map(ItemId::new).collect(),
             recipes: Vec::new(),
             npc_kinds: Vec::new(),
+            room_patterns: Vec::new(),
             defs_hash: hash,
         }
+    }
+
+    #[test]
+    fn room_pattern_divergence_is_reported() {
+        let mut server = manifest(vec!["vanilla:log"], 7);
+        server.room_patterns = vec!["vanilla:bedroom".to_string()];
+        let local = manifest(vec!["vanilla:log"], 7);
+        let lines = diff(&server, &local);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("room pattern"), "{lines:?}");
     }
 
     #[test]

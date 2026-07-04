@@ -34,10 +34,11 @@
 //! visibility/material bookkeeping a real entity would need.
 
 use bevy::prelude::*;
+use block_junk_mod_api::blocks::WorkVerb;
 use lightyear::prelude::Predicted;
 
 use crate::blocks::{BlockRegistry, BlockSlot};
-use crate::client::{PlaceablePalette, SelectedBlock, entity_aware_raycast, raycast_world_items};
+use crate::client::{entity_aware_raycast, raycast_world_items};
 use crate::items::{ItemRegistry, PLAYER_CARRY_CAPACITY};
 use crate::menu::AppState;
 use crate::plans::{PlanDragState, Plans, raycast_plans};
@@ -61,39 +62,17 @@ impl Plugin for TargetOutlinePlugin {
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),
         );
-        app.add_systems(
-            Update,
-            draw_plan_outlines
-                .in_set(GameSet::PostSimulation)
-                .run_if(in_state(AppState::InGame)),
-        );
+        // Committed plans no longer draw per-cell wireframes here.
+        // Build plans render as dithered ghosts and Remove plans as
+        // the crosshatch overlay — both in [`crate::plan_ghosts`].
+        // (Per-cell gizmo cubes made a cancelled cell in a cluster
+        // invisible: its six neighbours re-traced every edge of the
+        // hole.)
+        //
         // Station progress bars used to live here as a stack of gizmo
         // lines. Lines render thin and depth-test poorly against world
         // geometry; the proper bevy_ui implementation lives in
         // [`crate::craft_progress_hud`].
-    }
-}
-
-/// Render every tagged cell as a persistent gizmo wireframe so the
-/// player can see their queue. Visible in every mode — once you're in
-/// Normal you still want to see what your villagers are about to work
-/// on. Red for Remove. Build plans are full green when materials are
-/// satisfied (NPCs / players can self-work), desaturated green when
-/// still waiting on materials (deposit-needed visual cue).
-fn draw_plan_outlines(plans: Res<Plans>, mut gizmos: Gizmos) {
-    for (cell, state) in plans.iter() {
-        let centre = cell.as_vec3() + Vec3::splat(0.5);
-        let colour = match state.kind {
-            PlanKind::Remove => Color::srgb(1.0, 0.2, 0.2),
-            PlanKind::Build { .. } => {
-                if state.is_satisfied() {
-                    Color::srgb(0.2, 1.0, 0.4)
-                } else {
-                    Color::srgb(0.35, 0.55, 0.35)
-                }
-            }
-        };
-        gizmos.cube(Transform::from_translation(centre), colour);
     }
 }
 
@@ -112,8 +91,6 @@ fn draw_target_outline(
     recipes: Res<crate::recipes::RecipeRegistry>,
     stations: Res<crate::craft_stations::CraftStations>,
     plans: Res<Plans>,
-    selected: Res<SelectedBlock>,
-    palette: Res<PlaceablePalette>,
     world_items: Query<&WorldItem>,
     local_carry: Query<&Carrying, (With<Avatar>, With<Predicted>)>,
     local_tool: Query<&EquippedTool, (With<Avatar>, With<Predicted>)>,
@@ -140,8 +117,6 @@ fn draw_target_outline(
             &chunk_map,
             &registry,
             &plans,
-            &selected,
-            &palette,
             &mut gizmos,
         ),
         PlayerMode::Normal => {
@@ -166,7 +141,6 @@ fn draw_target_outline(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_plan_target(
     origin: Vec3,
     dir: Vec3,
@@ -174,10 +148,13 @@ fn draw_plan_target(
     chunk_map: &ChunkMap,
     registry: &BlockRegistry,
     plans: &Plans,
-    selected: &SelectedBlock,
-    palette: &PlaceablePalette,
     gizmos: &mut Gizmos,
 ) {
+    // One visual language per verb: the red wireframe is the L-remove
+    // cursor, full stop. Where an R-build would land is communicated
+    // by the placement ghost alone — the old green neighbour box
+    // double-encoded it and read as noise next to the red.
+    //
     // L can land on a Build tag floating in empty space; check the
     // plan raycast and prefer whichever target is closer.
     let world_hit =
@@ -189,7 +166,6 @@ fn draw_plan_target(
     let plan_dist = plan_hit.as_ref().map(|(d, _)| *d);
 
     let red = Color::srgb(1.0, 0.35, 0.3);
-    let green = Color::srgb(0.3, 1.0, 0.4);
 
     let prefer_plan = match (plan_dist, world_dist) {
         (Some(p), Some(w)) => p < w,
@@ -197,18 +173,12 @@ fn draw_plan_target(
         _ => false,
     };
     if prefer_plan {
-        // L would single-cell un-tag a floating Build plan. No face
-        // to project R against — only the L outline draws.
         let (_, cell) = plan_hit.unwrap();
         draw_cell(gizmos, cell, red);
         return;
     }
-    let Some(hit) = world_hit else { return };
-    // L outline: cursor cell. R outline: outward-face neighbour, only
-    // if the palette has something selectable.
-    draw_cell(gizmos, hit.cell, red);
-    if selected.current_block(palette).is_some() {
-        draw_cell(gizmos, hit.cell + hit.face_normal, green);
+    if let Some(hit) = world_hit {
+        draw_cell(gizmos, hit.cell, red);
     }
 }
 
@@ -300,7 +270,8 @@ fn draw_normal_target(
                 }
                 _ if state.is_satisfied() => {
                     let work_slot = self_work_block_slot(cell, state.kind, chunks, chunk_map);
-                    if player_can_work_slot(work_slot, registry, items, tool) {
+                    let verb = state.kind.work_verb();
+                    if player_can_work_slot(work_slot, verb, registry, items, tool) {
                         Color::srgb(1.0, 0.6, 0.1) // self-work orange
                     } else {
                         TOOL_GATED_GREY
@@ -348,7 +319,7 @@ fn draw_normal_target(
         }
         // Non-station: direct-mine red, OR grey if the live block
         // needs a tool the player isn't holding.
-        let colour = if player_can_work_slot(live_slot, registry, items, tool) {
+        let colour = if player_can_work_slot(live_slot, WorkVerb::Destroy, registry, items, tool) {
             Color::srgb(1.0, 0.35, 0.3)
         } else {
             TOOL_GATED_GREY
@@ -371,21 +342,26 @@ const TOOL_GATED_GREY: Color = Color::srgb(0.55, 0.55, 0.55);
 /// sees and what the click does in sync.
 pub(crate) fn player_can_work_slot(
     slot: Option<BlockSlot>,
+    verb: WorkVerb,
     registry: &BlockRegistry,
     items: &ItemRegistry,
     tool: EquippedTool,
 ) -> bool {
-    let Some(slot) = slot else {
-        return true;
-    };
-    let def = registry.def(slot);
-    let Some(work_action) = &def.work_action else {
-        return true;
-    };
-    let Some(required) = &work_action.required_tool else {
-        return true;
-    };
-    items.tool_has_tag(tool.item, required)
+    match required_tool_for_slot(slot, verb, registry) {
+        Some(required) => items.tool_has_tag(tool.item, required),
+        None => true,
+    }
+}
+
+/// The tool tag `slot`'s work-action demands for `verb`, if any.
+/// Companion to [`player_can_work_slot`] for callers that need to
+/// *name* the missing tool (toast text) rather than just gate on it.
+pub(crate) fn required_tool_for_slot(
+    slot: Option<BlockSlot>,
+    verb: WorkVerb,
+    registry: &BlockRegistry,
+) -> Option<&block_junk_mod_api::blocks::TagId> {
+    registry.def(slot?).work_action.as_ref()?.tool_for(verb)
 }
 
 /// The BlockSlot whose work-action drives gating for a self-work

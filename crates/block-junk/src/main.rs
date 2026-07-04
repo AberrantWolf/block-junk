@@ -28,6 +28,7 @@ mod player_mode;
 mod preview;
 mod protocol;
 mod recipes;
+mod room_sync;
 mod rooms;
 mod save;
 mod scripting;
@@ -71,6 +72,9 @@ enum CliMode {
     },
     /// Pure client connecting to `addr`. Skips the main menu.
     Client { addr: Option<core::net::SocketAddr> },
+    /// Hosted session loading `save_name`, skipping the main menu — the
+    /// same path as menu → Load, for dev/debug of real saves.
+    HostLoad { save_name: String },
     /// Default: client with the main menu.
     Solo,
 }
@@ -112,6 +116,13 @@ fn parse_cli() -> CliMode {
             });
             CliMode::Client { addr }
         }
+        "host" | "h" => match args.next() {
+            Some(save_name) => CliMode::HostLoad { save_name },
+            None => {
+                eprintln!("host needs a save name; opening the menu instead");
+                CliMode::Solo
+            }
+        },
         _ => CliMode::Solo,
     }
 }
@@ -122,6 +133,9 @@ fn main() {
         CliMode::Client { addr } => {
             let target = addr.unwrap_or(crate::network::LOCAL_CONNECT_ADDR);
             run_client(Some(LaunchMode::JoinRemote { addr: target }));
+        }
+        CliMode::HostLoad { save_name } => {
+            run_client(Some(LaunchMode::HostLoad { save_name }));
         }
         CliMode::Solo => run_client(None),
     }

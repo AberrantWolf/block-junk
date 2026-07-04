@@ -43,6 +43,12 @@ pub enum NpcBootstrapError {
     WorkDefaultsUnknownNeed(String),
     #[error("work defaults duration_secs must be > 0, got {0}")]
     WorkDefaultsBadDuration(f32),
+    #[error("kind {kind} stat {stat:?} is invalid: {problem}")]
+    KindStatInvalid {
+        kind: String,
+        stat: String,
+        problem: &'static str,
+    },
 }
 
 /// Registered NPC kinds, keyed by full string id. Spawned NPCs reference
@@ -91,6 +97,28 @@ impl NpcKindRegistry {
                         kind: def.id.0.clone(),
                         slot,
                         anim: anim.clone(),
+                    });
+                }
+            }
+            // Stat declarations: fail loudly on malformed data — a bad
+            // range would silently skew every roll of the kind.
+            for (i, stat) in def.stats.iter().enumerate() {
+                let problem = if stat.id.is_empty() {
+                    Some("empty id")
+                } else if !stat.min.is_finite() || !stat.max.is_finite() {
+                    Some("non-finite range")
+                } else if stat.min > stat.max {
+                    Some("min > max")
+                } else if def.stats[..i].iter().any(|s| s.id == stat.id) {
+                    Some("duplicate id")
+                } else {
+                    None
+                };
+                if let Some(problem) = problem {
+                    return Err(NpcBootstrapError::KindStatInvalid {
+                        kind: def.id.0.clone(),
+                        stat: stat.id.clone(),
+                        problem,
                     });
                 }
             }

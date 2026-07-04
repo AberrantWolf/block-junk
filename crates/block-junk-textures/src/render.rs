@@ -24,14 +24,19 @@ use std::collections::HashMap;
 
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::image::Image;
-use bevy::pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin};
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::pbr::{
+    ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+    MaterialPlugin,
+};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat, TextureViewDescriptor,
+    AsBindGroup, CompareFunction, Extent3d, RenderPipelineDescriptor, ShaderType,
+    SpecializedMeshPipelineError, TextureDimension, TextureFormat, TextureViewDescriptor,
     TextureViewDimension,
 };
 use bevy::render::storage::ShaderBuffer;
-use bevy::shader::ShaderRef;
+use bevy::shader::{ShaderRef, load_shader_library};
 
 use crate::bake::BakedTexture;
 
@@ -215,13 +220,147 @@ impl MaterialExtension for BlockTextureExt {
 
 pub type ChunkMaterial = ExtendedMaterial<StandardMaterial, BlockTextureExt>;
 
-/// Registers the embedded shader + the material. Add once per app
+const GHOST_SHADER_PATH: &str = "embedded://block_junk_textures/render/ghost_block.wgsl";
+
+/// Uniform block for [`GhostBlockExt`]. Mirrors WGSL `GhostParams` in
+/// `ghost_block.wgsl` — field order and explicit padding must match.
+#[derive(ShaderType, Clone, Copy, Debug)]
+pub struct GhostParams {
+    /// Multiplies the composited display-space color: white = the
+    /// block's real look, red = invalid placement, amber = waiting on
+    /// materials.
+    pub tint: Vec4,
+    /// Block slot whose textures to composite (ghost cubes carry no
+    /// vertex-color slot encoding).
+    pub slot: u32,
+    /// Dither coverage in [0,1] up close.
+    pub coverage: f32,
+    /// Coverage floor the distance fade eases toward — keep nonzero so
+    /// far-away plans stay a faint sketch instead of vanishing.
+    pub min_coverage: f32,
+    /// Camera distance (m) where the fade begins.
+    pub fade_start: f32,
+    /// Camera distance (m) where coverage reaches `min_coverage`. Set
+    /// `min_coverage == coverage` to disable fading (cursor ghost).
+    pub fade_end: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+}
+
+impl GhostParams {
+    /// Constant-coverage params (no distance fade) — the cursor ghost.
+    pub fn fixed(slot: u32, tint: Vec4, coverage: f32) -> Self {
+        Self {
+            tint,
+            slot,
+            coverage,
+            min_coverage: coverage,
+            fade_start: f32::MAX,
+            fade_end: f32::MAX,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        }
+    }
+
+    /// Distance-faded params — committed plan ghosts.
+    pub fn faded(
+        slot: u32,
+        tint: Vec4,
+        coverage: f32,
+        min_coverage: f32,
+        fade_start: f32,
+        fade_end: f32,
+    ) -> Self {
+        Self {
+            min_coverage,
+            fade_start,
+            fade_end,
+            ..Self::fixed(slot, tint, coverage)
+        }
+    }
+}
+
+/// Pipeline-key data for [`GhostBlockExt`]: the front and x-ray
+/// variants of one material type specialize into different pipelines
+/// (depth state) keyed by this.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GhostBlockKey {
+    pub xray: bool,
+}
+
+impl From<&GhostBlockExt> for GhostBlockKey {
+    fn from(ext: &GhostBlockExt) -> Self {
+        Self { xray: ext.xray }
+    }
+}
+
+/// Extension rendering a single block's composited texture as a
+/// dithered screen-door ghost. Shares the tile array + lookup tables
+/// with [`BlockTextureExt`] (same handles, zero extra GPU uploads);
+/// adds the per-ghost uniform.
+///
+/// Two variants of the same type, split by `xray` via the pipeline key:
+///   - `xray: false` — base `alpha_mode` MUST be `Opaque`: renders in
+///     the Opaque pass, writes depth, ghosts occlude each other.
+///   - `xray: true` — base `alpha_mode` MUST be `Blend`: routes to
+///     Transparent3d (draws after all opaques), depth compare flipped
+///     to `Less` (reversed-Z "behind world geometry"), no depth write —
+///     the sparse behind-wall hint.
+#[derive(Asset, AsBindGroup, Clone, TypePath)]
+#[bind_group_data(GhostBlockKey)]
+pub struct GhostBlockExt {
+    #[texture(100, dimension = "2d_array")]
+    pub tiles: Handle<Image>,
+    #[storage(101, read_only)]
+    pub blocks: Handle<ShaderBuffer>,
+    #[storage(102, read_only)]
+    pub textures: Handle<ShaderBuffer>,
+    #[storage(103, read_only)]
+    pub layers: Handle<ShaderBuffer>,
+    #[uniform(104)]
+    pub params: GhostParams,
+    pub xray: bool,
+}
+
+impl MaterialExtension for GhostBlockExt {
+    fn fragment_shader() -> ShaderRef {
+        GHOST_SHADER_PATH.into()
+    }
+
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if key.bind_group_data.xray
+            && let Some(ds) = descriptor.depth_stencil.as_mut()
+        {
+            // Reversed-Z: `Less` keeps fragments FARTHER than the depth
+            // buffer — i.e. behind existing geometry. No depth write so
+            // the hint pass leaves no trace.
+            ds.depth_compare = Some(CompareFunction::Less);
+            ds.depth_write_enabled = Some(false);
+        }
+        Ok(())
+    }
+}
+
+pub type GhostBlockMaterial = ExtendedMaterial<StandardMaterial, GhostBlockExt>;
+
+/// Registers the embedded shaders + the materials. Add once per app
 /// (game client and texture-studio both use it).
 pub struct ChunkMaterialPlugin;
 
 impl Plugin for ChunkMaterialPlugin {
     fn build(&self, app: &mut App) {
+        load_shader_library!(app, "render/composite.wgsl");
+        load_shader_library!(app, "render/dither.wgsl");
         embedded_asset!(app, "render/chunk_material.wgsl");
+        embedded_asset!(app, "render/ghost_block.wgsl");
         app.add_plugins(MaterialPlugin::<ChunkMaterial>::default());
+        app.add_plugins(MaterialPlugin::<GhostBlockMaterial>::default());
     }
 }

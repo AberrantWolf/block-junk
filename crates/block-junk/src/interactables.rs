@@ -85,6 +85,13 @@ impl InteractableIndex {
 #[derive(Resource, Default, Debug)]
 pub struct InteractionClaims {
     by_anchor: HashMap<IVec3, NpcId>,
+    /// Anchors whose approach recently defeated an NPC (physically
+    /// stuck mid-walk or no A* path) → world-time when retries may
+    /// resume. Same 30 s backoff pattern as `HaulStore`'s unreachable
+    /// memo: without it a starving NPC re-picks the same blocked
+    /// basket every stuck-release forever while reachable alternatives
+    /// sit ignored one entry further down the snapshot.
+    unreachable_until: HashMap<IVec3, f32>,
 }
 
 impl InteractionClaims {
@@ -132,6 +139,21 @@ impl InteractionClaims {
             Some(holder) => holder.0 != npc.0,
             None => false,
         }
+    }
+
+    /// Record that reaching `anchor` just failed (A* miss or physical
+    /// stuck); the planner snapshot won't offer it again until
+    /// `retry_at` (elapsed seconds).
+    pub fn memo_unreachable(&mut self, anchor: IVec3, retry_at: f32) {
+        self.unreachable_until.insert(anchor, retry_at);
+    }
+
+    /// True while `anchor` is memoized as unreachable. Read-only (no
+    /// lazy prune — the table is bounded by the interactable count).
+    pub fn is_unreachable(&self, anchor: IVec3, now: f32) -> bool {
+        self.unreachable_until
+            .get(&anchor)
+            .is_some_and(|&retry_at| now < retry_at)
     }
 }
 

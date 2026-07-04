@@ -55,7 +55,9 @@ impl PlayerMode {
     pub fn verb_hint(self) -> &'static str {
         match self {
             PlayerMode::Normal => "L: mine · R: interact",
-            PlayerMode::Plan => "L: remove · R: build\nwheel: block · Ctrl+wheel: rotate",
+            PlayerMode::Plan => {
+                "L: remove · R: build\n1-9/wheel: block · re-press: deselect · Ctrl+wheel: rotate"
+            }
         }
     }
 
@@ -199,9 +201,10 @@ fn spawn_verb_hint(commands: &mut Commands, mode: PlayerMode) {
 }
 
 /// Compact hint strip sitting just above the mode pill: one `Tab` key
-/// cap (the cycle binding) followed by `1`/`2` key caps each paired
-/// with the destination mode's icon. Always-on; cheap to leave in the
-/// HUD because the player can stop reading once they've memorised it.
+/// cap (the cycle binding) followed by the mode icons in cycle order.
+/// Digit keys belong to the hotbar now, so no per-mode key caps.
+/// Always-on; cheap to leave in the HUD because the player can stop
+/// reading once they've memorised it.
 fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer) {
     commands
         .spawn((
@@ -218,26 +221,14 @@ fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer) {
         .with_children(|row| {
             spawn_key_cap(row, "Tab");
             for m in PlayerMode::ALL {
-                let label = match m {
-                    PlayerMode::Normal => "1",
-                    PlayerMode::Plan => "2",
-                };
-                row.spawn(Node {
-                    column_gap: Val::Px(3.0),
-                    align_items: AlignItems::Center,
-                    ..default()
-                })
-                .with_children(|pair| {
-                    spawn_key_cap(pair, label);
-                    pair.spawn((
-                        ImageNode::new(asset_server.load(m.icon_path())),
-                        Node {
-                            width: Val::Px(18.0),
-                            height: Val::Px(18.0),
-                            ..default()
-                        },
-                    ));
-                });
+                row.spawn((
+                    ImageNode::new(asset_server.load(m.icon_path())),
+                    Node {
+                        width: Val::Px(18.0),
+                        height: Val::Px(18.0),
+                        ..default()
+                    },
+                ));
             }
         });
 }
@@ -292,26 +283,15 @@ fn handle_mode_input(
         return;
     }
 
+    // Tab / Shift+Tab is the whole binding — digit keys belong to the
+    // hotbar (`client::hotbar_digit_select`), which is why the old
+    // 1/2 direct-select was retired.
     if keys.just_pressed(KeyCode::Tab) {
         let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
         let next = mode.cycle(!shift);
         if next != *mode {
             *mode = next;
         }
-        return;
-    }
-
-    let direct = if keys.just_pressed(KeyCode::Digit1) {
-        Some(PlayerMode::Normal)
-    } else if keys.just_pressed(KeyCode::Digit2) {
-        Some(PlayerMode::Plan)
-    } else {
-        None
-    };
-    if let Some(m) = direct
-        && m != *mode
-    {
-        *mode = m;
     }
 }
 

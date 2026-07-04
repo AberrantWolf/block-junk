@@ -25,7 +25,10 @@ use bevy::render::storage::ShaderBuffer;
 use block_junk_textures::render::{BlockTexGpu, build_gpu_textures};
 use block_junk_textures::{BakedTexture, TexError, TextureSetDoc, bake_set, flatten, lua_io};
 
-pub use block_junk_textures::render::{BlockTextureExt, ChunkMaterial, ChunkMaterialPlugin};
+pub use block_junk_textures::render::{
+    BlockTextureExt, ChunkMaterial, ChunkMaterialPlugin, GhostBlockExt, GhostBlockMaterial,
+    GhostParams,
+};
 
 use crate::blocks::{BlockRegistry, BlockSlot};
 

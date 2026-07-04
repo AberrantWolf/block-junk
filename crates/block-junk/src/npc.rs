@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::blocks::BlockRegistry;
 use crate::collision::WorldCollision;
-use crate::haul::HaulStore;
+use crate::haul::{HaulStore, HaulTarget};
 use crate::interactables::{InteractableIndex, InteractionClaims};
 use crate::items::ItemSlot;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
@@ -107,6 +107,28 @@ pub struct NpcKind(pub String);
 /// in that state.
 #[derive(Component, Clone, Debug, Default)]
 pub struct Needs(pub HashMap<String, f32>);
+
+/// Per-NPC rolled stat values, keyed by
+/// [`NpcStatDef`](block_junk_mod_api::npcs::NpcStatDef) id. Rolled once
+/// at spawn from the NPC's persisted rng, fixed for life, saved with
+/// the NPC, and mirrored into `NpcSnapshot.stats` for the Lua planner.
+/// Never decays — parallel to [`Needs`] in storage shape only.
+#[derive(Component, Clone, Debug, Default)]
+pub struct NpcStats(pub HashMap<String, f32>);
+
+/// Roll every stat a kind declares, in registration order (declaration
+/// order is what makes the roll deterministic for a given rng state).
+pub fn roll_stats(
+    defs: &[block_junk_mod_api::npcs::NpcStatDef],
+    rng: &mut u64,
+) -> HashMap<String, f32> {
+    defs.iter()
+        .map(|def| {
+            let value = def.min + rand_unit(rng) * (def.max - def.min);
+            (def.id.clone(), value)
+        })
+        .collect()
+}
 
 /// Per-NPC marker indicating its planner has errored and shouldn't run
 /// again this session. The brain tick filters this out via
@@ -584,7 +606,74 @@ impl Plugin for NpcServerPlugin {
         // animation. Updates after the brain tick so the broadcast
         // reflects the just-decided goal.
         app.add_systems(FixedUpdate, refresh_npc_activity.after(npc_brain_tick));
+        // Settlement-arc S1 diagnostics — read-only census; Update is
+        // fine (it samples, it doesn't steer).
+        app.add_systems(Update, npc_census);
     }
+}
+
+/// Seconds between census log lines.
+const NPC_CENSUS_INTERVAL_SECS: f32 = 5.0;
+/// A `MoveTo` NPC that displaced less than this since the last census
+/// reads as "not actually moving."
+const NPC_CENSUS_MOVE_EPSILON_M: f32 = 0.25;
+
+/// Settlement-arc S1 instrumentation: periodically bucket NPCs by goal
+/// variant and count movers that aren't moving. The 2026-05-18 playtest
+/// ended with "most of my dudes ended up stuck" and no way to tell WHICH
+/// failure mode accumulated (embedded body, impossible path, disabled
+/// brain, corner-fight) — this log identifies the growing bucket so the
+/// fix targets the right cause. Read-only; safe to leave on.
+fn npc_census(
+    time: Res<Time>,
+    mut last_run: Local<f32>,
+    mut last_positions: Local<HashMap<u64, Vec3>>,
+    npcs: Query<(&NpcId, &Brain, &AvatarPose, Has<BrainDisabled>), With<Npc>>,
+) {
+    let now = time.elapsed_secs();
+    if now - *last_run < NPC_CENSUS_INTERVAL_SECS {
+        return;
+    }
+    *last_run = now;
+    if npcs.is_empty() {
+        return;
+    }
+    let (mut idle, mut moving, mut resting, mut interacting, mut working, mut crafting) =
+        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut disabled = 0u32;
+    let mut movers_not_moving = 0u32;
+    let mut max_path_stuck_secs: f32 = 0.0;
+    let mut positions: HashMap<u64, Vec3> = HashMap::with_capacity(last_positions.len());
+    for (id, brain, pose, is_disabled) in &npcs {
+        if is_disabled {
+            disabled += 1;
+        }
+        let displaced = last_positions
+            .get(&id.0)
+            .map(|prev| prev.distance(pose.translation));
+        positions.insert(id.0, pose.translation);
+        match &brain.goal {
+            Goal::Idle => idle += 1,
+            Goal::MoveTo { stuck_secs, .. } => {
+                moving += 1;
+                max_path_stuck_secs = max_path_stuck_secs.max(*stuck_secs);
+                if displaced.is_some_and(|d| d < NPC_CENSUS_MOVE_EPSILON_M) {
+                    movers_not_moving += 1;
+                }
+            }
+            Goal::Resting { .. } => resting += 1,
+            Goal::Interacting { .. } => interacting += 1,
+            Goal::Working { .. } => working += 1,
+            Goal::CraftingAtStation { .. } => crafting += 1,
+        }
+    }
+    *last_positions = positions;
+    info!(
+        "npc census: {} | idle={idle} move={moving} rest={resting} interact={interacting} \
+         work={working} craft={crafting} | disabled={disabled} \
+         movers_not_moving={movers_not_moving} max_path_stuck={max_path_stuck_secs:.1}s",
+        npcs.iter().count(),
+    );
 }
 
 /// Map [`Brain::goal`] onto the replicated [`NpcAnimOverride`]. The
@@ -724,14 +813,14 @@ fn spawn_initial_npc_on_first_connect(
         return;
     }
     let kind_id = "vanilla:wanderer";
-    let default_needs = match kinds.get(kind_id) {
-        Some(def) => def.default_needs.clone(),
+    let (default_needs, stat_defs) = match kinds.get(kind_id) {
+        Some(def) => (def.default_needs.clone(), def.stats.clone()),
         None => {
             warn!(
                 kind = kind_id,
                 "no NPC kind registered; spawning with empty needs (native fallback brain)"
             );
-            HashMap::new()
+            (HashMap::new(), Vec::new())
         }
     };
     // Offset positions east + south of the player spawn (0, 32, 60).
@@ -746,6 +835,11 @@ fn spawn_initial_npc_on_first_connect(
     ];
     for translation in cluster.into_iter() {
         let id = allocator.allocate();
+        // Roll stats from the same rng the brain keeps: the roll
+        // advances the state, and the advanced state goes into Brain so
+        // save/load reproduces neither the roll nor the wander stream.
+        let mut rng = 0xDEAD_BEEF_CAFE_F00D ^ id.0;
+        let stats = roll_stats(&stat_defs, &mut rng);
         // Nested tuples work around Bevy's 15-element Bundle cap. Two
         // groups: identity/brain (cheap markers + structured state) and
         // physics + replication (per-frame state + lightyear).
@@ -756,9 +850,10 @@ fn spawn_initial_npc_on_first_connect(
                 id,
                 NpcKind(kind_id.into()),
                 Needs(default_needs.clone()),
+                NpcStats(stats),
                 Brain {
                     goal: Goal::Idle,
-                    rng: 0xDEAD_BEEF_CAFE_F00D ^ id.0,
+                    rng,
                     home_cluster: None,
                     preempt_cooldown_secs: 0.0,
                 },
@@ -912,6 +1007,7 @@ type BrainNpcQuery<'w, 's> = Query<
         &'static mut Carrying,
         &'static mut EquippedTool,
         &'static NpcKind,
+        &'static NpcStats,
         Has<KinematicLock>,
     ),
     (With<Npc>, Without<BrainDisabled>),
@@ -1134,6 +1230,7 @@ fn npc_brain_tick(
         mut carrying,
         mut equipped_tool,
         kind,
+        stats,
         is_locked,
     ) in npcs.iter_mut()
     {
@@ -1874,12 +1971,32 @@ fn npc_brain_tick(
                 match on_arrive {
                     ArrivalAction::Interact {
                         anchor_cell,
-                        exclusive: true,
+                        exclusive,
                         ..
                     } => {
-                        interaction_claims.release(*anchor_cell, *npc_id);
+                        // Physically stuck en route despite a valid
+                        // path (wedged on furniture, jammed in a
+                        // doorway) — back off like the haul/work arms
+                        // below, or a starving NPC re-picks the same
+                        // blocked target every stuck-release forever.
+                        interaction_claims.memo_unreachable(
+                            *anchor_cell,
+                            now_secs + HAUL_UNREACHABLE_RETRY_SECS,
+                        );
+                        if *exclusive {
+                            interaction_claims.release(*anchor_cell, *npc_id);
+                        }
                     }
                     ArrivalAction::Work { target_cell, .. } => {
+                        // Physically stuck/timed out en route, even
+                        // though A* found a path — memoize like the
+                        // A*-failure branch does, or the planner
+                        // re-picks the same plan next tick and the NPC
+                        // ping-pongs against the same obstacle.
+                        haul.store.memo_unreachable(
+                            crate::haul::HaulTarget::Plan(*target_cell),
+                            now_secs + HAUL_UNREACHABLE_RETRY_SECS,
+                        );
                         haul.plan_claims.release(*target_cell, *npc_id);
                     }
                     ArrivalAction::PickupForPlan { .. }
@@ -1887,8 +2004,21 @@ fn npc_brain_tick(
                     | ArrivalAction::DepositAtStation { .. }
                     | ArrivalAction::PickupTool { .. } => {
                         // Stuck or timed out mid-haul: free the entire
-                        // assignment + every reservation it holds. The
-                        // scheduler will repick next tick.
+                        // assignment + every reservation it holds.
+                        // Memoize the assignment's target first — the
+                        // walk failed physically (A* said yes, the
+                        // world said no), and without the same backoff
+                        // the A*-failure branch gets, the scheduler
+                        // re-commits the identical target every
+                        // STUCK_REPLAN_SECS forever (the playtest's
+                        // ~1.5 s "haul assignment committed" spam).
+                        if let Some(a) = haul.store.assignment_of(*npc_id) {
+                            let target = a.target;
+                            haul.store.memo_unreachable(
+                                target,
+                                now_secs + HAUL_UNREACHABLE_RETRY_SECS,
+                            );
+                        }
                         haul.store.release_for_npc(*npc_id);
                     }
                     ArrivalAction::WorkStation { .. } => {
@@ -2300,6 +2430,7 @@ fn npc_brain_tick(
                 &kind_id,
                 &pose,
                 &needs,
+                stats,
                 &equipped_tool,
                 &anchors.rooms,
                 &interactable_index,
@@ -2314,6 +2445,7 @@ fn npc_brain_tick(
                 &haul.item_registry,
                 &work_defaults.0,
                 world_clock,
+                now_secs,
             );
             // One-line per-NPC trace at every planner call so a
             // session log shows what each NPC saw on each decision.
@@ -2730,6 +2862,13 @@ fn npc_brain_tick(
                                 reason,
                                 "interact failed: no A* path to approach cell, releasing claim and parking briefly"
                             );
+                            // Same backoff the work/haul A*-miss arms
+                            // use — no point re-offering this anchor
+                            // to the planner every tick.
+                            interaction_claims.memo_unreachable(
+                                anchor_cell,
+                                now_secs + HAUL_UNREACHABLE_RETRY_SECS,
+                            );
                             if exclusive {
                                 interaction_claims.release(anchor_cell, *npc_id);
                             }
@@ -2784,12 +2923,13 @@ fn npc_brain_tick(
                     // reload, future mod changes). Degrade silently
                     // to a brief rest — same pattern as the no-tag
                     // branch above.
+                    let commit_verb = plan_kind.work_verb();
                     let commit_required_tool = match plan_kind {
                         PlanKind::Build { slot, .. } => block_registry
                             .def(slot)
                             .work_action
                             .as_ref()
-                            .and_then(|w| w.required_tool.clone()),
+                            .and_then(|w| w.tool_for(commit_verb).cloned()),
                         PlanKind::Remove => {
                             let (coord, local) = world_to_chunk(target_cell);
                             chunk_map
@@ -2805,7 +2945,7 @@ fn npc_brain_tick(
                                         .def(s)
                                         .work_action
                                         .as_ref()
-                                        .and_then(|w| w.required_tool.clone())
+                                        .and_then(|w| w.tool_for(commit_verb).cloned())
                                 })
                         }
                     };
@@ -2911,6 +3051,17 @@ fn npc_brain_tick(
                                 stand = ?stand_cell.to_array(),
                                 reason,
                                 "work failed: no A* path to standable neighbour, releasing claim and parking briefly"
+                            );
+                            // Memoize like the haul scheduler does, or the
+                            // planner re-picks this exact plan on the next
+                            // idle entry and the NPC livelocks at ~2 Hz on
+                            // commit→path-fail→park (2026-07-03 playtest:
+                            // a roof-level tag pinned two NPCs for good).
+                            // `collect_nearby_plans` hides memoized cells,
+                            // so the planner falls through to other work.
+                            haul.store.memo_unreachable(
+                                HaulTarget::Plan(target_cell),
+                                now_secs + HAUL_UNREACHABLE_RETRY_SECS,
                             );
                             haul.plan_claims.release(target_cell, *npc_id);
                             if !npc_path.0.is_empty() {
@@ -3277,7 +3428,6 @@ fn pick_next_haul_leg<W: Walkability>(
     item_registry: &crate::items::ItemRegistry,
     world: &W,
 ) -> Result<Option<Goal>, ()> {
-    use crate::haul::HaulTarget;
     // Tool prereq comes first. Until the NPC has the right tool, no
     // amount of material hauling helps — work would be gated at the
     // plan. Scheduler reserved this tool atomically, so by the time
@@ -3392,6 +3542,7 @@ fn build_snapshot(
     kind: &NpcKindId,
     pose: &AvatarPose,
     needs: &Needs,
+    stats: &NpcStats,
     equipped_tool: &EquippedTool,
     rooms: &RoomMap,
     interactables: &InteractableIndex,
@@ -3406,6 +3557,7 @@ fn build_snapshot(
     item_registry: &crate::items::ItemRegistry,
     work_defaults: &block_junk_mod_api::npcs::WorkDefaults,
     world_clock: WorldClock,
+    now_secs: f32,
 ) -> NpcSnapshot {
     let foot = pose_to_foot_cell(pose);
     let nearby_rooms = collect_nearby_rooms(rooms, foot, SNAPSHOT_ROOM_LIMIT);
@@ -3419,10 +3571,13 @@ fn build_snapshot(
         foot,
         SNAPSHOT_INTERACTION_RADIUS_CELLS,
         SNAPSHOT_INTERACTION_LIMIT,
+        now_secs,
     );
     let nearby_plans = collect_nearby_plans(
         plans,
         plan_claims,
+        haul_store,
+        now_secs,
         id,
         equipped_tool,
         foot,
@@ -3464,6 +3619,7 @@ fn build_snapshot(
             z: foot.z,
         },
         needs: needs.0.clone(),
+        stats: stats.0.clone(),
         nearby_rooms,
         nearby_interactions,
         nearby_plans,
@@ -3487,9 +3643,15 @@ fn build_snapshot(
     clippy::too_many_arguments,
     reason = "snapshot collector mirrors live brain lookups"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "flat filter pipeline over several registries"
+)]
 fn collect_nearby_plans(
     plans: &Plans,
     plan_claims: &PlanClaims,
+    haul_store: &HaulStore,
+    now_secs: f32,
     self_id: NpcId,
     equipped_tool: &EquippedTool,
     foot: IVec3,
@@ -3530,6 +3692,19 @@ fn collect_nearby_plans(
             );
             continue;
         }
+        // Memoized-unreachable gate: a plan whose stand cell recently
+        // failed A* (from the planner's WorkPlan commit or the haul
+        // scheduler) is hidden until the memo expires, so the planner
+        // falls through to reachable work instead of livelocking on
+        // commit→path-fail→park against the same cell.
+        if haul_store.is_unreachable_peek(HaulTarget::Plan(*cell), now_secs) {
+            trace!(
+                npc = self_id.0,
+                cell = ?cell.to_array(),
+                "nearby plan filter: memoized unreachable",
+            );
+            continue;
+        }
         // Phase-3 gate: NPCs can only commit to plans whose materials
         // are fully delivered. Pending-materials Build plans wait for
         // the player (or the haul scheduler) to fill them — the
@@ -3563,7 +3738,7 @@ fn collect_nearby_plans(
         };
         if let Some(slot) = block_slot
             && let Some(work) = &block_registry.def(slot).work_action
-            && let Some(required) = &work.required_tool
+            && let Some(required) = work.tool_for(state.kind.work_verb())
             && !item_registry.tool_has_tag(equipped_tool.item, required)
         {
             trace!(
@@ -3944,6 +4119,7 @@ fn collect_nearby_interactions(
     foot: IVec3,
     radius_cells: i32,
     limit: usize,
+    now_secs: f32,
 ) -> Vec<NearbyInteraction> {
     let mut seen_anchors: HashSet<IVec3> = HashSet::new();
     let mut out: Vec<NearbyInteraction> = Vec::new();
@@ -3966,6 +4142,12 @@ fn collect_nearby_interactions(
         // exclusive blocks ignore claims entirely (anyone may use
         // a water well at the same time).
         if i.exclusive && claims.is_taken_by_other(anchor, self_id) {
+            continue;
+        }
+        // Recently defeated an NPC's walk (stuck or no path) ⇒
+        // excluded until the backoff expires, so the planner offers
+        // the next-nearest alternative instead of the same dead end.
+        if claims.is_unreachable(anchor, now_secs) {
             continue;
         }
         let d = anchor - foot;
@@ -4294,6 +4476,17 @@ fn step_up_imminent(path: &[IVec3], progress: f32, foot_y: i32) -> bool {
             traversed = segment_end;
             continue;
         }
+        // The segment being traversed sits WHOLLY above the feet: the
+        // NPC is below its own path — it slid off a ledge mid-walk, or
+        // the path was planned from a higher cell it never reached.
+        // Endpoint deltas can't see this (both ends are already "up"),
+        // so without this check the NPC presses into the riser forever
+        // and never jumps — the playtest's "won't jump the 1-high
+        // wall" stall. `min` keeps step-DOWN segments (one end at foot
+        // level) from spuriously hopping.
+        if w[0].y.min(w[1].y) > foot_y {
+            return true;
+        }
         // How far ahead of the NPC's progress this segment ends.
         let dist_to_end = segment_end - progress;
         if dist_to_end > JUMP_TRIGGER_DIST {
@@ -4378,7 +4571,7 @@ pub(crate) fn npc_physics_step(
 
 /// splitmix64-style PRNG. Returns a uniform float in [0, 1). Quality
 /// only has to fool human eyes scanning wander patterns.
-fn rand_unit(state: &mut u64) -> f32 {
+pub(crate) fn rand_unit(state: &mut u64) -> f32 {
     *state = state.wrapping_add(0x9E3779B97F4A7C15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);

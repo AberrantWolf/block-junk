@@ -12,7 +12,9 @@ use bevy::world_serialization::WorldInstanceReady;
 use lightyear::frame_interpolation::prelude::*;
 use lightyear::input::native::prelude::*;
 
-use crate::block_textures::{BlockTextures, BlockTexturesPlugin};
+use crate::block_textures::{
+    BlockTextures, BlockTexturesPlugin, GhostBlockExt, GhostBlockMaterial, GhostParams,
+};
 use crate::blocks::{BlockRegistry, BlockSlot, TerrainSlots};
 use crate::camera::{FlyCam, FlyCamPlugin};
 use crate::client_chunks::{BlockEntities, mesh_chunks, refresh_block_entities};
@@ -29,14 +31,15 @@ use crate::physics::{
 use crate::plans::{Plans, PlansClientPlugin};
 use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{
-    PreviewBack, PreviewFront, PreviewMaterialPair, PreviewPlugin, PreviewSceneReady,
+    DitherExt, DitherMeshMaterial, DitherParams, GhostMeshMaterials, GhostMeshStyle,
+    PreviewPlugin, PreviewSceneReady,
 };
 use crate::protocol::{
     ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
     ModSetManifest, Carrying, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
     DropToolRequest, EquippedTool, GameSet, INTERACT_REACH, MovementIntent, MovementMode,
-    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, WorldChannel, WorldClock, WorldClockSync,
-    WorldItem,
+    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, PlanState, WorldChannel, WorldClock,
+    WorldClockSync, WorldItem,
 };
 use crate::target_outline::TargetOutlinePlugin;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
@@ -50,6 +53,7 @@ impl Plugin for ClientPlugin {
             .add_plugins(PlayerModePlugin)
             .add_plugins(TargetOutlinePlugin)
             .add_plugins(PlansClientPlugin)
+            .add_plugins(crate::room_sync::RoomSyncClientPlugin)
             .add_plugins(crate::plan_ghosts::PlanGhostsPlugin)
             .add_plugins(crate::craft_stations::CraftStationsClientPlugin)
             .add_plugins(crate::craft_ui::CraftUiPlugin)
@@ -112,6 +116,7 @@ impl Plugin for ClientPlugin {
                     drop_carry_input,
                     drop_tool_input,
                     cycle_selected_or_rotation,
+                    hotbar_digit_select,
                     reset_rotation_on_selection_change,
                 )
                     .in_set(GameSet::Input),
@@ -218,6 +223,8 @@ impl Plugin for ClientPlugin {
                     refresh_block_entities,
                     update_hotbar_highlight,
                     update_hotbar_visibility,
+                    update_selected_block_hud,
+                    update_plan_status_hud,
                     update_carry_hud,
                     update_tool_hud,
                     update_action_progress_ui,
@@ -294,18 +301,21 @@ const KAYKIT_KNIGHT_GLB: &str = "mods://vanilla/models/characters/Knight.glb";
 #[derive(Resource)]
 pub struct PlaceablePalette(pub Vec<BlockSlot>);
 
-/// Index into [`PlaceablePalette`] of the currently selected entry.
-/// Mouse wheel cycles. Read only by Plan-mode R-click Build — Normal
-/// mode drives its verb from cursor context, not the hotbar.
+/// Index into [`PlaceablePalette`] of the currently selected entry, or
+/// `None` when the hand is empty (no Build ghost, R-click Build inert —
+/// the mode for pure demolition planning). Mouse wheel cycles; digit
+/// keys 1-9 jump-select, re-pressing the active digit deselects. Read
+/// only by Plan-mode R-click Build — Normal mode drives its verb from
+/// cursor context, not the hotbar.
 #[derive(Resource, Default)]
-pub struct SelectedBlock(pub usize);
+pub struct SelectedBlock(pub Option<usize>);
 
 impl SelectedBlock {
-    /// The selected block, or `None` if the palette is empty (no
-    /// placeable blocks registered — shouldn't happen in practice,
-    /// vanilla mods register at least a few).
+    /// The selected block, or `None` when deselected or the palette is
+    /// empty (no placeable blocks registered — shouldn't happen in
+    /// practice, vanilla mods register at least a few).
     pub fn current_block(&self, palette: &PlaceablePalette) -> Option<BlockSlot> {
-        palette.0.get(self.0).copied()
+        palette.0.get(self.0?).copied()
     }
 }
 
@@ -325,6 +335,19 @@ pub struct PlacementRotation(pub Cardinal);
 #[derive(Resource, Default)]
 pub struct PlayerActionState {
     pub active: Option<ActiveAction>,
+    /// Set when a hold-path action completes while L stays held. The
+    /// continuing hold may only chain onto the same verb against the
+    /// same block type; anything else waits for a fresh press. Kills
+    /// the fall-through where breaking a block (or picking up an item)
+    /// immediately started mining whatever the ray hit next.
+    pub hold_latch: Option<HoldLatch>,
+}
+
+/// See [`PlayerActionState::hold_latch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldLatch {
+    pub verb: ActionKind,
+    pub block: BlockSlot,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -349,6 +372,16 @@ pub const PLAYER_ACTION_DURATION_SECS: f32 = 0.6;
 
 #[derive(Component)]
 struct HotbarSlot(usize);
+
+/// Marker on the text naming the selected hotbar block (or the
+/// empty-hand state) at the bottom of the hotbar column.
+#[derive(Component)]
+struct SelectedBlockHudLabel;
+
+/// Marker on the Build-plan tally text ("N ready · M waiting") under
+/// the hotbar column.
+#[derive(Component)]
+struct PlanStatusLabel;
 
 /// Marker on the absolute-positioned root Node holding the hotbar
 /// column. Used to flip the whole column's `Visibility` in modes that
@@ -408,19 +441,31 @@ struct PreviewCubeRoot;
 #[derive(Component)]
 struct PreviewWorldAssetRoot;
 
-// `PreviewSceneReady` + `PreviewMaterialPair` live in `preview.rs` —
+// `PreviewSceneReady` + `GhostMeshStyle` live in `preview.rs` —
 // shared with the plan-ghost system, which reuses the same material-
-// swap observer below with per-block handles.
+// swap observer below with per-plan params.
 
-/// Shared material handles for every preview draw. Two materials
-/// (front, back) get re-tinted each frame from the selected block's
-/// swatch + a validity flag, so a single pair covers every block. The
-/// cube mesh is held alive via the cube preview's `Mesh3d` child
-/// entities, no separate handle needed here.
+/// Dither coverage of the cursor placement ghost. Deliberately denser
+/// than committed plan ghosts (0.35) so the live placement always
+/// reads stronger than the queue behind it. No distance fade — the
+/// cursor cell is always within reach.
+const CURSOR_GHOST_COVERAGE: f32 = 0.55;
+/// Coverage of the cursor ghost's behind-wall x-ray pass.
+const CURSOR_XRAY_COVERAGE: f32 = 0.2;
+/// Tint multiplier for an invalid placement (footprint overlaps solid
+/// cells): the ghost stays visible but reads unmistakably "no".
+const INVALID_TINT: Vec4 = Vec4::new(1.0, 0.25, 0.25, 1.0);
+
+/// Shared material handles for the cursor's cube preview. Two
+/// [`GhostBlockMaterial`] instances (front + x-ray) get their `slot` +
+/// `tint` params rewritten each frame from the selected block and a
+/// validity flag, so a single pair covers every voxel block. Mesh-block
+/// previews create their own per-scene materials via the swap observer
+/// and re-tint through [`GhostMeshMaterials`].
 #[derive(Resource)]
 struct PreviewMaterials {
-    front: Handle<PreviewFront>,
-    back: Handle<PreviewBack>,
+    front: Handle<GhostBlockMaterial>,
+    xray: Handle<GhostBlockMaterial>,
 }
 
 /// Live state for the preview pipeline. `cube_root` is spawned once at
@@ -713,6 +758,32 @@ fn setup_scene(
                             }
                         });
                 }
+                // Selected-block name under the slots: the highlighted
+                // slot shows the icon, this names it (32 px patterns
+                // read ambiguously — the playtest's "what am I about
+                // to place?"). Doubles as the empty-hand indicator.
+                column.spawn((
+                    SelectedBlockHudLabel,
+                    Text::new(""),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(crate::ui_theme::TEXT),
+                ));
+                // Build-plan tally: how many committed plans NPCs can
+                // work right now vs how many wait on materials. The
+                // per-plan signal is the ghost tint; this is the
+                // at-a-glance rollup.
+                column.spawn((
+                    PlanStatusLabel,
+                    Text::new(""),
+                    TextFont {
+                        font_size: FontSize::Px(12.0),
+                        ..default()
+                    },
+                    TextColor(crate::ui_theme::TEXT_DIM),
+                ));
             });
         });
 
@@ -767,10 +838,46 @@ fn cycle_selected_or_rotation(
     }
     // Hotbar is laid out top→bottom (index 0 at top). Scroll up moves the
     // highlight to the slot *above* the current one, i.e. toward index 0.
-    if dy > 0.0 {
-        selected.0 = (selected.0 + n - 1) % n;
-    } else {
-        selected.0 = (selected.0 + 1) % n;
+    // From the deselected state the wheel enters at the nearest end.
+    selected.0 = Some(match (selected.0, dy > 0.0) {
+        (Some(i), true) => (i + n - 1) % n,
+        (Some(i), false) => (i + 1) % n,
+        (None, true) => n - 1,
+        (None, false) => 0,
+    });
+}
+
+/// Digit keys 1-9 jump-select hotbar slots in Plan mode; re-pressing
+/// the already-selected digit deselects (empty hand → no Build ghost,
+/// pure demolition planning). Digits are inert in Normal mode — the
+/// hotbar isn't visible there. Mode switching lives on Tab/Shift+Tab
+/// (`handle_mode_input`), which this system deliberately freed up.
+fn hotbar_digit_select(
+    keys: Res<ButtonInput<KeyCode>>,
+    captures: Res<crate::ui_capture::UiCaptures>,
+    mode: Res<PlayerMode>,
+    palette: Res<PlaceablePalette>,
+    mut selected: ResMut<SelectedBlock>,
+) {
+    if captures.is_captured() || !matches!(*mode, PlayerMode::Plan) {
+        return;
+    }
+    const DIGITS: [KeyCode; 9] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    for (i, key) in DIGITS.into_iter().enumerate() {
+        if keys.just_pressed(key) && i < palette.0.len() {
+            selected.0 = if selected.0 == Some(i) { None } else { Some(i) };
+            return;
+        }
     }
 }
 
@@ -1058,11 +1165,62 @@ fn update_hotbar_highlight(
         return;
     }
     for (slot, mut border) in slots.iter_mut() {
-        *border = if slot.0 == selected.0 {
+        *border = if Some(slot.0) == selected.0 {
             BorderColor::all(Color::WHITE)
         } else {
             BorderColor::all(Color::BLACK)
         };
+    }
+}
+
+/// Keep the selected-block name under the hotbar in sync. Writes only
+/// on an actual text change so Text change-detection stays quiet on
+/// idle frames (no `is_changed` guard on the resource — the label
+/// spawns after the resource and would otherwise miss its first fill).
+fn update_selected_block_hud(
+    selected: Res<SelectedBlock>,
+    palette: Res<PlaceablePalette>,
+    blocks: Res<BlockRegistry>,
+    mut labels: Query<&mut Text, With<SelectedBlockHudLabel>>,
+) {
+    let text = match selected.current_block(&palette) {
+        Some(slot) => blocks.def(slot).display_name.as_str(),
+        None => "empty hand",
+    };
+    for mut label in labels.iter_mut() {
+        if label.0 != text {
+            label.0 = text.to_owned();
+        }
+    }
+}
+
+/// Roll up the client's plan mirror into the "N ready · M waiting"
+/// tally under the hotbar. Remove plans are excluded — they're never
+/// materials-gated, and the tally exists to answer "why isn't anyone
+/// building?".
+fn update_plan_status_hud(
+    plans: Res<Plans>,
+    mut labels: Query<&mut Text, With<PlanStatusLabel>>,
+) {
+    let (mut ready, mut waiting) = (0usize, 0usize);
+    for (_, state) in plans.iter() {
+        if matches!(state.kind, PlanKind::Build { .. }) {
+            if state.is_satisfied() {
+                ready += 1;
+            } else {
+                waiting += 1;
+            }
+        }
+    }
+    let text = if ready + waiting == 0 {
+        String::new()
+    } else {
+        format!("{ready} ready · {waiting} waiting")
+    };
+    for mut label in labels.iter_mut() {
+        if label.0 != text {
+            label.0 = text.clone();
+        }
     }
 }
 
@@ -1326,6 +1484,7 @@ fn normal_mode_action_input(
     if captures.is_captured() || *mode != PlayerMode::Normal {
         stop_work!();
         action.active = None;
+        action.hold_latch = None;
         return;
     }
 
@@ -1335,7 +1494,13 @@ fn normal_mode_action_input(
     if !l_held {
         stop_work!();
         action.active = None;
+        action.hold_latch = None;
         return;
+    }
+    // A fresh press always re-arms — the latch only constrains a hold
+    // that carried over from a completed action.
+    if l_just_pressed {
+        action.hold_latch = None;
     }
 
     let Ok(cam_t) = cam.single() else {
@@ -1498,20 +1663,79 @@ fn normal_mode_action_input(
     // Resolve the remaining L-hold verb: self-work on a satisfied
     // plan tag, or direct-mine on a plain solid block.
     let resolved = resolve_left_hold(cam_pos, &ctx.plans, world_hit.as_ref(), plan_hit);
-    let Some((target_cell, kind, edit)) = resolved else {
-        action.active = None;
-        return;
+    let (target_cell, kind, edit) = match resolved {
+        LeftHoldResolution::Act {
+            target_cell,
+            kind,
+            edit,
+        } => (target_cell, kind, edit),
+        LeftHoldResolution::BlockedByPlan { cell } => {
+            // A materials-short Build tag shields whatever is behind
+            // it — mining through the ghost is exactly the "ate the
+            // wall behind my plan" accident. Toast on the press edge
+            // only so a held L doesn't spam.
+            if l_just_pressed {
+                let text = ctx
+                    .plans
+                    .get(cell)
+                    .and_then(|state| first_missing_material(state, &ctx.items))
+                    .map(|m| format!("Waiting on materials: {m}"))
+                    .unwrap_or_else(|| "Waiting on materials".to_owned());
+                toasts.push(crate::worldspace_toast::SpawnToast { cell, text });
+            }
+            action.active = None;
+            return;
+        }
+        LeftHoldResolution::Nothing => {
+            action.active = None;
+            return;
+        }
     };
 
-    // Tool gate. Build: gate on the block being placed; Break: gate
-    // on the live block being destroyed. Same predicate the outline
-    // uses to render grey, kept in sync.
-    let work_slot = if edit.slot.is_empty() {
-        crate::target_outline::live_block_slot(target_cell, &ctx.chunks, &ctx.chunk_map)
-    } else {
-        Some(edit.slot)
+    // The block the verb acts on. Build: the block being placed;
+    // Break: the live block being destroyed. Drives both the hold
+    // latch and the tool gate.
+    let work_slot = match kind {
+        ActionKind::Place => Some(edit.slot),
+        ActionKind::Break => {
+            crate::target_outline::live_block_slot(target_cell, &ctx.chunks, &ctx.chunk_map)
+        }
     };
-    if !crate::target_outline::player_can_work_slot(work_slot, &ctx.blocks, &ctx.items, tool) {
+    let target_block = work_slot.unwrap_or(BlockSlot::EMPTY);
+
+    // Hold latch: a completed action's hold only chains onto more of
+    // the same verb + block type. Silent by design — the outline
+    // already shows the new target; releasing L re-arms.
+    if let Some(latch) = action.hold_latch
+        && (latch.verb, latch.block) != (kind, target_block)
+    {
+        action.active = None;
+        return;
+    }
+
+    // Tool gate. Same predicate the outline uses to render grey, kept
+    // in sync. Toast the missing tool on the press edge so the grey
+    // outline isn't the only hint.
+    let work_verb = match kind {
+        ActionKind::Place => block_junk_mod_api::blocks::WorkVerb::Build,
+        ActionKind::Break => block_junk_mod_api::blocks::WorkVerb::Destroy,
+    };
+    if !crate::target_outline::player_can_work_slot(
+        work_slot,
+        work_verb,
+        &ctx.blocks,
+        &ctx.items,
+        tool,
+    ) {
+        if l_just_pressed
+            && let Some(required) =
+                crate::target_outline::required_tool_for_slot(work_slot, work_verb, &ctx.blocks)
+        {
+            toasts.push(crate::worldspace_toast::SpawnToast {
+                cell: target_cell,
+                text: format!("Needs a {}", tool_display_name(required, &ctx.items)),
+            });
+        }
         action.active = None;
         return;
     }
@@ -1537,6 +1761,10 @@ fn normal_mode_action_input(
             s.send::<WorldChannel>(edit);
         }
         action.active = None;
+        action.hold_latch = Some(HoldLatch {
+            verb: kind,
+            block: target_block,
+        });
     } else {
         action.active = Some(ActiveAction {
             target_cell,
@@ -1602,53 +1830,113 @@ fn drop_tool_input(
     }
 }
 
+/// What the player's L-click hold should do this frame. See
+/// [`resolve_left_hold`].
+enum LeftHoldResolution {
+    /// Actionable target: self-work a satisfied tag or direct-mine a
+    /// plain solid block.
+    Act {
+        target_cell: IVec3,
+        kind: ActionKind,
+        edit: BlockEdit,
+    },
+    /// A materials-short Build tag sits in front of anything else the
+    /// hold could act on. The plan shields the world behind it — the
+    /// caller reports why instead of mining through the ghost.
+    BlockedByPlan { cell: IVec3 },
+    /// No actionable target under the cursor.
+    Nothing,
+}
+
 /// Pick the cell the player's L-click hold should act on. Tagged-plan
-/// self-work wins over direct-mine when a satisfied tag lies under the
-/// cursor (world or plan-aware raycast, closer wins). Otherwise the
-/// world-raycast hit drives direct-mine. `None` ⇒ no actionable target.
-///
-/// Returns `(target_cell, ActionKind, BlockEdit)`.
+/// self-work wins over direct-mine when a tag lies under the cursor
+/// (world or plan-aware raycast, closer wins): satisfied tags become
+/// self-work, unsatisfied ones block the hold entirely. Direct-mine
+/// only applies to a plain solid hit with no tag in front of it.
 fn resolve_left_hold(
     cam_pos: Vec3,
     plans: &Plans,
     world_hit: Option<&EntityAwareHit>,
     plan_hit: Option<(f32, IVec3)>,
-) -> Option<(IVec3, ActionKind, BlockEdit)> {
-    // Tagged self-work first.
-    let materialize = |cell: IVec3, dist: f32| -> Option<(f32, IVec3, PlanKind)> {
-        let state = plans.get(cell)?;
-        if !state.is_satisfied() {
-            return None;
-        }
-        Some((dist, cell, state.kind))
+) -> LeftHoldResolution {
+    // Closest tag under the cursor, whether the world ray hit it (tag
+    // on a solid cell) or the plan ray did (Build tag floating in air).
+    let world_dist =
+        world_hit.map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
+    let tagged = |cell: IVec3, dist: f32| plans.get(cell).map(|state| (dist, cell, state));
+    let world_candidate =
+        world_hit.and_then(|h| tagged(h.cell, world_dist.unwrap_or(f32::INFINITY)));
+    let plan_candidate = plan_hit.and_then(|(dist, cell)| tagged(cell, dist));
+    let winner = match (world_candidate, plan_candidate) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
     };
-    let world_candidate = world_hit.and_then(|h| {
-        let dist = (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length();
-        materialize(h.cell, dist)
-    });
-    let plan_candidate = plan_hit.and_then(|(dist, cell)| materialize(cell, dist));
-    if let Some((_, cell, kind)) = match (world_candidate, plan_candidate) {
-        (Some(a), Some(b)) if a.0 <= b.0 => Some(a),
-        (Some(_), Some(b)) => Some(b),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    } {
-        let edit = plan_to_edit(cell, kind);
-        let action_kind = match kind {
-            PlanKind::Remove => ActionKind::Break,
-            PlanKind::Build { .. } => ActionKind::Place,
-        };
-        return Some((cell, action_kind, edit));
+    if let Some((dist, cell, state)) = winner {
+        if state.is_satisfied() {
+            let edit = plan_to_edit(cell, state.kind);
+            let action_kind = match state.kind {
+                PlanKind::Remove => ActionKind::Break,
+                PlanKind::Build { .. } => ActionKind::Place,
+            };
+            return LeftHoldResolution::Act {
+                target_cell: cell,
+                kind: action_kind,
+                edit,
+            };
+        }
+        // Unsatisfied Build tag. It only yields when the world hit is
+        // strictly in front of it (aiming at a wall closer than the
+        // plan); at equal-or-greater distance it shields what's behind.
+        if !world_dist.is_some_and(|wd| wd < dist) {
+            return LeftHoldResolution::BlockedByPlan { cell };
+        }
     }
     // Direct-mine on a plain solid block.
-    let hit = world_hit?;
+    let Some(hit) = world_hit else {
+        return LeftHoldResolution::Nothing;
+    };
     let edit = BlockEdit {
         anchor: hit.cell,
         slot: BlockSlot::EMPTY,
         orientation: Cardinal::default(),
     };
-    Some((hit.cell, ActionKind::Break, edit))
+    LeftHoldResolution::Act {
+        target_cell: hit.cell,
+        kind: ActionKind::Break,
+        edit,
+    }
+}
+
+/// `"Wood Log 0/1"` for the first still-short material on a plan.
+/// Feeds the "Waiting on materials" toast; `None` when nothing is
+/// missing (callers only ask about unsatisfied plans).
+fn first_missing_material(state: &PlanState, items: &ItemRegistry) -> Option<String> {
+    state.materials.iter().find(|m| m.present < m.needed).map(|m| {
+        format!(
+            "{} {}/{}",
+            items.def(m.item).display_name,
+            m.present,
+            m.needed
+        )
+    })
+}
+
+/// Human name for a tool requirement: the display name of the first
+/// registered item carrying `tag`. Falls back to the tag's post-colon
+/// segment when no item provides it (mod data mistake — still better
+/// than a raw tag id in a toast).
+fn tool_display_name(tag: &block_junk_mod_api::blocks::TagId, items: &ItemRegistry) -> String {
+    items
+        .iter()
+        .find(|(_, def)| def.tool_tags.iter().any(|t| t == tag))
+        .map(|(_, def)| def.display_name.clone())
+        .unwrap_or_else(|| {
+            tag.as_str()
+                .rsplit(':')
+                .next()
+                .unwrap_or(tag.as_str())
+                .to_owned()
+        })
 }
 
 /// Pick the Build-plan cell a player's L-click deposit would target.
@@ -1978,8 +2266,8 @@ fn ray_aabb_within(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3, max_distance: 
 fn setup_placement_preview(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut front_mats: ResMut<Assets<PreviewFront>>,
-    mut back_mats: ResMut<Assets<PreviewBack>>,
+    mut ghost_mats: ResMut<Assets<GhostBlockMaterial>>,
+    textures: Res<BlockTextures>,
     mut state: ResMut<PreviewState>,
 ) {
     // `OnEnter(InGame)` re-fires on every un-pause. Without this guard
@@ -1990,14 +2278,18 @@ fn setup_placement_preview(
     }
 
     let cube_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-    let front = front_mats.add(PreviewFront {
-        color: LinearRgba::new(1.0, 1.0, 1.0, 0.4),
-    });
-    let back = back_mats.add(PreviewBack {
-        // Default darken factor; valid placements re-tint to neutral
-        // grey, invalid to a red shade.
-        color: LinearRgba::new(0.6, 0.6, 0.6, 1.0),
-    });
+    // Same tile-array + table handles the chunk material uses — the
+    // ghost composites the real block texture, zero extra GPU uploads.
+    let front = ghost_mats.add(ghost_block_material(
+        &textures,
+        GhostParams::fixed(0, Vec4::ONE, CURSOR_GHOST_COVERAGE),
+        false,
+    ));
+    let xray = ghost_mats.add(ghost_block_material(
+        &textures,
+        GhostParams::fixed(0, Vec4::ONE, CURSOR_XRAY_COVERAGE),
+        true,
+    ));
 
     let root = commands
         .spawn((
@@ -2010,55 +2302,100 @@ fn setup_placement_preview(
             parent.spawn((
                 Mesh3d(cube_mesh.clone()),
                 MeshMaterial3d(front.clone()),
+                bevy::light::NotShadowCaster,
                 Name::new("preview_cube_front"),
             ));
             parent.spawn((
                 Mesh3d(cube_mesh.clone()),
-                MeshMaterial3d(back.clone()),
-                Name::new("preview_cube_back"),
+                MeshMaterial3d(xray.clone()),
+                bevy::light::NotShadowCaster,
+                Name::new("preview_cube_xray"),
             ));
         })
         .id();
     state.cube_root = Some(root);
 
     let _ = cube_mesh; // strong handle is now held by the spawned children
-    commands.insert_resource(PreviewMaterials { front, back });
+    commands.insert_resource(PreviewMaterials { front, xray });
+}
+
+/// Assemble a [`GhostBlockMaterial`] over the shared block-texture GPU
+/// resources. The `xray` flag picks the pipeline variant — the base's
+/// `alpha_mode` MUST follow it (Opaque front / Blend x-ray), which is
+/// why construction is funnelled through here. Shared by the cursor
+/// preview and the committed plan ghosts.
+pub(crate) fn ghost_block_material(
+    textures: &BlockTextures,
+    params: GhostParams,
+    xray: bool,
+) -> GhostBlockMaterial {
+    GhostBlockMaterial {
+        base: StandardMaterial {
+            alpha_mode: if xray {
+                AlphaMode::Blend
+            } else {
+                AlphaMode::Opaque
+            },
+            ..default()
+        },
+        extension: GhostBlockExt {
+            tiles: textures.tiles.clone(),
+            blocks: textures.blocks.clone(),
+            textures: textures.textures.clone(),
+            layers: textures.layers.clone(),
+            params,
+            xray,
+        },
+    }
 }
 
 /// Run-condition: only show the placement preview ghost in Plan mode
-/// with a real block in the hotbar (the empty-palette case bails). The
-/// preview reads as "this is what an R-click Build would tag here"
-/// while the cursor is parked on a single cell.
+/// with a real block in the hotbar (deselected / empty-palette bails).
+/// The preview reads as "this is what an R-click Build would tag here"
+/// while the cursor is parked on a single cell — so it hides for the
+/// duration of any L interaction (press, hold, destroy sweep): L is
+/// the remove verb, and the ghost sitting over the target was the
+/// playtest's top annoyance while planning deletions.
 fn show_placement_preview(
     mode: Res<PlayerMode>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    drag: Res<crate::plans::PlanDragState>,
 ) -> bool {
-    *mode == PlayerMode::Plan && selected.current_block(&palette).is_some()
+    *mode == PlayerMode::Plan
+        && selected.current_block(&palette).is_some()
+        && !mouse.pressed(MouseButton::Left)
+        && drag.active.is_none()
 }
 
-/// Hide the placement preview ghost when the player just left Plan
-/// mode. Without this the last-frame ghost would linger on screen —
-/// the main preview system stops running thanks to the `run_if` gate,
-/// so something has to actively flip Visibility on the transition.
+/// Hide the placement preview ghost when the run-condition just went
+/// false (left Plan mode, deselected, started an L interaction).
+/// Without this the last-frame ghost would linger on screen — the main
+/// preview system stops running thanks to the `run_if` gate, so
+/// something has to actively flip Visibility on the transition.
 fn hide_preview_on_mode_change(
     mode: Res<PlayerMode>,
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    drag: Res<crate::plans::PlanDragState>,
     state: Res<PreviewState>,
     mut vis: Query<&mut Visibility>,
 ) {
-    // Re-run when either the mode or the selection changed; the
-    // gate decides whether to hide based on the new state.
-    if !mode.is_changed() && !selected.is_changed() {
-        return;
-    }
-    let should_show = *mode == PlayerMode::Plan && selected.current_block(&palette).is_some();
+    let should_show = *mode == PlayerMode::Plan
+        && selected.current_block(&palette).is_some()
+        && !mouse.pressed(MouseButton::Left)
+        && drag.active.is_none();
     if should_show {
         return;
     }
+    // Runs every frame while hidden (mouse state has no change tick to
+    // gate on) — the != check keeps Visibility change-detection quiet.
     for entity in [state.cube_root, state.scene_root].into_iter().flatten() {
-        if let Ok(mut v) = vis.get_mut(entity) {
+        if let Ok(mut v) = vis.get_mut(entity)
+            && *v != Visibility::Hidden
+        {
             *v = Visibility::Hidden;
         }
     }
@@ -2075,6 +2412,18 @@ fn hide_preview_on_mode_change(
 /// In both cases the front + back-pass draws come for free — both sit
 /// under the root entity and pick up its world transform via Bevy's
 /// hierarchy.
+/// Material access for `update_placement_preview`, bundled to stay
+/// under the 16-system-param cap.
+#[derive(bevy::ecs::system::SystemParam)]
+struct PreviewMaterialAccess<'w, 's> {
+    handles: Res<'w, PreviewMaterials>,
+    ghost_mats: ResMut<'w, Assets<GhostBlockMaterial>>,
+    dither_mats: ResMut<'w, Assets<DitherMeshMaterial>>,
+    /// Per-scene material handles the swap observer recorded on mesh
+    /// preview roots (cursor re-tints them each frame).
+    mesh_mats: Query<'w, 's, &'static GhostMeshMaterials>,
+}
+
 #[allow(clippy::too_many_arguments, reason = "preview spans many subsystems")]
 fn update_placement_preview(
     cam: Query<(&GlobalTransform, &FlyCam, &AvatarPose)>,
@@ -2086,9 +2435,7 @@ fn update_placement_preview(
     rotation: Res<PlacementRotation>,
     registry: Res<BlockRegistry>,
     asset_server: Res<AssetServer>,
-    materials_handles: Res<PreviewMaterials>,
-    mut front_mats: ResMut<Assets<PreviewFront>>,
-    mut back_mats: ResMut<Assets<PreviewBack>>,
+    mut mats: PreviewMaterialAccess,
     mut state: ResMut<PreviewState>,
     mut commands: Commands,
     mut roots: Query<(&mut Visibility, &mut Transform)>,
@@ -2156,27 +2503,25 @@ fn update_placement_preview(
     }
     let valid = cells.iter().all(|&c| get_block(c).is_empty());
 
-    // Re-tint shared materials from the selection swatch + validity.
-    // Front: tinted with alpha so the ghost reads as the chosen block;
-    // a red override tells the player "no" without hiding the preview.
-    // Back: a near-grey multiply factor; for invalid we shift it warm
-    // so the X-ray shadow on the wall behind also reads "no".
-    let [r, g, b] = def.color;
-    let front_color = if valid {
-        LinearRgba::new(r, g, b, 0.4)
-    } else {
-        LinearRgba::new(1.0, 0.2, 0.2, 0.55)
-    };
-    let back_color = if valid {
-        LinearRgba::new(0.55, 0.55, 0.55, 1.0)
-    } else {
-        LinearRgba::new(0.7, 0.4, 0.4, 1.0)
-    };
-    if let Some(mut m) = front_mats.get_mut(&materials_handles.front) {
-        m.color = front_color;
+    // Re-tint from validity: white passes the block's real composited
+    // texture through untouched; the red multiply tells the player
+    // "no" without hiding the preview. The x-ray pass gets the same
+    // tint so the behind-wall hint also reads "no".
+    let tint = if valid { Vec4::ONE } else { INVALID_TINT };
+    for handle in [&mats.handles.front, &mats.handles.xray] {
+        if let Some(mut m) = mats.ghost_mats.get_mut(handle) {
+            m.extension.params.slot = u32::from(slot.0);
+            m.extension.params.tint = tint;
+        }
     }
-    if let Some(mut m) = back_mats.get_mut(&materials_handles.back) {
-        m.color = back_color;
+    if let Some(scene_entity) = state.scene_root
+        && let Ok(mesh_mats) = mats.mesh_mats.get(scene_entity)
+    {
+        for handle in mesh_mats.front.iter().chain(mesh_mats.xray.iter()) {
+            if let Some(mut m) = mats.dither_mats.get_mut(handle) {
+                m.extension.params.tint = tint;
+            }
+        }
     }
 
     if def.mesh.is_some() {
@@ -2194,9 +2539,9 @@ fn update_placement_preview(
                 .spawn((
                     PreviewWorldAssetRoot,
                     WorldAssetRoot(scene),
-                    PreviewMaterialPair {
-                        front: materials_handles.front.clone(),
-                        back: materials_handles.back.clone(),
+                    GhostMeshStyle {
+                        front: DitherParams::fixed(Vec4::ONE, CURSOR_GHOST_COVERAGE),
+                        xray: DitherParams::fixed(Vec4::ONE, CURSOR_XRAY_COVERAGE),
                     },
                     Transform::default(),
                     Visibility::Hidden,
@@ -2243,47 +2588,79 @@ fn update_placement_preview(
     }
 }
 
-/// Walk a freshly-spawned preview WorldAssetRoot's descendants and replace
-/// every `Mesh3d` entity's material with our `PreviewFront` handle, plus
-/// add a sibling-as-child carrying `PreviewBack` for the depth-flipped
-/// X-ray pass. Marker swap completes by inserting `PreviewSceneReady`
-/// on the root, which `update_placement_preview` reads to decide when
-/// the scene can finally be made visible.
+/// Walk a freshly-spawned ghost WorldAssetRoot's descendants and re-create
+/// every `Mesh3d` entity's material as a dithered ghost: the glTF's real
+/// `StandardMaterial` is CLONED into a [`DitherMeshMaterial`] base (so
+/// the ghost keeps its actual textures/colors), with the root's
+/// [`GhostMeshStyle`] params — front pass replaces the original
+/// material, a child twin carries the depth-flipped x-ray pass. Created
+/// handles are recorded in [`GhostMeshMaterials`] on the root so the
+/// cursor preview can re-tint per frame. Swap completes by inserting
+/// `PreviewSceneReady`, which gates first visibility.
 fn swap_preview_scene_materials(
     trigger: On<WorldInstanceReady>,
-    pairs: Query<&PreviewMaterialPair>,
+    styles: Query<&GhostMeshStyle>,
     children_q: Query<&Children>,
-    meshes: Query<&Mesh3d>,
+    meshes: Query<(&Mesh3d, Option<&MeshMaterial3d<StandardMaterial>>)>,
+    std_mats: Res<Assets<StandardMaterial>>,
+    mut dither_mats: ResMut<Assets<DitherMeshMaterial>>,
     mut commands: Commands,
 ) {
     let root = trigger.event_target();
-    // Any scene root carrying a material pair gets the treatment — the
-    // cursor preview (shared re-tinted pair) and plan ghosts (per-block
-    // fixed-tint pairs) both route through here.
-    let Ok(pair) = pairs.get(root) else {
+    // Any scene root carrying a ghost style gets the treatment — the
+    // cursor preview and committed plan ghosts both route through here.
+    let Ok(style) = styles.get(root) else {
         return;
     };
-    // BFS through descendants. For each Mesh3d we find: install our
-    // front material (replacing whatever StandardMaterial the glTF
-    // shipped with) and parent a back-pass twin underneath it.
+    let mut created = GhostMeshMaterials::default();
     let mut stack: Vec<Entity> = vec![root];
     while let Some(entity) = stack.pop() {
         if let Ok(children) = children_q.get(entity) {
             stack.extend(children.iter());
         }
-        let Ok(mesh) = meshes.get(entity) else {
+        let Ok((mesh, material)) = meshes.get(entity) else {
             continue;
         };
+        // Clone the real glTF material; force the alpha modes the two
+        // dither pipeline variants contract on (see preview.rs docs).
+        let base = material
+            .and_then(|m| std_mats.get(&m.0))
+            .cloned()
+            .unwrap_or_default();
+        let mut front_base = base.clone();
+        front_base.alpha_mode = AlphaMode::Opaque;
+        let front = dither_mats.add(DitherMeshMaterial {
+            base: front_base,
+            extension: DitherExt {
+                params: style.front,
+                xray: false,
+            },
+        });
+        let mut xray_base = base;
+        xray_base.alpha_mode = AlphaMode::Blend;
+        let xray = dither_mats.add(DitherMeshMaterial {
+            base: xray_base,
+            extension: DitherExt {
+                params: style.xray,
+                xray: true,
+            },
+        });
         let mesh_handle = mesh.0.clone();
         commands
             .entity(entity)
             .remove::<MeshMaterial3d<StandardMaterial>>()
-            .insert(MeshMaterial3d(pair.front.clone()))
+            .insert((MeshMaterial3d(front.clone()), bevy::light::NotShadowCaster))
             .with_children(|parent| {
-                parent.spawn((Mesh3d(mesh_handle), MeshMaterial3d(pair.back.clone())));
+                parent.spawn((
+                    Mesh3d(mesh_handle),
+                    MeshMaterial3d(xray.clone()),
+                    bevy::light::NotShadowCaster,
+                ));
             });
+        created.front.push(front);
+        created.xray.push(xray);
     }
-    commands.entity(root).insert(PreviewSceneReady);
+    commands.entity(root).insert((PreviewSceneReady, created));
 }
 
 /// Snapshot from server → spawn (or replace) the corresponding local chunk.
@@ -2590,6 +2967,7 @@ fn receive_modset_manifest(
     item_registry: Res<ItemRegistry>,
     recipe_registry: Res<crate::recipes::RecipeRegistry>,
     npc_kind_registry: Res<NpcKindRegistry>,
+    room_pattern_registry: Res<crate::rooms::RoomPatternRegistry>,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
     clients: Query<Entity, With<Client>>,
 ) {
@@ -2600,6 +2978,7 @@ fn receive_modset_manifest(
                 &item_registry,
                 &recipe_registry,
                 &npc_kind_registry,
+                &room_pattern_registry,
             );
             let mismatches = crate::modset::diff(&manifest, &local);
             if mismatches.is_empty() {

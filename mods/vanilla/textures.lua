@@ -165,6 +165,9 @@ return {
       },
       finish = { scale = 12.0, brightness = 0.05 },
     },
+    -- Plank grid. No block uses this today (the wood block wears bark +
+    -- rings below); kept for the future vanilla:planks crafted block —
+    -- it's exactly the look planks want.
     {
       id = "vanilla:wood",
       layers = {
@@ -192,6 +195,71 @@ return {
         },
       },
       finish = { scale = 9.0, brightness = 0.04 },
+    },
+    -- Trunk sides: vertical bark streaks. Stripes rotated 90° (vertical),
+    -- domain-warped by fbm so they gnarl instead of reading mechanical,
+    -- under a darker/browner ramp than the plank tan.
+    {
+      id = "vanilla:wood_bark",
+      layers = {
+        {
+          period = 2,
+          steps = {
+            { op = "stripes", count = 10, duty = 0.55, out = "s0" },
+            { op = "transform", input = "s0", scale = 1, rotate = "90", out = "s1" },
+            { op = "fbm", cells = 4, octaves = 3, seed = 41, out = "wob" },
+            { op = "warp", input = "s1", by = "wob", amount = 0.06, out = "bark" },
+            {
+              op = "ramp",
+              input = "bark",
+              stops = { { 0.0, 0.26, 0.17, 0.09 }, { 1.0, 0.42, 0.3, 0.16 } },
+            },
+            {
+              op = "scratches",
+              count = 20,
+              length = 0.4,
+              width = 0.006,
+              seed = 42,
+              out = "fiss",
+            },
+            { op = "fill", color = { 0.16, 0.1, 0.05 }, opacity = 0.5, mask = "fiss" },
+          },
+        },
+      },
+      finish = { scale = 9.0, brightness = 0.05 },
+    },
+    -- Trunk top/bottom: end grain. Radial gradient warped by fbm then
+    -- posterized into bands = concentric growth rings; the ramp's
+    -- alternating light/dark stops color each band; dark rim past the
+    -- inscribed circle reads as the bark edge.
+    {
+      id = "vanilla:wood_rings",
+      layers = {
+        {
+          period = 1,
+          steps = {
+            { op = "gradient", dir = "radial", out = "r" },
+            { op = "fbm", cells = 5, octaves = 2, seed = 43, out = "wob" },
+            { op = "warp", input = "r", by = "wob", amount = 0.05, out = "rw" },
+            { op = "quantize", input = "rw", steps = 6, out = "rq" },
+            {
+              op = "ramp",
+              input = "rq",
+              stops = {
+                { 0.0, 0.46, 0.33, 0.18 },
+                { 0.2, 0.33, 0.22, 0.11 },
+                { 0.4, 0.5, 0.36, 0.2 },
+                { 0.6, 0.35, 0.24, 0.12 },
+                { 0.8, 0.52, 0.38, 0.21 },
+                { 1.0, 0.38, 0.26, 0.13 },
+              },
+            },
+            { op = "threshold", input = "rw", threshold = 0.85, softness = 0.05, out = "rim" },
+            { op = "fill", color = { 0.2, 0.13, 0.07 }, opacity = 0.8, mask = "rim" },
+          },
+        },
+      },
+      finish = { scale = 7.0, brightness = 0.04 },
     },
     {
       id = "vanilla:leaves",

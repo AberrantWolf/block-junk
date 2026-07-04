@@ -31,13 +31,30 @@ use crate::voxel::{Chunk, ChunkMap, world_to_chunk};
 /// Hard upper bound on floor-fill cells. Anything bigger is "outdoors" or
 /// "unclassifiably huge" and isn't tracked as a room.
 pub const FLOOD_CAP: u32 = 4096;
-/// Limit when probing column heights. Past this we declare the column
-/// "open to sky" and the room has no roof.
-const ROOF_PROBE_CAP: i32 = 1024;
+/// Per-column ceiling probe limit. A column with no ceiling block within
+/// this many layers above the floor reads as open to sky.
+const ROOF_SCAN_CAP: i32 = 32;
+/// A region reads as roofed (`has_roof = true`) when at least this
+/// fraction of its floor columns find a ceiling. Buys tolerance for
+/// skylights and chimney holes without letting a half-open shell pass.
+const HAS_ROOF_MIN_FRACTION: f32 = 0.85;
 /// Quiet period after the most recent edit before detection runs. Keeps
 /// per-edit thrash from emitting `Created/Destroyed` storms during a
 /// player's place-or-break burst.
 const DEBOUNCE: Duration = Duration::from_millis(250);
+/// Ceiling on how long continuous editing can starve detection. The
+/// quiet-window gate above never opens while a player keeps placing
+/// blocks faster than one per `DEBOUNCE`; once the *oldest* queued edit
+/// is this stale we run anyway, so a room finished early in a long
+/// building burst still registers mid-burst.
+const DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(750);
+/// Identity threshold for re-detected regions: a new fill keeps an old
+/// room's id when it overlaps at least half of the smaller of the two
+/// floor sets. Single-block edits trivially clear this; a room replaced
+/// wholesale doesn't.
+fn overlap_keeps_identity(overlap: usize, old_len: usize, new_len: usize) -> bool {
+    overlap > 0 && 2 * overlap >= old_len.min(new_len)
+}
 
 // ---------- pattern registry (existing) ----------
 
@@ -216,6 +233,30 @@ impl RoomMap {
         })
     }
 
+    /// Wire snapshot of a matched room for client mirroring. `None` for
+    /// unknown ids and for unmatched (internal-bookkeeping) regions.
+    pub fn summary_of(&self, id: RoomId) -> Option<crate::protocol::RoomSummary> {
+        let room = self.rooms.get(&id)?;
+        let pattern = room.pattern.as_ref()?;
+        let anchor = floor_anchor(&room.floor_cells)?;
+        Some(crate::protocol::RoomSummary {
+            room_id: id.0,
+            pattern: pattern.as_str().to_owned(),
+            anchor,
+            bbox_min: room.bbox_min,
+            bbox_max: room.bbox_max,
+            floor_area: room.floor_cells.len() as u32,
+        })
+    }
+
+    /// Every matched room as a wire summary — the connect-time full sync.
+    pub fn matched_summaries(&self) -> Vec<crate::protocol::RoomSummary> {
+        self.rooms
+            .keys()
+            .filter_map(|&id| self.summary_of(id))
+            .collect()
+    }
+
     /// If `cell` is a floor cell of a matched room, return a floor cell
     /// from the same room picked by `rng_unit` (a uniform `[0, 1)`
     /// value). Otherwise return `None`.
@@ -316,7 +357,13 @@ pub fn process_dirty(
     }
     let now = Instant::now();
     let most_recent = dirty.cells.iter().map(|(_, t)| *t).max().unwrap();
-    if now.duration_since(most_recent) < DEBOUNCE {
+    let oldest = dirty.cells.iter().map(|(_, t)| *t).min().unwrap();
+    // Quiet-window debounce, with a staleness ceiling: continuous editing
+    // refreshes `most_recent` forever, so without the second clause a
+    // long building burst starves detection until the player stops.
+    if now.duration_since(most_recent) < DEBOUNCE
+        && now.duration_since(oldest) < DEBOUNCE_MAX_WAIT
+    {
         return;
     }
     let edited: Vec<IVec3> = dirty.cells.drain(..).map(|(c, _)| c).collect();
@@ -382,7 +429,7 @@ pub fn process_dirty(
     // marker. So a fill that bails at the cap (outdoor leak) leaves the
     // walked cells marked, and the next sibling seed in the same outdoor
     // region skips immediately instead of rewalking 4096 cells.
-    let mut new_fills: Vec<Vec<IVec3>> = Vec::new();
+    let mut new_fills: Vec<FloorFill> = Vec::new();
     let mut visited: HashSet<IVec3> = HashSet::new();
     for &s in &seeds {
         if visited.contains(&s) {
@@ -391,26 +438,32 @@ pub fn process_dirty(
         if !is_floor_cell(s, &get_block, &block_registry) {
             continue;
         }
-        if let Some(cells) =
+        // A seed sitting IN a doorway gap belongs to no room — filling
+        // from inside the choke would traverse both sides and merge the
+        // two rooms it connects.
+        if is_choke_along(s, IVec3::X, &get_block, &block_registry)
+            || is_choke_along(s, IVec3::Z, &get_block, &block_registry)
+        {
+            continue;
+        }
+        if let Some(fill) =
             flood_fill_floor(s, &get_block, &block_registry, FLOOD_CAP, &mut visited)
         {
-            new_fills.push(cells);
+            new_fills.push(fill);
         }
     }
 
     // Pre-compute pattern matches & signatures for new fills, then apply.
     struct Pending {
         cells: Vec<IVec3>,
-        canonical: IVec3,
         signature: RoomSignature,
         pattern: Option<RoomPatternId>,
         bbox_min: IVec3,
         bbox_max: IVec3,
     }
     let mut pending: Vec<Pending> = Vec::with_capacity(new_fills.len());
-    for cells in new_fills {
-        let canonical = canonical_min(&cells).expect("flood-fill produced an empty cell list");
-        let signature = compute_signature(&cells, &get_block, &block_registry);
+    for fill in new_fills {
+        let (signature, extras) = compute_signature(&fill, &get_block, &block_registry);
         let pattern = match_pattern(&signature, &pattern_registry);
         // Volumetric bbox covering everything that, if edited, can affect
         // this room's classification:
@@ -421,10 +474,13 @@ pub fn process_dirty(
         //     invalidation.
         //   - One Y below the floor for the support layer (breaking the
         //     ground under the floor invalidates the room).
-        //   - enclosure_height layers above the floor, plus 1 slack so a
-        //     roof or new wall placed just above the topmost bounded
-        //     layer still intersects.
-        let height = signature.enclosure_height.unwrap_or(1).max(1);
+        //   - The tallest probed height (ceiling or wall run) above the
+        //     floor, plus 1 slack so a roof or new wall placed just above
+        //     the topmost observed layer still intersects.
+        let height = extras
+            .max_probe_height
+            .max(signature.enclosure_height.unwrap_or(1))
+            .max(1);
         let bbox_min = IVec3::new(
             signature.bbox.min.x - 1,
             signature.bbox.min.y - 1,
@@ -436,8 +492,7 @@ pub fn process_dirty(
             signature.bbox.max.z + 1,
         );
         pending.push(Pending {
-            cells,
-            canonical,
+            cells: fill.cells,
             signature,
             pattern,
             bbox_min,
@@ -445,23 +500,40 @@ pub fn process_dirty(
         });
     }
 
-    // For each invalidated room: if its canonical key matches a pending
-    // fill, the room *kept its identity* (its anchor cell is still part
-    // of the new region) and we emit Changed instead of Destroyed+Created.
-    // Cell sets aren't required to match exactly — a single edit usually
-    // trades a cell at Y for a new one at Y+1 (block placed) or vice
-    // versa, which would otherwise flicker as Destroyed+Created every
-    // time the player toggles a single block.
-    let mut changed_pairs: HashMap<IVec3, RoomId> = HashMap::new();
-    for id in &to_invalidate {
-        let Some(room) = rooms.rooms.get(id) else {
-            continue;
-        };
-        let Some(canon) = canonical_min(&room.floor_cells) else {
-            continue;
-        };
-        if pending.iter().any(|p| p.canonical == canon) {
-            changed_pairs.insert(canon, *id);
+    // Identity: a pending fill keeps an invalidated room's id when their
+    // floor sets substantially overlap (see `overlap_keeps_identity`),
+    // greedily matched biggest-overlap-first. Overlap — not a canonical
+    // corner cell — so trimming or furnishing the room's min corner
+    // doesn't churn the id (which used to read as Destroyed+Created to
+    // every consumer: cluster membership reset, NPC snapshots forgetting
+    // the room, mods re-firing on_created).
+    let mut changed_pairs: HashMap<usize, RoomId> = HashMap::new();
+    {
+        let mut candidates: Vec<(usize, RoomId, usize)> = Vec::new();
+        for (pi, p) in pending.iter().enumerate() {
+            let new_set: HashSet<IVec3> = p.cells.iter().copied().collect();
+            for id in &to_invalidate {
+                let Some(room) = rooms.rooms.get(id) else {
+                    continue;
+                };
+                let overlap = room
+                    .floor_cells
+                    .iter()
+                    .filter(|c| new_set.contains(c))
+                    .count();
+                if overlap_keeps_identity(overlap, room.floor_cells.len(), p.cells.len()) {
+                    candidates.push((pi, *id, overlap));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.2.cmp(&a.2));
+        let mut claimed_old: HashSet<RoomId> = HashSet::new();
+        for (pi, id, _) in candidates {
+            if changed_pairs.contains_key(&pi) || claimed_old.contains(&id) {
+                continue;
+            }
+            changed_pairs.insert(pi, id);
+            claimed_old.insert(id);
         }
     }
 
@@ -487,8 +559,8 @@ pub fn process_dirty(
     }
 
     // Apply Changed (for matched survivors) and Created (for the rest).
-    for p in pending {
-        let mut keep_id = changed_pairs.get(&p.canonical).copied();
+    for (pi, p) in pending.into_iter().enumerate() {
+        let mut keep_id = changed_pairs.get(&pi).copied();
         let from_pattern = if let Some(id) = keep_id {
             // Pull the previous pattern out of the map so we can compare.
             rooms.rooms.get(&id).and_then(|r| r.pattern.clone())
@@ -501,8 +573,17 @@ pub fn process_dirty(
         }
         let id = keep_id.unwrap();
 
-        // Re-stamp cell_to_room (cells haven't moved for Changed, but it's
-        // the same code path).
+        // Under overlap identity a surviving room's floor set CAN shrink
+        // or shift — clear the old mapping before re-stamping so trimmed
+        // cells don't linger in cell_to_room pointing at this id.
+        if let Some(old) = rooms.rooms.get(&id) {
+            let stale: Vec<IVec3> = old.floor_cells.clone();
+            for c in stale {
+                if rooms.cell_to_room.get(&c).copied() == Some(id) {
+                    rooms.cell_to_room.remove(&c);
+                }
+            }
+        }
         for &c in &p.cells {
             rooms.cell_to_room.insert(c, id);
         }
@@ -557,12 +638,6 @@ pub fn process_dirty(
 
 // ---------- helpers ----------
 
-/// Canonical key for a floor-cell set: the lexicographically minimum cell.
-/// Stable across re-detection as long as the set itself doesn't change.
-fn canonical_min(cells: &[IVec3]) -> Option<IVec3> {
-    cells.iter().copied().min_by_key(|c| (c.y, c.x, c.z))
-}
-
 fn bbox_contains(min: IVec3, max: IVec3, p: IVec3) -> bool {
     p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y && p.z >= min.z && p.z <= max.z
 }
@@ -594,16 +669,63 @@ fn is_floor_cell(c: IVec3, get_block: &impl Fn(IVec3) -> BlockSlot, reg: &BlockR
     reg.def(below).flags.support_below
 }
 
+/// Does this block bound a room volumetrically? Walls, doors, glass,
+/// furniture. Gated on flags rather than `!is_empty()` so future
+/// passable decor (torches, signs) doesn't read as a wall.
+fn bounds_room(slot: BlockSlot, reg: &BlockRegistry) -> bool {
+    if slot.is_empty() {
+        return false;
+    }
+    let f = reg.def(slot).flags;
+    f.room_boundary || f.solid
+}
+
+/// Is `c` a 1-wide gap in a wall run along `axis` (the axis PERPENDICULAR
+/// to travel)? Both flanking cells at floor Y must be `room_boundary`
+/// blocks — walls, doors, terrain — NOT merely solid. Furniture (a bed is
+/// solid but not room_boundary) must not flank a choke, or a bed placed
+/// one cell from a wall would carve the strip behind it into "doorways"
+/// and split the room. A choke cell is a *virtual doorway*: the fill
+/// stops at it instead of leaking through, and — when it has walkable
+/// headroom — it counts toward `door_count`. 2-wide openings are
+/// breaches and still leak.
+fn is_choke_along(
+    c: IVec3,
+    axis: IVec3,
+    get_block: &impl Fn(IVec3) -> BlockSlot,
+    reg: &BlockRegistry,
+) -> bool {
+    let wall_flank = |w: IVec3| {
+        let slot = get_block(w);
+        !slot.is_empty() && reg.def(slot).flags.room_boundary
+    };
+    wall_flank(c + axis) && wall_flank(c - axis)
+}
+
+/// Result of one floor flood-fill.
+struct FloorFill {
+    cells: Vec<IVec3>,
+    /// Virtual-doorway cells the fill stopped at (1-wide wall gaps).
+    /// These seal the perimeter check; the walkable subset also counts
+    /// as doors.
+    boundary_gaps: HashSet<IVec3>,
+    /// Subset of `boundary_gaps` with walkable headroom (the cell above
+    /// is passable) — an actor-sized doorway, not a floor-level slit.
+    doorways: HashSet<IVec3>,
+}
+
 fn flood_fill_floor(
     seed: IVec3,
     get_block: &impl Fn(IVec3) -> BlockSlot,
     reg: &BlockRegistry,
     cap: u32,
     visited: &mut HashSet<IVec3>,
-) -> Option<Vec<IVec3>> {
+) -> Option<FloorFill> {
     debug_assert!(is_floor_cell(seed, get_block, reg));
     let mut queue: VecDeque<IVec3> = VecDeque::new();
     let mut out: Vec<IVec3> = Vec::new();
+    let mut boundary_gaps: HashSet<IVec3> = HashSet::new();
+    let mut doorways: HashSet<IVec3> = HashSet::new();
     queue.push_back(seed);
     visited.insert(seed);
     while let Some(c) = queue.pop_front() {
@@ -621,23 +743,54 @@ fn flood_fill_floor(
         // A future `step` block tag (or `wall_only` tag, or a structural
         // wall-detector) can re-enable selective ±Y traversal.
         for [dx, dz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
-            let n = c + IVec3::new(dx, 0, dz);
-            if !visited.insert(n) {
+            let d = IVec3::new(dx, 0, dz);
+            let n = c + d;
+            if visited.contains(&n) {
                 continue;
             }
-            if is_floor_cell(n, get_block, reg) {
-                queue.push_back(n);
+            if !is_floor_cell(n, get_block, reg) {
+                continue;
             }
+            // Perpendicular flanks both walls ⇒ virtual doorway: the
+            // fill treats it as a boundary rather than leaking into
+            // whatever lies beyond (outdoors, the next room). Not
+            // inserted into `visited` — the region on the far side must
+            // evaluate it independently to count the shared door.
+            let perp = IVec3::new(d.z, 0, d.x);
+            if is_choke_along(n, perp, get_block, reg) {
+                boundary_gaps.insert(n);
+                let above = get_block(n + IVec3::Y);
+                if above.is_empty() || reg.def(above).flags.support_in_cell {
+                    doorways.insert(n);
+                }
+                continue;
+            }
+            visited.insert(n);
+            queue.push_back(n);
         }
     }
-    Some(out)
+    Some(FloorFill {
+        cells: out,
+        boundary_gaps,
+        doorways,
+    })
+}
+
+/// Signature plus detector-internal geometry that doesn't belong on the
+/// mod-facing type.
+struct SignatureExtras {
+    /// Tallest probe (ceiling or wall run) observed, in layers above the
+    /// floor. Sizes the invalidation bbox so an edit at a vaulted
+    /// ceiling still re-triggers detection.
+    max_probe_height: u32,
 }
 
 fn compute_signature(
-    floor_cells: &[IVec3],
+    fill: &FloorFill,
     get_block: &impl Fn(IVec3) -> BlockSlot,
     reg: &BlockRegistry,
-) -> RoomSignature {
+) -> (RoomSignature, SignatureExtras) {
+    let floor_cells = &fill.cells;
     let n = floor_cells.len() as f32;
     let mut min = floor_cells[0];
     let mut max = floor_cells[0];
@@ -669,10 +822,11 @@ fn compute_signature(
 
     // Door count: walk the floor's horizontal boundary (cells *not* in the
     // fill that are directly adjacent to a floor cell at the same Y) and
-    // count distinct cells whose block has `walkable_boundary` set. A
-    // single 2-tall door's lower block is at floor-Y, which is what the
-    // boundary walk encounters. Distinct cells, so a door adjacent to
-    // multiple floor cells still counts once.
+    // count distinct cells whose block has `walkable_boundary` set, plus
+    // the fill's virtual doorways (1-wide wall openings with walkable
+    // headroom). The two sets are disjoint — doorway gaps are air cells.
+    // Distinct cells, so a door adjacent to multiple floor cells still
+    // counts once.
     let floor_set: HashSet<IVec3> = floor_cells.iter().copied().collect();
     let mut door_cells: HashSet<IVec3> = HashSet::new();
     for &c in floor_cells {
@@ -686,20 +840,8 @@ fn compute_signature(
             }
         }
     }
-    let door_count = door_cells.len() as u32;
+    let door_count = (door_cells.len() + fill.doorways.len()) as u32;
 
-    // Bottom-up enclosure walk. From the floor's Y, scan layer by layer
-    // upward. A layer counts as "enclosed" iff every perimeter cell at
-    // that Y is solid (the walls extend) AND there's still some interior
-    // air at that Y (we haven't hit the roof yet). The room ends when
-    // either the walls give out (open above) or the interior closes
-    // (capped by a roof).
-    //
-    // This replaces the older per-column headroom probe — the old way
-    // confused "walled yard, infinite air column" with "tall hall," and
-    // worse, it had no notion of "wall extends here," so a 1-high wall
-    // and a 5-high wall produced the same signature. Now the signature
-    // tells us the actual built height.
     let floor_y = floor_cells[0].y;
     let floor_xz: HashSet<(i32, i32)> = floor_cells.iter().map(|c| (c.x, c.z)).collect();
     let mut perimeter_xz: HashSet<(i32, i32)> = HashSet::new();
@@ -713,72 +855,102 @@ fn compute_signature(
         }
     }
     // External vs internal perimeter. A perimeter cell *outside* the
-    // floor's XZ bbox is part of the room's exterior wall ring — it must
-    // be solid at every Y for the room to be enclosed. A perimeter cell
-    // *inside* the bbox is a column / pillar the player has placed on
-    // the floor (a single block carved out of a previously-floor cell);
-    // requiring walls above it would mean every interior column kicks
-    // the room out of small_house back to walled_yard, which is
-    // surprising. So we only enforce the exterior perimeter for the
-    // bound check at higher Ys.
+    // floor's XZ bbox is part of the room's exterior wall ring. A
+    // perimeter cell *inside* the bbox is a column / pillar / furniture
+    // block sitting on the floor (carved out of a previously-floor cell).
     let external_perimeter: HashSet<(i32, i32)> = perimeter_xz
         .iter()
         .copied()
         .filter(|&(x, z)| x < min.x || x > max.x || z < min.z || z > max.z)
         .collect();
-    // Floor must be enclosed at its OWN Y too. Without this check, a fill
-    // that runs along a wall ring (cells whose support is the wall block
-    // below them) would count as "enclosed" — its perimeter at floor Y
-    // is air on both sides (interior + exterior), not walls. Real rooms
-    // have walls (or terrain, or other solids) directly bounding the
-    // floor cells in 4-cardinal at the floor's Y. Use the *full* perimeter
-    // here (including internal columns) — at floor Y, an internal column
-    // is itself solid (it's the placed block), so this still passes for
-    // legitimate column placements.
-    let perimeter_at_floor_solid = perimeter_xz
-        .iter()
-        .all(|&(x, z)| !get_block(IVec3::new(x, floor_y, z)).is_empty());
-    let mut enclosure_height: u32 = if perimeter_at_floor_solid { 1 } else { 0 };
-    let mut has_roof = false;
-    let mut tag_counts: HashMap<_, u32> = HashMap::new();
-    for dy in 1..ROOF_PROBE_CAP {
-        if !perimeter_at_floor_solid {
-            // Floor isn't enclosed; don't bother probing higher layers.
-            break;
-        }
-        let y = floor_y + dy;
-        // Roof check: every interior column position is solid at this y.
-        let interior_all_solid = floor_xz
-            .iter()
-            .all(|&(x, z)| !get_block(IVec3::new(x, y, z)).is_empty());
-        if interior_all_solid {
-            has_roof = true;
-            break;
-        }
-        // Bound check: every *exterior* perimeter position is solid at
-        // this y (the wall extends up to here). Internal column positions
-        // are exempt — they don't need walls above them.
-        let bounded = external_perimeter
-            .iter()
-            .all(|&(x, z)| !get_block(IVec3::new(x, y, z)).is_empty());
-        if !bounded {
-            break;
-        }
-        // Layer is enclosed. Collect tags on any solid blocks inside the
-        // interior at this y (furniture, decorations).
+    // The floor must be sealed at its own Y: every perimeter cell either
+    // bounds the room (wall, door block, terrain, furniture) or is one of
+    // the fill's virtual doorways. Without this, a fill running along a
+    // wall top would read as enclosed.
+    let perimeter_sealed = perimeter_xz.iter().all(|&(x, z)| {
+        bounds_room(get_block(IVec3::new(x, floor_y, z)), reg)
+            || fill.boundary_gaps.contains(&IVec3::new(x, floor_y, z))
+    });
+
+    // Per-column ceiling probe. Each floor column independently looks up
+    // for the first bounding block within ROOF_SCAN_CAP layers — so a
+    // pitched roof, a skylight, or the air gap above a door block no
+    // longer voids the whole room the way the old "one all-solid layer,
+    // walls solid at every layer" walk did.
+    let mut ceilings: Vec<u32> = Vec::new();
+    let mut max_probe_height: u32 = 1;
+    if perimeter_sealed {
         for &(x, z) in &floor_xz {
-            let slot = get_block(IVec3::new(x, y, z));
-            if slot.is_empty() {
-                continue;
-            }
-            let def = reg.def(slot);
-            for tag in &def.tags {
-                *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+            let ceiling = (1..=ROOF_SCAN_CAP)
+                .find(|&dy| bounds_room(get_block(IVec3::new(x, floor_y + dy, z)), reg));
+            if let Some(dy) = ceiling {
+                ceilings.push(dy as u32);
+                max_probe_height = max_probe_height.max(dy as u32);
             }
         }
-        enclosure_height += 1;
     }
+    let roof_fraction = if floor_xz.is_empty() || !perimeter_sealed {
+        0.0
+    } else {
+        ceilings.len() as f32 / floor_xz.len() as f32
+    };
+    let has_roof = roof_fraction >= HAS_ROOF_MIN_FRACTION;
+
+    // Interior height. Roofed: median clear headroom under the ceiling
+    // (median, not min, so one low beam doesn't reclassify the room).
+    // Unroofed: minimum wall run along the external perimeter, doorway
+    // columns exempt. Unsealed regions read 0 and match nothing that
+    // requires enclosure.
+    let enclosure_height: u32 = if !perimeter_sealed {
+        0
+    } else if has_roof {
+        let mut sorted = ceilings.clone();
+        sorted.sort_unstable();
+        sorted[(sorted.len() - 1) / 2]
+    } else {
+        external_perimeter
+            .iter()
+            .filter(|&&(x, z)| !fill.boundary_gaps.contains(&IVec3::new(x, floor_y, z)))
+            .map(|&(x, z)| {
+                let run = (0..=ROOF_SCAN_CAP)
+                    .take_while(|&dy| bounds_room(get_block(IVec3::new(x, floor_y + dy, z)), reg))
+                    .count() as u32;
+                max_probe_height = max_probe_height.max(run);
+                run
+            })
+            .min()
+            .unwrap_or(0)
+    };
     let volume = enclosure_height.saturating_mul(floor_cells.len() as u32);
+
+    // Interior contents scan for tags: every column of the region —
+    // floor columns AND internal-perimeter columns (furniture, pillars;
+    // these were carved out of the floor set by the very block we want
+    // to count) — from floor Y up through the interior height. Multi-
+    // cell block entities are normalised to placement units by their
+    // footprint size so a 2-cell bed counts as ONE bed.
+    let mut slot_cell_counts: HashMap<BlockSlot, u32> = HashMap::new();
+    let internal_perimeter = perimeter_xz.difference(&external_perimeter);
+    let scan_top = enclosure_height.saturating_sub(1) as i32;
+    for &(x, z) in floor_xz.iter().chain(internal_perimeter) {
+        for dy in 0..=scan_top {
+            let slot = get_block(IVec3::new(x, floor_y + dy, z));
+            if !slot.is_empty() {
+                *slot_cell_counts.entry(slot).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut tag_counts: HashMap<_, u32> = HashMap::new();
+    for (slot, cells) in slot_cell_counts {
+        let def = reg.def(slot);
+        if def.tags.is_empty() {
+            continue;
+        }
+        let units = cells.div_ceil(def.footprint.len().max(1) as u32);
+        for tag in &def.tags {
+            *tag_counts.entry(tag.clone()).or_insert(0) += units;
+        }
+    }
 
     // Walkable cells = floor cells with player-height clearance above.
     // Floor set itself stays geometric (so the room stays enclosed even
@@ -794,7 +966,7 @@ fn compute_signature(
         })
         .count() as u32;
 
-    RoomSignature {
+    let signature = RoomSignature {
         domain: PatternDomain::Volumetric,
         bbox: BBox {
             min: BlockPos {
@@ -813,13 +985,15 @@ fn compute_signature(
         walkable_count: Some(walkable_count),
         enclosure_height: Some(enclosure_height),
         has_roof: Some(has_roof),
+        roof_fraction: Some(roof_fraction),
         door_count: Some(door_count),
         floor_composition: Some(comp),
         tag_counts: tag_counts
             .into_iter()
             .map(|(tag, count)| TagCount { tag, count })
             .collect(),
-    }
+    };
+    (signature, SignatureExtras { max_probe_height })
 }
 
 /// Find the deepest matching pattern (with the parent chain's constraints
@@ -878,6 +1052,10 @@ fn evaluate_constraint(c: &Constraint, sig: &RoomSignature) -> bool {
             min.is_none_or(|m| v >= m) && max.is_none_or(|m| v <= m)
         }
         Constraint::HasRoof { required } => sig.has_roof == Some(*required),
+        Constraint::RoofFraction { min, max } => {
+            let v = sig.roof_fraction.unwrap_or(0.0);
+            min.is_none_or(|m| v >= m) && max.is_none_or(|m| v <= m)
+        }
         Constraint::FloorFraction { surface, min } => {
             let fc = sig.floor_composition.unwrap_or_default();
             let v = match surface {
@@ -917,5 +1095,433 @@ fn evaluate_constraint(c: &Constraint, sig: &RoomSignature) -> bool {
         // an `AdjacentPair` constraint can't match. Returning false keeps
         // the volumetric matcher from accidentally selecting one.
         Constraint::AdjacentPair { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use block_junk_mod_api::blocks::BlockDef;
+
+    // ---------- harness ----------
+
+    /// Named slots for the test registry, in registration order.
+    /// `vanilla:empty` must be slot 0 (BlockRegistry::build enforces it).
+    struct Slots {
+        stone: BlockSlot,
+        door: BlockSlot,
+        bed: BlockSlot,
+    }
+
+    fn test_registry() -> (BlockRegistry, Slots) {
+        let defs: Vec<BlockDef> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "vanilla:empty",
+                "display_name": "Empty",
+                "flags": {},
+                "color": [0.0, 0.0, 0.0]
+            },
+            {
+                "id": "test:stone",
+                "display_name": "Stone",
+                "flags": { "solid": true, "room_boundary": true, "support_below": true },
+                "color": [0.5, 0.5, 0.5]
+            },
+            {
+                "id": "test:door",
+                "display_name": "Door",
+                "flags": { "room_boundary": true, "walkable_boundary": true },
+                "color": [0.4, 0.2, 0.1]
+            },
+            {
+                "id": "test:bed",
+                "display_name": "Bed",
+                "flags": { "solid": true, "support_below": true },
+                "tags": ["vanilla:bed"],
+                "footprint": [[0, 0, 0], [1, 0, 0]],
+                "color": [0.4, 0.2, 0.1]
+            }
+        ]))
+        .expect("test block defs deserialize");
+        let (reg, _) = BlockRegistry::build(defs).expect("test registry builds");
+        let slots = Slots {
+            stone: reg.slot_of(&"test:stone".into()).unwrap(),
+            door: reg.slot_of(&"test:door".into()).unwrap(),
+            bed: reg.slot_of(&"test:bed".into()).unwrap(),
+        };
+        (reg, slots)
+    }
+
+    fn vanilla_like_patterns() -> RoomPatternRegistry {
+        use block_junk_mod_api::rooms::Constraint as C;
+        let p = |id: &str, parent: Option<&str>, priority: i32, constraints: Vec<C>| RoomPattern {
+            id: id.into(),
+            display_name: id.to_string(),
+            parent: parent.map(Into::into),
+            domain: PatternDomain::Volumetric,
+            constraints,
+            priority,
+        };
+        RoomPatternRegistry::build(vec![
+            p(
+                "enclosed_space",
+                None,
+                0,
+                vec![
+                    C::FloorArea {
+                        min: Some(4),
+                        max: Some(4096),
+                    },
+                    C::EnclosureHeight {
+                        min: Some(1),
+                        max: None,
+                    },
+                    C::DoorCount { min: 1, max: None },
+                ],
+            ),
+            p(
+                "walled_yard",
+                Some("enclosed_space"),
+                0,
+                vec![
+                    C::RoofFraction {
+                        min: None,
+                        max: Some(0.5),
+                    },
+                    C::FloorFraction {
+                        surface: FloorKind::Solid,
+                        min: 0.6,
+                    },
+                ],
+            ),
+            p(
+                "small_house",
+                Some("enclosed_space"),
+                1,
+                vec![
+                    C::HasRoof { required: true },
+                    C::EnclosureHeight {
+                        min: Some(2),
+                        max: None,
+                    },
+                    C::FloorArea {
+                        min: None,
+                        max: Some(50),
+                    },
+                    C::FloorFraction {
+                        surface: FloorKind::Solid,
+                        min: 0.8,
+                    },
+                ],
+            ),
+            p(
+                "bedroom",
+                Some("small_house"),
+                2,
+                vec![C::TagCount {
+                    tag: block_junk_mod_api::blocks::TagId("vanilla:bed".into()),
+                    min: 1,
+                    max: None,
+                }],
+            ),
+        ])
+        .expect("test patterns build")
+    }
+
+    #[derive(Default)]
+    struct World {
+        blocks: HashMap<IVec3, BlockSlot>,
+    }
+
+    impl World {
+        fn set(&mut self, x: i32, y: i32, z: i32, slot: BlockSlot) {
+            self.blocks.insert(IVec3::new(x, y, z), slot);
+        }
+
+        fn clear(&mut self, x: i32, y: i32, z: i32) {
+            self.blocks.remove(&IVec3::new(x, y, z));
+        }
+
+        fn getter(&self) -> impl Fn(IVec3) -> BlockSlot + '_ {
+            |w| self.blocks.get(&w).copied().unwrap_or(BlockSlot::EMPTY)
+        }
+    }
+
+    /// Stone ground at y=0 over `0..=5` square, stone wall ring at
+    /// `y = 1..=wall_h` on the x/z ∈ {0,5} border. Interior floor cells
+    /// are the 4×4 at y=1. No roof, no door — callers add those.
+    fn walled_box(world: &mut World, s: &Slots, wall_h: i32) {
+        for x in 0..=5 {
+            for z in 0..=5 {
+                world.set(x, 0, z, s.stone);
+                let on_ring = x == 0 || x == 5 || z == 0 || z == 5;
+                if on_ring {
+                    for y in 1..=wall_h {
+                        world.set(x, y, z, s.stone);
+                    }
+                }
+            }
+        }
+    }
+
+    fn flat_roof(world: &mut World, s: &Slots, y: i32) {
+        for x in 0..=5 {
+            for z in 0..=5 {
+                world.set(x, y, z, s.stone);
+            }
+        }
+    }
+
+    /// Run fill + signature + match from an interior seed.
+    fn detect(
+        world: &World,
+        reg: &BlockRegistry,
+        patterns: &RoomPatternRegistry,
+        seed: IVec3,
+    ) -> Option<(RoomSignature, Option<RoomPatternId>)> {
+        let get = world.getter();
+        let mut visited = HashSet::new();
+        let fill = flood_fill_floor(seed, &get, reg, FLOOD_CAP, &mut visited)?;
+        let (sig, _) = compute_signature(&fill, &get, reg);
+        let pattern = match_pattern(&sig, patterns);
+        Some((sig, pattern))
+    }
+
+    fn pattern_name(p: &Option<RoomPatternId>) -> &str {
+        p.as_ref().map(|id| id.as_str()).unwrap_or("<none>")
+    }
+
+    const SEED: IVec3 = IVec3::new(2, 1, 2);
+
+    // ---------- enclosure + ceilings ----------
+
+    #[test]
+    fn box_with_door_block_is_small_house() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        w.set(0, 1, 2, s.door);
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        assert_eq!(sig.door_count, Some(1));
+        assert_eq!(sig.enclosure_height, Some(2));
+        assert_eq!(sig.has_roof, Some(true));
+        assert_eq!(pattern_name(&pat), "small_house");
+    }
+
+    #[test]
+    fn open_doorway_bounds_the_fill_and_counts_as_a_door() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        // 1-wide, 2-high opening in the west wall: no door block at all.
+        w.clear(0, 1, 2);
+        w.clear(0, 2, 2);
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill must not leak");
+        assert_eq!(sig.cell_count, 16, "fill stayed inside the room");
+        assert_eq!(sig.door_count, Some(1), "virtual doorway counted");
+        assert_eq!(pattern_name(&pat), "small_house");
+    }
+
+    #[test]
+    fn sealed_box_without_any_door_matches_nothing() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        assert_eq!(sig.door_count, Some(0));
+        assert_eq!(pat, None, "no access point ⇒ not a room");
+    }
+
+    #[test]
+    fn pitched_roof_is_still_a_house() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        w.set(0, 1, 2, s.door);
+        // Two-level "pitched" roof: west half at y=3, east half at y=4.
+        for x in 0..=5 {
+            for z in 0..=5 {
+                w.set(x, if x <= 2 { 3 } else { 4 }, z, s.stone);
+            }
+        }
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        assert_eq!(sig.has_roof, Some(true), "per-column roof sees the pitch");
+        assert_eq!(pattern_name(&pat), "small_house");
+    }
+
+    #[test]
+    fn skylight_hole_is_still_a_house() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        w.set(0, 1, 2, s.door);
+        w.clear(2, 3, 2); // one missing roof block over the interior
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        let fraction = sig.roof_fraction.expect("fraction populated");
+        assert!(
+            (fraction - 15.0 / 16.0).abs() < 1e-6,
+            "15 of 16 columns roofed, got {fraction}"
+        );
+        assert_eq!(sig.has_roof, Some(true));
+        assert_eq!(pattern_name(&pat), "small_house");
+    }
+
+    #[test]
+    fn air_gap_above_door_block_does_not_unroof_the_house() {
+        // The pre-2026-07 layer-walk regression in miniature: door block
+        // at floor Y, nothing filling the wall at Y+1 over the door.
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        w.set(0, 1, 2, s.door);
+        w.clear(0, 2, 2); // wall opening directly above the door
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        assert_eq!(sig.has_roof, Some(true));
+        assert_eq!(sig.enclosure_height, Some(2));
+        assert_eq!(pattern_name(&pat), "small_house");
+    }
+
+    #[test]
+    fn crawlspace_is_not_a_room_at_all() {
+        // Ceiling directly at head height: sealed and roofed, but no
+        // floor cell has standing clearance, so walkable area is 0 and
+        // nothing matches. A space the player can't stand in isn't a
+        // room — the fix for "low ceilings feel wrong" is the R1
+        // feedback/diagnosis surface, not loosening this.
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 1);
+        flat_roof(&mut w, &s, 2);
+        w.set(0, 1, 2, s.door);
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        assert_eq!(sig.enclosure_height, Some(1));
+        assert_eq!(sig.has_roof, Some(true), "roofed, just too low");
+        assert_eq!(sig.walkable_count, Some(0), "nowhere to stand");
+        assert_eq!(pat, None);
+    }
+
+    #[test]
+    fn open_yard_with_low_walls_is_walled_yard() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 1);
+        w.clear(0, 1, 2); // open doorway; sky above, so it's walkable
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        assert_eq!(sig.roof_fraction, Some(0.0));
+        assert_eq!(sig.enclosure_height, Some(1));
+        assert_eq!(sig.door_count, Some(1));
+        assert_eq!(pattern_name(&pat), "walled_yard");
+    }
+
+    #[test]
+    fn half_roofed_shell_is_neither_yard_nor_house() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        w.set(0, 1, 2, s.door);
+        // Roof over 10 of 16 interior columns (the x ∈ {1,2} rows plus
+        // two cells of the x == 3 row): fraction 0.625 — between the
+        // yard's ≤ 0.5 and the house's ≥ 0.85.
+        for x in 1..=2 {
+            for z in 1..=4 {
+                w.set(x, 3, z, s.stone);
+            }
+        }
+        w.set(3, 3, 1, s.stone);
+        w.set(3, 3, 2, s.stone);
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        let fraction = sig.roof_fraction.expect("fraction populated");
+        assert!((fraction - 0.625).abs() < 1e-6, "got {fraction}");
+        assert_eq!(sig.has_roof, Some(false));
+        assert_eq!(pattern_name(&pat), "enclosed_space");
+    }
+
+    #[test]
+    fn two_wide_gap_leaks_the_fill() {
+        let (reg, s) = test_registry();
+        let mut w = World::default();
+        // Wide ground plane so the leak has room to exceed the cap.
+        for x in -8..=13 {
+            for z in -8..=13 {
+                w.set(x, 0, z, s.stone);
+            }
+        }
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        // 2-wide breach: neither cell is flanked on both sides.
+        w.clear(0, 1, 2);
+        w.clear(0, 1, 3);
+        let get = w.getter();
+        let mut visited = HashSet::new();
+        let fill = flood_fill_floor(SEED, &get, &reg, 200, &mut visited);
+        assert!(fill.is_none(), "2-wide breach must leak to the cap");
+    }
+
+    // ---------- furniture typing ----------
+
+    #[test]
+    fn bed_in_a_house_makes_a_bedroom() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        w.set(0, 1, 2, s.door);
+        // 2-cell bed standing ON the floor (carves 2 floor cells).
+        w.set(2, 1, 3, s.bed);
+        w.set(3, 1, 3, s.bed);
+        let (sig, pat) = detect(&w, &reg, &patterns, SEED).expect("fill succeeds");
+        assert_eq!(sig.cell_count, 14, "bed cells left the floor set");
+        let beds = sig
+            .tag_counts
+            .iter()
+            .find(|tc| tc.tag.0 == "vanilla:bed")
+            .map(|tc| tc.count);
+        assert_eq!(beds, Some(1), "2-cell bed counts as ONE bed");
+        assert_eq!(pattern_name(&pat), "bedroom");
+    }
+
+    // ---------- helpers ----------
+
+    #[test]
+    fn corridor_cell_reads_as_choke() {
+        let (reg, s) = test_registry();
+        let mut w = World::default();
+        for x in 0..=6 {
+            w.set(x, 0, 0, s.stone); // ground
+            w.set(x, 1, -1, s.stone); // south wall
+            w.set(x, 1, 1, s.stone); // north wall
+        }
+        let get = w.getter();
+        assert!(is_choke_along(IVec3::new(3, 1, 0), IVec3::Z, &get, &reg));
+        assert!(!is_choke_along(IVec3::new(3, 1, 0), IVec3::X, &get, &reg));
+    }
+
+    #[test]
+    fn overlap_identity_thresholds() {
+        // Single-cell trim of a 16-cell room keeps identity.
+        assert!(overlap_keeps_identity(15, 16, 15));
+        // Wholesale replacement (no shared cells) does not.
+        assert!(!overlap_keeps_identity(0, 16, 16));
+        // A room split in half: the 8-cell survivor keeps identity
+        // against the old 16 (overlap 8 ≥ half of min(16, 8)).
+        assert!(overlap_keeps_identity(8, 16, 8));
+        // Tiny sliver of a big room grabbing its id: 2 of 40 shared,
+        // new fill is 30 cells of mostly-new geometry — rejected.
+        assert!(!overlap_keeps_identity(2, 40, 30));
     }
 }

@@ -260,6 +260,14 @@ In-repo: `menu.rs::pause_menu_ui`, `debug.rs::debug_panel_ui`.
 - CPU preview images: `ctx.load_texture(name, ColorImage::…, TextureOptions::NEAREST)` unchanged.
 - bevy_egui 0.40 scaling: zoom now via `native_pixels_per_point`/`set_zoom_factor` — don't call `set_pixels_per_point`.
 
+## Shader-library + ghost-material learnings (2026-07)
+
+- **Import-only WGSL libraries**: give the file `#define_import_path my_crate::my_lib`, register with `bevy::shader::load_shader_library!(app, "path/lib.wgsl")` (embeds + permanently loads; a bare `embedded_asset!` is NOT enough — nothing would load it). Cross-crate imports work (block-junk imports `block_junk_textures::dither`); a library may declare bind-group bindings, but then every importer's `AsBindGroup` must bind the same resources at the same slot numbers (chunk material + ghost material share `composite.wgsl`'s @100-103 this way).
+- **Per-instance pipeline variants on one material type**: `#[bind_group_data(MyKey)]` on the `AsBindGroup` type + `impl From<&MyExt> for MyKey`; `specialize` reads `key.bind_group_data` — used for the ghost materials' front (opaque, depth write) vs x-ray (Blend → Transparent3d, `depth_compare: Some(Less)`, no write) split. For `ExtendedMaterial`, which pass a mesh renders in comes from the *base* StandardMaterial's `alpha_mode` — keep it consistent with the key.
+- **Screen-door (Bayer-dither discard) transparency**: render opaque + `discard` on a Bayer threshold. Depth writes make ghosts self-occlude correctly (no alpha accumulation). Fragment pixel coords = `in.position.xy` (`@builtin(position)`); camera pos = `view.world_position` via `#import bevy_pbr::mesh_view_bindings::view`. Opaque ghosts cast shadows — add `bevy::light::NotShadowCaster`. Forward-only: if a depth/deferred prepass is ever added, mirror the discard into a prepass fragment shader or early-Z resurrects the discarded pixels.
+- **Uniform structs**: mirror field order Rust↔WGSL and pad explicitly to 16-byte multiples (`_pad0: f32...`) rather than trusting implicit layout agreement.
+- **Save-format gotcha (project, not Bevy)**: the save blob is bincode = positional; `#[serde(default)]` does NOT provide backward compat there. Any field added to a saved struct needs a `SAVE_VERSION` bump + a verbatim `SaveFileVn` migration struct (see save.rs v12/v13 pattern).
+
 ## Texture/material learnings from the procedural-texture build (2026-06)
 
 - **`embedded_asset!` in a library crate**: path relative to the invoking file's dir; URL `embedded://<crate_snake_case>/<path-from-src>`.
