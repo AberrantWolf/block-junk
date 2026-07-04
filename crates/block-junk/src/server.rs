@@ -177,16 +177,13 @@ impl Plugin for ServerPlugin {
         // compares this against the client's predicted state and replays
         // unacked inputs on disagreement.
         app.add_systems(FixedUpdate, server_player_step);
-        // Soft actor separation runs after both physics systems have
-        // moved everyone for this tick. The pairwise push then nudges
-        // any overlapping actors apart 50/50 — gentle pushing instead
-        // of hard contact-stop. Also runs on the first tick after
-        // load and incidentally separates pre-stacked NPCs.
+        // Soft actor separation (players only — kinematic NPCs ghost
+        // through) runs after the player step has moved everyone for
+        // this tick. The pairwise push nudges overlapping players
+        // apart 50/50 — gentle pushing instead of hard contact-stop.
         app.add_systems(
             FixedUpdate,
-            soft_separate_actors
-                .after(server_player_step)
-                .after(crate::npc::npc_physics_step),
+            soft_separate_actors.after(server_player_step),
         );
         // Block-stuck NPCs from a save (or any load-time edge case
         // where an actor is inside a solid cell) get one pushout
@@ -721,7 +718,7 @@ fn spawn_loaded_npc(
         AvatarVelocity::default(),
         AvatarOnGround::default(),
         npc.movement_mode,
-        MovementIntent::default(),
+        crate::npc_mover::NavMover::default(),
         NpcPath::default(),
         NpcAnimOverride::default(),
         Replicate::to_clients(NetworkTarget::All),
@@ -2602,10 +2599,9 @@ fn spawn_drops_on_destroy(
 /// Push any actor (player or NPC) out of a cell that just became solid.
 ///
 /// Observed when an NPC finishes a Build plan while their head cell is
-/// the build target — `PATH_ARRIVE_RADIUS` is wider than the body, and
-/// the standable-neighbour picker only checks the foot's cell, so a
-/// body straddling target_cell vertically is possible. After the
-/// block lands, the body is embedded.
+/// the build target — the standable-neighbour picker only checks the
+/// foot's cell, so a body straddling target_cell vertically is
+/// possible. After the block lands, the body is embedded.
 ///
 /// Mechanism: listens to the same `CellEdit` bus as
 /// `auto_clear_stale_plans`. For each cell that became blocking (solid +

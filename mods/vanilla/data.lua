@@ -243,6 +243,11 @@ register {
     flags = {
         solid = true,
         support_below = true,
+        -- NPC nav may route *through* the bed's cells at extra cost
+        -- (the kinematic mover walks over furniture at floor level).
+        -- Beds prefer aisles but never wall an NPC in — a bed-packed
+        -- bedroom stays traversable without hand-authored gaps.
+        nav_passable = true,
     },
     -- Room-typing tag: one unit of "vanilla:bed" per placed bed (the
     -- detector normalises the 2-cell footprint). Drives the bedroom
@@ -739,11 +744,4 @@ engine.npcs.register {
         walk = "vanilla:walk",
         work = "vanilla:work",
     },
-    -- Per-tick velocity preservation (0..1). 0 = snap horizontal
-    -- velocity to wishdir target every FixedUpdate tick; 1 = keep
-    -- previous velocity (controller is horizontally inert, only
-    -- gravity + collisions move the NPC). Vanilla wanderers
-    -- path-follow precisely, so we want no momentum. Dial up if a
-    -- future heavy creature should feel slidey / hard to turn.
-    npc_momentum = 0.0,
 }

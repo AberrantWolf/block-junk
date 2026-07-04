@@ -2802,19 +2802,25 @@ fn buffer_input(
 
 /// Client-side soft separation. Same pairwise overlap pass as
 /// [`crate::physics::soft_separate_actors`], but only writes pushes
-/// back to *Predicted* actors. Interpolated remote actors (other
-/// players, NPCs) take part in the pairwise direction calculation
-/// — without them the local owner would walk through bodies — but
-/// they aren't moved locally, since their pose is owned by lightyear's
-/// interpolation against authoritative server snapshots. Locally
-/// pushing them would drift each tick away from the snapshot value
-/// and stay drifted (a clean fix instead of "next snapshot corrects
-/// it," which empirically didn't recover under sustained contact).
+/// back to *Predicted* actors. Interpolated remote players take part
+/// in the pairwise direction calculation — without them the local
+/// owner would walk through bodies — but they aren't moved locally,
+/// since their pose is owned by lightyear's interpolation against
+/// authoritative server snapshots. Locally pushing them would drift
+/// each tick away from the snapshot value and stay drifted (a clean
+/// fix instead of "next snapshot corrects it," which empirically
+/// didn't recover under sustained contact).
+///
+/// NPCs are excluded from the snapshot entirely, matching the server
+/// pass: kinematic NPCs can't be pushed server-side, so if the
+/// predicted player were pushed off NPC bodies here the server would
+/// disagree every contact and the player would rubber-band. Players
+/// ghost through NPCs, by design.
 fn soft_separate_predicted_actors(
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    mut actors: Query<(Entity, &mut AvatarPose), With<Actor>>,
+    mut actors: Query<(Entity, &mut AvatarPose), (With<Actor>, Without<Npc>)>,
     predicted_only: Query<(), With<Predicted>>,
 ) {
     let snapshot: Vec<(Entity, Vec3)> = actors

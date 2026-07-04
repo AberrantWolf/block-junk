@@ -18,6 +18,7 @@ mod menu;
 mod modset;
 mod network;
 mod npc;
+mod npc_mover;
 mod npc_registry;
 mod pathfinding;
 mod physics;

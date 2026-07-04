@@ -90,7 +90,16 @@ pub fn soft_separate_actors(
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    mut actors: Query<(Entity, &mut AvatarPose), (With<Actor>, Without<KinematicLock>)>,
+    // NPCs are excluded entirely (ghost-through): the kinematic mover
+    // owns their pose, nothing may push them off the validated path,
+    // and pushing *players* off NPC bodies here would mispredict
+    // clients unless the client pass did the same — so neither does.
+    // The client variant in client.rs mirrors this exclusion; keep the
+    // two in lockstep.
+    mut actors: Query<
+        (Entity, &mut AvatarPose),
+        (With<Actor>, Without<KinematicLock>, Without<crate::npc::Npc>),
+    >,
 ) {
     let snapshot: Vec<(Entity, Vec3)> = actors
         .iter()
@@ -418,89 +427,6 @@ fn walk_step(
     let mut aabb = Aabb::from_centre_half(centre, PLAYER_HALF_EXTENTS);
     let delta = *v * dt;
 
-    let mut grounded = false;
-    for axis in [1, 0, 2] {
-        let mut step = Vec3::ZERO;
-        step[axis] = delta[axis];
-        let resolved = sweep_axis(&aabb, step, axis, world);
-        aabb = aabb.translated(resolved);
-        if (resolved[axis] - step[axis]).abs() > f32::EPSILON {
-            v[axis] = 0.0;
-            if axis == 1 && step.y < 0.0 {
-                grounded = true;
-            }
-        }
-    }
-    on_ground.0 = grounded;
-    pose.translation = aabb.centre() + Vec3::Y * EYE_OFFSET_FROM_CENTRE;
-}
-
-/// NPC-specific walk step. Same shape as the player's `walk_step` but
-/// replaces Quake friction + accel with a single momentum lerp toward
-/// the wishdir-derived target velocity each tick. The lerp factor is
-/// passed in from the kind def (see `NpcKindDef::npc_momentum`) so a
-/// mod can tune feel per kind without recompiling. `0.0` snaps
-/// instantly (no inertia); `1.0` fully preserves velocity (controller
-/// is a no-op horizontally, gravity + collision still apply).
-///
-/// Players keep the Quake controller in `walk_step` because their
-/// input is real-time WASD and the friction/accel pair gives the
-/// muscle-memory feel; NPCs path-follow toward a stream of waypoints,
-/// where Quake's smoothing tail makes them overshoot corners and look
-/// drunk.
-pub fn npc_walk_step(
-    pose: &mut AvatarPose,
-    velocity: &mut AvatarVelocity,
-    on_ground: &mut AvatarOnGround,
-    input: &MovementIntent,
-    momentum: f32,
-    dt: f32,
-    world: &WorldCollision,
-) {
-    if dt <= 0.0 {
-        return;
-    }
-    pose.yaw = (pose.yaw + input.dyaw).rem_euclid(core::f32::consts::TAU);
-
-    // Wishdir basis. Same convention as `apply_walk_step`: yaw=0 →
-    // forward = -Z, right = +X.
-    let (sin_y, cos_y) = pose.yaw.sin_cos();
-    let forward = Vec3::new(-sin_y, 0.0, -cos_y);
-    let right = Vec3::new(cos_y, 0.0, -sin_y);
-    let wishdir_local = Vec3::new(
-        input.wishdir[0] as f32,
-        input.wishdir[1] as f32,
-        input.wishdir[2] as f32,
-    );
-    let wish_horizontal = right * wishdir_local.x + forward * (-wishdir_local.z);
-    let wishspeed = wish_horizontal.length();
-    let wishdir = if wishspeed > f32::EPSILON {
-        wish_horizontal / wishspeed
-    } else {
-        Vec3::ZERO
-    };
-    let target_speed = if wishspeed > 0.0 { WALK_SPEED } else { 0.0 };
-
-    let v = &mut velocity.0;
-    let keep = momentum.clamp(0.0, 1.0);
-    let target_x = wishdir.x * target_speed;
-    let target_z = wishdir.z * target_speed;
-    v.x = v.x * keep + target_x * (1.0 - keep);
-    v.z = v.z * keep + target_z * (1.0 - keep);
-
-    // Jump on rising edge while grounded — same as `walk_step`. NPC
-    // brains only set `jump = true` when their path requires a
-    // step-up.
-    if on_ground.0 && input.jump {
-        v.y = JUMP_SPEED;
-        on_ground.0 = false;
-    }
-    v.y -= GRAVITY * dt;
-
-    // Sweep — Y first so we settle on the floor before XZ resolves.
-    let centre = pose.translation - Vec3::Y * EYE_OFFSET_FROM_CENTRE;
-    let mut aabb = Aabb::from_centre_half(centre, PLAYER_HALF_EXTENTS);
-    let delta = *v * dt;
     let mut grounded = false;
     for axis in [1, 0, 2] {
         let mut step = Vec3::ZERO;
