@@ -93,6 +93,13 @@ pub struct BlockFlags {
     /// A boundary the player or an NPC can pass through (door, open gate).
     /// Implies `room_boundary`.
     pub walkable_boundary: bool,
+    /// NPC navigation treats this block's cells as passable at extra
+    /// cost instead of hard-blocking — low furniture (beds) that a body
+    /// can move through/over without the room becoming a maze. Applies
+    /// to every footprint cell of a multi-cell block. Collision is
+    /// unaffected; the block still counts as solid for support (you can
+    /// stand on it) and item settling.
+    pub nav_passable: bool,
     /// The cell directly ABOVE a block with this flag is a valid floor cell.
     /// Solid ground has this; water has this (you stand on the surface).
     pub support_below: bool,

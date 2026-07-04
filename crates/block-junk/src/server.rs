@@ -140,6 +140,17 @@ impl Plugin for ServerPlugin {
                 .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
         );
+        // Live-path invalidation rides the CellEdit bus too: flags NPCs
+        // whose MoveTo path envelope an edit touched (`PathDirty`); the
+        // FixedUpdate brain tick re-validates and repaths. Must stay in
+        // Update — a MessageReader polled from FixedUpdate drops
+        // messages on frames without a fixed tick.
+        app.add_systems(
+            Update,
+            crate::npc::mark_paths_dirty_on_cell_edit
+                .after(receive_block_edits)
+                .in_set(GameSet::Simulation),
+        );
         app.add_systems(
             Update,
             receive_npc_inspection_requests.in_set(GameSet::Simulation),

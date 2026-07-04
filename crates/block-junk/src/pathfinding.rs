@@ -21,28 +21,55 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use bevy::math::IVec3;
+use bevy::math::{IVec3, Vec2};
 use bevy::platform::collections::HashMap;
 
 /// What the pathfinder needs to know about the world. Implemented by
 /// the game-side wrapper around `ChunkMap`/`Chunk`; tests implement it
 /// over a hand-rolled grid.
 pub trait Walkability {
-    /// True if `cell` is occupied by anything that blocks an actor's
-    /// body. Unloaded chunks return `true` so the search doesn't commit
-    /// to paths through unknown territory.
+    /// True if `cell` is occupied. Unloaded chunks return `true` so the
+    /// search doesn't commit to paths through unknown territory. This is
+    /// the *support* question ("can something rest on / in this cell?");
+    /// body passage is `blocks_body`.
     fn is_solid(&self, cell: IVec3) -> bool;
 
-    /// Per-cell movement cost. Default 1.0; future road tags lower it.
+    /// True if `cell` blocks an actor's body from occupying it. Defaults
+    /// to `is_solid`; the game world overrides this so blocks flagged
+    /// `nav_passable` (low furniture) let bodies through while still
+    /// counting as solid for support and item settling.
+    fn blocks_body(&self, cell: IVec3) -> bool {
+        self.is_solid(cell)
+    }
+
+    /// Per-cell movement cost. Default 1.0; nav-passable furniture costs
+    /// more (so A* prefers aisles), future road tags will cost less.
     fn cost(&self, _cell: IVec3) -> f32 {
         1.0
     }
 }
 
+/// Half-extent of the walker's body in the XZ plane, in cells. Kept in
+/// lockstep with `PLAYER_HALF_EXTENTS.x` in `physics.rs` (this module
+/// stays Bevy-system-free, so the constant is mirrored rather than
+/// imported). Path smoothing inflates its corridor checks by this much
+/// so a smoothed diagonal never grazes a solid the collision sweep
+/// would catch.
+pub const NAV_BODY_HALF_EXTENT: f32 = 0.3;
+
+/// Cost multiplier for walking through an occupied nav-passable cell
+/// (bed, low furniture). High enough that A* takes any reasonable
+/// aisle detour first, low enough that furniture never walls an NPC in.
+pub const NAV_PASSABLE_COST_MULT: f32 = 4.0;
+
 /// True when an actor with a 1×2-cell body can stand at `foot_cell`:
-/// foot cell empty, head cell empty, supporting cell solid.
+/// foot and head cells passable to the body, supporting cell solid.
+/// Support deliberately stays `is_solid`, not `blocks_body`: a
+/// nav-passable bed still supports standing on top of it.
 pub fn standable<W: Walkability>(world: &W, foot: IVec3) -> bool {
-    !world.is_solid(foot) && !world.is_solid(foot + IVec3::Y) && world.is_solid(foot - IVec3::Y)
+    !world.blocks_body(foot)
+        && !world.blocks_body(foot + IVec3::Y)
+        && world.is_solid(foot - IVec3::Y)
 }
 
 /// String-pulling smoother. Given an A* path that zig-zags through
@@ -54,7 +81,7 @@ pub fn standable<W: Walkability>(world: &W, foot: IVec3) -> bool {
 ///
 /// Step-up / step-down cells are deliberately preserved — vertical
 /// transitions need to remain explicit so the NPC brain can detect
-/// them and trigger a jump. `line_of_sight` returns false across any
+/// them and trigger a jump. `corridor_clear` returns false across any
 /// Y change, which keeps the surrounding kinks intact.
 pub fn smooth_path<W: Walkability>(path: Vec<IVec3>, world: &W) -> Vec<IVec3> {
     if path.len() <= 2 {
@@ -69,7 +96,7 @@ pub fn smooth_path<W: Walkability>(path: Vec<IVec3>, world: &W) -> Vec<IVec3> {
     // bypass it. The last cell is always pushed unconditionally
     // outside the loop, so the loop only inspects interior cells.
     while i < path.len() - 1 {
-        if line_of_sight(anchor, path[i + 1], world) {
+        if corridor_clear(anchor, path[i + 1], world, NAV_BODY_HALF_EXTENT) {
             // path[i] is redundant — the line from anchor to
             // path[i+1] passes through walkable cells.
             i += 1;
@@ -85,28 +112,39 @@ pub fn smooth_path<W: Walkability>(path: Vec<IVec3>, world: &W) -> Vec<IVec3> {
     out
 }
 
-/// True if a body can travel in a straight line from cell `a` to cell
-/// `b` without entering any non-standable cell. Same-Y only — vertical
-/// transitions stay as kinks so the brain can jump them. Uses
-/// Amanatides-Woo grid traversal so every cell the line passes
-/// through is checked, including diagonal corner-cuts.
-fn line_of_sight<W: Walkability>(a: IVec3, b: IVec3, world: &W) -> bool {
+/// Slack subtracted from the body half-extent in corridor checks so
+/// exactly-marginal fits (a smoothed segment down the centreline of a
+/// 1-cell aisle) pass instead of failing on float noise.
+const CORRIDOR_EPS: f32 = 1e-3;
+
+/// True if a body of XZ half-extent `half_extent` can travel in a
+/// straight line from cell `a`'s centre to cell `b`'s centre. Same-Y
+/// only — vertical transitions stay as kinks so path execution keeps
+/// them explicit. Two requirements:
+///
+/// - Every cell the centreline passes through (Amanatides-Woo grid
+///   traversal, including diagonal corner-cuts) must be `standable`.
+/// - Every cell the body's swept width reaches — anything within
+///   `half_extent` of the segment — must not block the body at foot or
+///   head height. Support is deliberately not required off-centreline:
+///   a shoulder may overhang a ledge edge on a diagonal.
+///
+/// The width check is what keeps smoothing honest with the collision
+/// sweep: the old zero-width ray let smoothed diagonals graze furniture
+/// corners the sweep then wedged on.
+pub fn corridor_clear<W: Walkability>(a: IVec3, b: IVec3, world: &W, half_extent: f32) -> bool {
     if a.y != b.y {
         return false;
     }
     if a == b {
         return true;
     }
-    let y = a.y;
-    let ax = a.x as f32 + 0.5;
-    let az = a.z as f32 + 0.5;
-    let bx = b.x as f32 + 0.5;
-    let bz = b.z as f32 + 0.5;
-    let dx = bx - ax;
-    let dz = bz - az;
+    let p0 = Vec2::new(a.x as f32 + 0.5, a.z as f32 + 0.5);
+    let p1 = Vec2::new(b.x as f32 + 0.5, b.z as f32 + 0.5);
+    let dx = p1.x - p0.x;
+    let dz = p1.y - p0.y;
 
-    let mut cell = IVec3::new(ax.floor() as i32, y, az.floor() as i32);
-    let end = IVec3::new(bx.floor() as i32, y, bz.floor() as i32);
+    let mut cell = a;
 
     let step_x = if dx > 0.0 {
         1
@@ -128,14 +166,14 @@ fn line_of_sight<W: Walkability>(a: IVec3, b: IVec3, world: &W) -> bool {
     // the positive direction is `cell + 1`; in the negative direction
     // it's `cell` itself.
     let next_x = if dx > 0.0 {
-        (cell.x + 1) as f32 - ax
+        (cell.x + 1) as f32 - p0.x
     } else {
-        ax - cell.x as f32
+        p0.x - cell.x as f32
     };
     let next_z = if dz > 0.0 {
-        (cell.z + 1) as f32 - az
+        (cell.z + 1) as f32 - p0.y
     } else {
-        az - cell.z as f32
+        p0.y - cell.z as f32
     };
     let mut t_max_x = if dx.abs() > f32::EPSILON {
         next_x / dx.abs()
@@ -158,22 +196,17 @@ fn line_of_sight<W: Walkability>(a: IVec3, b: IVec3, world: &W) -> bool {
         f32::INFINITY
     };
 
-    if !standable(world, cell) {
+    if !corridor_cell_clear(world, cell, p0, p1, half_extent) {
         return false;
     }
-    while cell != end {
+    while cell != b {
         // When the line passes exactly through a corner (t_max_x ==
-        // t_max_z) we step diagonally and verify both flanking cells.
-        // A body that physically traverses the corner clips both, so
-        // either being solid must invalidate the line. Without this,
-        // smoothing would happily route through a 1-cell-wide opening
+        // t_max_z) we step diagonally. The two flanking cells the body
+        // clips on the way through are covered by the neighbour sweep
+        // in `corridor_cell_clear` — a solid flank fails the width
+        // check, so smoothing can't route through a zero-width gap
         // between two walls.
         if (t_max_x - t_max_z).abs() < f32::EPSILON && t_max_x.is_finite() && t_max_z.is_finite() {
-            let flank_x = IVec3::new(cell.x + step_x, y, cell.z);
-            let flank_z = IVec3::new(cell.x, y, cell.z + step_z);
-            if !standable(world, flank_x) || !standable(world, flank_z) {
-                return false;
-            }
             t_max_x += t_delta_x;
             t_max_z += t_delta_z;
             cell.x += step_x;
@@ -185,11 +218,68 @@ fn line_of_sight<W: Walkability>(a: IVec3, b: IVec3, world: &W) -> bool {
             t_max_z += t_delta_z;
             cell.z += step_z;
         }
-        if !standable(world, cell) {
+        if !corridor_cell_clear(world, cell, p0, p1, half_extent) {
             return false;
         }
     }
     true
+}
+
+/// One centreline cell's contribution to [`corridor_clear`]: the cell
+/// itself must be standable, and any of its 8 XZ neighbours that the
+/// body's swept width reaches must not block the body. Neighbours are
+/// sufficient coverage: with `half_extent < 0.5`, every cell within
+/// reach of the segment is within Chebyshev distance 1 of some
+/// centreline cell.
+fn corridor_cell_clear<W: Walkability>(
+    world: &W,
+    cell: IVec3,
+    p0: Vec2,
+    p1: Vec2,
+    half_extent: f32,
+) -> bool {
+    if !standable(world, cell) {
+        return false;
+    }
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if dx == 0 && dz == 0 {
+                continue;
+            }
+            let n = cell + IVec3::new(dx, 0, dz);
+            if !world.blocks_body(n) && !world.blocks_body(n + IVec3::Y) {
+                continue;
+            }
+            if segment_cell_distance(p0, p1, n) < half_extent - CORRIDOR_EPS {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Minimum XZ-plane distance between segment `p0`→`p1` and `cell`'s
+/// unit square footprint. Distance-to-a-convex-set is convex along the
+/// segment, so a fixed-iteration ternary search converges; 40 rounds
+/// shrink the parameter interval below 1e-7.
+fn segment_cell_distance(p0: Vec2, p1: Vec2, cell: IVec3) -> f32 {
+    let lo = Vec2::new(cell.x as f32, cell.z as f32);
+    let hi = lo + Vec2::ONE;
+    let dist_at = |t: f32| {
+        let p = p0.lerp(p1, t);
+        (p.clamp(lo, hi) - p).length()
+    };
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for _ in 0..40 {
+        let m0 = t0 + (t1 - t0) / 3.0;
+        let m1 = t1 - (t1 - t0) / 3.0;
+        if dist_at(m0) <= dist_at(m1) {
+            t1 = m1;
+        } else {
+            t0 = m0;
+        }
+    }
+    dist_at(0.5 * (t0 + t1))
 }
 
 /// Drop straight down from `from` looking for the highest standable
@@ -342,17 +432,17 @@ fn step_neighbours<'a, W: Walkability>(
             return Some((same, world.cost(same)));
         }
         // Step up: head clearance for the *current* tile (cell two
-        // above the foot must be empty so the actor doesn't bonk
-        // ascending through it). Destination is one above `same`.
+        // above the foot must be body-passable so the actor doesn't
+        // bonk ascending through it). Destination is one above `same`.
         let up = same + IVec3::Y;
-        let head_clear_for_climb = !world.is_solid(from + IVec3::new(0, 2, 0));
+        let head_clear_for_climb = !world.blocks_body(from + IVec3::new(0, 2, 0));
         if head_clear_for_climb && standable(world, up) {
             return Some((up, world.cost(up) * STEP_UP_PREMIUM));
         }
-        // Step down: same is empty (we walk through it on the way
-        // down) and the cell below is standable.
+        // Step down: same is body-passable (we walk through it on the
+        // way down) and the cell below is standable.
         let down = same - IVec3::Y;
-        if !world.is_solid(same) && standable(world, down) {
+        if !world.blocks_body(same) && standable(world, down) {
             return Some((down, world.cost(down)));
         }
         None
@@ -410,10 +500,11 @@ mod tests {
     use bevy::platform::collections::HashSet;
 
     /// Tiny test world: any cell explicitly listed in `solid` is a
-    /// block; everything else is air. Saves the test cases from
-    /// listing the entire empty world.
+    /// block; cells in `passable` model nav-passable furniture (solid
+    /// for support, open to the body, costed); everything else is air.
     struct GridWorld {
         solid: HashSet<IVec3>,
+        passable: HashSet<IVec3>,
     }
 
     impl GridWorld {
@@ -425,7 +516,10 @@ mod tests {
                     solid.insert(IVec3::new(x, y, z));
                 }
             }
-            Self { solid }
+            Self {
+                solid,
+                passable: HashSet::default(),
+            }
         }
 
         fn add_wall(&mut self, min: IVec3, max: IVec3) {
@@ -441,7 +535,19 @@ mod tests {
 
     impl Walkability for GridWorld {
         fn is_solid(&self, cell: IVec3) -> bool {
+            self.solid.contains(&cell) || self.passable.contains(&cell)
+        }
+
+        fn blocks_body(&self, cell: IVec3) -> bool {
             self.solid.contains(&cell)
+        }
+
+        fn cost(&self, cell: IVec3) -> f32 {
+            if self.passable.contains(&cell) {
+                NAV_PASSABLE_COST_MULT
+            } else {
+                1.0
+            }
         }
     }
 
@@ -621,7 +727,8 @@ mod tests {
         // It clamps at the lowest scanned cell rather than falling
         // forever (or being deleted).
         let world = GridWorld {
-            solid: bevy::platform::collections::HashSet::default(),
+            solid: HashSet::default(),
+            passable: HashSet::default(),
         };
         let cell = settle_item_cell(&world, IVec3::new(0, 100, 0), 32, 10);
         assert_eq!(cell, IVec3::new(0, 90, 0));
@@ -634,10 +741,122 @@ mod tests {
         // on top of it rather than passing through — the property that
         // keeps items from dropping out of the world at chunk edges.
         let mut world = GridWorld {
-            solid: bevy::platform::collections::HashSet::default(),
+            solid: HashSet::default(),
+            passable: HashSet::default(),
         };
         world.solid.insert(IVec3::new(0, 0, 0));
         let cell = settle_item_cell(&world, IVec3::new(0, 50, 0), 32, 128);
         assert_eq!(cell, IVec3::new(0, 1, 0));
+    }
+
+    #[test]
+    fn corridor_rejects_graze_that_zero_width_ray_missed() {
+        // The wedge-bug repro. The centreline from (0,1,0) to (10,1,1)
+        // never *enters* cell (4,·,1) — a zero-width ray accepts this
+        // line — but it passes within ~0.05 of the cell's face, so a
+        // 0.6-wide body sweeping along it clips the block.
+        let mut world = GridWorld::floor_at(0);
+        world.add_wall(IVec3::new(4, 1, 1), IVec3::new(4, 2, 1));
+        assert!(
+            !corridor_clear(
+                IVec3::new(0, 1, 0),
+                IVec3::new(10, 1, 1),
+                &world,
+                NAV_BODY_HALF_EXTENT,
+            ),
+            "body-width corridor must reject the corner graze"
+        );
+        // The same corridor with the block removed is open.
+        let open = GridWorld::floor_at(0);
+        assert!(corridor_clear(
+            IVec3::new(0, 1, 0),
+            IVec3::new(10, 1, 1),
+            &open,
+            NAV_BODY_HALF_EXTENT,
+        ));
+    }
+
+    #[test]
+    fn corridor_allows_one_wide_aisle() {
+        // Walls flanking a 1-cell aisle: the centreline runs 0.5 from
+        // each wall face, comfortably outside the 0.3 half-extent. The
+        // width check must not regress 1-wide corridors.
+        let mut world = GridWorld::floor_at(0);
+        world.add_wall(IVec3::new(0, 1, -1), IVec3::new(6, 2, -1));
+        world.add_wall(IVec3::new(0, 1, 1), IVec3::new(6, 2, 1));
+        assert!(corridor_clear(
+            IVec3::new(0, 1, 0),
+            IVec3::new(6, 1, 0),
+            &world,
+            NAV_BODY_HALF_EXTENT,
+        ));
+    }
+
+    #[test]
+    fn standable_on_and_through_passable_furniture() {
+        // A 2-cell "bed" (multi-cell footprint: the flag applies
+        // per-cell, so both cells behave identically).
+        let mut world = GridWorld::floor_at(0);
+        world.passable.insert(IVec3::new(2, 1, 0));
+        world.passable.insert(IVec3::new(3, 1, 0));
+        for x in [2, 3] {
+            // Standing IN the bed cell: body passes, floor supports.
+            assert!(standable(&world, IVec3::new(x, 1, 0)));
+            // Standing ON TOP: the bed itself is support (`is_solid`).
+            assert!(standable(&world, IVec3::new(x, 2, 0)));
+        }
+        // Items settle ON the bed, not inside it.
+        assert_eq!(
+            settle_item_cell(&world, IVec3::new(2, 5, 0), 32, 64),
+            IVec3::new(2, 2, 0)
+        );
+    }
+
+    #[test]
+    fn astar_prefers_aisle_over_passable_furniture() {
+        // Direct route crosses a furniture cell at 4× cost; a 2-step
+        // detour around it is cheaper, so A* takes the aisle.
+        let mut world = GridWorld::floor_at(0);
+        world.passable.insert(IVec3::new(1, 1, 0));
+        let path = find_path(IVec3::new(0, 1, 0), IVec3::new(2, 1, 0), &world, 1000, 100)
+            .expect("reachable");
+        assert!(
+            !path.contains(&IVec3::new(1, 1, 0)),
+            "detour beats 4x furniture cost, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn astar_crosses_passable_furniture_when_walled_in() {
+        // Same furniture cell, but walls close every detour: the
+        // passable cell is costly, not impossible — the room never
+        // becomes a maze the NPC refuses to cross.
+        let mut world = GridWorld::floor_at(0);
+        world.passable.insert(IVec3::new(1, 1, 0));
+        world.add_wall(IVec3::new(0, 1, -1), IVec3::new(2, 2, -1));
+        world.add_wall(IVec3::new(0, 1, 1), IVec3::new(2, 2, 1));
+        let path = find_path(IVec3::new(0, 1, 0), IVec3::new(2, 1, 0), &world, 1000, 100)
+            .expect("furniture is passable, not blocking");
+        assert!(path.contains(&IVec3::new(1, 1, 0)), "got {path:?}");
+    }
+
+    #[test]
+    fn step_up_head_clearance_respects_passable() {
+        let mut world = GridWorld::floor_at(0);
+        // A ledge to climb onto from (0,1,0).
+        world.solid.insert(IVec3::new(1, 1, 0));
+        // Solid canopy over the climber's head blocks the climb...
+        world.solid.insert(IVec3::new(0, 3, 0));
+        let ups: Vec<IVec3> = step_neighbours(&world, IVec3::new(0, 1, 0))
+            .map(|(cell, _)| cell)
+            .collect();
+        assert!(!ups.contains(&IVec3::new(1, 2, 0)));
+        // ...a passable canopy (furniture overhang) does not.
+        world.solid.remove(&IVec3::new(0, 3, 0));
+        world.passable.insert(IVec3::new(0, 3, 0));
+        let ups: Vec<IVec3> = step_neighbours(&world, IVec3::new(0, 1, 0))
+            .map(|(cell, _)| cell)
+            .collect();
+        assert!(ups.contains(&IVec3::new(1, 2, 0)));
     }
 }

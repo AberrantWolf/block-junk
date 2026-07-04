@@ -36,20 +36,23 @@ use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::blocks::BlockRegistry;
+use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::collision::WorldCollision;
 use crate::haul::{HaulStore, HaulTarget};
 use crate::interactables::{InteractableIndex, InteractionClaims};
 use crate::items::ItemSlot;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
-use crate::pathfinding::{Walkability, find_path, nearest_standable_below, smooth_path, standable};
+use crate::pathfinding::{
+    NAV_BODY_HALF_EXTENT, NAV_PASSABLE_COST_MULT, Walkability, corridor_clear, find_path,
+    nearest_standable_below, smooth_path, standable,
+};
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, standing_pose_translation};
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
-    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, EquippedTool, KinematicLock,
-    MovementIntent, MovementMode, NpcAnimOverride, PlanEdit, PlanKind, StateSyncChannel,
-    WorldClock, WorldItem,
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, CellEdit, EquippedTool,
+    KinematicLock, MovementIntent, MovementMode, NpcAnimOverride, PlanEdit, PlanKind,
+    StateSyncChannel, WorldClock, WorldItem,
 };
 use crate::rooms::RoomMap;
 use crate::scripting::ServerMods;
@@ -72,6 +75,18 @@ pub struct Npc;
 /// once there are dozens of NPCs and the bandwidth matters.
 #[derive(Component, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NpcPath(pub Vec<IVec3>);
+
+/// Server-only marker: a [`CellEdit`] landed inside this NPC's live
+/// `MoveTo` path envelope. The brain re-validates the remaining path on
+/// its next tick — repathing in place when the route broke, abandoning
+/// (with the usual claim/memo cleanup) only when no route remains.
+///
+/// Set by [`mark_paths_dirty_on_cell_edit`] in `Update`, consumed in
+/// the `FixedUpdate` brain tick. A component rather than a Message on
+/// purpose: a `MessageReader` polled from `FixedUpdate` misses messages
+/// on frames with no fixed tick, a marker can't be lost.
+#[derive(Component)]
+pub(crate) struct PathDirty;
 
 /// Stable identifier for an NPC across save/load. Distinct from Bevy
 /// `Entity` because Entity values aren't preserved across reboots.
@@ -276,6 +291,30 @@ pub enum Goal {
     /// order's inputs are still satisfied, it auto-starts the next
     /// `active_work` so the NPC keeps crafting without re-routing.
     CraftingAtStation { station_cell: IVec3 },
+}
+
+impl Goal {
+    /// The one way to build a [`Goal::MoveTo`]: fresh progress/stuck
+    /// bookkeeping, starting from the NPC's current pose. Centralized
+    /// so the variant's bookkeeping fields can change shape (kinematic
+    /// mover) without touching every planner dispatch site.
+    fn move_to(
+        path: Vec<IVec3>,
+        deadline_secs: f32,
+        on_arrive: ArrivalAction,
+        snap: Option<UseSlotSnap>,
+        pose: &AvatarPose,
+    ) -> Self {
+        Goal::MoveTo {
+            path,
+            progress: 0.0,
+            deadline_secs,
+            last_pos: pose.translation,
+            stuck_secs: 0.0,
+            on_arrive,
+            snap,
+        }
+    }
 }
 
 /// Pre-computed pose-snap for a
@@ -895,16 +934,25 @@ pub(crate) struct WorldWalk<'q, 'w, 's> {
     pub(crate) registry: &'q BlockRegistry,
 }
 
+impl<'q, 'w, 's> WorldWalk<'q, 'w, 's> {
+    /// Slot occupying `cell`, or `None` when the owning chunk isn't
+    /// loaded. Every `Walkability` answer funnels through this so the
+    /// unloaded-chunk rule stays in one place.
+    fn slot_at(&self, cell: IVec3) -> Option<BlockSlot> {
+        let (coord, local) = world_to_chunk(cell);
+        let &entity = self.chunk_map.0.get(&coord)?;
+        let chunk = self.chunks.get(entity).ok()?;
+        Some(chunk.get(local))
+    }
+}
+
 impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
     fn is_solid(&self, cell: IVec3) -> bool {
-        let (coord, local) = world_to_chunk(cell);
-        let Some(&entity) = self.chunk_map.0.get(&coord) else {
+        let Some(slot) = self.slot_at(cell) else {
+            // Unloaded chunk: solid, so the search doesn't commit to
+            // paths through unknown territory.
             return true;
         };
-        let Ok(chunk) = self.chunks.get(entity) else {
-            return true;
-        };
-        let slot = chunk.get(local);
         if slot.is_empty() {
             return false;
         }
@@ -915,8 +963,32 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
         // both controllers see the same passable cell.
         !self.registry.def(slot).flags.walkable_boundary
     }
-    // cost() default 1.0 — future road tags hook in here without
-    // changing the algorithm.
+
+    fn blocks_body(&self, cell: IVec3) -> bool {
+        let Some(slot) = self.slot_at(cell) else {
+            return true;
+        };
+        if slot.is_empty() {
+            return false;
+        }
+        // Nav-passable furniture (beds): the body may occupy the cell,
+        // at a cost — see `cost` below. `is_solid` stays true for these
+        // cells, so they still support standing on top and stop items.
+        let flags = &self.registry.def(slot).flags;
+        !flags.walkable_boundary && !flags.nav_passable
+    }
+
+    fn cost(&self, cell: IVec3) -> f32 {
+        // Occupied nav-passable cells cost extra so A* prefers any
+        // reasonable aisle over cutting through furniture. Future road
+        // tags hook in here without changing the algorithm.
+        match self.slot_at(cell) {
+            Some(slot) if !slot.is_empty() && self.registry.def(slot).flags.nav_passable => {
+                NAV_PASSABLE_COST_MULT
+            }
+            _ => 1.0,
+        }
+    }
 }
 
 /// Per fixed-tick brain. Four phases per NPC:
@@ -1009,6 +1081,7 @@ type BrainNpcQuery<'w, 's> = Query<
         &'static NpcKind,
         &'static NpcStats,
         Has<KinematicLock>,
+        Has<PathDirty>,
     ),
     (With<Npc>, Without<BrainDisabled>),
 >;
@@ -1025,6 +1098,54 @@ type PhysicsNpcQuery<'w, 's> = Query<
     ),
     (With<Npc>, Without<KinematicLock>),
 >;
+
+type CleanPathNpcQuery<'w, 's> =
+    Query<'w, 's, (Entity, &'static Brain), (With<Npc>, Without<PathDirty>)>;
+
+/// `Update`-schedule consumer of the [`CellEdit`] bus: flag every NPC
+/// whose live `MoveTo` path envelope contains an edited cell with
+/// [`PathDirty`]. Deliberately coarse — a cell-AABB test, no oracle
+/// calls — because the precise re-validation runs in the brain tick
+/// where the `WorldWalk` oracle already exists. Runs after
+/// `receive_block_edits` like the other bus consumers in `server.rs`.
+pub(crate) fn mark_paths_dirty_on_cell_edit(
+    mut reader: MessageReader<CellEdit>,
+    npcs: CleanPathNpcQuery,
+    mut commands: Commands,
+) {
+    let edited: Vec<IVec3> = reader.read().map(|edit| edit.world).collect();
+    if edited.is_empty() {
+        return;
+    }
+    for (entity, brain) in npcs.iter() {
+        let Goal::MoveTo { path, .. } = &brain.goal else {
+            continue;
+        };
+        if path_envelope_hit(path, &edited) {
+            commands.entity(entity).insert(PathDirty);
+        }
+    }
+}
+
+/// True if any edited cell lands inside the path's cell AABB inflated
+/// by ±1 in XZ (smoothed corridors and body width stay within one cell
+/// of the waypoint bounding box) and by [-1, +2] in Y (support cells
+/// below; head and step-up clearance above).
+fn path_envelope_hit(path: &[IVec3], edited: &[IVec3]) -> bool {
+    let Some(&first) = path.first() else {
+        return false;
+    };
+    let (mut lo, mut hi) = (first, first);
+    for &cell in path {
+        lo = lo.min(cell);
+        hi = hi.max(cell);
+    }
+    let lo = lo - IVec3::new(1, 1, 1);
+    let hi = hi + IVec3::new(1, 2, 1);
+    edited
+        .iter()
+        .any(|edit| edit.cmpge(lo).all() && edit.cmple(hi).all())
+}
 
 /// Goals the preempt check considers abortable. Goals the Lua planner
 /// itself picks under critical need (Interact, Wander, Goto, Rest) are
@@ -1232,6 +1353,7 @@ fn npc_brain_tick(
         kind,
         stats,
         is_locked,
+        path_dirty,
     ) in npcs.iter_mut()
     {
         // Phase 1: decay every subscribed need by its registry-defined
@@ -1391,6 +1513,47 @@ fn npc_brain_tick(
                 on_arrive,
                 snap,
             } => {
+                // A world edit landed in this path's envelope since the
+                // last tick. Re-validate before advancing: still clear →
+                // keep walking; broken → repath in place (the *target*
+                // isn't unreachable just because a cell en route
+                // changed, so claims/memos stay untouched); no route
+                // left → the normal abandon machinery below memoizes
+                // and releases.
+                if path_dirty {
+                    commands.entity(entity).remove::<PathDirty>();
+                    if !remaining_path_valid(path, *progress, &world) {
+                        let foot = pose_to_standable_foot(&pose, &world)
+                            .unwrap_or_else(|| pose_to_foot_cell(&pose));
+                        let goal_cell = *path.last().expect("path non-empty");
+                        let repath =
+                            find_path(foot, goal_cell, &world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
+                                .map(|raw| smooth_path(raw, &world));
+                        match repath {
+                            Some(new_path) => {
+                                info!(
+                                    npc = npc_id.0,
+                                    goal = ?goal_cell.to_array(),
+                                    "world edit broke path; repathed in place",
+                                );
+                                *path = new_path;
+                                *progress = 0.0;
+                                *last_pos = pose.translation;
+                                *stuck_secs = 0.0;
+                                npc_path.set_if_neq(NpcPath(path.clone()));
+                            }
+                            None => {
+                                info!(
+                                    npc = npc_id.0,
+                                    goal = ?goal_cell.to_array(),
+                                    "world edit severed route; abandoning",
+                                );
+                                move_abandoned = true;
+                            }
+                        }
+                    }
+                }
+
                 *deadline_secs -= dt;
                 let moved = (pose.translation - *last_pos).length();
                 if moved < STUCK_MOVE_THRESHOLD {
@@ -2306,15 +2469,13 @@ fn npc_brain_tick(
                 match path {
                     Some(path) if path.len() >= 2 => {
                         npc_path.set_if_neq(NpcPath(path.clone()));
-                        brain.goal = Goal::MoveTo {
+                        brain.goal = Goal::move_to(
                             path,
-                            progress: 0.0,
-                            deadline_secs: 60.0,
-                            last_pos: pose.translation,
-                            stuck_secs: 0.0,
-                            on_arrive: ArrivalAction::WorkStation { station_cell },
-                            snap: None,
-                        };
+                            60.0,
+                            ArrivalAction::WorkStation { station_cell },
+                            None,
+                            &pose,
+                        );
                         *intent = MovementIntent::default();
                         continue;
                     }
@@ -2326,15 +2487,13 @@ fn npc_brain_tick(
                         if !npc_path.0.is_empty() {
                             npc_path.0.clear();
                         }
-                        brain.goal = Goal::MoveTo {
-                            path: vec![foot],
-                            progress: 0.0,
-                            deadline_secs: 1.0,
-                            last_pos: pose.translation,
-                            stuck_secs: 0.0,
-                            on_arrive: ArrivalAction::WorkStation { station_cell },
-                            snap: None,
-                        };
+                        brain.goal = Goal::move_to(
+                            vec![foot],
+                            1.0,
+                            ArrivalAction::WorkStation { station_cell },
+                            None,
+                            &pose,
+                        );
                         *intent = MovementIntent::default();
                         continue;
                     }
@@ -2583,15 +2742,8 @@ fn npc_brain_tick(
                             // basically every time, but the guard is
                             // free if it doesn't.
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal = Goal::MoveTo {
-                                path,
-                                progress: 0.0,
-                                deadline_secs: timeout,
-                                last_pos: pose.translation,
-                                stuck_secs: 0.0,
-                                on_arrive: ArrivalAction::None,
-                                snap: None,
-                            };
+                            brain.goal =
+                                Goal::move_to(path, timeout, ArrivalAction::None, None, &pose);
                         }
                         None => {
                             warn!(
@@ -2654,15 +2806,8 @@ fn npc_brain_tick(
                     match path {
                         Some(path) => {
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal = Goal::MoveTo {
-                                path,
-                                progress: 0.0,
-                                deadline_secs: timeout,
-                                last_pos: pose.translation,
-                                stuck_secs: 0.0,
-                                on_arrive: ArrivalAction::None,
-                                snap: None,
-                            };
+                            brain.goal =
+                                Goal::move_to(path, timeout, ArrivalAction::None, None, &pose);
                         }
                         None => {
                             warn!(
@@ -2821,13 +2966,10 @@ fn npc_brain_tick(
                     match path {
                         Some(path) => {
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal = Goal::MoveTo {
+                            brain.goal = Goal::move_to(
                                 path,
-                                progress: 0.0,
-                                deadline_secs: timeout,
-                                last_pos: pose.translation,
-                                stuck_secs: 0.0,
-                                on_arrive: ArrivalAction::Interact {
+                                timeout,
+                                ArrivalAction::Interact {
                                     need_restore,
                                     duration_secs: duration,
                                     target_cell,
@@ -2836,7 +2978,8 @@ fn npc_brain_tick(
                                     animation,
                                 },
                                 snap,
-                            };
+                                &pose,
+                            );
                         }
                         None => {
                             // Classify the A* miss: `find_path` bails
@@ -3021,20 +3164,18 @@ fn npc_brain_tick(
                     match path {
                         Some(path) => {
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal = Goal::MoveTo {
+                            brain.goal = Goal::move_to(
                                 path,
-                                progress: 0.0,
-                                deadline_secs: timeout,
-                                last_pos: pose.translation,
-                                stuck_secs: 0.0,
-                                on_arrive: ArrivalAction::Work {
+                                timeout,
+                                ArrivalAction::Work {
                                     duration_secs: work_duration_secs,
                                     target_cell,
                                     plan_kind,
                                     need_restore: work_need_restore,
                                 },
-                                snap: None,
-                            };
+                                None,
+                                &pose,
+                            );
                         }
                         None => {
                             let reason = if !standable(&world, foot) {
@@ -3303,15 +3444,7 @@ fn plan_haul_move<W: Walkability>(
         .map(|raw| smooth_path(raw, world))
         .filter(|p| p.len() >= 2)?
     };
-    Some(Goal::MoveTo {
-        path,
-        progress: 0.0,
-        deadline_secs,
-        last_pos: pose.translation,
-        stuck_secs: 0.0,
-        on_arrive,
-        snap: None,
-    })
+    Some(Goal::move_to(path, deadline_secs, on_arrive, None, pose))
 }
 
 /// Continue the NPC's active haul assignment: pick the next leg and
@@ -4453,6 +4586,65 @@ fn closest_progress_after(path: &[IVec3], p: Vec2, min_progress: f32) -> f32 {
     best.map(|(p, _)| p).unwrap_or(traversed)
 }
 
+/// Re-validate the not-yet-walked portion of a smoothed path after a
+/// world edit near it. Mirrors exactly what planning promised: every
+/// remaining waypoint `standable`, every same-Y segment `corridor_clear`
+/// at body width, and the `step_neighbours` clearance probes on
+/// vertical kinks (climb head room on step-up, pass-through cell on
+/// step-down). The already-walked prefix is skipped via `progress` so
+/// an edit behind the NPC doesn't force a pointless repath.
+fn remaining_path_valid<W: Walkability>(path: &[IVec3], progress: f32, world: &W) -> bool {
+    // Find the segment containing `progress` (same XZ arc-length walk
+    // that `closest_progress_after` uses), then validate from its
+    // start waypoint onward.
+    let mut first = 0;
+    let mut traversed = 0.0_f32;
+    for (i, w) in path.windows(2).enumerate() {
+        let seg_len = (waypoint_xz(w[1]) - waypoint_xz(w[0])).length();
+        if traversed + seg_len > progress {
+            first = i;
+            break;
+        }
+        traversed += seg_len;
+        first = i + 1;
+    }
+    for i in first..path.len() {
+        if !standable(world, path[i]) {
+            return false;
+        }
+        let Some(&next) = path.get(i + 1) else {
+            continue;
+        };
+        let cell = path[i];
+        match next.y - cell.y {
+            0 => {
+                if !corridor_clear(cell, next, world, NAV_BODY_HALF_EXTENT) {
+                    return false;
+                }
+            }
+            // Step up: the cell two above the current foot must be
+            // body-passable to climb through (same probe as
+            // `step_neighbours`).
+            1 => {
+                if world.blocks_body(cell + IVec3::new(0, 2, 0)) {
+                    return false;
+                }
+            }
+            // Step down: the cell walked through on the way down (one
+            // above the destination foot) must be body-passable.
+            -1 => {
+                if world.blocks_body(next + IVec3::Y) {
+                    return false;
+                }
+            }
+            // Anything else can't come from the planner; treat as
+            // broken so the NPC repaths rather than walks it.
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// True if the upcoming portion of `path` (within `JUMP_TRIGGER_DIST`
 /// of `progress`) requires a step up from the NPC's current foot Y.
 /// Lets the brain hold the jump button as the NPC approaches an
@@ -4593,6 +4785,73 @@ mod tests {
     use crate::haul::{HaulAssignment, HaulStore, ReservedItem};
     use crate::interactables::InteractionClaims;
     use crate::items::ItemSlot;
+
+    /// Minimal `Walkability` world for the path-invalidation helpers:
+    /// explicit solid set, everything else air.
+    struct TestGrid {
+        solid: HashSet<IVec3>,
+    }
+
+    impl TestGrid {
+        /// Floor plane at y=0 spanning x,z in [-10, 10].
+        fn floored() -> Self {
+            let mut solid = HashSet::new();
+            for x in -10..=10 {
+                for z in -10..=10 {
+                    solid.insert(IVec3::new(x, 0, z));
+                }
+            }
+            Self { solid }
+        }
+    }
+
+    impl Walkability for TestGrid {
+        fn is_solid(&self, cell: IVec3) -> bool {
+            self.solid.contains(&cell)
+        }
+    }
+
+    #[test]
+    fn path_envelope_hit_covers_support_head_and_corridor() {
+        let path = vec![IVec3::new(0, 1, 0), IVec3::new(4, 1, 0)];
+        // Support cell below the path.
+        assert!(path_envelope_hit(&path, &[IVec3::new(2, 0, 0)]));
+        // Head / step-up clearance above (up to +2).
+        assert!(path_envelope_hit(&path, &[IVec3::new(2, 3, 0)]));
+        // XZ-adjacent cell a smoothed corridor could sweep.
+        assert!(path_envelope_hit(&path, &[IVec3::new(2, 1, 1)]));
+        // Outside the envelope: too high, too far along X.
+        assert!(!path_envelope_hit(&path, &[IVec3::new(2, 4, 0)]));
+        assert!(!path_envelope_hit(&path, &[IVec3::new(6, 1, 0)]));
+        // No false positive from an empty edit list.
+        assert!(!path_envelope_hit(&path, &[]));
+    }
+
+    #[test]
+    fn remaining_path_valid_skips_walked_prefix() {
+        let mut world = TestGrid::floored();
+        let path = vec![IVec3::new(0, 1, 0), IVec3::new(4, 1, 0), IVec3::new(4, 1, 3)];
+        assert!(remaining_path_valid(&path, 0.0, &world));
+
+        // Wall dropped onto the FIRST segment breaks the path from the
+        // start…
+        world.solid.insert(IVec3::new(2, 1, 0));
+        world.solid.insert(IVec3::new(2, 2, 0));
+        assert!(!remaining_path_valid(&path, 0.0, &world));
+        // …but an NPC already past that segment (first segment is 4
+        // long) doesn't care.
+        assert!(remaining_path_valid(&path, 4.5, &world));
+    }
+
+    #[test]
+    fn remaining_path_valid_checks_support_removal() {
+        let mut world = TestGrid::floored();
+        let path = vec![IVec3::new(0, 1, 0), IVec3::new(4, 1, 0)];
+        // Dig out the floor under a mid-path cell: the waypoint's
+        // corridor loses support, so the path is invalid.
+        world.solid.remove(&IVec3::new(2, 0, 0));
+        assert!(!remaining_path_valid(&path, 0.0, &world));
+    }
     use crate::plan_claims::PlanClaims;
     use bevy::prelude::{Entity, IVec3, Vec3};
 
