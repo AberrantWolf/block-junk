@@ -98,6 +98,13 @@ pub struct ItemDef {
     /// is one [`WorldItem`] entity with that count.
     #[serde(default)]
     pub pile: Option<PileConfig>,
+    /// Animation id (matching a registered [`crate::animations::AnimationDef`])
+    /// played while an NPC *works* with this item equipped as a tool —
+    /// e.g. an axe sets `"vanilla:chopping"`, a pickaxe `"vanilla:pickaxing"`.
+    /// `None` ⇒ fall back to the NPC kind's default work clip. Only
+    /// consulted for the item in the carrier's `EquippedTool` slot.
+    #[serde(default)]
+    pub work_animation: Option<String>,
 }
 
 /// Per-item pile tuning. All fields optional in Lua — an item that just

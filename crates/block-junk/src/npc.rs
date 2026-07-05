@@ -734,14 +734,22 @@ fn npc_census(
 /// transitions; the override doesn't change every tick.
 fn refresh_npc_activity(
     kinds: Res<NpcKindRegistry>,
-    mut npcs: Query<(&Brain, &NpcKind, &mut NpcAnimOverride), With<Npc>>,
+    items: Res<crate::items::ItemRegistry>,
+    mut npcs: Query<(&Brain, &NpcKind, &EquippedTool, &mut NpcAnimOverride), With<Npc>>,
 ) {
-    for (brain, kind, mut override_) in npcs.iter_mut() {
+    for (brain, kind, tool, mut override_) in npcs.iter_mut() {
         let next = match &brain.goal {
             Goal::Interacting { animation, .. } => NpcAnimOverride(animation.clone()),
             Goal::SleepingGround { animation, .. } => NpcAnimOverride(animation.clone()),
             Goal::Working { .. } => {
-                NpcAnimOverride(kinds.get(&kind.0).map(|k| k.animations.work.clone()))
+                // The equipped tool picks the work clip (axe → chopping,
+                // pickaxe → pickaxing); an empty hand or a tool that
+                // declares no clip falls back to the kind's default.
+                let from_tool = tool
+                    .item
+                    .and_then(|slot| items.def(slot).work_animation.clone());
+                let kind_work = kinds.get(&kind.0).map(|k| k.animations.work.clone());
+                NpcAnimOverride(from_tool.or(kind_work))
             }
             _ => NpcAnimOverride(None),
         };

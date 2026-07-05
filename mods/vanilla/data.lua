@@ -73,6 +73,7 @@ engine.items.register {
     color = { 0.78, 0.45, 0.18 },
     tool_tags = { "vanilla:axe" },
     bulk = 6,
+    work_animation = "vanilla:chopping",
 }
 
 engine.items.register {
@@ -82,6 +83,7 @@ engine.items.register {
     color = { 0.45, 0.30, 0.20 },
     tool_tags = { "vanilla:hammer" },
     bulk = 6,
+    work_animation = "vanilla:hammering",
 }
 
 engine.items.register {
@@ -91,6 +93,7 @@ engine.items.register {
     color = { 0.38, 0.40, 0.45 },
     tool_tags = { "vanilla:pickaxe" },
     bulk = 6,
+    work_animation = "vanilla:pickaxing",
 }
 
 -- Crafting outputs (Phase 6a). KayKit Resource Bits
@@ -859,6 +862,10 @@ engine.civilization.set_params {
 --   Rig_Medium_MovementBasic.glb[8] = "Walking_A"
 --   Rig_Medium_Simulation.glb[2]    = "Lie_Idle"
 --   Rig_Medium_Tools.glb[26]        = "Working_A"
+--   Rig_Medium_Tools.glb[1]         = "Chopping"   (looping)
+--   Rig_Medium_Tools.glb[12]        = "Hammering"
+--   Rig_Medium_Tools.glb[19]        = "Pickaxing"
+--   Rig_Medium_Tools.glb[21]        = "Sawing"
 engine.animations.register {
     id = "vanilla:idle",
     asset = "mods://vanilla/models/characters/Rig_Medium_General.glb",
@@ -881,6 +888,33 @@ engine.animations.register {
     id = "vanilla:work",
     asset = "mods://vanilla/models/characters/Rig_Medium_Tools.glb",
     clip_index = 26,
+}
+
+-- Tool-specific work clips. An item with `work_animation = "..."` plays
+-- its clip while its carrier is Working; otherwise the NPC kind's
+-- `animations.work` (vanilla:work) is used. All looping.
+engine.animations.register {
+    id = "vanilla:chopping",
+    asset = "mods://vanilla/models/characters/Rig_Medium_Tools.glb",
+    clip_index = 1,
+}
+
+engine.animations.register {
+    id = "vanilla:hammering",
+    asset = "mods://vanilla/models/characters/Rig_Medium_Tools.glb",
+    clip_index = 12,
+}
+
+engine.animations.register {
+    id = "vanilla:pickaxing",
+    asset = "mods://vanilla/models/characters/Rig_Medium_Tools.glb",
+    clip_index = 19,
+}
+
+engine.animations.register {
+    id = "vanilla:sawing",
+    asset = "mods://vanilla/models/characters/Rig_Medium_Tools.glb",
+    clip_index = 21,
 }
 
 -- The smoke-test NPC kind. The planner that drives it lives in
