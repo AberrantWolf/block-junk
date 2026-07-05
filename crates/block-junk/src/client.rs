@@ -242,6 +242,7 @@ impl Plugin for ClientPlugin {
                     attach_npc_carry_icons,
                     update_npc_carry_icons,
                     update_npc_held_tools,
+                    update_npc_held_carry,
                     start_npc_anim_idle,
                     drive_npc_animation,
                 )
@@ -3284,6 +3285,14 @@ struct NpcVisuals {
     /// against `EquippedTool` each frame to detect equip/swap/unequip and
     /// despawn+respawn the held mesh accordingly.
     held_tool: Option<(ItemSlot, Entity)>,
+    /// The rig's `handslot.l` socket entity — the left hand, used for the
+    /// carried item. `None` until the skeleton is ready; while `None` the
+    /// floating carry cube shows as a fallback.
+    hand_l: Option<Entity>,
+    /// The carried item currently rendered in the left hand: source
+    /// [`ItemSlot`] and spawned mesh child (under `hand_l`). Mirrors
+    /// `held_tool` but driven by `Carrying`.
+    held_carry: Option<(ItemSlot, Entity)>,
 }
 
 /// NPC visual attach: spawn the KayKit character as a child of the NPC
@@ -3391,18 +3400,21 @@ fn attach_npc_carry_icons(
 /// child lookup is one HashMap probe via the `Children` deref) and
 /// avoids the change-detection bookkeeping for sub-frame correctness.
 fn update_npc_carry_icons(
-    npcs: Query<(&Carrying, &Children), With<Npc>>,
+    npcs: Query<(&Carrying, &Children, &NpcVisuals), With<Npc>>,
     mut icons: Query<(&MeshMaterial3d<StandardMaterial>, &mut Visibility), With<NpcCarryIcon>>,
     items: Res<ItemRegistry>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    for (carry, children) in npcs.iter() {
+    for (carry, children, visuals) in npcs.iter() {
         for child in children.iter() {
             let Ok((mat_handle, mut vis)) = icons.get_mut(child) else {
                 continue;
             };
             match (carry.item, carry.count) {
-                (Some(slot), c) if c > 0 => {
+                // The cube is only the fallback: once the left-hand socket
+                // exists, `update_npc_held_carry` renders the item in-hand
+                // and the cube stays hidden.
+                (Some(slot), c) if c > 0 && visuals.hand_l.is_none() => {
                     *vis = Visibility::Inherited;
                     if let Some(mut material) = materials.get_mut(&mat_handle.0) {
                         let [r, g, b] = items.def(slot).color;
@@ -3456,22 +3468,74 @@ fn update_npc_held_tools(
         let (Some(slot), Some(hand_r)) = (desired, visuals.hand_r) else {
             continue;
         };
-        let mesh = &items.def(slot).mesh;
-        let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh}#Scene0"));
-        // Identity local transform: `handslot.r` already positions and
-        // orients the grip. TODO(A1 visual pass): if a tool sits wrong in
-        // the hand, tune a per-item hold offset/scale here (candidate for
-        // an ItemDef `hold_transform` field) — needs an in-game look.
+        let def = items.def(slot);
+        let scene: Handle<WorldAsset> = asset_server.load(format!("{}#Scene0", def.mesh));
+        // `handslot.r` positions the grip; the item's `hold_transform`
+        // (identity for hand-authored tools) tunes offset/scale on top.
         let child = commands
             .spawn((
                 NpcHeldTool,
                 WorldAssetRoot(scene),
                 ChildOf(hand_r),
-                Transform::default(),
+                hold_transform_of(def),
                 Visibility::default(),
             ))
             .id();
         visuals.held_tool = Some((slot, child));
+    }
+}
+
+/// Build the in-hand local [`Transform`] for an item from its
+/// [`ItemDef::hold_pose`] (identity when no `hold_transform` is set).
+fn hold_transform_of(def: &block_junk_mod_api::items::ItemDef) -> Transform {
+    let (pos, rot, scale) = def.hold_pose();
+    Transform::from_translation(Vec3::from_array(pos))
+        .with_rotation(Quat::from_euler(EulerRot::XYZ, rot[0], rot[1], rot[2]))
+        .with_scale(Vec3::splat(scale))
+}
+
+/// Marker on the mesh child rendering an NPC's carried item in its left
+/// hand (parent = `handslot.l`). Despawned + respawned when `Carrying`
+/// changes item.
+#[derive(Component)]
+struct NpcHeldCarry;
+
+/// Render each NPC's carried item as a mesh childed to the left-hand
+/// socket — the in-hand counterpart to the floating carry cube (which
+/// `update_npc_carry_icons` now hides whenever `hand_l` is available).
+/// Same every-frame compare-and-swap shape as `update_npc_held_tools`;
+/// shows the base mesh (one representative unit, not a pile tier) since a
+/// carry is an abstract count, not a physical stack.
+fn update_npc_held_carry(
+    mut npcs: Query<(&Carrying, &mut NpcVisuals), With<Npc>>,
+    items: Res<ItemRegistry>,
+    asset_server: Res<AssetServer>,
+    mut commands: Commands,
+) {
+    for (carry, mut visuals) in npcs.iter_mut() {
+        let desired = carry.item.filter(|_| carry.count > 0);
+        let current = visuals.held_carry.map(|(slot, _)| slot);
+        if desired == current {
+            continue;
+        }
+        if let Some((_, ent)) = visuals.held_carry.take() {
+            commands.entity(ent).despawn();
+        }
+        let (Some(slot), Some(hand_l)) = (desired, visuals.hand_l) else {
+            continue;
+        };
+        let def = items.def(slot);
+        let scene: Handle<WorldAsset> = asset_server.load(format!("{}#Scene0", def.mesh));
+        let child = commands
+            .spawn((
+                NpcHeldCarry,
+                WorldAssetRoot(scene),
+                ChildOf(hand_l),
+                hold_transform_of(def),
+                Visibility::default(),
+            ))
+            .id();
+        visuals.held_carry = Some((slot, child));
     }
 }
 
@@ -3613,13 +3677,15 @@ fn setup_npc_skeleton_anim(
     // the body as a `.with_child`). `handslot.r` is KayKit's dedicated
     // right-hand attach node, nested under `hand.r` in the rig.
     let hand_r = find_named_descendant(rig_root, "handslot.r", &children_q, &names);
+    let hand_l = find_named_descendant(rig_root, "handslot.l", &children_q, &names);
     if let Ok(npc_root) = parents.get(scene_bearer).map(|c| c.0)
         && let Ok(mut visuals) = npc_visuals_q.get_mut(npc_root)
     {
         visuals.hand_r = hand_r;
+        visuals.hand_l = hand_l;
     }
-    if hand_r.is_none() {
-        warn!("npc rig has no 'handslot.r' node: {scene_bearer:?} (held tool won't render)");
+    if hand_r.is_none() || hand_l.is_none() {
+        warn!("npc rig missing a handslot node: {scene_bearer:?} (r={hand_r:?} l={hand_l:?}); held item falls back to the floating cube");
     }
 
     info!(

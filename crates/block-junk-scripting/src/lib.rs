@@ -917,6 +917,40 @@ mod tests {
         assert_eq!(items[0].pile_mesh(5), "mods://test/axe.gltf");
     }
 
+    /// The A1 `hold_transform` knob survives Lua→serde and `hold_pose`
+    /// converts degrees→radians. An item without it poses at identity.
+    #[test]
+    fn item_hold_transform_deserializes() {
+        let (lua, ctx) = engine_fixture();
+        lua.load(
+            "engine.items.register {
+                 id = 'test:log',
+                 display_name = 'Log',
+                 mesh = 'mods://test/log.gltf',
+                 hold_transform = { scale = 0.35, rot_deg = { 90, 0, 0 } },
+             }
+             engine.items.register {
+                 id = 'test:plain',
+                 display_name = 'Plain',
+                 mesh = 'mods://test/plain.gltf',
+             }",
+        )
+        .exec()
+        .expect("register hold items");
+        let items = ctx.take_items();
+
+        let (pos, rot, scale) = items[0].hold_pose();
+        assert_eq!(pos, [0.0, 0.0, 0.0], "pos defaults to origin");
+        assert!((scale - 0.35).abs() < 1e-6, "scale carries through");
+        assert!(
+            (rot[0] - core::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "90 deg → π/2 rad"
+        );
+
+        let (pos, rot, scale) = items[1].hold_pose();
+        assert_eq!((pos, rot, scale), ([0.0; 3], [0.0; 3], 1.0), "no knob ⇒ identity");
+    }
+
     /// Multiplier setter: value lands in the context; a second caller
     /// fails loudly (single-writer, like set_work_defaults).
     #[test]

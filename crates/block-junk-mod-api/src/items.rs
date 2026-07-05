@@ -105,6 +105,35 @@ pub struct ItemDef {
     /// consulted for the item in the carrier's `EquippedTool` slot.
     #[serde(default)]
     pub work_animation: Option<String>,
+    /// Local pose applied to this item's mesh when it's held in an NPC's
+    /// hand (an equipped tool in the right hand, a carried unit in the
+    /// left). `None` ⇒ identity, which suits meshes authored for the hand
+    /// socket (KayKit tools). World-scale resource meshes — a 1.35 m log —
+    /// set a `scale` here so they sit in the fist instead of dwarfing the
+    /// carrier. Does not affect the loose [`WorldItem`]/pile render.
+    #[serde(default)]
+    pub hold_transform: Option<HoldTransform>,
+}
+
+/// Local transform for an item's mesh while held in an NPC's hand. All
+/// fields optional in Lua: `hold_transform = { scale = 0.35 }` is the
+/// common case (shrink a bulky resource to hand size).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct HoldTransform {
+    /// Offset from the hand socket, in metres (local to the socket).
+    #[serde(default)]
+    pub pos: [f32; 3],
+    /// Rotation as XYZ Euler angles in **degrees** (author-friendly; the
+    /// render crate converts to radians).
+    #[serde(default)]
+    pub rot_deg: [f32; 3],
+    /// Uniform scale. Defaults to 1.0 (no scaling).
+    #[serde(default = "default_hold_scale")]
+    pub scale: f32,
+}
+
+fn default_hold_scale() -> f32 {
+    1.0
 }
 
 /// Per-item pile tuning. All fields optional in Lua — an item that just
@@ -172,6 +201,25 @@ impl ItemDef {
             }
         }
         &self.mesh
+    }
+
+    /// In-hand local pose components: `(translation, rotation_xyz_radians,
+    /// uniform_scale)`. Identity when no `hold_transform` is set. Returned
+    /// as plain arrays so this bevy-free crate needn't know about `Transform`
+    /// — the render crate assembles it.
+    pub fn hold_pose(&self) -> ([f32; 3], [f32; 3], f32) {
+        match &self.hold_transform {
+            None => ([0.0; 3], [0.0; 3], 1.0),
+            Some(h) => (
+                h.pos,
+                [
+                    h.rot_deg[0].to_radians(),
+                    h.rot_deg[1].to_radians(),
+                    h.rot_deg[2].to_radians(),
+                ],
+                h.scale,
+            ),
+        }
     }
 }
 

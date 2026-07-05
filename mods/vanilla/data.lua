@@ -40,6 +40,9 @@ engine.items.register {
             { min = 2, mesh = "mods://vanilla/models/Wood_Log_Stack.gltf" },
         },
     },
+    -- The log mesh is ~1.35 m long — shrink it to sit in a carrier's hand.
+    -- (Scale is a first-pass eyeball; tune in-game.)
+    hold_transform = { scale = 0.35 },
 }
 
 engine.items.register {
@@ -54,6 +57,7 @@ engine.items.register {
             { min = 3, mesh = "mods://vanilla/models/Stone_Chunks_Large.gltf" },
         },
     },
+    hold_transform = { scale = 0.4 },   -- ~1.1 m chunk → hand size (tune in-game)
 }
 
 -- Tools (Phase 5a/b). Each tool's `tool_tags` is the engine-side
@@ -117,6 +121,7 @@ engine.items.register {
             { min = 6, mesh = "mods://vanilla/models/Wood_Planks_Stack_Large.gltf" },
         },
     },
+    hold_transform = { scale = 0.3 },   -- ~1.5 m board → hand size (tune in-game)
 }
 
 -- Second crafted output: stone bricks from the forge (Phase 6c). Base
@@ -134,6 +139,7 @@ engine.items.register {
             { min = 6, mesh = "mods://vanilla/models/Stone_Bricks_Stack_Large.gltf" },
         },
     },
+    hold_transform = { scale = 0.5 },   -- ~0.75 m brick → hand size (tune in-game)
 }
 
 -- Block surface textures live in textures.lua (a pure-data file owned by
