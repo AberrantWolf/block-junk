@@ -58,6 +58,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::debug::DebugServerPlugin);
         app.add_plugins(crate::npc::NpcServerPlugin);
         app.add_plugins(crate::plans::PlansServerPlugin);
+        app.add_plugins(crate::storage::StorageServerPlugin);
         app.add_plugins(crate::room_sync::RoomSyncServerPlugin);
         app.add_plugins(crate::plan_claims::PlanClaimsPlugin);
         app.add_plugins(crate::haul::HaulPlugin);
@@ -256,11 +257,6 @@ pub struct SaveWriteGuard {
     pub reason: Option<String>,
 }
 
-/// Item id the engine equips on a freshly-spawned player when no save
-/// override is present. One hardcode — easy to lift to mod data when
-/// a starter-loadout system needs more than one item. Mod-side
-/// equivalent isn't worth the surface until there's a second item.
-const STARTER_TOOL_ID: &str = "vanilla:axe";
 
 /// Server App Startup: if `ServerSaveConfig::load_existing`, read the save
 /// file and pre-populate `ChunkMap` with the persisted edited chunks. They
@@ -285,6 +281,7 @@ fn load_from_save(
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
     mut stations: ResMut<CraftStations>,
+    mut storage_zones: ResMut<crate::storage::StorageZones>,
     mut guard: ResMut<SaveWriteGuard>,
     mut npc_ids: ResMut<crate::npc::NpcIdAllocator>,
     config: Option<Res<ServerSaveConfig>>,
@@ -339,6 +336,10 @@ fn load_from_save(
         save.plans.len(),
         save.world_items.len(),
     );
+    // Storage zones are plain coords — no slot remap, straight restore.
+    if !save.storage_cells.is_empty() {
+        storage_zones.replace_all(save.storage_cells.iter().copied());
+    }
     // Restore the plan map before chunk spawn so `auto_clear_stale_plans`
     // running on the load's CellEdits doesn't see a partial state.
     // Convert from on-disk SavedPlanState (item ids as strings) to
@@ -1025,6 +1026,7 @@ pub struct SaveCtx<'w, 's> {
     clock: Res<'w, WorldClock>,
     plans: Res<'w, Plans>,
     stations: Res<'w, CraftStations>,
+    storage_zones: Res<'w, crate::storage::StorageZones>,
     chunks: Query<
         'w,
         's,
@@ -1070,6 +1072,13 @@ fn assemble_save_file(ctx: &SaveCtx) -> SaveFile {
         plans: convert_saved_plans(&ctx.plans, &ctx.item_registry),
         world_items: collect_saved_world_items(&ctx.world_items, &ctx.item_registry),
         craft_stations: convert_saved_stations(&ctx.stations, &ctx.item_registry),
+        storage_cells: {
+            // Sorted for deterministic bytes — HashSet iteration order
+            // would churn the save blob on every write.
+            let mut cells = ctx.storage_zones.snapshot();
+            cells.sort_by_key(|c| (c.x, c.y, c.z));
+            cells
+        },
     }
 }
 
@@ -1193,27 +1202,16 @@ fn register_new_client(
     let (spawn_pose, spawn_carry, spawn_tool) = match persisted {
         Some(state) => (state.pose, state.carry, state.tool),
         None => {
-            // Starter axe for a brand-new identity. Missing tool id
-            // (mod removed) → empty slot + a warning, same degradation
-            // as the carry path.
-            let id = block_junk_mod_api::items::ItemId::new(STARTER_TOOL_ID);
-            let tool = match item_registry.slot_of(&id) {
-                Some(slot) => EquippedTool { item: Some(slot) },
-                None => {
-                    warn!(
-                        starter = STARTER_TOOL_ID,
-                        "starter tool id missing from item registry; spawning tool slot empty",
-                    );
-                    EquippedTool::default()
-                }
-            };
+            // Brand-new identity spawns empty-handed: the day-one loop
+            // is bare-hands chopping (soft tool gates) into workbench
+            // tool crafting, not a granted starter axe.
             (
                 AvatarPose {
                     translation: Vec3::new(0.0, 32.0, 60.0),
                     yaw: 0.0,
                 },
                 Carrying::default(),
-                tool,
+                EquippedTool::default(),
             )
         }
     };
@@ -2413,6 +2411,9 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
     match goal {
         Goal::Idle => ("idle".into(), None),
         Goal::Resting { remaining_secs } => (format!("resting ({remaining_secs:.1}s)"), None),
+        Goal::SleepingGround { remaining_secs, .. } => {
+            (format!("sleeping on the ground ({remaining_secs:.1}s)"), None)
+        }
         Goal::MoveTo { path, .. } => {
             let target = path.last().copied();
             (format!("moving ({} cells)", path.len()), target)

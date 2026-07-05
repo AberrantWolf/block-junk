@@ -100,6 +100,13 @@ pub struct WorkDefaults {
     pub need_restore: Option<NeedRestore>,
     #[serde(default = "default_work_duration_secs")]
     pub duration_secs: f32,
+    /// Optional "worn down" work modifier: while the named need sits
+    /// at/above its trigger, every plan-work duration is multiplied
+    /// (composes with the tool-gate multiplier). Vanilla: hungry NPCs
+    /// work slower. Global — applies to all blocks, not per-block —
+    /// because exhaustion is a property of the worker, not the wall.
+    #[serde(default)]
+    pub worn_down: Option<DecayBoost>,
 }
 
 impl Default for WorkDefaults {
@@ -107,6 +114,7 @@ impl Default for WorkDefaults {
         Self {
             need_restore: None,
             duration_secs: default_work_duration_secs(),
+            worn_down: None,
         }
     }
 }
@@ -147,6 +155,30 @@ pub struct NeedDef {
     /// brain tick. See type docs.
     #[serde(default)]
     pub preempt_threshold: Option<f32>,
+    /// Optional cross-need decay coupling: while the *other* need
+    /// named here sits at/above its trigger value, THIS need decays
+    /// faster. Vanilla's use: starvation — a hungry NPC's `sleep`
+    /// decays at a multiple, so going unfed drains energy. Pure data;
+    /// the engine applies it in the per-tick decay pass, and it
+    /// composes with nothing else (one boost per need — revisit if a
+    /// need ever wants several triggers).
+    #[serde(default)]
+    pub decay_boost: Option<DecayBoost>,
+}
+
+/// See [`NeedDef::decay_boost`]. `multiplier` scales the decaying
+/// need's `decay_per_sec` the whole time `need` ≥ `above`; no ramp —
+/// a threshold keeps the rule legible in play ("they're starving,
+/// they tire fast") where a gradient would read as mush.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecayBoost {
+    /// The triggering need's id (cross-validated at boot like
+    /// `need_restore.need`).
+    pub need: String,
+    /// Trigger level of the *triggering* need, `0.0..=1.0`.
+    pub above: f32,
+    /// Applied to the host need's `decay_per_sec` while triggered.
+    pub multiplier: f32,
 }
 
 /// One per-NPC rolled stat a kind declares: every NPC of the kind
@@ -203,6 +235,16 @@ pub struct NpcKindDef {
     /// Use-slot interactions override these by setting
     /// [`UseSlot.animation`](crate::blocks::UseSlot::animation).
     pub animations: NpcKindAnimations,
+    /// Body model variants (`mods://` glTF scene paths), all sharing
+    /// the kind's rig so every registered clip retargets onto any of
+    /// them. The engine assigns one per NPC deterministically —
+    /// `models[(NpcId - 1) % len]` — so ids allocated sequentially
+    /// walk the list round-robin and the first N spawns of an
+    /// N-variant kind are visually distinct on every machine without
+    /// replicating anything. Empty (the default) ⇒ the engine's
+    /// built-in fallback body.
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// Per-kind default animation set. All three slots are mandatory —
@@ -511,6 +553,40 @@ pub enum PlannerGoal {
         #[serde(default = "default_work_timeout")]
         timeout_secs: f32,
     },
+    /// Lie down and sleep right where the NPC stands — the no-bed
+    /// fallback. Restores `restores` worth of the `need` deficit
+    /// spread evenly across `duration_secs`, so an interrupted nap
+    /// keeps the fraction already slept (unlike a bed's on-completion
+    /// restore). Deliberately tuned worse than any bed: the default
+    /// works out to well under half a bed's rate, and blocks keep the
+    /// upper hand because their `Interactable::need_restore` is mod
+    /// data — better beds simply declare bigger restores.
+    ///
+    /// `animation` names a registered clip to play while down
+    /// (vanilla passes its lie idle). `None` ⇒ the kind's idle plays,
+    /// which reads as standing — pass the clip.
+    SleepGround {
+        #[serde(default = "default_sleep_ground_duration")]
+        duration_secs: f32,
+        #[serde(default = "default_sleep_ground_restores")]
+        restores: f32,
+        #[serde(default = "default_sleep_need")]
+        need: String,
+        #[serde(default)]
+        animation: Option<String>,
+    },
+}
+
+fn default_sleep_ground_duration() -> f32 {
+    30.0
+}
+
+fn default_sleep_ground_restores() -> f32 {
+    0.35
+}
+
+fn default_sleep_need() -> String {
+    "sleep".to_owned()
 }
 
 fn default_wander_radius() -> i32 {

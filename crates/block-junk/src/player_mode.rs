@@ -1,9 +1,10 @@
 //! Top-level player intent: which "tool" the player is wielding.
 //!
-//! Two modes total: `Normal` (avatar default — L mines/picks/deposits/
-//! works, R opens menus / interacts) and `Plan` (DF-style designation
-//! — L tags-for-remove or un-tags, R places Build tags). Tab toggles,
-//! `1` and `2` directly select.
+//! Three modes: `Normal` (avatar default — L mines/picks/deposits/
+//! works, R opens menus / interacts), `Plan` (DF-style designation
+//! — L tags-for-remove or un-tags, R places Build tags), and
+//! `Storage` (zone painting — R paints storage floor cells, L
+//! erases; see `storage.rs`). Tab / Shift+Tab cycles.
 //!
 //! Two on-screen surfaces live here:
 //!   - bottom-left "mode pill": icon + label naming the current mode.
@@ -23,6 +24,7 @@ use crate::protocol::GameSet;
 pub enum PlayerMode {
     Normal,
     Plan,
+    Storage,
 }
 
 impl Default for PlayerMode {
@@ -32,12 +34,13 @@ impl Default for PlayerMode {
 }
 
 impl PlayerMode {
-    pub const ALL: [PlayerMode; 2] = [PlayerMode::Normal, PlayerMode::Plan];
+    pub const ALL: [PlayerMode; 3] = [PlayerMode::Normal, PlayerMode::Plan, PlayerMode::Storage];
 
     pub fn label(self) -> &'static str {
         match self {
             PlayerMode::Normal => "Normal",
             PlayerMode::Plan => "Plan",
+            PlayerMode::Storage => "Storage",
         }
     }
 
@@ -45,6 +48,7 @@ impl PlayerMode {
         match self {
             PlayerMode::Normal => "ui/mode_icons/hand_point.png",
             PlayerMode::Plan => "ui/mode_icons/drawing_pencil.png",
+            PlayerMode::Storage => "ui/mode_icons/basket.png",
         }
     }
 
@@ -58,6 +62,7 @@ impl PlayerMode {
             PlayerMode::Plan => {
                 "L: remove · R: build\n1-9/wheel: block · re-press: deselect · Ctrl+wheel: rotate"
             }
+            PlayerMode::Storage => "L: clear storage · R: mark storage (drag on ground)",
         }
     }
 

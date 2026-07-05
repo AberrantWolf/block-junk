@@ -34,6 +34,7 @@ mod rooms;
 mod save;
 mod scripting;
 mod server;
+mod storage;
 mod target_outline;
 mod ui_capture;
 mod ui_theme;

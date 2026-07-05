@@ -433,8 +433,21 @@ pub struct WorkAction {
     /// the tool (you fell a tree with an axe; you stack the log with
     /// your hands). `None` — the default, and what all vanilla content
     /// uses — means anyone can build it.
+    ///
+    /// Unlike [`Self::required_tool`], this gate is always *hard* —
+    /// [`Self::no_tool_multiplier`] does not soften it. A block whose
+    /// assembly demands a tool (hammered planks) shouldn't be slowly
+    /// hand-assembled the way a tree can be slowly hand-felled.
     #[serde(default)]
     pub build_required_tool: Option<TagId>,
+    /// Softens [`Self::required_tool`] from a hard gate into a speed
+    /// gate: `Some(x)` ⇒ an actor *without* a matching tool may still
+    /// destroy the block, at `duration_secs * x`. `None` — the default
+    /// — keeps the historical hard gate (no tool ⇒ action blocked).
+    /// Only meaningful when `required_tool` is `Some`; ignored (and
+    /// never consulted) for the Build verb.
+    #[serde(default)]
+    pub no_tool_multiplier: Option<f32>,
 }
 
 impl WorkAction {
@@ -445,6 +458,22 @@ impl WorkAction {
         match verb {
             WorkVerb::Build => self.build_required_tool.as_ref(),
             WorkVerb::Destroy => self.required_tool.as_ref(),
+        }
+    }
+
+    /// Resolve `verb` against whether the actor's tool satisfies the
+    /// gate: `Some(multiplier)` to scale the work duration by (1.0
+    /// when ungated or properly tooled), `None` when the action is
+    /// blocked outright (hard gate, no matching tool). Single accessor
+    /// so the player click path and every NPC gate agree on what a
+    /// missing tool means.
+    pub fn duration_multiplier(&self, verb: WorkVerb, has_tool: bool) -> Option<f32> {
+        if self.tool_for(verb).is_none() || has_tool {
+            return Some(1.0);
+        }
+        match verb {
+            WorkVerb::Destroy => self.no_tool_multiplier,
+            WorkVerb::Build => None,
         }
     }
 }

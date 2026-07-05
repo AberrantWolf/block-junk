@@ -47,6 +47,22 @@ local HUNGER_THRESHOLD = urge_threshold("hunger", 0.3)
 local SLEEP_THRESHOLD = urge_threshold("sleep", 0.25)
 local WORK_THRESHOLD = urge_threshold("work", 0.3)
 
+-- "Collapse where you stand" cutoff for daytime ground sleep. Read
+-- from the same data the engine's preempt check uses so the two can't
+-- disagree: the moment the engine yanks an NPC off work for sleep,
+-- this planner has a sleep action to give them — otherwise they'd
+-- flap work→preempt→work while the deficit climbs (2026-07-05
+-- playtest log: four NPCs pinned at a tree all night).
+local function preempt_threshold(need_id, fallback)
+    local def = engine.needs.get(need_id)
+    if def and def.preempt_threshold then
+        return def.preempt_threshold
+    end
+    return fallback
+end
+
+local MUST_SLEEP_THRESHOLD = preempt_threshold("sleep", 0.6)
+
 -- Probability of "go visit a room" after a rest, when at least one
 -- matched room is reachable in the snapshot. 0.5 makes the room
 -- behavior frequent enough to demo, but still leaves wander time so
@@ -104,7 +120,9 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- need_restore.need matches. The engine reads the block def to
     -- find duration, exclusivity, and slot data.
     local sleep_need = snapshot.needs.sleep or 0.0
-    if snapshot.is_night and sleep_need >= SLEEP_THRESHOLD then
+    local night_sleepy = snapshot.is_night and sleep_need >= SLEEP_THRESHOLD
+    local must_sleep = sleep_need >= MUST_SLEEP_THRESHOLD
+    if night_sleepy or must_sleep then
         local bed_cell = nearest_interaction_for(snapshot, "sleep")
         if bed_cell ~= nil then
             last_action[snapshot.id] = "sleep"
@@ -114,9 +132,18 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
                 timeout_secs = 60.0,
             }
         end
-        -- Tired at night with no bed: fall through to wander/eat so
-        -- the NPC isn't frozen pacing in place. If a player places a
-        -- bed nearby, the next planner call will catch it.
+        -- No bed anywhere in range: sleep on the ground instead of
+        -- falling through to work while exhausted. The engine
+        -- restores the need continuously at a rate well below any
+        -- bed's, so beds stay strictly better — this is survival,
+        -- not comfort. Short slices: between naps the planner runs
+        -- again, so a freshly-placed bed gets noticed within ~30s.
+        last_action[snapshot.id] = "sleep"
+        return {
+            kind = "sleep_ground",
+            duration_secs = 30.0,
+            animation = "vanilla:lie_idle",
+        }
     end
 
     -- Next: hunger that's reached the eat threshold AND a reachable
@@ -173,7 +200,12 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     then
         last_action[snapshot.id] = "rest"
         local lazy = (snapshot.stats and snapshot.stats.laziness) or 1.0
-        return { kind = "rest", duration_secs = (3.0 + math.random() * 5.0) * lazy }
+        -- Hungry NPCs drag: the breather stretches with the hunger
+        -- deficit past the eat threshold (up to ~1.7x at starving).
+        -- Third leg of the starvation placeholder, next to the sleep
+        -- decay_boost + worn_down work slowdown in data.lua.
+        local hungry_drag = 1.0 + math.max(0.0, hunger - HUNGER_THRESHOLD)
+        return { kind = "rest", duration_secs = (3.0 + math.random() * 5.0) * lazy * hungry_drag }
     end
 
     -- After resting, pick a fresh motion: visit a known room or

@@ -53,6 +53,7 @@ impl Plugin for ClientPlugin {
             .add_plugins(PlayerModePlugin)
             .add_plugins(TargetOutlinePlugin)
             .add_plugins(PlansClientPlugin)
+            .add_plugins(crate::storage::StorageClientPlugin)
             .add_plugins(crate::room_sync::RoomSyncClientPlugin)
             .add_plugins(crate::plan_ghosts::PlanGhostsPlugin)
             .add_plugins(crate::craft_stations::CraftStationsClientPlugin)
@@ -274,12 +275,14 @@ struct AvatarAssets {
 /// `clip_nodes` — `drive_npc_animation` looks up nodes by name
 /// instead of dispatching on a hardcoded enum.
 ///
-/// `knight_scene` is the visible body. We currently only ship one
-/// rig variant; per-kind body meshes land later as a `NpcKindDef`
-/// field alongside the animation set.
+/// `body_scenes` holds every visible body variant, keyed by the
+/// `mods://` path a kind's `NpcKindDef::models` names — plus the
+/// engine fallback at [`KAYKIT_KNIGHT_GLB`] for kinds that declare
+/// none. All variants share the Medium rig, so the one `anim_graph`
+/// retargets onto any of them.
 #[derive(Resource)]
 struct CharacterAssets {
-    knight_scene: Handle<WorldAsset>,
+    body_scenes: HashMap<String, Handle<WorldAsset>>,
     anim_graph: Handle<AnimationGraph>,
     /// Resolved clip → graph-node index for every registered
     /// [`AnimationId`](block_junk_mod_api::animations::AnimationId).
@@ -288,8 +291,31 @@ struct CharacterAssets {
     clip_nodes: HashMap<String, AnimationNodeIndex>,
 }
 
-/// Knight body asset path. The animation clips live in separate glbs
-/// declared in `mods/vanilla/data.lua` via `engine.animations.register`.
+impl CharacterAssets {
+    /// The body scene for `npc_id` of kind `def`: the kind's model
+    /// list walked round-robin by sequentially-allocated id (the
+    /// first N spawns of an N-variant kind are all distinct), or the
+    /// knight fallback for kinds with no models / unloadable paths.
+    fn body_scene_for(
+        &self,
+        npc_id: u64,
+        def: Option<&block_junk_mod_api::npcs::NpcKindDef>,
+    ) -> Handle<WorldAsset> {
+        let path = def
+            .filter(|d| !d.models.is_empty())
+            .map(|d| d.models[(npc_id.saturating_sub(1) as usize) % d.models.len()].as_str())
+            .unwrap_or(KAYKIT_KNIGHT_GLB);
+        self.body_scenes
+            .get(path)
+            .or_else(|| self.body_scenes.get(KAYKIT_KNIGHT_GLB))
+            .cloned()
+            .expect("fallback body scene always loaded in setup_scene")
+    }
+}
+
+/// Fallback body asset path (kinds with an empty `models` list). The
+/// animation clips live in separate glbs declared in
+/// `mods/vanilla/data.lua` via `engine.animations.register`.
 const KAYKIT_KNIGHT_GLB: &str = "mods://vanilla/models/characters/Knight.glb";
 
 /// Hotbar entries shown to the player. Each entry is a placeable
@@ -492,6 +518,7 @@ fn setup_scene(
     textures: Res<BlockTextures>,
     block_registry: Res<crate::blocks::BlockRegistry>,
     animations: Res<crate::npc_registry::AnimationRegistry>,
+    kinds: Res<crate::npc_registry::NpcKindRegistry>,
     existing: Option<Res<AvatarAssets>>,
 ) {
     // `OnEnter(InGame)` re-fires on every un-pause, but the scene
@@ -536,8 +563,21 @@ fn setup_scene(
     let (anim_graph, node_indices) = AnimationGraph::from_clips(clip_handles);
     let clip_nodes: HashMap<String, AnimationNodeIndex> =
         clip_ids.into_iter().zip(node_indices.into_iter()).collect();
+    // Load every body variant any kind declares, plus the knight
+    // fallback. Deduped by path — kinds sharing a variant share the
+    // scene handle.
+    let mut body_scenes: HashMap<String, Handle<WorldAsset>> = HashMap::new();
+    for path in kinds
+        .iter()
+        .flat_map(|(_, def)| def.models.iter().map(String::as_str))
+        .chain(std::iter::once(KAYKIT_KNIGHT_GLB))
+    {
+        body_scenes.entry(path.to_owned()).or_insert_with(|| {
+            asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.to_owned()))
+        });
+    }
     commands.insert_resource(CharacterAssets {
-        knight_scene: asset_server.load(GltfAssetLabel::Scene(0).from_asset(KAYKIT_KNIGHT_GLB)),
+        body_scenes,
         anim_graph: anim_graphs.add(anim_graph),
         clip_nodes,
     });
@@ -1237,7 +1277,9 @@ fn update_hotbar_visibility(
     mut roots: Query<&mut Visibility, With<HotbarRoot>>,
 ) {
     let target = match *mode {
-        PlayerMode::Normal => Visibility::Hidden,
+        // Storage paints zones, not blocks — the hotbar is as
+        // irrelevant there as in Normal.
+        PlayerMode::Normal | PlayerMode::Storage => Visibility::Hidden,
         PlayerMode::Plan => Visibility::Visible,
     };
     for mut v in roots.iter_mut() {
@@ -1720,13 +1762,13 @@ fn normal_mode_action_input(
         ActionKind::Place => block_junk_mod_api::blocks::WorkVerb::Build,
         ActionKind::Break => block_junk_mod_api::blocks::WorkVerb::Destroy,
     };
-    if !crate::target_outline::player_can_work_slot(
+    let Some(tool_multiplier) = crate::target_outline::player_work_multiplier(
         work_slot,
         work_verb,
         &ctx.blocks,
         &ctx.items,
         tool,
-    ) {
+    ) else {
         if l_just_pressed
             && let Some(required) =
                 crate::target_outline::required_tool_for_slot(work_slot, work_verb, &ctx.blocks)
@@ -1738,6 +1780,18 @@ fn normal_mode_action_input(
         }
         action.active = None;
         return;
+    };
+    // Soft gate: workable bare-handed, just slower. Hint once on the
+    // press edge so the stretched progress bar isn't a mystery.
+    if tool_multiplier > 1.0
+        && l_just_pressed
+        && let Some(required) =
+            crate::target_outline::required_tool_for_slot(work_slot, work_verb, &ctx.blocks)
+    {
+        toasts.push(crate::worldspace_toast::SpawnToast {
+            cell: target_cell,
+            text: format!("Slow without a {}", tool_display_name(required, &ctx.items)),
+        });
     }
 
     // Instant-builds debug toggle: single send on the press edge.
@@ -1751,7 +1805,7 @@ fn normal_mode_action_input(
 
     // Timed path: accumulate progress against the same target across
     // frames; restart on target or verb change.
-    let step = time.delta_secs() / PLAYER_ACTION_DURATION_SECS;
+    let step = time.delta_secs() / (PLAYER_ACTION_DURATION_SECS * tool_multiplier);
     let progress = match action.active {
         Some(a) if a.target_cell == target_cell && a.kind == kind => a.progress + step,
         _ => step,
@@ -3234,13 +3288,18 @@ struct NpcVisuals {
 /// `setup_npc_skeleton_anim` replays that pass manually once the scene
 /// instance is ready.
 fn attach_npc_visuals(
-    npcs: Query<Entity, (With<Npc>, Without<NpcVisuals>)>,
+    npcs: Query<(Entity, &NpcId, &crate::npc::NpcKind), (With<Npc>, Without<NpcVisuals>)>,
     assets: Res<CharacterAssets>,
+    kinds: Res<crate::npc_registry::NpcKindRegistry>,
     mut commands: Commands,
 ) {
     let foot_offset = -(EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y);
-    for entity in npcs.iter() {
+    for (entity, npc_id, kind) in npcs.iter() {
         info!("npc entered view: {entity:?}");
+        // Body variant: the kind's model list walked round-robin by
+        // NpcId — deterministic on every client from replicated data,
+        // so no extra component crosses the wire.
+        let body = assets.body_scene_for(npc_id.0, kinds.get(&kind.0));
         // Transform + Visibility on the NPC root: `sync_avatar_transforms`
         // queries for `&mut Transform`, and without it (and the propagation
         // siblings Visibility brings in) the child WorldAssetRoot inherits from
@@ -3262,7 +3321,7 @@ fn attach_npc_visuals(
             ))
             .with_child((
                 NpcWorldAssetRoot,
-                WorldAssetRoot(assets.knight_scene.clone()),
+                WorldAssetRoot(body),
                 Transform::from_xyz(0.0, foot_offset, 0.0)
                     .with_rotation(Quat::from_rotation_y(core::f32::consts::PI)),
             ));

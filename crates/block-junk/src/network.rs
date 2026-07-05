@@ -63,7 +63,7 @@ pub const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECI
 /// than a desync hunt when someone joins with a stale build. The
 /// registry-level mod-set check is a separate, later gate.
 // …0003: NpcDetails gained `stats` (2026-07).
-pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0003;
+pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0004;
 
 /// Which address the server socket binds. Inserted by
 /// `run_server_inner`; the dedicated CLI can override the default.
@@ -151,6 +151,12 @@ impl Plugin for ProtocolPlugin {
         app.register_message::<PlanEditBatch>()
             .add_direction(NetworkDirection::Bidirectional);
         app.register_message::<PlanFullSync>()
+            .add_direction(NetworkDirection::ServerToClient);
+        // Storage-zone designation: batch deltas + connect-time full
+        // sync (S1 of the storage arc).
+        app.register_message::<crate::protocol::StorageEditBatch>()
+            .add_direction(NetworkDirection::Bidirectional);
+        app.register_message::<crate::protocol::StorageFullSync>()
             .add_direction(NetworkDirection::ServerToClient);
         // Room-state mirror: recognition deltas + connect-time full sync.
         app.register_message::<crate::protocol::RoomSync>()

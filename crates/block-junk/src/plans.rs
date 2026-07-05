@@ -453,7 +453,8 @@ fn rect_cells_for_preview(drag: ActiveDrag) -> Vec<IVec3> {
 /// Iterate every cell in the axis-aligned rectangle whose two corners
 /// are `a` and `b`. Both corners share their value on one axis (the
 /// "depth" axis fixed by the face normal); the other two range freely.
-fn rect_cells_on_plane(a: IVec3, b: IVec3) -> Vec<IVec3> {
+/// Crate-visible: `storage.rs` reuses the same drag-rectangle geometry.
+pub(crate) fn rect_cells_on_plane(a: IVec3, b: IVec3) -> Vec<IVec3> {
     let min = IVec3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z));
     let max = IVec3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z));
     let mut cells = Vec::new();
@@ -491,7 +492,8 @@ fn commit_batch(
 ///
 /// `None` if the ray is parallel to the plane (dot(dir, normal) ≈ 0)
 /// or if the intersection lies behind the camera.
-fn project_to_face_plane(
+/// Crate-visible: `storage.rs` reuses the same drag-tracking projection.
+pub(crate) fn project_to_face_plane(
     origin: Vec3,
     dir: Vec3,
     anchor_cell: IVec3,
@@ -820,7 +822,7 @@ fn receive_plan_edit_batches(
     }
 }
 
-fn cell_is_solid(cell: IVec3, chunks: &Query<&Chunk>, chunk_map: &ChunkMap) -> bool {
+pub(crate) fn cell_is_solid(cell: IVec3, chunks: &Query<&Chunk>, chunk_map: &ChunkMap) -> bool {
     let (coord, local) = world_to_chunk(cell);
     chunk_map
         .0

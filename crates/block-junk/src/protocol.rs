@@ -627,6 +627,30 @@ pub struct DepositRequest {
 /// cells — at that size we split into two messages.
 pub const PLAN_EDIT_BATCH_MAX: usize = 4096;
 
+/// Bidirectional storage-zone designation (Storage mode). Client →
+/// server as a request; server validates (reach + batch cap), applies
+/// to its `StorageZones`, and broadcasts the accepted set back in the
+/// same shape. `add = true` marks the cells as storage, `false`
+/// clears them. Rides [`StateSyncChannel`] with [`StorageFullSync`]
+/// so full-sync-before-delta ordering holds (same rule as plans).
+///
+/// Zone cells are the *air* cells items sit in (solid floor below),
+/// not the floor blocks — the same cell a pile or container occupies.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct StorageEditBatch {
+    pub add: bool,
+    pub cells: Vec<IVec3>,
+}
+
+/// Server → client on connect: every storage-zone cell. Shares the
+/// batch cap with [`PLAN_EDIT_BATCH_MAX`]; bigger zone sets split
+/// across multiple messages (ordering within the channel keeps them
+/// coherent, and add-only application makes splits commutative).
+#[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StorageFullSync {
+    pub cells: Vec<IVec3>,
+}
+
 /// Small critical world-command lane. Ordered reliable so edit *requests*,
 /// targeted rejections, request/response UX, and dev commands preserve
 /// the order a player expects without waiting behind bulk state sync.

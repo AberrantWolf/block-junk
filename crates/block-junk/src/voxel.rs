@@ -422,7 +422,14 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
     // doesn't bury its trunk inside the slope.
     if world.y < h_here {
         return if world.y == h_here - 1 {
-            slots.grass
+            // Sparse gravel outcrops replace the grass surface: the
+            // no-tool-gate stone source a fresh player scrapes their
+            // first chunks from (real stone is 10x slow bare-handed).
+            if in_gravel_patch(world.x, world.z) {
+                slots.gravel
+            } else {
+                slots.grass
+            }
         } else if world.y >= h_here - 4 {
             slots.dirt
         } else {
@@ -475,6 +482,32 @@ fn tree_height(x: i32, z: i32) -> i32 {
 fn surface_height(x: i32, z: i32) -> i32 {
     let h = (x as f32 * 0.07).sin() * 4.0 + (z as f32 * 0.05).sin() * 4.0 + 8.0;
     h.floor() as i32
+}
+
+/// Whether column `(x, z)` sits inside a gravel outcrop. Same
+/// stamp-scan pattern as trees: sparse hash-picked patch centres, and
+/// every column within the patch's Chebyshev radius turns gravel.
+/// Centre density 1/512 columns with radius 1-2 (3x3 or 5x5 patches)
+/// ⇒ roughly 2-4% of the surface — an outcrop every screen or two,
+/// not a gravel biome. Uses bits 5+ of `tree_hash` so patch centres
+/// don't correlate with tree roots (which mask bits 0-4; a shared
+/// low-bit mask would put a tree on top of every outcrop).
+fn in_gravel_patch(x: i32, z: i32) -> bool {
+    const PATCH_RADIUS_MAX: i32 = 2;
+    for dx in -PATCH_RADIUS_MAX..=PATCH_RADIUS_MAX {
+        for dz in -PATCH_RADIUS_MAX..=PATCH_RADIUS_MAX {
+            let (cx, cz) = (x + dx, z + dz);
+            let h = tree_hash(cx, cz);
+            if (h >> 5) & 0x1FF != 0 {
+                continue;
+            }
+            let radius = 1 + ((h >> 16) & 1) as i32;
+            if dx.abs().max(dz.abs()) <= radius {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether column `(x, z)` is a tree root. Pure hash → bool: deterministic

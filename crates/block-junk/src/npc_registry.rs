@@ -134,6 +134,12 @@ impl NpcKindRegistry {
         self.defs.get(id)
     }
 
+    /// All kinds, in map order (unordered — callers needing
+    /// determinism sort or collect into keyed maps).
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &NpcKindDef)> + '_ {
+        self.defs.iter()
+    }
+
     pub fn kind_count(&self) -> usize {
         self.defs.len()
     }
@@ -184,6 +190,14 @@ impl NeedRegistry {
     /// every brain tick. `None` ⇒ this need never preempts.
     pub fn preempt_threshold(&self, id: &str) -> Option<f32> {
         self.defs.get(id).and_then(|d| d.preempt_threshold)
+    }
+
+    /// Cross-need decay coupling for `id`, if its def declares one
+    /// (starvation: hunger past its trigger makes `sleep` decay
+    /// faster). A boost naming an unknown trigger need simply never
+    /// fires — the trigger reads as 0.
+    pub fn decay_boost(&self, id: &str) -> Option<&block_junk_mod_api::npcs::DecayBoost> {
+        self.defs.get(id).and_then(|d| d.decay_boost.as_ref())
     }
 
     pub fn need_count(&self) -> usize {
@@ -281,6 +295,7 @@ mod tests {
             decay_per_sec: decay,
             urge_threshold: urge,
             preempt_threshold: preempt,
+            decay_boost: None,
         }
     }
 

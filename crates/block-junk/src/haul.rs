@@ -487,7 +487,25 @@ pub fn try_schedule_haul_for_npc(
         }
     }
     let Some((target, item_slot, remaining_for_kind, _)) = best else {
-        return false;
+        // No material hauling to do. Before giving up, see whether a
+        // work-ready plan is blocked only on this NPC's missing tool —
+        // if so, fetch the tool now so the planner can commit the work
+        // next tick. Covers Remove plans (never haul targets — nothing
+        // to deliver) and satisfied Build plans with a build tool gate.
+        return try_schedule_tool_fetch(
+            npc_id,
+            pose,
+            foot,
+            equipped_tool,
+            plans,
+            block_registry,
+            item_registry,
+            chunks,
+            chunk_map,
+            world_items,
+            store,
+            now_secs,
+        );
     };
 
     // Reserve the tool first (if any). Stations never carry a tool
@@ -710,6 +728,101 @@ pub fn compute_station_demand(
         }
     }
     deficit
+}
+
+/// Tool-fetch-only scheduling: when there's no material hauling to
+/// do, route a tool-less NPC to a loose tool that unlocks (or speeds
+/// up) a work-ready plan. The assignment carries an empty material
+/// queue + a `pending_tool`; after the `PickupTool` arrival equips
+/// it, `pick_next_haul_leg` sees nothing left to haul and releases,
+/// and the planner commits the now-properly-tooled work.
+///
+/// Greedy, and deliberately deferential: if *any* nearby work-ready
+/// plan is already workable at full speed with the current tool (or
+/// ungated), we fetch nothing — the planner should drive that work
+/// instead of the NPC swapping tools while jobs wait. (The plan we
+/// defer to may turn out claimed by another NPC; the next Idle tick
+/// re-evaluates. Greedy-per-tick, same trade the material scheduler
+/// makes.)
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shares the scheduler's subsystem spread"
+)]
+fn try_schedule_tool_fetch(
+    npc_id: NpcId,
+    pose: Vec3,
+    foot: IVec3,
+    equipped_tool: &crate::protocol::EquippedTool,
+    plans: &crate::plans::Plans,
+    block_registry: &crate::blocks::BlockRegistry,
+    item_registry: &crate::items::ItemRegistry,
+    chunks: &Query<&crate::voxel::Chunk>,
+    chunk_map: &crate::voxel::ChunkMap,
+    world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
+    store: &mut HaulStore,
+    now_secs: f32,
+) -> bool {
+    use crate::protocol::PlanKind;
+    let mut fetch: Option<(IVec3, block_junk_mod_api::blocks::TagId, i32)> = None;
+    for (cell, state) in plans.iter() {
+        // Only plans that are otherwise ready to work: Remove plans
+        // always, Build plans once their materials are delivered.
+        if matches!(state.kind, PlanKind::Build { .. }) && !state.is_satisfied() {
+            continue;
+        }
+        let dist = chebyshev(*cell, foot);
+        if dist > MAX_HAUL_PLAN_RADIUS_CELLS {
+            continue;
+        }
+        if store.is_unreachable(HaulTarget::Plan(*cell), now_secs) {
+            continue;
+        }
+        let required =
+            required_tool_for_plan(*cell, &state.kind, block_registry, chunks, chunk_map);
+        let Some(tag) = required else {
+            return false; // ungated work available — planner's job
+        };
+        if item_registry.tool_has_tag(equipped_tool.item, &tag) {
+            return false; // properly-tooled work available — planner's job
+        }
+        if fetch.as_ref().map(|(_, _, d)| dist < *d).unwrap_or(true) {
+            fetch = Some((*cell, tag, dist));
+        }
+    }
+    let Some((plan_cell, tag, _)) = fetch else {
+        return false;
+    };
+    let Some((entity, item, translation)) =
+        find_nearest_unreserved_tool(&tag, pose, npc_id, world_items, item_registry, store)
+    else {
+        // No tool to fetch. Soft-gated plans stay visible to the
+        // planner (slow bare-hands work); hard-gated ones wait for a
+        // tool to exist.
+        return false;
+    };
+    if !store.try_reserve_internal(entity, npc_id) {
+        return false;
+    }
+    info!(
+        npc = npc_id.0,
+        plan = ?plan_cell.to_array(),
+        tool = item.0,
+        required = %tag,
+        "haul assignment (tool fetch) committed",
+    );
+    store.commit_assignment(
+        npc_id,
+        HaulAssignment {
+            target: HaulTarget::Plan(plan_cell),
+            queue: Vec::new(),
+            pending_tool: Some(ReservedItem {
+                entity,
+                item,
+                translation,
+            }),
+        },
+    );
+    true
 }
 
 /// What tool tag (if any) the plan at `cell` requires its worker to

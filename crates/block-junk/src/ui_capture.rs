@@ -186,6 +186,7 @@ fn handle_escape(
     mut captures: ResMut<UiCaptures>,
     mut craft_ui: ResMut<crate::craft_stations::CraftStationUiState>,
     mut drag: ResMut<crate::plans::PlanDragState>,
+    mut storage_drag: ResMut<crate::storage::StorageDragState>,
     session: Res<crate::menu::ServerSession>,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
@@ -206,6 +207,10 @@ fn handle_escape(
     }
     if drag.active.is_some() {
         drag.active = None;
+        return;
+    }
+    if storage_drag.active.is_some() {
+        storage_drag.active = None;
         return;
     }
     if captures.contains(UiCapture::CraftModal) {

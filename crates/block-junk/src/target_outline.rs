@@ -110,6 +110,10 @@ fn draw_target_outline(
     let dir = *cam_t.forward();
 
     match *mode {
+        // Storage mode's cursor feedback is the drag-preview /
+        // zone-overlay gizmos in storage.rs — a block outline here
+        // would suggest block verbs that don't exist in that mode.
+        PlayerMode::Storage => {}
         PlayerMode::Plan => draw_plan_target(
             origin,
             dir,
@@ -347,10 +351,32 @@ pub(crate) fn player_can_work_slot(
     items: &ItemRegistry,
     tool: EquippedTool,
 ) -> bool {
-    match required_tool_for_slot(slot, verb, registry) {
-        Some(required) => items.tool_has_tag(tool.item, required),
-        None => true,
-    }
+    player_work_multiplier(slot, verb, registry, items, tool).is_some()
+}
+
+/// The duration multiplier the player works `slot` at for `verb`:
+/// `Some(1.0)` ungated or properly tooled, `Some(x > 1)` soft-gated
+/// without the tool (slow work), `None` hard-blocked. `None` slot
+/// (empty cell) → `Some(1.0)` (nothing to gate). Companion to
+/// [`player_can_work_slot`] for the timed-action path that needs the
+/// magnitude, not just the verdict.
+pub(crate) fn player_work_multiplier(
+    slot: Option<BlockSlot>,
+    verb: WorkVerb,
+    registry: &BlockRegistry,
+    items: &ItemRegistry,
+    tool: EquippedTool,
+) -> Option<f32> {
+    let Some(slot) = slot else {
+        return Some(1.0);
+    };
+    let Some(work) = registry.def(slot).work_action.as_ref() else {
+        return Some(1.0);
+    };
+    let has_tool = work
+        .tool_for(verb)
+        .is_none_or(|tag| items.tool_has_tag(tool.item, tag));
+    work.duration_multiplier(verb, has_tool)
 }
 
 /// The tool tag `slot`'s work-action demands for `verb`, if any.

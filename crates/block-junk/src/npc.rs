@@ -223,6 +223,20 @@ pub enum Goal {
     /// `[MIN_REST_SECS, MAX_REST_SECS]` so a misbehaving mod can't
     /// freeze an NPC indefinitely or churn the planner at 60 Hz.
     Resting { remaining_secs: f32 },
+    /// Lying on the ground sleeping — the planner's no-bed fallback
+    /// ([`PlannerGoal::SleepGround`]). Restores `need` continuously at
+    /// `restore_per_sec` while counting down, so an interruption keeps
+    /// whatever was already slept. Ends early once the need is fully
+    /// restored. Not preempt-eligible (it IS the survival response),
+    /// holds no claims, and doesn't lock the body — like `Resting`,
+    /// just horizontal.
+    SleepingGround {
+        remaining_secs: f32,
+        need: String,
+        restore_per_sec: f32,
+        /// Clip id for the client override (vanilla: the lie idle).
+        animation: Option<String>,
+    },
     /// Standing at an interactable cell, counting down to completion.
     /// One state covers every variant the engine used to have a
     /// separate Goal for (Consuming, Sleeping, and the future
@@ -678,7 +692,7 @@ fn npc_census(
                     movers_not_moving += 1;
                 }
             }
-            Goal::Resting { .. } => resting += 1,
+            Goal::Resting { .. } | Goal::SleepingGround { .. } => resting += 1,
             Goal::Interacting { .. } => interacting += 1,
             Goal::Working { .. } => working += 1,
             Goal::CraftingAtStation { .. } => crafting += 1,
@@ -713,6 +727,7 @@ fn refresh_npc_activity(
     for (brain, kind, mut override_) in npcs.iter_mut() {
         let next = match &brain.goal {
             Goal::Interacting { animation, .. } => NpcAnimOverride(animation.clone()),
+            Goal::SleepingGround { animation, .. } => NpcAnimOverride(animation.clone()),
             Goal::Working { .. } => {
                 NpcAnimOverride(kinds.get(&kind.0).map(|k| k.animations.work.clone()))
             }
@@ -1154,7 +1169,7 @@ pub(crate) fn preempt_release_holds(
     haul_store: &mut HaulStore,
 ) {
     match goal {
-        Goal::Idle | Goal::Resting { .. } => {}
+        Goal::Idle | Goal::Resting { .. } | Goal::SleepingGround { .. } => {}
         Goal::MoveTo { on_arrive, .. } => match on_arrive {
             ArrivalAction::Interact {
                 anchor_cell,
@@ -1323,9 +1338,30 @@ fn npc_brain_tick(
         // rate. Unknown ids decay at 0 (the rate-lookup returns 0) so
         // an NPC carrying a stale need from before a mod reload won't
         // crash — it just freezes that value.
-        for (id, value) in needs.0.iter_mut() {
-            let decay = need_registry.decay_per_sec(id);
-            *value = (*value + decay * dt).clamp(0.0, 1.0);
+        //
+        // Two passes because of `decay_boost` (starvation coupling —
+        // e.g. hunger past its trigger multiplies sleep's decay):
+        // effective rates are computed against the pre-decay values
+        // so map iteration order can't change the outcome. The alloc
+        // is a few (String, f32) pairs per NPC per tick — noise next
+        // to the registry lookups the old single pass already did.
+        let effective_decay: Vec<(String, f32)> = needs
+            .0
+            .keys()
+            .map(|id| {
+                let mut decay = need_registry.decay_per_sec(id);
+                if let Some(boost) = need_registry.decay_boost(id)
+                    && needs.0.get(&boost.need).copied().unwrap_or(0.0) >= boost.above
+                {
+                    decay *= boost.multiplier;
+                }
+                (id.clone(), decay)
+            })
+            .collect();
+        for (id, decay) in effective_decay {
+            if let Some(value) = needs.0.get_mut(&id) {
+                *value = (*value + decay * dt).clamp(0.0, 1.0);
+            }
         }
 
         // Phase 1.5: preempt check. If any need crossed its data-defined
@@ -1427,6 +1463,28 @@ fn npc_brain_tick(
             Goal::Resting { remaining_secs } => {
                 *remaining_secs -= dt;
                 if *remaining_secs <= 0.0 {
+                    rest_done = true;
+                }
+            }
+            Goal::SleepingGround {
+                remaining_secs,
+                need,
+                restore_per_sec,
+                ..
+            } => {
+                *remaining_secs -= dt;
+                // Continuous restore: fights the same decay the Phase-1
+                // loop above just applied, so the *net* rate is
+                // restore - decay. Fully rested (or timer up) → back to
+                // Idle; the planner re-issues another slice if the NPC
+                // is still tired, which is what lets a ground sleeper
+                // notice a freshly-placed bed between naps.
+                let mut fully_rested = false;
+                if let Some(value) = needs.0.get_mut(need) {
+                    *value = (*value - *restore_per_sec * dt).max(0.0);
+                    fully_rested = *value <= 0.0;
+                }
+                if *remaining_secs <= 0.0 || fully_rested {
                     rest_done = true;
                 }
             }
@@ -2603,6 +2661,7 @@ fn npc_brain_tick(
                 PlannerGoal::Goto { .. } => "Goto",
                 PlannerGoal::Interact { .. } => "Interact",
                 PlannerGoal::WorkPlan { .. } => "WorkPlan",
+                PlannerGoal::SleepGround { .. } => "SleepGround",
             };
             let chosen_target: Option<BlockPos> = match &planner_goal {
                 PlannerGoal::Goto { cell, .. }
@@ -2635,6 +2694,27 @@ fn npc_brain_tick(
                 PlannerGoal::Rest { duration_secs } => {
                     brain.goal = Goal::Resting {
                         remaining_secs: duration_secs.clamp(MIN_REST_SECS, MAX_REST_SECS),
+                    };
+                    if !npc_path.0.is_empty() {
+                        npc_path.0.clear();
+                    }
+                }
+                PlannerGoal::SleepGround {
+                    duration_secs,
+                    restores,
+                    need,
+                    animation,
+                } => {
+                    // Same clamp window as Rest. The restore is spread
+                    // over the *clamped* duration so a mod passing a
+                    // huge `restores` with a tiny duration can't beat
+                    // bed rates through the clamp.
+                    let duration = duration_secs.clamp(MIN_REST_SECS, MAX_REST_SECS);
+                    brain.goal = Goal::SleepingGround {
+                        remaining_secs: duration,
+                        need,
+                        restore_per_sec: restores.clamp(0.0, 1.0) / duration,
+                        animation,
                     };
                     if !npc_path.0.is_empty() {
                         npc_path.0.clear();
@@ -2987,12 +3067,10 @@ fn npc_brain_tick(
                     // to a brief rest — same pattern as the no-tag
                     // branch above.
                     let commit_verb = plan_kind.work_verb();
-                    let commit_required_tool = match plan_kind {
-                        PlanKind::Build { slot, .. } => block_registry
-                            .def(slot)
-                            .work_action
-                            .as_ref()
-                            .and_then(|w| w.tool_for(commit_verb).cloned()),
+                    let commit_work_action = match plan_kind {
+                        PlanKind::Build { slot, .. } => {
+                            block_registry.def(slot).work_action.clone()
+                        }
                         PlanKind::Remove => {
                             let (coord, local) = world_to_chunk(target_cell);
                             chunk_map
@@ -3003,30 +3081,37 @@ fn npc_brain_tick(
                                     let s = chunk.get(local);
                                     if s.is_empty() { None } else { Some(s) }
                                 })
-                                .and_then(|s| {
-                                    block_registry
-                                        .def(s)
-                                        .work_action
-                                        .as_ref()
-                                        .and_then(|w| w.tool_for(commit_verb).cloned())
-                                })
+                                .and_then(|s| block_registry.def(s).work_action.clone())
                         }
                     };
-                    if let Some(tag) = &commit_required_tool
-                        && !haul.item_registry.tool_has_tag(equipped_tool.item, tag)
-                    {
-                        warn!(
-                            npc = npc_id.0,
-                            target = ?target_cell.to_array(),
-                            required = %tag,
-                            "work commit: required tool no longer satisfied; releasing claim and resting",
-                        );
-                        haul.plan_claims.release(target_cell, *npc_id);
-                        brain.goal = Goal::Resting {
-                            remaining_secs: MIN_REST_SECS,
-                        };
-                        continue;
-                    }
+                    // Soft gates resolve to a duration multiplier (1.0
+                    // when tooled, >1 bare-handed); a hard gate with no
+                    // matching tool resolves to None and releases as
+                    // before.
+                    let commit_tool_multiplier = match commit_work_action.as_ref() {
+                        None => 1.0,
+                        Some(work) => {
+                            let has_tool = work.tool_for(commit_verb).is_none_or(|tag| {
+                                haul.item_registry.tool_has_tag(equipped_tool.item, tag)
+                            });
+                            match work.duration_multiplier(commit_verb, has_tool) {
+                                Some(mult) => mult,
+                                None => {
+                                    warn!(
+                                        npc = npc_id.0,
+                                        target = ?target_cell.to_array(),
+                                        required = ?work.tool_for(commit_verb),
+                                        "work commit: hard tool gate unsatisfied; releasing claim and resting",
+                                    );
+                                    haul.plan_claims.release(target_cell, *npc_id);
+                                    brain.goal = Goal::Resting {
+                                        remaining_secs: MIN_REST_SECS,
+                                    };
+                                    continue;
+                                }
+                            }
+                        }
+                    };
                     // Capture work-action knobs (need + magnitude + duration)
                     // *once* at goal commit. Build plans consult the block
                     // being placed (in the plan slot); Remove plans consult
@@ -3042,6 +3127,18 @@ fn npc_brain_tick(
                         block_registry,
                         &work_defaults.0,
                     );
+                    // Worn-down modifier (starvation): a needy worker
+                    // is a slow worker. Composes with the tool gate —
+                    // a starving bare-handed miner stacks both.
+                    let worn_down_multiplier = work_defaults
+                        .0
+                        .worn_down
+                        .as_ref()
+                        .filter(|w| needs.0.get(&w.need).copied().unwrap_or(0.0) >= w.above)
+                        .map(|w| w.multiplier)
+                        .unwrap_or(1.0);
+                    let work_duration_secs =
+                        work_duration_secs * commit_tool_multiplier * worn_down_multiplier;
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     let Some(stand_cell) = nearest_standable_neighbor(target_cell, foot, &world)
@@ -3050,6 +3147,19 @@ fn npc_brain_tick(
                             npc = npc_id.0,
                             target = ?target_cell.to_array(),
                             "no standable neighbour of plan target; releasing claim and parking briefly",
+                        );
+                        // Memoize like the A*-failure branch below —
+                        // without this the planner re-picks the same
+                        // plan on the next idle entry and the NPC
+                        // livelocks at ~2 Hz (2026-07-05 playtest: a
+                        // high tag with no perch pinned an NPC while
+                        // its needs decayed). Common case: the upper
+                        // blocks of a tall Remove column — clearing
+                        // the lower ones creates the perch, and the
+                        // 30s retry naturally picks the plan back up.
+                        haul.store.memo_unreachable(
+                            HaulTarget::Plan(target_cell),
+                            now_secs + HAUL_UNREACHABLE_RETRY_SECS,
                         );
                         haul.plan_claims.release(target_cell, *npc_id);
                         brain.goal = Goal::Resting {
@@ -3701,11 +3811,13 @@ fn collect_nearby_plans(
             );
             continue;
         }
-        // Phase-5b gate: skip plans whose `work_action.required_tool`
-        // this NPC's `EquippedTool` doesn't satisfy. The planner only
-        // sees plans this NPC can actually drive — engine-haul
-        // tool-fetch is the route for tool-less NPCs, not the planner
-        // picking a plan and the engine silently failing.
+        // Phase-5b gate, softened: skip only plans whose tool gate is
+        // *hard*-unsatisfied (duration_multiplier → None). Soft-gated
+        // plans stay visible — the commit path stretches the work
+        // duration instead, so a tool-less NPC grinds slowly rather
+        // than ignoring the plan. Hard-gated Build plans still wait
+        // for the haul scheduler's tool-fetch (or a crafted tool) to
+        // make them workable.
         let block_slot = match state.kind {
             PlanKind::Build { slot, .. } => Some(slot),
             PlanKind::Remove => {
@@ -3722,17 +3834,21 @@ fn collect_nearby_plans(
         };
         if let Some(slot) = block_slot
             && let Some(work) = &block_registry.def(slot).work_action
-            && let Some(required) = work.tool_for(state.kind.work_verb())
-            && !item_registry.tool_has_tag(equipped_tool.item, required)
         {
-            trace!(
-                npc = self_id.0,
-                cell = ?cell.to_array(),
-                required = %required,
-                equipped = ?equipped_tool.item.map(|s| s.0),
-                "nearby plan filter: tool gate",
-            );
-            continue;
+            let verb = state.kind.work_verb();
+            let has_tool = work
+                .tool_for(verb)
+                .is_none_or(|tag| item_registry.tool_has_tag(equipped_tool.item, tag));
+            if work.duration_multiplier(verb, has_tool).is_none() {
+                trace!(
+                    npc = self_id.0,
+                    cell = ?cell.to_array(),
+                    required = ?work.tool_for(verb),
+                    equipped = ?equipped_tool.item.map(|s| s.0),
+                    "nearby plan filter: hard tool gate",
+                );
+                continue;
+            }
         }
         let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
         let hint = match state.kind {
@@ -4164,10 +4280,21 @@ fn collect_nearby_interactions(
 ///
 /// Search order: same-Y cardinals first (the common case — basket on a
 /// floor), then one cell up (basket on a low step), then one cell down
-/// (basket on a raised platform the NPC approaches from below). Within
-/// each Y, ties broken by Manhattan distance from `from` so the
-/// resulting path bends toward whichever side the NPC's already
-/// approaching from rather than picking an arbitrary cardinal.
+/// (basket on a raised platform the NPC approaches from below), then
+/// two cells down (target at head-height-plus-one — an NPC working a
+/// wall row it can reach standing on the ground beside it; same arm's-
+/// reach rationale as the overhead stance below). Within each Y, ties
+/// broken by Manhattan distance from `from` so the resulting path
+/// bends toward whichever side the NPC's already approaching from
+/// rather than picking an arbitrary cardinal.
+///
+/// Last resort: the cell exactly two below the target — overhead work.
+/// This is what lets an NPC standing on the floor of a 2-cell-high
+/// interior place (or break) its ceiling instead of stair-stepping
+/// scaffolds up the outside. Exactly two, not one: standing one below
+/// puts the NPC's head *inside* the target cell, so a Build there
+/// would materialise the block around their skull. Ordered dead last
+/// so any side approach keeps winning when one exists.
 fn nearest_standable_neighbor<W: Walkability>(
     target: IVec3,
     from: IVec3,
@@ -4179,7 +4306,7 @@ fn nearest_standable_neighbor<W: Walkability>(
         IVec3::new(0, 0, 1),
         IVec3::new(0, 0, -1),
     ];
-    for dy in [0, 1, -1] {
+    for dy in [0, 1, -1, -2] {
         let mut best: Option<(IVec3, i32)> = None;
         for off in offsets {
             let cand = target + off + IVec3::new(0, dy, 0);
@@ -4197,6 +4324,10 @@ fn nearest_standable_neighbor<W: Walkability>(
         if let Some((cell, _)) = best {
             return Some(cell);
         }
+    }
+    let overhead = target - IVec3::new(0, 2, 0);
+    if standable(world, overhead) {
+        return Some(overhead);
     }
     None
 }

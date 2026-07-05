@@ -76,7 +76,10 @@ use crate::voxel::{Chunk, ChunkEntities};
 ///                  a `players` entry under [`UNCLAIMED_PLAYER_ID`],
 ///                  claimed by the first client id that connects
 ///                  without an entry of its own.
-pub const SAVE_VERSION: u32 = 14;
+/// v15 (2026-07-05): added `storage_cells` — player-designated storage
+///                  zone cells (storage arc S1). v14 saves migrate on
+///                  load with an empty set.
+pub const SAVE_VERSION: u32 = 15;
 
 /// Sentinel `SavedPlayer::client_id` for state not yet bound to a real
 /// client id: v12-migrated legacy state. Real ids are never 0 (see
@@ -186,6 +189,11 @@ pub struct SaveFile {
     /// active stations OR for saves predating v10 (serde-default).
     #[serde(default)]
     pub craft_stations: Vec<(IVec3, SavedStationState)>,
+    /// Player-designated storage-zone cells (v15). Sorted at write
+    /// time for deterministic bytes. Cells are plain world coords —
+    /// no slot/id indirection to remap.
+    #[serde(default)]
+    pub storage_cells: Vec<IVec3>,
 }
 
 /// One player's persisted state, keyed by their netcode client id (a
@@ -234,6 +242,49 @@ impl From<SavedNpcV13> for SavedNpc {
     }
 }
 
+/// The v14 `SaveFile` layout, kept verbatim (field order is the bincode
+/// wire order) so v14 saves can be decoded and migrated instead of
+/// refused. Identical to v15 minus `storage_cells`.
+/// Serialize exists only so tests can author v14 bytes.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct SaveFileV14 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    block_slots: Vec<String>,
+    edited_chunks: Vec<SavedChunk>,
+    #[serde(default)]
+    players: Vec<SavedPlayer>,
+    #[serde(default)]
+    npcs: Vec<SavedNpc>,
+    #[serde(default)]
+    world_clock: Option<WorldClock>,
+    #[serde(default)]
+    plans: Vec<(IVec3, SavedPlanState)>,
+    #[serde(default)]
+    world_items: Vec<SavedWorldItem>,
+    #[serde(default)]
+    craft_stations: Vec<(IVec3, SavedStationState)>,
+}
+
+impl From<SaveFileV14> for SaveFile {
+    fn from(old: SaveFileV14) -> Self {
+        SaveFile {
+            version: SAVE_VERSION,
+            block_slots: old.block_slots,
+            edited_chunks: old.edited_chunks,
+            players: old.players,
+            npcs: old.npcs,
+            world_clock: old.world_clock,
+            plans: old.plans,
+            world_items: old.world_items,
+            craft_stations: old.craft_stations,
+            storage_cells: Vec::new(),
+        }
+    }
+}
+
 /// The v13 `SaveFile` layout, kept verbatim (field order is the bincode
 /// wire order) so v13 saves can be decoded and migrated instead of
 /// refused. Identical to v14 except NPCs lack rolled stats.
@@ -272,6 +323,7 @@ impl From<SaveFileV13> for SaveFile {
             plans: old.plans,
             world_items: old.world_items,
             craft_stations: old.craft_stations,
+            storage_cells: Vec::new(),
         }
     }
 }
@@ -332,6 +384,7 @@ impl From<SaveFileV12> for SaveFile {
             plans: old.plans,
             world_items: old.world_items,
             craft_stations: old.craft_stations,
+            storage_cells: Vec::new(),
         }
     }
 }
@@ -640,7 +693,8 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         });
     }
     let meta = read_metadata(&dir)?;
-    if meta.version != SAVE_VERSION && meta.version != 13 && meta.version != 12 {
+    if meta.version != SAVE_VERSION && meta.version != 14 && meta.version != 13 && meta.version != 12
+    {
         return Err(SaveError::VersionMismatch {
             name: name.to_string(),
             found: meta.version,
@@ -652,6 +706,14 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         path: blob,
         source: e,
     })?;
+    if meta.version == 14 {
+        // In-memory migration only; the file upgrades on the next
+        // write, so a failed session never rewrites a good v14 save.
+        let (old, _): (SaveFileV14, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+        bevy::log::info!("migrated save {name:?} from v14 (gained storage zones)");
+        return Ok(old.into());
+    }
     if meta.version == 13 {
         // In-memory migration only; the file upgrades on the next
         // write, so a failed session never rewrites a good v13 save.
@@ -828,6 +890,7 @@ mod tests {
                     }),
                 },
             )],
+            storage_cells: vec![IVec3::new(0, 9, 4), IVec3::new(1, 9, 4)],
         };
 
         let bytes = bincode::serde::encode_to_vec(&original, bincode::config::standard()).unwrap();
@@ -981,6 +1044,7 @@ mod tests {
             )],
             world_items: vec![],
             craft_stations: vec![],
+            storage_cells: vec![],
         }
     }
 

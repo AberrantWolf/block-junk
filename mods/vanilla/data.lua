@@ -109,13 +109,15 @@ register {
     materials = {
         { item = "vanilla:stone_chunk", count = 1 },
     },
-    -- Phase 5a: stone needs a pickaxe to work (chop or build). Engine
-    -- defaults supply duration_secs + need_restore; we override only
-    -- the tool gate.
+    -- Stone wants a pickaxe but doesn't demand one: bare-handed
+    -- mining works at 10x duration (progression bootstrap — you can
+    -- always scrape together the chunks for your first tools, it
+    -- just hurts). The pickaxe restores the 1x baseline.
     work_action = {
         duration_secs = 4.0,
         need_restore = { need = "work", restores = 0.1 },
         required_tool = "vanilla:pickaxe",
+        no_tool_multiplier = 10.0,
     },
 }
 
@@ -178,13 +180,14 @@ register {
     materials = {
         { item = "vanilla:wood_log", count = 1 },
     },
-    -- Phase 5a: wood needs an axe to chop (or build). Same pattern as
-    -- stone — engine defaults for duration + need_restore, override
-    -- only the tool gate.
+    -- Wood wants an axe but only 3x-slows without one (vs stone's
+    -- 10x): punching your first tree is the intended day-one loop,
+    -- so bare-handed chopping stings less than bare-handed mining.
     work_action = {
         duration_secs = 4.0,
         need_restore = { need = "work", restores = 0.1 },
         required_tool = "vanilla:axe",
+        no_tool_multiplier = 3.0,
     },
 }
 
@@ -198,6 +201,14 @@ register {
     },
     color = { 0.20, 0.50, 0.25 },
     texture = "vanilla:leaves",
+    -- Quarter the default 4s: clearing a felled tree's canopy is
+    -- ~20 blocks of busywork, not real work. Proportionally small
+    -- purpose restore so leaf-clearing NPCs don't out-satisfy
+    -- builders.
+    work_action = {
+        duration_secs = 1.0,
+        need_restore = { need = "work", restores = 0.025 },
+    },
 }
 
 -- Doors. `walkable_boundary` marks them as access points the room
@@ -554,17 +565,86 @@ register {
     drops = {
         { item = "vanilla:stone_chunk", count = 1 },
     },
+    -- Costs what it drops. Without this, gravel was free to build but
+    -- dropped a chunk — an infinite-stone pump. As terrain it doubles
+    -- as the intended early stone source: no tool gate, so bare-hands
+    -- players scrape their first chunks here at normal speed.
+    materials = {
+        { item = "vanilla:stone_chunk", count = 1 },
+    },
+}
+
+-- Refined building blocks. The material-efficiency tier: one log
+-- mills into two planks (recipe below), so a plank build costs half
+-- the trees of a raw-wood build at the price of workbench time and
+-- hauling. Both refined blocks HARD-require a hammer to build
+-- (build_required_tool has no soft fallback by design) — carpentry
+-- without a hammer is how you get a log cabin, not a plank house.
+-- Mining them back stays soft-gated like their raw parents, and
+-- drops = materials keeps the chop-refund symmetry.
+register {
+    id = "vanilla:planks",
+    display_name = "Planks",
+    flags = {
+        solid = true,
+        room_boundary = true,
+        support_below = true,
+    },
+    color = { 0.72, 0.55, 0.32 },
+    texture = "vanilla:planks",
+    drops = {
+        { item = "vanilla:wood_planks", count = 1 },
+    },
+    materials = {
+        { item = "vanilla:wood_planks", count = 1 },
+    },
+    work_action = {
+        duration_secs = 4.0,
+        need_restore = { need = "work", restores = 0.1 },
+        required_tool = "vanilla:axe",
+        no_tool_multiplier = 3.0,
+        build_required_tool = "vanilla:hammer",
+    },
+}
+
+register {
+    id = "vanilla:stone_bricks",
+    display_name = "Stone Bricks",
+    flags = {
+        solid = true,
+        room_boundary = true,
+        support_below = true,
+    },
+    color = { 0.60, 0.58, 0.55 },
+    texture = "vanilla:stone_bricks",
+    drops = {
+        { item = "vanilla:stone_brick", count = 1 },
+    },
+    materials = {
+        { item = "vanilla:stone_brick", count = 1 },
+    },
+    work_action = {
+        duration_secs = 4.0,
+        need_restore = { need = "work", restores = 0.1 },
+        required_tool = "vanilla:pickaxe",
+        no_tool_multiplier = 10.0,
+        build_required_tool = "vanilla:hammer",
+    },
 }
 
 -- Recipes. One per station for the MVP; multi-recipe selection UI
 -- lands when a station gains its second recipe.
+--
+-- Refine yields are 1 → 2: refined blocks are the material-efficient
+-- way to build (a plank house costs half the trees of a log house),
+-- paid for in station time + hauling + the hammer gate above.
 engine.recipes.register {
     id = "vanilla:planks_from_log",
     display_name = "Wood planks (from log)",
     inputs = {
         { item = "vanilla:wood_log", count = 1 },
     },
-    output = { item = "vanilla:wood_planks", count = 1 },
+    output = { item = "vanilla:wood_planks", count = 2 },
     duration_secs = 4.0,
     station = "vanilla:carpentry",
     tier = 1,
@@ -576,9 +656,57 @@ engine.recipes.register {
     inputs = {
         { item = "vanilla:stone_chunk", count = 1 },
     },
-    output = { item = "vanilla:stone_brick", count = 1 },
+    output = { item = "vanilla:stone_brick", count = 2 },
     duration_secs = 4.0,
     station = "vanilla:smithing",
+    tier = 1,
+}
+
+-- Tool recipes: the intended exit from the bare-hands bootstrap.
+-- All carpentry tier 1 so one workbench (2 logs, hand-buildable)
+-- unlocks every basic tool. Inputs stay within reach of slow
+-- bare-hand gathering: one punched tree covers the logs, and the
+-- chunks come from bare-hand mining (10x slow) or surface gravel.
+-- duration 6s > the 4s refine recipes — tools should read as more
+-- deliberate work than milling a plank. Players queue these at the
+-- station like any order, so "make the villagers some tools" needs
+-- no extra UI.
+engine.recipes.register {
+    id = "vanilla:craft_axe",
+    display_name = "Axe",
+    inputs = {
+        { item = "vanilla:wood_log", count = 1 },
+        { item = "vanilla:stone_chunk", count = 1 },
+    },
+    output = { item = "vanilla:axe", count = 1 },
+    duration_secs = 6.0,
+    station = "vanilla:carpentry",
+    tier = 1,
+}
+
+engine.recipes.register {
+    id = "vanilla:craft_pickaxe",
+    display_name = "Pickaxe",
+    inputs = {
+        { item = "vanilla:wood_log", count = 1 },
+        { item = "vanilla:stone_chunk", count = 2 },
+    },
+    output = { item = "vanilla:pickaxe", count = 1 },
+    duration_secs = 6.0,
+    station = "vanilla:carpentry",
+    tier = 1,
+}
+
+engine.recipes.register {
+    id = "vanilla:craft_hammer",
+    display_name = "Hammer",
+    inputs = {
+        { item = "vanilla:wood_log", count = 1 },
+        { item = "vanilla:stone_chunk", count = 1 },
+    },
+    output = { item = "vanilla:hammer", count = 1 },
+    duration_secs = 6.0,
+    station = "vanilla:carpentry",
     tier = 1,
 }
 
@@ -615,6 +743,11 @@ engine.needs.register {
     id = "sleep",
     display_name = "Tiredness",
     decay_per_sec = 1.0 / 450.0,
+    -- Starvation coupling (pre-health placeholder): an unfed NPC
+    -- burns energy — past hunger 0.7, tiredness accumulates at 2x.
+    -- Pairs with the worn_down work slowdown in set_work_defaults
+    -- below; both read the same "visibly starving" trigger level.
+    decay_boost = { need = "hunger", above = 0.7, multiplier = 2.0 },
     urge_threshold = 0.25,
     -- Critical exhaustion preempts current task. The planner still
     -- gates the *sleep* action on it being night, so a preempted-at-
@@ -651,6 +784,10 @@ engine.needs.register {
 engine.npcs.set_work_defaults {
     need_restore = { need = "work", restores = 0.1 },
     duration_secs = 4.0,
+    -- Starving workers work at 1.5x duration (see the sleep need's
+    -- decay_boost for the matching energy drain). Health, when it
+    -- lands, replaces both placeholders with real consequences.
+    worn_down = { need = "hunger", above = 0.7, multiplier = 1.5 },
 }
 
 -- Civilization clustering. Two matched rooms join the same cluster when
@@ -743,5 +880,18 @@ engine.npcs.register {
         idle = "vanilla:idle",
         walk = "vanilla:walk",
         work = "vanilla:work",
+    },
+    -- Body variants, assigned round-robin by NPC id (engine rule:
+    -- models[(id-1) % #models]), so the first four villagers are
+    -- visually distinct on every machine. All KayKit Adventurers on
+    -- the same Medium rig — every registered clip fits every body.
+    -- Textures are embedded in the glbs; alt-palette variants
+    -- (\*_texture_alt_A/B/C in the pack) are the future skin-tone /
+    -- palette-swap hook.
+    models = {
+        "mods://vanilla/models/characters/Knight.glb",
+        "mods://vanilla/models/characters/Ranger.glb",
+        "mods://vanilla/models/characters/Druid.glb",
+        "mods://vanilla/models/characters/Engineer.glb",
     },
 }

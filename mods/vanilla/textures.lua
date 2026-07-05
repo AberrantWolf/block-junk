@@ -165,11 +165,10 @@ return {
       },
       finish = { scale = 12.0, brightness = 0.05 },
     },
-    -- Plank grid. No block uses this today (the wood block wears bark +
-    -- rings below); kept for the future vanilla:planks crafted block —
-    -- it's exactly the look planks want.
+    -- Plank grid: the vanilla:planks crafted block's surface (the raw
+    -- wood block wears bark + rings below).
     {
-      id = "vanilla:wood",
+      id = "vanilla:planks",
       layers = {
         {
           period = 2,
@@ -195,6 +194,32 @@ return {
         },
       },
       finish = { scale = 9.0, brightness = 0.04 },
+    },
+    -- Dressed stone courses: the bricks grid wearing the stone block's
+    -- grey palette, for the vanilla:stone_bricks crafted block. Same
+    -- seam-and-bevel recipe as the planks/door grids so the three
+    -- "worked material" surfaces read as one family.
+    {
+      id = "vanilla:stone_bricks",
+      layers = {
+        {
+          period = 2,
+          steps = {
+            { op = "bricks", columns = 2, rows = 4, gap = 0.04, bevel = 0.1, seed = 9, out = "b" },
+            {
+              op = "ramp",
+              input = "b.cells",
+              stops = { { 0.0, 0.42, 0.42, 0.46 }, { 1.0, 0.58, 0.58, 0.62 } },
+            },
+            { op = "invert", input = "b", out = "seams" },
+            { op = "fill", color = { 0.2, 0.2, 0.23 }, opacity = 0.85, mask = "seams" },
+            { op = "white", seed = 12, out = "spk" },
+            { op = "threshold", input = "spk", threshold = 0.93, softness = 0.02, out = "spkm" },
+            { op = "fill", color = { 0.32, 0.32, 0.36 }, opacity = 0.5, mask = "spkm" },
+          },
+        },
+      },
+      finish = { scale = 11.0, brightness = 0.05 },
     },
     -- Trunk sides: vertical bark streaks. Stripes rotated 90° (vertical),
     -- domain-warped by fbm so they gnarl instead of reading mechanical,
