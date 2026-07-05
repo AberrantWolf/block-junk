@@ -241,6 +241,7 @@ impl Plugin for ClientPlugin {
                     attach_npc_visuals,
                     attach_npc_carry_icons,
                     update_npc_carry_icons,
+                    update_npc_held_tools,
                     start_npc_anim_idle,
                     drive_npc_animation,
                 )
@@ -3273,6 +3274,16 @@ struct NpcWorldAssetRoot;
 struct NpcVisuals {
     player: Option<Entity>,
     current_clip: Option<String>,
+    /// The rig's `handslot.r` socket entity, resolved once the skeleton
+    /// scene is ready (`setup_npc_skeleton_anim`). `None` until then —
+    /// `update_npc_held_tools` retries the tool attach each frame until
+    /// this is populated. KayKit's purpose-built right-hand attach node.
+    hand_r: Option<Entity>,
+    /// The equipped tool currently rendered in the right hand: the source
+    /// [`ItemSlot`] and the spawned mesh child (under `hand_r`). Compared
+    /// against `EquippedTool` each frame to detect equip/swap/unequip and
+    /// despawn+respawn the held mesh accordingly.
+    held_tool: Option<(ItemSlot, Entity)>,
 }
 
 /// NPC visual attach: spawn the KayKit character as a child of the NPC
@@ -3406,6 +3417,64 @@ fn update_npc_carry_icons(
     }
 }
 
+/// Marker on the mesh child that renders an NPC's equipped tool in its
+/// right hand. Its parent is the rig's `handslot.r` socket; despawned +
+/// respawned when the `EquippedTool` slot changes.
+#[derive(Component)]
+struct NpcHeldTool;
+
+/// Render each NPC's [`EquippedTool`] as a mesh childed to the rig's
+/// right-hand socket. Runs every frame (like `update_npc_carry_icons`)
+/// so it also catches the case where the tool was equipped *before* the
+/// skeleton finished loading — `hand_r` fills in asynchronously, and the
+/// slot-vs-`held_tool` comparison re-drives the attach once it does.
+///
+/// The comparison is the idempotence guard: a matching slot is a no-op,
+/// so the every-frame walk costs one `Option<ItemSlot>` compare per NPC.
+/// On a mismatch (equip / swap / unequip) the old mesh child is despawned
+/// (recursively — it bears an instantiated scene) and, if a tool is now
+/// held and the socket exists, a fresh one is childed to `hand_r`.
+fn update_npc_held_tools(
+    mut npcs: Query<(&EquippedTool, &mut NpcVisuals), With<Npc>>,
+    items: Res<ItemRegistry>,
+    asset_server: Res<AssetServer>,
+    mut commands: Commands,
+) {
+    for (tool, mut visuals) in npcs.iter_mut() {
+        let desired = tool.item;
+        let current = visuals.held_tool.map(|(slot, _)| slot);
+        if desired == current {
+            continue;
+        }
+        // State changed (or the socket only just became available). Tear
+        // down whatever is attached, then rebuild for the new slot.
+        if let Some((_, ent)) = visuals.held_tool.take() {
+            commands.entity(ent).despawn();
+        }
+        // Attach only when a tool is held *and* the socket exists; if the
+        // rig isn't ready yet, held_tool stays None and we retry next frame.
+        let (Some(slot), Some(hand_r)) = (desired, visuals.hand_r) else {
+            continue;
+        };
+        let mesh = &items.def(slot).mesh;
+        let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh}#Scene0"));
+        // Identity local transform: `handslot.r` already positions and
+        // orients the grip. TODO(A1 visual pass): if a tool sits wrong in
+        // the hand, tune a per-item hold offset/scale here (candidate for
+        // an ItemDef `hold_transform` field) — needs an in-game look.
+        let child = commands
+            .spawn((
+                NpcHeldTool,
+                WorldAssetRoot(scene),
+                ChildOf(hand_r),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        visuals.held_tool = Some((slot, child));
+    }
+}
+
 /// Attach the visible glTF scene + Transform when a `WorldItem`
 /// component is added (whether by local spawn or by lightyear's
 /// replication apply on the client). The component carries its own
@@ -3490,6 +3559,8 @@ fn setup_npc_skeleton_anim(
     npc_scene_roots: Query<(), With<NpcWorldAssetRoot>>,
     children_q: Query<&Children>,
     names: Query<&Name>,
+    parents: Query<&ChildOf>,
+    mut npc_visuals_q: Query<&mut NpcVisuals>,
     assets: Res<CharacterAssets>,
     mut commands: Commands,
 ) {
@@ -3535,6 +3606,22 @@ fn setup_npc_skeleton_anim(
         AnimationPlayer::default(),
         AnimationGraphHandle(assets.anim_graph.clone()),
     ));
+
+    // Cache the right-hand attach socket on the NPC root's NpcVisuals so
+    // `update_npc_held_tools` can child the equipped tool's mesh to it.
+    // The scene bearer's parent is the NPC root (attach_npc_visuals spawns
+    // the body as a `.with_child`). `handslot.r` is KayKit's dedicated
+    // right-hand attach node, nested under `hand.r` in the rig.
+    let hand_r = find_named_descendant(rig_root, "handslot.r", &children_q, &names);
+    if let Ok(npc_root) = parents.get(scene_bearer).map(|c| c.0)
+        && let Ok(mut visuals) = npc_visuals_q.get_mut(npc_root)
+    {
+        visuals.hand_r = hand_r;
+    }
+    if hand_r.is_none() {
+        warn!("npc rig has no 'handslot.r' node: {scene_bearer:?} (held tool won't render)");
+    }
+
     info!(
         "npc skeleton rigged: bearer {scene_bearer:?} rig_root {rig_root:?} \
          rig_name={rig_name:?} tagged={tagged}"
