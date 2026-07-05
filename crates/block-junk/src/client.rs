@@ -1576,7 +1576,7 @@ fn normal_mode_action_input(
         // route to the EquippedTool slot server-side; the client just
         // sends the pickup unconditionally and lets swap-semantics
         // handle slot occupancy. Resources still gate on Carrying.
-        if let Some((item_translation, item_dist, item_slot)) = item_hit {
+        if let Some((item_translation, item_dist, item_slot, _)) = item_hit {
             let beats_world = world_dist.map(|wd| item_dist < wd).unwrap_or(true);
             let beats_plan = plan_hit.map(|(pd, _)| item_dist < pd).unwrap_or(true);
             if beats_world && beats_plan {
@@ -2107,10 +2107,10 @@ pub(crate) fn raycast_world_items(
     dir: Vec3,
     max_distance: f32,
     items: &Query<&WorldItem>,
-) -> Option<(Vec3, f32, ItemSlot)> {
+) -> Option<(Vec3, f32, ItemSlot, u32)> {
     const HALF: f32 = 0.3;
     let inv_dir = Vec3::ONE / dir;
-    let mut best: Option<(Vec3, f32, ItemSlot)> = None;
+    let mut best: Option<(Vec3, f32, ItemSlot, u32)> = None;
     for wi in items.iter() {
         let min = wi.translation - Vec3::splat(HALF);
         let max = wi.translation + Vec3::splat(HALF);
@@ -2127,8 +2127,8 @@ pub(crate) fn raycast_world_items(
         if t > max_distance {
             continue;
         }
-        if best.as_ref().map(|(_, bd, _)| t < *bd).unwrap_or(true) {
-            best = Some((wi.translation, t, wi.item));
+        if best.as_ref().map(|(_, bd, _, _)| t < *bd).unwrap_or(true) {
+            best = Some((wi.translation, t, wi.item, wi.count));
         }
     }
     best
@@ -3431,13 +3431,18 @@ fn attach_world_item_visuals(
         return;
     };
     let def = items.def(world_item.item);
-    let scene: Handle<WorldAsset> = asset_server.load(format!("{}#Scene0", def.mesh));
+    // Tier the mesh by unit count: a single unit shows the base mesh, a
+    // pile shows its stack mesh (`ItemDef::pile`). `count` never changes
+    // for a live entity — a resized stack is despawned + respawned (see
+    // WorldItem docs) — so the mesh chosen here is never stale.
+    let mesh = def.pile_mesh(world_item.count);
+    let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh}#Scene0"));
     commands.entity(entity).insert((
         WorldAssetRoot(scene),
         Transform::from_translation(world_item.translation),
         GlobalTransform::default(),
         Visibility::default(),
-        Name::new(format!("WorldItem({})", def.id)),
+        Name::new(format!("WorldItem({}x{})", def.id, world_item.count)),
     ));
 }
 

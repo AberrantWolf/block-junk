@@ -85,10 +85,95 @@ pub struct ItemDef {
     /// `vec![]` for plain resources (logs, ore).
     #[serde(default)]
     pub tool_tags: Vec<TagId>,
+    /// How much room one unit of this item takes in a pile or (later) a
+    /// container. Drives pile capacity: a pile holds up to
+    /// [`PILE_CAPACITY_BULK`] worth. Berries 1, planks/chunks 2, logs 3,
+    /// tools 6. Defaults to 1.
+    #[serde(default = "default_bulk")]
+    pub bulk: u32,
+    /// Collective-pile behavior. `None` ⇒ this item never merges into a
+    /// stack — loose units only (the NPC tidy job leaves it alone).
+    /// `Some` ⇒ the tidy job may gather units into a single storage-cell
+    /// pile, capped and rendered per this config. A pile of `count` units
+    /// is one [`WorldItem`] entity with that count.
+    #[serde(default)]
+    pub pile: Option<PileConfig>,
+}
+
+/// Per-item pile tuning. All fields optional in Lua — an item that just
+/// wants default capacity and a base-mesh-only look can write `pile = {}`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PileConfig {
+    /// Max units in one pile. `None` ⇒ derive from `bulk` against
+    /// [`PILE_CAPACITY_BULK`]. An explicit value wins (clamped ≥ 1).
+    #[serde(default)]
+    pub capacity: Option<u32>,
+    /// Ascending count thresholds → mesh. The highest tier whose `min`
+    /// is ≤ the pile's count picks the mesh; below the lowest `min` (i.e.
+    /// a single unit) the base [`ItemDef::mesh`] renders — "a single unit
+    /// looks like a single item, a stack looks like a stack." Empty ⇒ the
+    /// pile always uses the base mesh regardless of count.
+    #[serde(default)]
+    pub tiers: Vec<PileTier>,
+}
+
+/// One count→mesh step in a [`PileConfig`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PileTier {
+    /// Minimum unit count at which this mesh applies.
+    pub min: u32,
+    /// glTF/scene path, same `mods://` convention as [`ItemDef::mesh`].
+    pub mesh: String,
+}
+
+/// Default total bulk a single pile holds. `capacity_units =
+/// PILE_CAPACITY_BULK / bulk`, so logs (bulk 3) pile 4-high, planks
+/// (bulk 2) 6-high, berries (bulk 1) 12-high. Engine tuning default;
+/// a `PileConfig.capacity` overrides per item.
+pub const PILE_CAPACITY_BULK: u32 = 12;
+
+impl ItemDef {
+    /// Whether the tidy job may merge this item into a pile (needs a
+    /// `pile` config and room for more than one unit).
+    pub fn is_pileable(&self) -> bool {
+        self.pile.is_some() && self.pile_capacity() > 1
+    }
+
+    /// Units this item stacks to in one pile (≥ 1). Non-pile items → 1.
+    pub fn pile_capacity(&self) -> u32 {
+        match &self.pile {
+            None => 1,
+            Some(p) => p
+                .capacity
+                .unwrap_or_else(|| PILE_CAPACITY_BULK / self.bulk.max(1))
+                .max(1),
+        }
+    }
+
+    /// Mesh path to render for a stack of `count` units. Picks the
+    /// highest matching pile tier, else the base mesh.
+    pub fn pile_mesh(&self, count: u32) -> &str {
+        if let Some(p) = &self.pile {
+            let mut chosen: Option<&PileTier> = None;
+            for t in &p.tiers {
+                if count >= t.min && chosen.map(|c| t.min >= c.min).unwrap_or(true) {
+                    chosen = Some(t);
+                }
+            }
+            if let Some(t) = chosen {
+                return &t.mesh;
+            }
+        }
+        &self.mesh
+    }
 }
 
 fn default_color() -> [f32; 3] {
     [0.7, 0.7, 0.7]
+}
+
+fn default_bulk() -> u32 {
+    1
 }
 
 /// A drop produced when a block is destroyed: which item, how many. Used

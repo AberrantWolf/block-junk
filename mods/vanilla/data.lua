@@ -23,11 +23,23 @@ register {
 -- KayKit Resource Bits and share the same `resource_bits_texture.png`
 -- already in this directory. Registration order doesn't matter for
 -- items the way it does for blocks (no slot-0 reservation).
+-- `bulk` + `pile` are the S2 collective-pile knobs. bulk is the item's
+-- weight in a pile/container (pile holds ~12 bulk). `pile.tiers` maps a
+-- unit count to a stack mesh: a single unit shows the base `mesh`, and
+-- count >= min switches to the tier mesh (all from KayKit Resource Bits,
+-- sharing resource_bits_texture.png). capacity is derived from bulk
+-- (12 / bulk) unless a `pile.capacity` overrides it.
 engine.items.register {
     id = "vanilla:wood_log",
     display_name = "Wood Log",
     mesh = "mods://vanilla/models/Wood_Log_B.gltf",
     color = { 0.55, 0.40, 0.22 },
+    bulk = 3,   -- pile cap = 12/3 = 4 logs
+    pile = {
+        tiers = {
+            { min = 2, mesh = "mods://vanilla/models/Wood_Log_Stack.gltf" },
+        },
+    },
 }
 
 engine.items.register {
@@ -35,6 +47,13 @@ engine.items.register {
     display_name = "Stone Chunk",
     mesh = "mods://vanilla/models/Stone_Chunks_Small.gltf",
     color = { 0.55, 0.55, 0.58 },
+    bulk = 2,   -- pile cap = 12/2 = 6 chunks
+    pile = {
+        -- Only two chunk meshes exist (Small = base for 1-2, Large for 3+).
+        tiers = {
+            { min = 3, mesh = "mods://vanilla/models/Stone_Chunks_Large.gltf" },
+        },
+    },
 }
 
 -- Tools (Phase 5a/b). Each tool's `tool_tags` is the engine-side
@@ -44,12 +63,16 @@ engine.items.register {
 -- `resource_bits_texture.png`. `color` is the HUD-chip fallback —
 -- the in-world model uses its textured material, but the carry /
 -- tool HUD swatches and inspect-panel tints read this RGB.
+-- Tools carry bulk 6 (heavy — two to a pile's worth) for future
+-- container math, but have no `pile` config: they're not tidied into
+-- stacks (there's no per-tool stack mesh, and loose tools are rare).
 engine.items.register {
     id = "vanilla:axe",
     display_name = "Axe",
     mesh = "mods://vanilla/models/axe.gltf",
     color = { 0.78, 0.45, 0.18 },
     tool_tags = { "vanilla:axe" },
+    bulk = 6,
 }
 
 engine.items.register {
@@ -58,6 +81,7 @@ engine.items.register {
     mesh = "mods://vanilla/models/hammer.gltf",
     color = { 0.45, 0.30, 0.20 },
     tool_tags = { "vanilla:hammer" },
+    bulk = 6,
 }
 
 engine.items.register {
@@ -66,6 +90,7 @@ engine.items.register {
     mesh = "mods://vanilla/models/pickaxe.gltf",
     color = { 0.38, 0.40, 0.45 },
     tool_tags = { "vanilla:pickaxe" },
+    bulk = 6,
 }
 
 -- Crafting outputs (Phase 6a). KayKit Resource Bits
@@ -73,20 +98,39 @@ engine.items.register {
 -- `resource_bits_texture.png` with the log/stone-chunk items.
 -- Visually distinct from the cylindrical Wood_Log_B so a dropped
 -- planks pile reads differently from a dropped log.
+-- Base mesh is a single board (Wood_Plank_A): a lone dropped plank reads
+-- as one, and only a tidied stack shows the Stack_Small/Medium/Large
+-- mesh. bulk 2 → pile cap 6.
 engine.items.register {
     id = "vanilla:wood_planks",
     display_name = "Wood Planks",
-    mesh = "mods://vanilla/models/Wood_Planks_Stack_Small.gltf",
+    mesh = "mods://vanilla/models/Wood_Plank_A.gltf",
     color = { 0.72, 0.55, 0.32 },
+    bulk = 2,
+    pile = {
+        tiers = {
+            { min = 2, mesh = "mods://vanilla/models/Wood_Planks_Stack_Small.gltf" },
+            { min = 4, mesh = "mods://vanilla/models/Wood_Planks_Stack_Medium.gltf" },
+            { min = 6, mesh = "mods://vanilla/models/Wood_Planks_Stack_Large.gltf" },
+        },
+    },
 }
 
--- Second crafted output: stone bricks from the forge (Phase 6c). Same
--- "small stack" convention as planks. Reuses resource_bits_texture.png.
+-- Second crafted output: stone bricks from the forge (Phase 6c). Base
+-- mesh is a single brick (Stone_Brick); stacks tier up like planks.
 engine.items.register {
     id = "vanilla:stone_brick",
     display_name = "Stone Brick",
-    mesh = "mods://vanilla/models/Stone_Bricks_Stack_Small.gltf",
+    mesh = "mods://vanilla/models/Stone_Brick.gltf",
     color = { 0.60, 0.58, 0.55 },
+    bulk = 2,
+    pile = {
+        tiers = {
+            { min = 2, mesh = "mods://vanilla/models/Stone_Bricks_Stack_Small.gltf" },
+            { min = 4, mesh = "mods://vanilla/models/Stone_Bricks_Stack_Medium.gltf" },
+            { min = 6, mesh = "mods://vanilla/models/Stone_Bricks_Stack_Large.gltf" },
+        },
+    },
 }
 
 -- Block surface textures live in textures.lua (a pure-data file owned by

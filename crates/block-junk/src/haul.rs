@@ -35,6 +35,12 @@ pub struct ReservedItem {
     pub entity: Entity,
     pub item: ItemSlot,
     pub translation: Vec3,
+    /// How many units to withdraw from this (possibly multi-unit pile)
+    /// entity on the pickup leg — `min(target's remaining need, carry
+    /// room, the stack's size)`. Loose items reserve `1`. The whole
+    /// entity is reserved regardless of `count` (one NPC works a stack
+    /// at a time).
+    pub count: u32,
 }
 
 /// Where the next deposit leg of a haul cycle delivers materials.
@@ -49,6 +55,9 @@ pub struct ReservedItem {
 pub enum HaulTarget {
     Plan(IVec3),
     Station(IVec3),
+    /// A designated storage cell the NPC is tidying loose items into
+    /// (S2). The deposit merges the carry into a pile at this cell.
+    Storage(IVec3),
 }
 
 impl HaulTarget {
@@ -57,7 +66,7 @@ impl HaulTarget {
     /// kind.
     pub fn cell(&self) -> IVec3 {
         match self {
-            HaulTarget::Plan(c) | HaulTarget::Station(c) => *c,
+            HaulTarget::Plan(c) | HaulTarget::Station(c) | HaulTarget::Storage(c) => *c,
         }
     }
 }
@@ -284,6 +293,7 @@ pub fn try_schedule_haul_for_npc(
     chunks: &Query<&crate::voxel::Chunk>,
     chunk_map: &crate::voxel::ChunkMap,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
+    storage: &crate::storage::StorageZones,
     store: &mut HaulStore,
     now_secs: f32,
 ) -> bool {
@@ -384,13 +394,17 @@ pub fn try_schedule_haul_for_npc(
     // Index every loose item by ItemSlot once per call. The pool is
     // shared across this NPC's plan scan + final reservation pass;
     // per-NPC rebuild is O(items) and items are sparse.
-    let mut items_by_slot: std::collections::HashMap<crate::items::ItemSlot, Vec<(Entity, Vec3)>> =
-        std::collections::HashMap::new();
+    // Each pool entry is (entity, position, unit count) — a pile
+    // (count > 1) is a single reservation that yields multiple units.
+    let mut items_by_slot: std::collections::HashMap<
+        crate::items::ItemSlot,
+        Vec<(Entity, Vec3, u32)>,
+    > = std::collections::HashMap::new();
     for (entity, wi) in world_items.iter() {
         items_by_slot
             .entry(wi.item)
             .or_default()
-            .push((entity, wi.translation));
+            .push((entity, wi.translation, wi.count));
     }
 
     // Pick the nearest viable target — Build plan or craft station.
@@ -492,7 +506,7 @@ pub fn try_schedule_haul_for_npc(
         // if so, fetch the tool now so the planner can commit the work
         // next tick. Covers Remove plans (never haul targets — nothing
         // to deliver) and satisfied Build plans with a build tool gate.
-        return try_schedule_tool_fetch(
+        if try_schedule_tool_fetch(
             npc_id,
             pose,
             foot,
@@ -505,7 +519,14 @@ pub fn try_schedule_haul_for_npc(
             world_items,
             store,
             now_secs,
-        );
+        ) {
+            return true;
+        }
+        // Last-resort idle-haul tier: sweep loose items into storage
+        // piles. Real pending work (material haul, tool fetch) always
+        // outranks cosmetic tidying — this only fires when there's
+        // nothing else useful to do.
+        return try_schedule_tidy(npc_id, pose, cap, item_registry, world_items, storage, store);
     };
 
     // Reserve the tool first (if any). Stations never carry a tool
@@ -541,6 +562,7 @@ pub fn try_schedule_haul_for_npc(
                     entity,
                     item,
                     translation,
+                    count: 1,
                 })
             }
         } else {
@@ -558,9 +580,9 @@ pub fn try_schedule_haul_for_npc(
     };
 
     // Sort by distance so closest items get reserved first.
-    let mut candidates: Vec<(Entity, Vec3, f32)> = pool
+    let mut candidates: Vec<(Entity, Vec3, u32, f32)> = pool
         .iter()
-        .filter_map(|(entity, translation)| {
+        .filter_map(|(entity, translation, count)| {
             if store.reservation_taken_by_other(*entity, npc_id) {
                 return None;
             }
@@ -568,23 +590,31 @@ pub fn try_schedule_haul_for_npc(
             if d > MAX_HAUL_ITEM_RADIUS_M {
                 return None;
             }
-            Some((*entity, *translation, d))
+            Some((*entity, *translation, *count, d))
         })
         .collect();
-    candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
 
-    let want = (cap as usize).min(remaining_for_kind as usize);
-    let mut queue: Vec<ReservedItem> = Vec::with_capacity(want);
-    for (entity, translation, _) in candidates {
-        if queue.len() >= want {
+    // Reserve nearest stacks until we've covered `want` units. A pile
+    // (count > 1) is one reservation that yields several units, so a
+    // single nearby pile can satisfy the whole trip; loose items still
+    // reserve one entity per unit as before.
+    let want = cap.min(remaining_for_kind);
+    let mut got: u32 = 0;
+    let mut queue: Vec<ReservedItem> = Vec::new();
+    for (entity, translation, stack_count, _) in candidates {
+        if got >= want {
             break;
         }
         if store.try_reserve_internal(entity, npc_id) {
+            let take = (want - got).min(stack_count.max(1));
             queue.push(ReservedItem {
                 entity,
                 item: item_slot,
                 translation,
+                count: take,
             });
+            got += take;
         }
     }
     if queue.is_empty() {
@@ -612,6 +642,157 @@ pub fn try_schedule_haul_for_npc(
     true
 }
 
+/// Idle-haul "tidy" scheduler (S2): sweep loose, pileable items that
+/// aren't already sitting in a storage cell into a designated storage
+/// cell, grouping by kind. Prefers topping up an existing same-kind
+/// pile with room; else fills an empty storage cell. Reserves the loose
+/// items (single-kind, up to carry cap and the destination's remaining
+/// room) and commits a [`HaulTarget::Storage`] assignment — the deposit
+/// leg ([`crate::npc::ArrivalAction::DepositAtStorage`]) merges the
+/// carry into a pile there.
+///
+/// Runs only after material haul + tool fetch found nothing, so real
+/// work always wins. Assumes an empty carry (the deposit-only branch
+/// upstream handles a carrying NPC).
+fn try_schedule_tidy(
+    npc_id: NpcId,
+    pose: Vec3,
+    cap: u32,
+    item_registry: &crate::items::ItemRegistry,
+    world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
+    storage: &crate::storage::StorageZones,
+    store: &mut HaulStore,
+) -> bool {
+    let storage_cells: std::collections::HashSet<IVec3> = storage.iter().copied().collect();
+    if storage_cells.is_empty() {
+        return false;
+    }
+
+    // One pass over world items: an item in a storage cell contributes to
+    // that cell's occupancy (a potential merge destination); a pileable
+    // item elsewhere is loose and sweepable.
+    let mut loose_by_kind: std::collections::HashMap<
+        crate::items::ItemSlot,
+        Vec<(Entity, Vec3, f32)>,
+    > = std::collections::HashMap::new();
+    // cell -> (kind, total units). A cell tracks the first kind seen;
+    // tidy keeps cells single-kind, so this only diverges under a manual
+    // player dump of mixed kinds onto one cell.
+    let mut occupancy: std::collections::HashMap<IVec3, (crate::items::ItemSlot, u32)> =
+        std::collections::HashMap::new();
+    for (entity, wi) in world_items.iter() {
+        let cell = wi.translation.floor().as_ivec3();
+        if storage_cells.contains(&cell) {
+            let occ = occupancy.entry(cell).or_insert((wi.item, 0));
+            if occ.0 == wi.item {
+                occ.1 += wi.count;
+            }
+            continue;
+        }
+        if !item_registry.def(wi.item).is_pileable() {
+            continue;
+        }
+        if store.reservation_taken_by_other(entity, npc_id) {
+            continue;
+        }
+        let d = (wi.translation - pose).length();
+        if d > MAX_HAUL_ITEM_RADIUS_M {
+            continue;
+        }
+        loose_by_kind
+            .entry(wi.item)
+            .or_default()
+            .push((entity, wi.translation, d));
+    }
+    if loose_by_kind.is_empty() {
+        return false;
+    }
+
+    // Tidy the kind of the nearest loose item.
+    let mut best_kind: Option<(crate::items::ItemSlot, f32)> = None;
+    for (slot, items) in &loose_by_kind {
+        let nearest = items.iter().map(|(_, _, d)| *d).fold(f32::INFINITY, f32::min);
+        if best_kind.map(|(_, bd)| nearest < bd).unwrap_or(true) {
+            best_kind = Some((*slot, nearest));
+        }
+    }
+    let (kind, _) = best_kind.unwrap();
+    let capacity = item_registry.def(kind).pile_capacity();
+
+    // Destination: prefer an existing same-kind pile with room (nearest);
+    // else an empty storage cell (nearest). Cells occupied by another
+    // kind or already full are skipped.
+    let mut dest: Option<(IVec3, u32, bool, f32)> = None; // (cell, existing, has_pile, dist)
+    for cell in &storage_cells {
+        let existing = match occupancy.get(cell) {
+            None => 0,
+            Some((k, c)) if *k == kind && *c < capacity => *c,
+            Some(_) => continue, // another kind, or same kind but full
+        };
+        let has_pile = existing > 0;
+        let d = (cell.as_vec3() + Vec3::splat(0.5) - pose).length();
+        let better = match dest {
+            None => true,
+            Some((_, _, dest_has, dd)) => {
+                if has_pile != dest_has {
+                    has_pile // topping up an existing pile beats a fresh cell
+                } else {
+                    d < dd
+                }
+            }
+        };
+        if better {
+            dest = Some((*cell, existing, has_pile, d));
+        }
+    }
+    let Some((dest_cell, dest_existing, _, _)) = dest else {
+        return false;
+    };
+
+    // Reserve loose items of `kind` nearest-first, up to the smaller of
+    // carry cap and the destination's remaining room (so we never
+    // over-fill the pile).
+    let room = capacity.saturating_sub(dest_existing).min(cap);
+    if room == 0 {
+        return false;
+    }
+    let mut cands = loose_by_kind.remove(&kind).unwrap();
+    cands.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    let mut queue: Vec<ReservedItem> = Vec::new();
+    for (entity, translation, _) in cands {
+        if queue.len() as u32 >= room {
+            break;
+        }
+        if store.try_reserve_internal(entity, npc_id) {
+            queue.push(ReservedItem {
+                entity,
+                item: kind,
+                translation,
+                count: 1,
+            });
+        }
+    }
+    if queue.is_empty() {
+        return false;
+    }
+    info!(
+        npc = npc_id.0,
+        dest = ?dest_cell.to_array(),
+        kind = kind.0,
+        queued = queue.len(),
+        "tidy assignment committed",
+    );
+    store.commit_assignment(
+        npc_id,
+        HaulAssignment {
+            target: HaulTarget::Storage(dest_cell),
+            queue,
+            pending_tool: None,
+        },
+    );
+    true
+}
+
 /// Chebyshev (chessboard) distance between two cells. Same metric
 /// used everywhere else in the scheduler for "is this within radius."
 fn chebyshev(a: IVec3, b: IVec3) -> i32 {
@@ -633,7 +814,7 @@ fn chebyshev(a: IVec3, b: IVec3) -> i32 {
 /// dead-end pickup leg.
 fn pick_haul_kind(
     demands: impl IntoIterator<Item = (crate::items::ItemSlot, u32)>,
-    items_by_slot: &std::collections::HashMap<crate::items::ItemSlot, Vec<(Entity, Vec3)>>,
+    items_by_slot: &std::collections::HashMap<crate::items::ItemSlot, Vec<(Entity, Vec3, u32)>>,
     pose: Vec3,
     npc_id: NpcId,
     store: &HaulStore,
@@ -646,7 +827,7 @@ fn pick_haul_kind(
         let Some(pool) = items_by_slot.get(&slot) else {
             continue;
         };
-        let reachable = pool.iter().any(|(entity, translation)| {
+        let reachable = pool.iter().any(|(entity, translation, _count)| {
             if store.reservation_taken_by_other(*entity, npc_id) {
                 return false;
             }
@@ -819,6 +1000,7 @@ fn try_schedule_tool_fetch(
                 entity,
                 item,
                 translation,
+                count: 1,
             }),
         },
     );
@@ -922,6 +1104,7 @@ mod tests {
                     entity: *e,
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
+                    count: 1,
                 })
                 .collect(),
             pending_tool: None,
@@ -996,6 +1179,7 @@ mod tests {
                     entity: tool,
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
+                    count: 1,
                 }),
             },
         );
@@ -1054,6 +1238,7 @@ mod tests {
                     entity: tool,
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
+                    count: 1,
                 }),
             },
         );

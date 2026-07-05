@@ -86,13 +86,12 @@ pub enum InspectState {
     },
     /// A loose [`WorldItem`] under the cursor — wins over block /
     /// NPC / plan hits when it's the closest target. Keyed by
-    /// [`ItemSlot`] (not the entity) because the panel only renders
-    /// kind-info (display name, id, tool tags) and slot is what
-    /// drives same/different change detection. Stack-merging or
-    /// per-entity inspection (count badges, "who reserved this")
-    /// would need the Entity instead.
+    /// [`ItemSlot`] + unit `count`: the panel renders kind-info plus a
+    /// stack count for piles, and both fields drive same/different
+    /// change detection so a pile that grows/shrinks re-renders.
     Item {
         slot: ItemSlot,
+        count: u32,
     },
 }
 
@@ -192,7 +191,7 @@ fn refresh_inspect_target(
     });
     let npc_dist = npc_hit.as_ref().map(|h| h.distance);
     let plan_dist = plan_hit.map(|(d, _)| d);
-    let item_dist = item_hit.as_ref().map(|(_, d, _)| *d);
+    let item_dist = item_hit.as_ref().map(|(_, d, _, _)| *d);
 
     // Loose-item hit wins outright when it's closer than everything
     // else. Inspect should describe what's actually under the cursor,
@@ -206,10 +205,13 @@ fn refresh_inspect_target(
                 && plan_dist.map(|p| i < p).unwrap_or(true)
         })
         .unwrap_or(false);
-    if item_beats_all && let Some((_, _, slot)) = item_hit {
-        let same = matches!(&target.state, InspectState::Item { slot: s } if *s == slot);
+    if item_beats_all && let Some((_, _, slot, count)) = item_hit {
+        let same = matches!(
+            &target.state,
+            InspectState::Item { slot: s, count: c } if *s == slot && *c == count
+        );
         if !same {
-            target.state = InspectState::Item { slot };
+            target.state = InspectState::Item { slot, count };
         }
         return;
     }
@@ -424,7 +426,7 @@ fn mod_inspect_target(
                 pos: Some(pos(*cell)),
             })
         }
-        InspectState::Item { slot } => Some(ModTarget {
+        InspectState::Item { slot, .. } => Some(ModTarget {
             kind: "item".to_owned(),
             id: items.id_of(*slot).to_string(),
             pos: None,
@@ -512,19 +514,21 @@ fn render_body(
             };
             Some(format!("{header}{body}{}", room_line(*cell)))
         }
-        InspectState::Item { slot } => Some(format_item(*slot, items)),
+        InspectState::Item { slot, count } => Some(format_item(*slot, *count, items)),
     }
 }
 
 /// Render the inspect panel body for a loose [`WorldItem`]. Display
 /// name + id + any tool tags so tools read as "what kind of action
-/// does this enable" at a glance. Stack-count surfaces here if /
-/// when items merge into multi-unit entities; today every WorldItem
-/// is one unit.
-fn format_item(slot: ItemSlot, items: &ItemRegistry) -> String {
+/// does this enable" at a glance. A `count > 1` is a collective pile,
+/// shown with its size and per-pile capacity.
+fn format_item(slot: ItemSlot, count: u32, items: &ItemRegistry) -> String {
     let def = items.def(slot);
     let mut out = String::new();
     out.push_str(&format!("{}\n", def.display_name));
+    if count > 1 {
+        out.push_str(&format!("pile: {} / {}\n", count, def.pile_capacity()));
+    }
     out.push_str(&format!("id: {}\n", def.id));
     if !def.tool_tags.is_empty() {
         out.push_str("tool tags:\n");

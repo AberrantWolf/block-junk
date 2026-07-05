@@ -420,6 +420,10 @@ pub enum ArrivalAction {
     PickupForPlan {
         item_entity: Entity,
         item_slot: ItemSlot,
+        /// Units to withdraw from this stack on arrival (piles yield
+        /// several per pickup); capped again by the live stack size and
+        /// carry room at arrival time.
+        count: u32,
         plan_cell: IVec3,
     },
     /// Final leg of a haul cycle: arrive at the plan and deposit the
@@ -473,6 +477,14 @@ pub enum ArrivalAction {
     /// longer wants the carry's item kind, the haul releases without
     /// depositing — same convention as DepositAtPlan.
     DepositAtStation { station_cell: IVec3 },
+    /// Final leg of a tidy cycle (S2): arrive at a storage cell and
+    /// merge the carry into a pile there — consolidating any same-kind
+    /// units already in the cell, clamped to the item's pile capacity.
+    /// The pile is a single counted [`WorldItem`] snapped to the cell
+    /// centre. If the cell is occupied by another kind or already full,
+    /// the haul releases with the carry intact (the scheduler re-tidies
+    /// to another cell next tick).
+    DepositAtStorage { cell: IVec3 },
 }
 
 /// Native-side brain state. Holds the current goal + a tiny PRNG seed
@@ -1021,6 +1033,7 @@ struct HaulCtx<'w, 's> {
     world_items: Query<'w, 's, (Entity, &'static WorldItem)>,
     kind_registry: Res<'w, NpcKindRegistry>,
     item_registry: Res<'w, crate::items::ItemRegistry>,
+    storage: Res<'w, crate::storage::StorageZones>,
 }
 
 /// Read-only world-anchor bundle: room registry plus civilization
@@ -1144,6 +1157,7 @@ pub(crate) fn preempt_eligible(goal: &Goal) -> bool {
                 | ArrivalAction::PickupForPlan { .. }
                 | ArrivalAction::DepositAtPlan { .. }
                 | ArrivalAction::DepositAtStation { .. }
+                | ArrivalAction::DepositAtStorage { .. }
                 | ArrivalAction::PickupTool { .. }
                 | ArrivalAction::WorkStation { .. }
         ),
@@ -1184,6 +1198,7 @@ pub(crate) fn preempt_release_holds(
             ArrivalAction::PickupForPlan { .. }
             | ArrivalAction::DepositAtPlan { .. }
             | ArrivalAction::DepositAtStation { .. }
+            | ArrivalAction::DepositAtStorage { .. }
             | ArrivalAction::PickupTool { .. } => {
                 haul_store.release_for_npc(npc_id);
             }
@@ -1701,50 +1716,63 @@ fn npc_brain_tick(
                 ArrivalAction::PickupForPlan {
                     item_entity,
                     item_slot,
+                    count: reserved_count,
                     plan_cell,
                 } => {
                     // Validate the reserved item is still where we
                     // left it and still matches the slot the scheduler
-                    // queued. A despawned entity (player grabbed it,
-                    // or some future cleanup removed it) or a slot
-                    // mismatch (degenerate edge — items can't currently
-                    // change kinds, but defensive) both release the
-                    // haul.
-                    let item_ok = haul
+                    // queued. A despawned entity (player grabbed it, a
+                    // pile shrank into a new entity id, or some cleanup
+                    // removed it) or a slot mismatch (degenerate edge —
+                    // items can't currently change kinds, but defensive)
+                    // both release the haul. Re-read the live count: a
+                    // player may have withdrawn from the pile since.
+                    let live = haul
                         .world_items
                         .get(item_entity)
-                        .map(|(_, wi)| wi.item == item_slot)
-                        .unwrap_or(false);
+                        .ok()
+                        .filter(|(_, wi)| wi.item == item_slot)
+                        .map(|(_, wi)| (wi.translation, wi.count));
                     let cap = haul
                         .kind_registry
                         .get(&kind.0)
                         .map(|d| d.carry_capacity)
                         .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
-                    if !item_ok || !carrying.can_accept(item_slot, cap) {
-                        if !item_ok {
-                            info!(
-                                npc = npc_id.0,
-                                item = ?item_entity,
-                                "haul pickup: item gone or kind mismatch; releasing assignment",
-                            );
-                        } else {
-                            info!(
-                                npc = npc_id.0,
-                                "haul pickup: carry can't accept the reserved item; releasing assignment",
-                            );
-                        }
+                    let Some((item_translation, live_count)) = live else {
+                        info!(
+                            npc = npc_id.0,
+                            item = ?item_entity,
+                            "haul pickup: item gone or kind mismatch; releasing assignment",
+                        );
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    };
+                    // Take min(what we reserved, what's actually there,
+                    // what fits in the carry). `pickup_many` returns 0
+                    // only when the carry is full or holds another kind.
+                    let want = reserved_count.min(live_count);
+                    let taken = carrying.pickup_many(item_slot, want, cap);
+                    if taken == 0 {
+                        info!(
+                            npc = npc_id.0,
+                            "haul pickup: carry can't accept the reserved item; releasing assignment",
+                        );
                         haul.store.release_for_npc(*npc_id);
                         brain.goal = Goal::Idle;
                         continue;
                     }
-                    // Commit: increment carry, despawn the world item,
-                    // free the reservation, drop the entry from the
-                    // assignment queue. Carry::pickup_one returns false
-                    // only if can_accept was false; we just checked, so
-                    // the unwrap_or path is unreachable in practice.
-                    let added = carrying.pickup_one(item_slot, cap);
-                    debug_assert!(added, "pickup_one rejected after can_accept said yes");
-                    commands.entity(item_entity).despawn();
+                    // Commit: the stack shrinks by `taken` — despawn +
+                    // respawn any remainder (keeps count immutable per
+                    // entity), free the reservation, drop the queue
+                    // entry.
+                    crate::server::shrink_or_despawn_stack(
+                        &mut commands,
+                        item_entity,
+                        item_slot,
+                        item_translation,
+                        live_count - taken,
+                    );
                     haul.store.drop_queue_entry(*npc_id, item_entity);
                     // Plan next leg from the (now updated) assignment.
                     continue_haul_or_release(
@@ -1973,6 +2001,75 @@ fn npc_brain_tick(
                         &world,
                     );
                 }
+                ArrivalAction::DepositAtStorage { cell } => {
+                    // Merge the carry into a pile at the storage cell.
+                    // No carry (raced pickup) → nothing to do.
+                    let (carry_item, carry_count) = match (carrying.item, carrying.count) {
+                        (Some(slot), c) if c > 0 => (slot, c),
+                        _ => {
+                            haul.store.release_for_npc(*npc_id);
+                            brain.goal = Goal::Idle;
+                            continue;
+                        }
+                    };
+                    // Consolidate every same-kind unit already in the
+                    // cell into one pile. Capacity is enforced at tidy-
+                    // schedule time (the NPC only reserved what fit), so
+                    // we deposit the whole carry here — a rare race can
+                    // overshoot capacity by a little, which is cosmetic.
+                    let mut existing_total: u32 = 0;
+                    let mut same_kind: Vec<Entity> = Vec::new();
+                    for (e, wi) in haul.world_items.iter() {
+                        if wi.translation.floor().as_ivec3() == cell && wi.item == carry_item {
+                            existing_total += wi.count;
+                            same_kind.push(e);
+                        }
+                    }
+                    for e in same_kind {
+                        commands.entity(e).despawn();
+                    }
+                    let new_total = existing_total + carry_count;
+                    // Snap the pile to the cell centre (count immutable
+                    // per entity — the client tiers the mesh at spawn).
+                    let pile_pos =
+                        cell.as_vec3() + Vec3::new(0.5, crate::items::ITEM_FLOOR_LIFT, 0.5);
+                    commands.spawn((
+                        WorldItem {
+                            item: carry_item,
+                            translation: pile_pos,
+                            count: new_total,
+                        },
+                        Transform::from_translation(pile_pos),
+                        GlobalTransform::default(),
+                        Replicate::to_clients(NetworkTarget::All),
+                        Name::new(format!("WorldItem(pile:{}x{})", carry_item.0, new_total)),
+                    ));
+                    carrying.item = None;
+                    carrying.count = 0;
+                    info!(
+                        npc = npc_id.0,
+                        cell = ?cell.to_array(),
+                        deposited = carry_count,
+                        total = new_total,
+                        "tidy deposit complete",
+                    );
+                    continue_haul_or_release(
+                        *npc_id,
+                        kind,
+                        now_secs,
+                        &pose,
+                        &carrying,
+                        &mut brain,
+                        &mut npc_path,
+                        &mut haul.store,
+                        &haul.plans,
+                        &haul.kind_registry,
+                        &haul.item_registry,
+                        &craft.stations,
+                        &craft.recipes,
+                        &world,
+                    );
+                }
                 ArrivalAction::PickupTool {
                     item_entity,
                     item_slot,
@@ -2021,6 +2118,7 @@ fn npc_brain_tick(
                             WorldItem {
                                 item: prev_slot,
                                 translation: pickup_pos,
+                                count: 1,
                             },
                             Transform::from_translation(pickup_pos),
                             GlobalTransform::default(),
@@ -2165,6 +2263,7 @@ fn npc_brain_tick(
                     ArrivalAction::PickupForPlan { .. }
                     | ArrivalAction::DepositAtPlan { .. }
                     | ArrivalAction::DepositAtStation { .. }
+                    | ArrivalAction::DepositAtStorage { .. }
                     | ArrivalAction::PickupTool { .. } => {
                         // Blocked-with-no-route or timed out mid-haul:
                         // free the entire assignment + every
@@ -2540,6 +2639,7 @@ fn npc_brain_tick(
                     chunks,
                     chunk_map,
                     &haul.world_items,
+                    &haul.storage,
                     &mut haul.store,
                     now_secs,
                 );
@@ -3551,12 +3651,17 @@ fn pick_next_haul_leg<W: Walkability>(
             .get(cell)
             .map(|s| !crate::haul::compute_station_demand(s, recipes, item_registry).is_empty())
             .unwrap_or(false),
+        // A tidy run always wants to finish fetching its reserved queue
+        // before depositing; the deposit handler clamps to the pile's
+        // capacity, so there's no "satisfied" state to short-circuit on.
+        HaulTarget::Storage(_) => true,
     };
     let carry_full = !carrying.is_empty() && carrying.count >= carry_cap;
     let queue_empty = assignment_queue.is_empty();
     let deposit_arrival = match target {
         HaulTarget::Plan(cell) => ArrivalAction::DepositAtPlan { plan_cell: cell },
         HaulTarget::Station(cell) => ArrivalAction::DepositAtStation { station_cell: cell },
+        HaulTarget::Storage(cell) => ArrivalAction::DepositAtStorage { cell },
     };
     // Walk to deposit if: carry has stuff AND (queue empty OR carry full
     // OR target no longer needs more). The "no longer needs more"
@@ -3590,6 +3695,7 @@ fn pick_next_haul_leg<W: Walkability>(
             ArrivalAction::PickupForPlan {
                 item_entity: next.entity,
                 item_slot: next.item,
+                count: next.count,
                 plan_cell: target.cell(),
             },
             HAUL_LEG_TIMEOUT_SECS,
@@ -4670,6 +4776,7 @@ mod tests {
             on_arrive: ArrivalAction::PickupForPlan {
                 item_entity,
                 item_slot: ItemSlot(0),
+                count: 1,
                 plan_cell,
             },
             snap: None,
@@ -4798,6 +4905,7 @@ mod tests {
                     entity: item_entity,
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
+                    count: 1,
                 }],
                 pending_tool: None,
             },

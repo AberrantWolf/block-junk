@@ -244,7 +244,7 @@ fn draw_normal_target(
     // (gold) because the server's swap path can't refuse — a full
     // tool slot just means the previous tool drops at the same spot.
     // Resources keep the existing carry-compat gate.
-    if let Some((item_translation, item_dist, item_slot)) = item_hit {
+    if let Some((item_translation, item_dist, item_slot, _)) = item_hit {
         let tagged_dist = tagged_target.map(|(d, _)| d);
         let beats_tagged = tagged_dist.map(|td| item_dist < td).unwrap_or(true);
         let beats_world = world_hit_dist.map(|wd| item_dist < wd).unwrap_or(true);

@@ -869,6 +869,54 @@ mod tests {
         assert_eq!(blocks[0].drops.as_ref().unwrap()[0].count, 5);
     }
 
+    /// The S2 pile knobs survive the Lua→serde boundary: `bulk`, the
+    /// optional `pile` table with its `tiers` list, and the derived
+    /// helpers (capacity from bulk, tier mesh by count). An item with no
+    /// `pile` stays non-pileable on the base mesh.
+    #[test]
+    fn item_pile_config_deserializes() {
+        let (lua, ctx) = engine_fixture();
+        lua.load(
+            "engine.items.register {
+                 id = 'test:plank',
+                 display_name = 'Plank',
+                 mesh = 'mods://test/base.gltf',
+                 bulk = 2,
+                 pile = {
+                     tiers = {
+                         { min = 2, mesh = 'mods://test/small.gltf' },
+                         { min = 4, mesh = 'mods://test/large.gltf' },
+                     },
+                 },
+             }",
+        )
+        .exec()
+        .expect("register pile item");
+        let items = ctx.take_items();
+        let def = &items[0];
+        assert_eq!(def.bulk, 2);
+        assert!(def.is_pileable());
+        assert_eq!(def.pile_capacity(), 6, "12 bulk / 2 = 6 units");
+        assert_eq!(def.pile_mesh(1), "mods://test/base.gltf", "single = base");
+        assert_eq!(def.pile_mesh(3), "mods://test/small.gltf", "2-3 = small tier");
+        assert_eq!(def.pile_mesh(9), "mods://test/large.gltf", "4+ = large tier");
+
+        let (lua, ctx) = engine_fixture();
+        lua.load(
+            "engine.items.register {
+                 id = 'test:axe',
+                 display_name = 'Axe',
+                 mesh = 'mods://test/axe.gltf',
+             }",
+        )
+        .exec()
+        .expect("register plain item");
+        let items = ctx.take_items();
+        assert_eq!(items[0].bulk, 1, "bulk defaults to 1");
+        assert!(!items[0].is_pileable(), "no pile config ⇒ not pileable");
+        assert_eq!(items[0].pile_mesh(5), "mods://test/axe.gltf");
+    }
+
     /// Multiplier setter: value lands in the context; a second caller
     /// fails loudly (single-writer, like set_work_defaults).
     #[test]

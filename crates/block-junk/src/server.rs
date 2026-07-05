@@ -536,6 +536,7 @@ fn load_from_save(
             WorldItem {
                 item: slot,
                 translation,
+                count: saved.count.max(1),
             },
             Transform::from_translation(translation),
             GlobalTransform::default(),
@@ -870,8 +871,39 @@ fn collect_saved_world_items(
         .map(|wi| SavedWorldItem {
             item_id: item_registry.id_of(wi.item).to_string(),
             translation: wi.translation,
+            count: wi.count,
         })
         .collect()
+}
+
+/// Shrink a stack after some units were withdrawn: despawn the old
+/// entity and, if any units remain, respawn a fresh `WorldItem` at the
+/// same spot with the remaining count. This keeps `WorldItem.count`
+/// immutable for a live entity (see the WorldItem docs) — the client's
+/// tier mesh is always chosen fresh at spawn, never swapped in place —
+/// and it naturally invalidates any stale NPC reservation on the old
+/// entity id. `remainder == 0` is a plain despawn.
+pub fn shrink_or_despawn_stack(
+    commands: &mut Commands,
+    entity: Entity,
+    item: crate::items::ItemSlot,
+    translation: Vec3,
+    remainder: u32,
+) {
+    commands.entity(entity).despawn();
+    if remainder > 0 {
+        commands.spawn((
+            WorldItem {
+                item,
+                translation,
+                count: remainder,
+            },
+            Transform::from_translation(translation),
+            GlobalTransform::default(),
+            Replicate::to_clients(NetworkTarget::All),
+            Name::new(format!("WorldItem(remainder:{})", item.0)),
+        ));
+    }
 }
 
 /// Carry stack → on-disk shape. Empty (or zero-count) serialises as
@@ -1398,6 +1430,7 @@ fn forget_disconnected_client(
                             WorldItem {
                                 item: *slot,
                                 translation,
+                                count: 1,
                             },
                             Transform::from_translation(translation),
                             GlobalTransform::default(),
@@ -2112,7 +2145,7 @@ fn receive_pickup_requests(
                 continue;
             }
             // Closest WorldItem within the match radius.
-            let mut best: Option<(Entity, crate::items::ItemSlot, f32)> = None;
+            let mut best: Option<(Entity, crate::items::ItemSlot, Vec3, u32, f32)> = None;
             for (entity, wi) in world_items.iter() {
                 if claimed.contains(&entity) {
                     continue;
@@ -2121,11 +2154,11 @@ fn receive_pickup_requests(
                 if d > PICKUP_MATCH_RADIUS {
                     continue;
                 }
-                if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
-                    best = Some((entity, wi.item, d));
+                if best.map(|(_, _, _, _, bd)| d < bd).unwrap_or(true) {
+                    best = Some((entity, wi.item, wi.translation, wi.count, d));
                 }
             }
-            let Some((entity, item_slot, _)) = best else {
+            let Some((entity, item_slot, item_translation, item_count, _)) = best else {
                 continue;
             };
             let is_tool = !item_registry.def(item_slot).tool_tags.is_empty();
@@ -2161,6 +2194,7 @@ fn receive_pickup_requests(
                         WorldItem {
                             item: prev_slot,
                             translation: req.target,
+                            count: 1,
                         },
                         Transform::from_translation(req.target),
                         GlobalTransform::default(),
@@ -2169,14 +2203,22 @@ fn receive_pickup_requests(
                     ));
                 }
             } else {
-                if !carry.pickup_one(item_slot, PLAYER_CARRY_CAPACITY) {
-                    // Carry full or holding a different item. Silent
-                    // no-op; the player keeps their stack and the
-                    // world item stays in the world.
+                // Withdraw as much of the (possibly multi-unit pile) as
+                // fits in the carry stack. `pickup_many` returns 0 when
+                // the hand is full or holds a different item — silent
+                // no-op then, the pile stays put.
+                let taken = carry.pickup_many(item_slot, item_count, PLAYER_CARRY_CAPACITY);
+                if taken == 0 {
                     continue;
                 }
                 claimed.insert(entity);
-                commands.entity(entity).despawn();
+                shrink_or_despawn_stack(
+                    &mut commands,
+                    entity,
+                    item_slot,
+                    item_translation,
+                    item_count - taken,
+                );
             }
         }
     }
@@ -2229,7 +2271,11 @@ fn receive_drop_requests(
             let offset = Vec3::new(angle.cos() * 0.08, 0.0, angle.sin() * 0.08);
             let translation = settled_translation(&world, centre + offset);
             commands.spawn((
-                WorldItem { item, translation },
+                WorldItem {
+                    item,
+                    translation,
+                    count: 1,
+                },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
                 Replicate::to_clients(NetworkTarget::All),
@@ -2280,6 +2326,7 @@ fn receive_drop_tool_requests(
             WorldItem {
                 item: slot,
                 translation: target,
+                count: 1,
             },
             Transform::from_translation(target),
             GlobalTransform::default(),
@@ -2603,6 +2650,7 @@ fn spawn_drops_on_destroy(
                     WorldItem {
                         item: slot,
                         translation,
+                        count: 1,
                     },
                     Transform::from_translation(translation),
                     GlobalTransform::default(),

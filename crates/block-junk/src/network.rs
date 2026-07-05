@@ -63,7 +63,9 @@ pub const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECI
 /// than a desync hunt when someone joins with a stale build. The
 /// registry-level mod-set check is a separate, later gate.
 // …0003: NpcDetails gained `stats` (2026-07).
-pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0004;
+// …0004: storage zones — StorageEditBatch/StorageFullSync (2026-07, S1).
+// …0005: WorldItem gained `count` — piles ride the same replication (2026-07, S2).
+pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0005;
 
 /// Which address the server socket binds. Inserted by
 /// `run_server_inner`; the dedicated CLI can override the default.

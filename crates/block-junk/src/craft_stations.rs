@@ -1171,6 +1171,7 @@ pub(crate) fn clear_destroyed_stations(
                     crate::protocol::WorldItem {
                         item: *slot,
                         translation,
+                        count: 1,
                     },
                     Transform::from_translation(translation),
                     GlobalTransform::default(),
@@ -1351,6 +1352,7 @@ fn tick_station_work(
                 crate::protocol::WorldItem {
                     item: output_slot,
                     translation,
+                    count: 1,
                 },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),

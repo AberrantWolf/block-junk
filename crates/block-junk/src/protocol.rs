@@ -350,19 +350,25 @@ impl Carrying {
         }
     }
 
-    /// Add one unit of `item`. Returns `true` on success, `false` if the
-    /// add would violate the cap or mix item types.
-    pub fn pickup_one(&mut self, item: ItemSlot, cap: u32) -> bool {
-        if !self.can_accept(item, cap) {
-            return false;
-        }
-        if self.is_empty() {
-            self.item = Some(item);
-            self.count = 1;
+    /// Add up to `want` units of `item` in one go — for withdrawing from
+    /// a multi-unit pile. Capped by the carry limit and the single-kind
+    /// rule. Returns how many units were actually added (0 if the hand
+    /// holds a different item or is already full).
+    pub fn pickup_many(&mut self, item: ItemSlot, want: u32, cap: u32) -> u32 {
+        let room = if self.is_empty() {
+            cap
+        } else if self.item == Some(item) {
+            cap.saturating_sub(self.count)
         } else {
-            self.count += 1;
+            0
+        };
+        let take = want.min(room);
+        if take == 0 {
+            return 0;
         }
-        true
+        self.item = Some(item);
+        self.count += take;
+        take
     }
 
     /// Empty the stack. Returns what was being held (if anything) so the
@@ -419,14 +425,25 @@ pub struct EquippedTool {
 /// random offset derived from spawn position; no facing direction to
 /// track).
 ///
-/// 14 bytes on the wire (Vec3 + u16). Stacks of 5 dropped from one
-/// destroyed block are 5 entities = 70 B/spawn. Profile if drop rates
-/// climb; merging stacks into one entity with a count is the obvious
-/// next step.
+/// `count` (S2) is how many units this entity represents. Loose drops
+/// are `count = 1` — one entity per unit, as before. The NPC tidy job is
+/// the only thing that mints `count > 1`: it sweeps loose units into a
+/// single "pile" entity snapped to a storage cell, which the client
+/// renders with a stack-tier mesh (`ItemDef::pile_mesh`).
+///
+/// INVARIANT: `count` is immutable for a live entity. A withdrawal or
+/// tidy-merge that changes a stack's size **despawns and respawns** the
+/// entity with the new count rather than mutating in place. This keeps
+/// the client render trivial — the tier mesh is chosen once at spawn
+/// (`attach_world_item_visuals`), never swapped — and is safe because a
+/// stack is only ever mutated while reserved by a single NPC. Bevy's
+/// `WorldAssetRoot` does not reliably tear down the old scene on an
+/// in-place handle change, so we sidestep in-place mesh swaps entirely.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldItem {
     pub item: ItemSlot,
     pub translation: Vec3,
+    pub count: u32,
 }
 
 /// What a player has tagged a cell to become. Lives in the shared [`Plans`]
@@ -905,4 +922,42 @@ pub struct NpcDetails {
     pub stats: std::collections::HashMap<String, f32>,
     pub current_goal: String,
     pub target_cell: Option<IVec3>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::items::ItemSlot;
+
+    /// `pickup_many` is the withdrawal primitive for both NPC and player
+    /// pile grabs — it must never exceed the cap, mix kinds, or miscount.
+    #[test]
+    fn pickup_many_clamps_and_respects_kind() {
+        let log = ItemSlot(1);
+        let stone = ItemSlot(2);
+        let cap = 5;
+
+        // Empty hand takes up to the cap.
+        let mut c = Carrying::default();
+        assert_eq!(c.pickup_many(log, 3, cap), 3);
+        assert_eq!((c.item, c.count), (Some(log), 3));
+
+        // Partial matching stack tops up only to the cap; returns the
+        // amount actually added, not what was requested.
+        assert_eq!(c.pickup_many(log, 10, cap), 2);
+        assert_eq!(c.count, cap);
+
+        // Full stack accepts nothing more.
+        assert_eq!(c.pickup_many(log, 1, cap), 0);
+        assert_eq!(c.count, cap);
+
+        // A different kind is refused outright (single-kind carry).
+        let mut c2 = Carrying::default();
+        assert_eq!(c2.pickup_many(log, 2, cap), 2);
+        assert_eq!(c2.pickup_many(stone, 2, cap), 0);
+        assert_eq!((c2.item, c2.count), (Some(log), 2));
+
+        // want == 0 is a no-op.
+        assert_eq!(c2.pickup_many(log, 0, cap), 0);
+    }
 }

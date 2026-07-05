@@ -479,6 +479,7 @@ fn receive_debug_spawn_tools(
                 crate::protocol::WorldItem {
                     item: slot,
                     translation,
+                    count: 1,
                 },
                 bevy::prelude::Transform::from_translation(translation),
                 bevy::prelude::GlobalTransform::default(),

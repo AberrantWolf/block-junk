@@ -79,7 +79,10 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v15 (2026-07-05): added `storage_cells` — player-designated storage
 ///                  zone cells (storage arc S1). v14 saves migrate on
 ///                  load with an empty set.
-pub const SAVE_VERSION: u32 = 15;
+/// v16 (2026-07-05): `SavedWorldItem` gained `count` (storage arc S2 —
+///                  loose items merge into counted "pile" entities). v15
+///                  and earlier migrate on load with `count = 1`.
+pub const SAVE_VERSION: u32 = 16;
 
 /// Sentinel `SavedPlayer::client_id` for state not yet bound to a real
 /// client id: v12-migrated legacy state. Real ids are never 0 (see
@@ -242,6 +245,56 @@ impl From<SavedNpcV13> for SavedNpc {
     }
 }
 
+/// The v15 `SaveFile` layout, kept verbatim (field order is the bincode
+/// wire order) so v15 saves can be decoded and migrated instead of
+/// refused. Identical to v16 except `world_items` carry the pre-`count`
+/// [`SavedWorldItemV15`] shape (piles didn't exist).
+/// Serialize exists only so tests can author v15 bytes.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct SaveFileV15 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    block_slots: Vec<String>,
+    edited_chunks: Vec<SavedChunk>,
+    #[serde(default)]
+    players: Vec<SavedPlayer>,
+    #[serde(default)]
+    npcs: Vec<SavedNpc>,
+    #[serde(default)]
+    world_clock: Option<WorldClock>,
+    #[serde(default)]
+    plans: Vec<(IVec3, SavedPlanState)>,
+    #[serde(default)]
+    world_items: Vec<SavedWorldItemV15>,
+    #[serde(default)]
+    craft_stations: Vec<(IVec3, SavedStationState)>,
+    #[serde(default)]
+    storage_cells: Vec<IVec3>,
+}
+
+impl From<SaveFileV15> for SaveFile {
+    fn from(old: SaveFileV15) -> Self {
+        SaveFile {
+            version: SAVE_VERSION,
+            block_slots: old.block_slots,
+            edited_chunks: old.edited_chunks,
+            players: old.players,
+            npcs: old.npcs,
+            world_clock: old.world_clock,
+            plans: old.plans,
+            world_items: old
+                .world_items
+                .into_iter()
+                .map(SavedWorldItem::from)
+                .collect(),
+            craft_stations: old.craft_stations,
+            storage_cells: old.storage_cells,
+        }
+    }
+}
+
 /// The v14 `SaveFile` layout, kept verbatim (field order is the bincode
 /// wire order) so v14 saves can be decoded and migrated instead of
 /// refused. Identical to v15 minus `storage_cells`.
@@ -263,7 +316,7 @@ struct SaveFileV14 {
     #[serde(default)]
     plans: Vec<(IVec3, SavedPlanState)>,
     #[serde(default)]
-    world_items: Vec<SavedWorldItem>,
+    world_items: Vec<SavedWorldItemV15>,
     #[serde(default)]
     craft_stations: Vec<(IVec3, SavedStationState)>,
 }
@@ -278,7 +331,11 @@ impl From<SaveFileV14> for SaveFile {
             npcs: old.npcs,
             world_clock: old.world_clock,
             plans: old.plans,
-            world_items: old.world_items,
+            world_items: old
+                .world_items
+                .into_iter()
+                .map(SavedWorldItem::from)
+                .collect(),
             craft_stations: old.craft_stations,
             storage_cells: Vec::new(),
         }
@@ -306,7 +363,7 @@ struct SaveFileV13 {
     #[serde(default)]
     plans: Vec<(IVec3, SavedPlanState)>,
     #[serde(default)]
-    world_items: Vec<SavedWorldItem>,
+    world_items: Vec<SavedWorldItemV15>,
     #[serde(default)]
     craft_stations: Vec<(IVec3, SavedStationState)>,
 }
@@ -321,7 +378,11 @@ impl From<SaveFileV13> for SaveFile {
             npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
             world_clock: old.world_clock,
             plans: old.plans,
-            world_items: old.world_items,
+            world_items: old
+                .world_items
+                .into_iter()
+                .map(SavedWorldItem::from)
+                .collect(),
             craft_stations: old.craft_stations,
             storage_cells: Vec::new(),
         }
@@ -350,7 +411,7 @@ struct SaveFileV12 {
     #[serde(default)]
     plans: Vec<(IVec3, SavedPlanState)>,
     #[serde(default)]
-    world_items: Vec<SavedWorldItem>,
+    world_items: Vec<SavedWorldItemV15>,
     #[serde(default)]
     last_player_carry: Option<SavedCarry>,
     #[serde(default)]
@@ -382,7 +443,11 @@ impl From<SaveFileV12> for SaveFile {
             npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
             world_clock: old.world_clock,
             plans: old.plans,
-            world_items: old.world_items,
+            world_items: old
+                .world_items
+                .into_iter()
+                .map(SavedWorldItem::from)
+                .collect(),
             craft_stations: old.craft_stations,
             storage_cells: Vec::new(),
         }
@@ -397,6 +462,31 @@ impl From<SaveFileV12> for SaveFile {
 pub struct SavedWorldItem {
     pub item_id: String,
     pub translation: bevy::math::Vec3,
+    /// Units this entity represents (S2 piles). `1` for a loose drop; a
+    /// tidied pile persists its accumulated count.
+    pub count: u32,
+}
+
+/// The pre-v16 [`SavedWorldItem`] shape (no `count`), kept verbatim so
+/// v12–v15 saves still decode (bincode is positional — a missing
+/// trailing `count` is a decode error, not a default). Every migration
+/// maps it forward with `count = 1`. Serialize exists only so tests can
+/// author old bytes.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Clone, Debug, Deserialize)]
+pub struct SavedWorldItemV15 {
+    pub item_id: String,
+    pub translation: bevy::math::Vec3,
+}
+
+impl From<SavedWorldItemV15> for SavedWorldItem {
+    fn from(old: SavedWorldItemV15) -> Self {
+        SavedWorldItem {
+            item_id: old.item_id,
+            translation: old.translation,
+            count: 1,
+        }
+    }
 }
 
 /// On-disk shape of an actor's
@@ -693,7 +783,11 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         });
     }
     let meta = read_metadata(&dir)?;
-    if meta.version != SAVE_VERSION && meta.version != 14 && meta.version != 13 && meta.version != 12
+    if meta.version != SAVE_VERSION
+        && meta.version != 15
+        && meta.version != 14
+        && meta.version != 13
+        && meta.version != 12
     {
         return Err(SaveError::VersionMismatch {
             name: name.to_string(),
@@ -706,6 +800,14 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         path: blob,
         source: e,
     })?;
+    if meta.version == 15 {
+        // In-memory migration only; the file upgrades on the next
+        // write, so a failed session never rewrites a good v15 save.
+        let (old, _): (SaveFileV15, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+        bevy::log::info!("migrated save {name:?} from v15 (world items gained pile counts)");
+        return Ok(old.into());
+    }
     if meta.version == 14 {
         // In-memory migration only; the file upgrades on the next
         // write, so a failed session never rewrites a good v14 save.
@@ -822,10 +924,12 @@ mod tests {
             SavedWorldItem {
                 item_id: "vanilla:wood_log".to_owned(),
                 translation: Vec3::new(10.0, 8.5, -3.25),
+                count: 1,
             },
             SavedWorldItem {
                 item_id: "vanilla:stone_chunk".to_owned(),
                 translation: Vec3::new(-1.0, 1.0, 1.0),
+                count: 4,
             },
         ];
         let original = SaveFile {
