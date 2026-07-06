@@ -78,6 +78,9 @@ engine.items.register {
     tool_tags = { "vanilla:axe" },
     bulk = 6,
     work_animation = "vanilla:chopping",
+    -- RPG Tools pack meshes face the opposite way to the rig's hand
+    -- socket, so they seat backwards without this 180° yaw correction.
+    hold_transform = { rot_deg = { 0, 180, 0 } },
 }
 
 engine.items.register {
@@ -88,6 +91,7 @@ engine.items.register {
     tool_tags = { "vanilla:hammer" },
     bulk = 6,
     work_animation = "vanilla:hammering",
+    hold_transform = { rot_deg = { 0, 180, 0 } },
 }
 
 engine.items.register {
@@ -98,6 +102,7 @@ engine.items.register {
     tool_tags = { "vanilla:pickaxe" },
     bulk = 6,
     work_animation = "vanilla:pickaxing",
+    hold_transform = { rot_deg = { 0, 180, 0 } },
 }
 
 -- Crafting outputs (Phase 6a). KayKit Resource Bits
