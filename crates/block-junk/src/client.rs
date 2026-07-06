@@ -57,6 +57,7 @@ impl Plugin for ClientPlugin {
             .add_plugins(crate::room_sync::RoomSyncClientPlugin)
             .add_plugins(crate::plan_ghosts::PlanGhostsPlugin)
             .add_plugins(crate::craft_stations::CraftStationsClientPlugin)
+            .add_plugins(crate::containers::ContainersClientPlugin)
             .add_plugins(crate::craft_ui::CraftUiPlugin)
             .add_plugins(crate::craft_progress_hud::CraftProgressHudPlugin)
             .add_plugins(crate::worldspace_toast::WorldspaceToastPlugin)

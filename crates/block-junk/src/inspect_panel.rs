@@ -332,18 +332,24 @@ fn refresh_inspect_panel(
     recipes: Res<crate::recipes::RecipeRegistry>,
     plans: Res<Plans>,
     stations: Res<CraftStations>,
+    containers: Res<crate::containers::Containers>,
     rooms: Res<crate::room_sync::ClientRooms>,
     room_patterns: Res<crate::rooms::RoomPatternRegistry>,
     mut mods: ResMut<crate::scripting::ClientMods>,
     mut roots: Query<&mut Visibility, With<InspectPanelRoot>>,
     mut texts: Query<&mut Text, With<InspectPanelText>>,
 ) {
-    // Re-render on target change *or* plans/stations/rooms mutation.
-    // Deposits land as `Plans` mutations, station updates as
-    // `CraftStations` mutations, room recognition as `ClientRooms`
-    // mutations — none touches `target` directly, so without these
-    // branches a hovered panel would freeze at the initial state.
-    if !target.is_changed() && !plans.is_changed() && !stations.is_changed() && !rooms.is_changed()
+    // Re-render on target change *or* plans/stations/containers/rooms
+    // mutation. Deposits land as `Plans` mutations, station updates as
+    // `CraftStations` mutations, container stock as `Containers`
+    // mutations, room recognition as `ClientRooms` mutations — none
+    // touches `target` directly, so without these branches a hovered
+    // panel would freeze at the initial state.
+    if !target.is_changed()
+        && !plans.is_changed()
+        && !stations.is_changed()
+        && !containers.is_changed()
+        && !rooms.is_changed()
     {
         return;
     }
@@ -354,6 +360,7 @@ fn refresh_inspect_panel(
         &recipes,
         &plans,
         &stations,
+        &containers,
         &rooms,
         &room_patterns,
     );
@@ -446,6 +453,7 @@ fn render_body(
     recipes: &crate::recipes::RecipeRegistry,
     plans: &Plans,
     stations: &CraftStations,
+    containers: &crate::containers::Containers,
     rooms: &crate::room_sync::ClientRooms,
     room_patterns: &crate::rooms::RoomPatternRegistry,
 ) -> Option<String> {
@@ -496,6 +504,17 @@ fn render_body(
                 }
                 out.push_str(&format_station_inner(station_tag, recipes, items));
             }
+            // Container stock appends when the inspected block is a
+            // container — live mirror read, so hovering a crate shows
+            // what's inside without opening anything.
+            if let Some(cfg) = &registry.def(*slot).container {
+                out.push('\n');
+                out.push_str(&format_container_inner(
+                    cfg,
+                    containers.get(*cell),
+                    items,
+                ));
+            }
             // Append plan info when the inspected block is tagged
             // (Remove plans live on solid cells, so the block raycast
             // resolves them).
@@ -535,6 +554,49 @@ fn format_item(slot: ItemSlot, count: u32, items: &ItemRegistry) -> String {
         for tag in &def.tool_tags {
             out.push_str(&format!("  {tag}\n"));
         }
+    }
+    out
+}
+
+/// Render the stock list when the inspected block is a container.
+/// Shows bulk usage against capacity plus a line per stocked kind;
+/// an empty container reads its accepts filter so the player knows
+/// what NPCs will stow here.
+fn format_container_inner(
+    cfg: &block_junk_mod_api::blocks::ContainerConfig,
+    state: Option<&crate::containers::ContainerState>,
+    items: &ItemRegistry,
+) -> String {
+    let mut out = String::new();
+    let used = state.map(|s| s.used_bulk(items)).unwrap_or(0);
+    out.push_str(&format!(
+        "container: {} / {} bulk\n",
+        used, cfg.capacity_bulk
+    ));
+    if !cfg.accepts.is_empty() {
+        let tags = cfg
+            .accepts
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("accepts: {tags}\n"));
+    }
+    match state {
+        Some(s) if !s.is_empty() => {
+            // Sorted by display name so the list doesn't reshuffle
+            // per frame (HashMap iteration order is arbitrary).
+            let mut lines: Vec<(String, u32)> = s
+                .inventory
+                .iter()
+                .map(|(slot, count)| (items.def(*slot).display_name.clone(), *count))
+                .collect();
+            lines.sort();
+            for (name, count) in lines {
+                out.push_str(&format!("  {count}x {name}\n"));
+            }
+        }
+        _ => out.push_str("  (empty)\n"),
     }
     out
 }

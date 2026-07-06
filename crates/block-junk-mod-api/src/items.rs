@@ -85,6 +85,14 @@ pub struct ItemDef {
     /// `vec![]` for plain resources (logs, ore).
     #[serde(default)]
     pub tool_tags: Vec<TagId>,
+    /// Category tags for filtering by *kind* rather than tool role —
+    /// what a container's [`accepts`](crate::blocks::ContainerConfig::accepts)
+    /// list matches against (`vanilla:resource` on logs/planks/chunks/
+    /// bricks, `vanilla:food` on edibles). Distinct from `tool_tags`,
+    /// which answer "what work does holding this enable"; these answer
+    /// "what is this". Match is byte-exact on the tag id.
+    #[serde(default)]
+    pub tags: Vec<TagId>,
     /// How much room one unit of this item takes in a pile or (later) a
     /// container. Drives pile capacity: a pile holds up to
     /// [`PILE_CAPACITY_BULK`] worth. Berries 1, planks/chunks 2, logs 3,
@@ -175,6 +183,13 @@ impl ItemDef {
         self.pile.is_some() && self.pile_capacity() > 1
     }
 
+    /// Whether this item passes a container's `accepts` filter: an
+    /// empty filter takes anything; otherwise at least one of the
+    /// item's category [`tags`](Self::tags) must appear in the filter.
+    pub fn accepted_by(&self, accepts: &[TagId]) -> bool {
+        accepts.is_empty() || self.tags.iter().any(|t| accepts.contains(t))
+    }
+
     /// Units this item stacks to in one pile (≥ 1). Non-pile items → 1.
     pub fn pile_capacity(&self) -> u32 {
         match &self.pile {
@@ -229,6 +244,41 @@ fn default_color() -> [f32; 3] {
 
 fn default_bulk() -> u32 {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item_with_tags(tags: &[&str]) -> ItemDef {
+        ItemDef {
+            id: ItemId::new("test:thing"),
+            display_name: "Thing".into(),
+            mesh: "mods://test/thing.gltf".into(),
+            color: default_color(),
+            tool_tags: vec![],
+            tags: tags.iter().map(|t| TagId::new(*t)).collect(),
+            bulk: 1,
+            pile: None,
+            work_animation: None,
+            hold_transform: None,
+        }
+    }
+
+    #[test]
+    fn empty_accepts_filter_takes_anything() {
+        assert!(item_with_tags(&[]).accepted_by(&[]));
+        assert!(item_with_tags(&["vanilla:food"]).accepted_by(&[]));
+    }
+
+    #[test]
+    fn accepts_filter_matches_on_any_shared_tag() {
+        let filter = vec![TagId::new("vanilla:food"), TagId::new("vanilla:resource")];
+        assert!(item_with_tags(&["vanilla:resource"]).accepted_by(&filter));
+        assert!(item_with_tags(&["vanilla:food", "x:y"]).accepted_by(&filter));
+        assert!(!item_with_tags(&["x:y"]).accepted_by(&filter));
+        assert!(!item_with_tags(&[]).accepted_by(&filter));
+    }
 }
 
 /// A drop produced when a block is destroyed: which item, how many. Used

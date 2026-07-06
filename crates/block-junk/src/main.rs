@@ -5,6 +5,7 @@ mod civilization;
 mod client;
 mod client_chunks;
 mod collision;
+mod containers;
 mod craft_progress_hud;
 mod craft_stations;
 mod craft_ui;

@@ -485,6 +485,27 @@ pub enum ArrivalAction {
     /// the haul releases with the carry intact (the scheduler re-tidies
     /// to another cell next tick).
     DepositAtStorage { cell: IVec3 },
+    /// Pickup leg of a haul cycle sourcing from container stock (S3):
+    /// arrive next to the container block at `cell` and move up to
+    /// `count` units of `item_slot` from its stock into the carry.
+    /// The live stock is re-read at arrival (a player may have mined
+    /// the container or another system drained it); an empty/missing
+    /// container releases the haul like a despawned ground item would.
+    WithdrawFromContainer {
+        cell: IVec3,
+        item_slot: ItemSlot,
+        /// Units to withdraw on arrival; capped again by live stock
+        /// and carry room at arrival time.
+        count: u32,
+    },
+    /// Final leg of a tidy cycle into a container (S3): arrive at the
+    /// container block and add the carry to its stock, clamped to the
+    /// container's remaining bulk room. Any clamped-off remainder
+    /// stays on the NPC until a plan/station wants that kind (rare
+    /// deposit race — same keep-the-carry convention as a plan
+    /// deposit's leftover). If the block is gone by arrival, the haul
+    /// releases with the carry intact.
+    DepositAtContainer { cell: IVec3 },
 }
 
 /// Native-side brain state. Holds the current goal + a tiny PRNG seed
@@ -1042,6 +1063,8 @@ struct HaulCtx<'w, 's> {
     kind_registry: Res<'w, NpcKindRegistry>,
     item_registry: Res<'w, crate::items::ItemRegistry>,
     storage: Res<'w, crate::storage::StorageZones>,
+    containers: ResMut<'w, crate::containers::Containers>,
+    container_index: Res<'w, crate::containers::ContainerIndex>,
 }
 
 /// Read-only world-anchor bundle: room registry plus civilization
@@ -1163,9 +1186,11 @@ pub(crate) fn preempt_eligible(goal: &Goal) -> bool {
             on_arrive,
             ArrivalAction::Work { .. }
                 | ArrivalAction::PickupForPlan { .. }
+                | ArrivalAction::WithdrawFromContainer { .. }
                 | ArrivalAction::DepositAtPlan { .. }
                 | ArrivalAction::DepositAtStation { .. }
                 | ArrivalAction::DepositAtStorage { .. }
+                | ArrivalAction::DepositAtContainer { .. }
                 | ArrivalAction::PickupTool { .. }
                 | ArrivalAction::WorkStation { .. }
         ),
@@ -1204,9 +1229,11 @@ pub(crate) fn preempt_release_holds(
                 plan_claims.release(*target_cell, npc_id);
             }
             ArrivalAction::PickupForPlan { .. }
+            | ArrivalAction::WithdrawFromContainer { .. }
             | ArrivalAction::DepositAtPlan { .. }
             | ArrivalAction::DepositAtStation { .. }
             | ArrivalAction::DepositAtStorage { .. }
+            | ArrivalAction::DepositAtContainer { .. }
             | ArrivalAction::PickupTool { .. } => {
                 haul_store.release_for_npc(npc_id);
             }
@@ -1781,7 +1808,8 @@ fn npc_brain_tick(
                         item_translation,
                         live_count - taken,
                     );
-                    haul.store.drop_queue_entry(*npc_id, item_entity);
+                    haul.store
+                        .drop_queue_entry(*npc_id, crate::haul::HaulSource::Ground(item_entity));
                     // Plan next leg from the (now updated) assignment.
                     continue_haul_or_release(
                         *npc_id,
@@ -2078,6 +2106,180 @@ fn npc_brain_tick(
                         &world,
                     );
                 }
+                ArrivalAction::WithdrawFromContainer {
+                    cell,
+                    item_slot,
+                    count: reserved_count,
+                } => {
+                    // Re-read the live stock — the container may have
+                    // been mined (state spilled) or drained since the
+                    // scheduler reserved it. Empty/missing ⇒ release,
+                    // same as a despawned ground item.
+                    let available = haul
+                        .containers
+                        .get(cell)
+                        .map(|s| s.available(item_slot))
+                        .unwrap_or(0);
+                    let cap = haul
+                        .kind_registry
+                        .get(&kind.0)
+                        .map(|d| d.carry_capacity)
+                        .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+                    if available == 0 {
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?cell.to_array(),
+                            "container withdraw: stock gone; releasing assignment",
+                        );
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    let want = reserved_count.min(available);
+                    let taken = carrying.pickup_many(item_slot, want, cap);
+                    if taken == 0 {
+                        info!(
+                            npc = npc_id.0,
+                            "container withdraw: carry can't accept the reserved item; releasing",
+                        );
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    let state_after = {
+                        let Some(state) = haul.containers.get_mut(cell) else {
+                            // Checked non-empty above; unreachable in
+                            // practice, but don't panic on a race.
+                            haul.store.release_for_npc(*npc_id);
+                            brain.goal = Goal::Idle;
+                            continue;
+                        };
+                        state.withdraw_up_to(item_slot, taken);
+                        state.clone()
+                    };
+                    haul.containers.remove_if_empty(cell);
+                    if let Some(server) = server {
+                        crate::containers::broadcast_container(
+                            &mut haul.broadcast,
+                            server,
+                            cell,
+                            (!state_after.is_empty()).then_some(state_after),
+                        );
+                    }
+                    info!(
+                        npc = npc_id.0,
+                        cell = ?cell.to_array(),
+                        taken,
+                        "container withdraw complete",
+                    );
+                    haul.store
+                        .drop_queue_entry(*npc_id, crate::haul::HaulSource::Container(cell));
+                    continue_haul_or_release(
+                        *npc_id,
+                        kind,
+                        now_secs,
+                        &pose,
+                        &carrying,
+                        &mut brain,
+                        &mut npc_path,
+                        &mut haul.store,
+                        &haul.plans,
+                        &haul.kind_registry,
+                        &haul.item_registry,
+                        &craft.stations,
+                        &craft.recipes,
+                        &world,
+                    );
+                }
+                ArrivalAction::DepositAtContainer { cell } => {
+                    // No carry (raced pickup) → nothing to do.
+                    let (carry_item, carry_count) = match (carrying.item, carrying.count) {
+                        (Some(slot), c) if c > 0 => (slot, c),
+                        _ => {
+                            haul.store.release_for_npc(*npc_id);
+                            brain.goal = Goal::Idle;
+                            continue;
+                        }
+                    };
+                    // Validate the cell still holds a container block —
+                    // a mined container between haul start and arrival
+                    // collapses to "release haul, keep carry, idle"
+                    // (never get_or_insert phantom stock into air).
+                    let Some(cfg) = crate::containers::container_config_at(
+                        cell,
+                        chunks,
+                        chunk_map,
+                        block_registry,
+                    ) else {
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?cell.to_array(),
+                            "container deposit: container gone; releasing assignment",
+                        );
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    };
+                    // Clamp to live bulk room (another NPC may have
+                    // deposited since scheduling). Clamped-off carry
+                    // stays on the NPC for the next assignment.
+                    let room = crate::containers::room_for(
+                        haul.containers.get(cell),
+                        cfg,
+                        &haul.item_registry,
+                        carry_item,
+                    );
+                    let accepted = room.min(carry_count);
+                    if accepted == 0 {
+                        info!(
+                            npc = npc_id.0,
+                            cell = ?cell.to_array(),
+                            "container deposit: no room left; releasing assignment",
+                        );
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    }
+                    let state_after = {
+                        let state = haul.containers.get_or_insert(cell);
+                        state.deposit(carry_item, accepted);
+                        state.clone()
+                    };
+                    carrying.count = carry_count - accepted;
+                    if carrying.count == 0 {
+                        carrying.item = None;
+                    }
+                    if let Some(server) = server {
+                        crate::containers::broadcast_container(
+                            &mut haul.broadcast,
+                            server,
+                            cell,
+                            Some(state_after),
+                        );
+                    }
+                    info!(
+                        npc = npc_id.0,
+                        cell = ?cell.to_array(),
+                        accepted,
+                        "tidy deposit (container) complete",
+                    );
+                    continue_haul_or_release(
+                        *npc_id,
+                        kind,
+                        now_secs,
+                        &pose,
+                        &carrying,
+                        &mut brain,
+                        &mut npc_path,
+                        &mut haul.store,
+                        &haul.plans,
+                        &haul.kind_registry,
+                        &haul.item_registry,
+                        &craft.stations,
+                        &craft.recipes,
+                        &world,
+                    );
+                }
                 ArrivalAction::PickupTool {
                     item_entity,
                     item_slot,
@@ -2269,9 +2471,11 @@ fn npc_brain_tick(
                         haul.plan_claims.release(*target_cell, *npc_id);
                     }
                     ArrivalAction::PickupForPlan { .. }
+                    | ArrivalAction::WithdrawFromContainer { .. }
                     | ArrivalAction::DepositAtPlan { .. }
                     | ArrivalAction::DepositAtStation { .. }
                     | ArrivalAction::DepositAtStorage { .. }
+                    | ArrivalAction::DepositAtContainer { .. }
                     | ArrivalAction::PickupTool { .. } => {
                         // Blocked-with-no-route or timed out mid-haul:
                         // free the entire assignment + every
@@ -2648,6 +2852,8 @@ fn npc_brain_tick(
                     chunk_map,
                     &haul.world_items,
                     &haul.storage,
+                    &haul.containers,
+                    &haul.container_index,
                     &mut haul.store,
                     now_secs,
                 );
@@ -3637,11 +3843,17 @@ fn pick_next_haul_leg<W: Walkability>(
     // targets never set pending_tool (recipe tool gates are enforced
     // by the *craft* scheduler, not the haul one).
     if let Some(tool) = pending_tool {
+        // Tools are always ground items; a container-sourced tool slot
+        // can't be scheduled today. Defensive: a malformed source ends
+        // the assignment instead of panicking.
+        let Some(tool_entity) = tool.ground_entity() else {
+            return Ok(None);
+        };
         return plan_haul_move(
             pose,
             pose_to_foot_cell_of(tool.translation),
             ArrivalAction::PickupTool {
-                item_entity: tool.entity,
+                item_entity: tool_entity,
                 item_slot: tool.item,
             },
             HAUL_LEG_TIMEOUT_SECS,
@@ -3660,9 +3872,10 @@ fn pick_next_haul_leg<W: Walkability>(
             .map(|s| !crate::haul::compute_station_demand(s, recipes, item_registry).is_empty())
             .unwrap_or(false),
         // A tidy run always wants to finish fetching its reserved queue
-        // before depositing; the deposit handler clamps to the pile's
-        // capacity, so there's no "satisfied" state to short-circuit on.
-        HaulTarget::Storage(_) => true,
+        // before depositing; the deposit handler clamps to the pile's /
+        // container's capacity, so there's no "satisfied" state to
+        // short-circuit on.
+        HaulTarget::Storage(_) | HaulTarget::Container(_) => true,
     };
     let carry_full = !carrying.is_empty() && carrying.count >= carry_cap;
     let queue_empty = assignment_queue.is_empty();
@@ -3670,6 +3883,7 @@ fn pick_next_haul_leg<W: Walkability>(
         HaulTarget::Plan(cell) => ArrivalAction::DepositAtPlan { plan_cell: cell },
         HaulTarget::Station(cell) => ArrivalAction::DepositAtStation { station_cell: cell },
         HaulTarget::Storage(cell) => ArrivalAction::DepositAtStorage { cell },
+        HaulTarget::Container(cell) => ArrivalAction::DepositAtContainer { cell },
     };
     // Walk to deposit if: carry has stuff AND (queue empty OR carry full
     // OR target no longer needs more). The "no longer needs more"
@@ -3692,25 +3906,37 @@ fn pick_next_haul_leg<W: Walkability>(
     // *arrival* (pickup) handler, not here — this fn only reads.
     if !queue_empty && target_remaining {
         let next = assignment_queue[0];
-        // PickupForPlan's `plan_cell` field is the original target's
-        // cell — for station targets it carries the station_cell, used
-        // by the pickup arrival only for "where am I delivering this"
-        // diagnostics. The actual deposit destination is re-derived
-        // from `assignment.target` on the next leg.
-        return plan_haul_move(
-            pose,
-            pose_to_foot_cell_of(next.translation),
-            ArrivalAction::PickupForPlan {
-                item_entity: next.entity,
+        // The pickup arrival differs by source: ground items despawn/
+        // shrink a WorldItem entity, container stock decrements the
+        // cell's inventory. PickupForPlan's `plan_cell` field is the
+        // original target's cell — for station targets it carries the
+        // station_cell, used by the pickup arrival only for "where am
+        // I delivering this" diagnostics. The actual deposit
+        // destination is re-derived from `assignment.target` on the
+        // next leg.
+        let arrival = match next.source {
+            crate::haul::HaulSource::Ground(entity) => ArrivalAction::PickupForPlan {
+                item_entity: entity,
                 item_slot: next.item,
                 count: next.count,
                 plan_cell: target.cell(),
             },
-            HAUL_LEG_TIMEOUT_SECS,
-            world,
-        )
-        .map(Some)
-        .ok_or(());
+            crate::haul::HaulSource::Container(cell) => ArrivalAction::WithdrawFromContainer {
+                cell,
+                item_slot: next.item,
+                count: next.count,
+            },
+        };
+        // Ground items sit in an air cell (path to it); containers are
+        // solid blocks (path to a standable neighbour, same as a
+        // station deposit).
+        let leg_cell = match next.source {
+            crate::haul::HaulSource::Ground(_) => pose_to_foot_cell_of(next.translation),
+            crate::haul::HaulSource::Container(cell) => cell,
+        };
+        return plan_haul_move(pose, leg_cell, arrival, HAUL_LEG_TIMEOUT_SECS, world)
+            .map(Some)
+            .ok_or(());
     }
     // Carry empty + (queue empty or target satisfied). The assignment
     // has run its course; release and idle. If the target still needs
@@ -4904,13 +5130,13 @@ mod tests {
         let mut interaction_claims = InteractionClaims::default();
         let mut haul_store = HaulStore::default();
 
-        assert!(haul_store.try_reserve_internal(item_entity, npc));
+        assert!(haul_store.try_reserve_internal(crate::haul::HaulSource::Ground(item_entity), npc));
         haul_store.commit_assignment(
             npc,
             HaulAssignment {
                 target: crate::haul::HaulTarget::Plan(plan_cell),
                 queue: vec![ReservedItem {
-                    entity: item_entity,
+                    source: crate::haul::HaulSource::Ground(item_entity),
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
                     count: 1,
@@ -4930,7 +5156,7 @@ mod tests {
 
         assert!(!haul_store.has_assignment(npc));
         let other = NpcId(8);
-        assert!(haul_store.try_reserve_internal(item_entity, other));
+        assert!(haul_store.try_reserve_internal(crate::haul::HaulSource::Ground(item_entity), other));
     }
 
     #[test]

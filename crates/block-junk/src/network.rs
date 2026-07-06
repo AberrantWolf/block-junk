@@ -65,7 +65,8 @@ pub const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECI
 // …0003: NpcDetails gained `stats` (2026-07).
 // …0004: storage zones — StorageEditBatch/StorageFullSync (2026-07, S1).
 // …0005: WorldItem gained `count` — piles ride the same replication (2026-07, S2).
-pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0005;
+// …0006: container stock — ContainerUpdate/ContainersFullSync (2026-07, S3).
+pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0006;
 
 /// Which address the server socket binds. Inserted by
 /// `run_server_inner`; the dedicated CLI can override the default.
@@ -218,6 +219,12 @@ impl Plugin for ProtocolPlugin {
         app.register_message::<StationUpdate>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<StationsFullSync>()
+            .add_direction(NetworkDirection::ServerToClient);
+        // Container stock mirror (storage arc S3): per-cell deltas +
+        // connect-time full sync, same lane as stations.
+        app.register_message::<crate::containers::ContainerUpdate>()
+            .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<crate::containers::ContainersFullSync>()
             .add_direction(NetworkDirection::ServerToClient);
 
         // Player-avatar replication. Server owns the avatar entities; the

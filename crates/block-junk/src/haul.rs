@@ -25,22 +25,45 @@ use bevy::prelude::*;
 use crate::items::ItemSlot;
 use crate::npc::NpcId;
 
-/// One loose item the scheduler has earmarked for delivery to a plan.
-/// Caches `item` + `translation` so the brain doesn't need to query the
-/// (possibly already-despawned) `WorldItem` entity on every leg — the
-/// cached fields are also the fallback used when the entity is gone by
-/// the time the NPC arrives.
+/// Where a reserved batch of units comes from. Ground items (loose
+/// drops + tidied piles) are `WorldItem` entities; container stock (S3)
+/// is a count inside the container block at a cell — no entity exists
+/// until the units come back out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HaulSource {
+    /// A loose [`crate::protocol::WorldItem`] entity (single drop or
+    /// pile).
+    Ground(Entity),
+    /// Stock inside the container block at this cell.
+    Container(IVec3),
+}
+
+/// One item source the scheduler has earmarked for a haul run. Caches
+/// `item` + `translation` so the brain doesn't need to query the
+/// (possibly already-despawned) source on every leg — the cached
+/// fields are also the fallback used when the source is gone by the
+/// time the NPC arrives.
 #[derive(Clone, Copy, Debug)]
 pub struct ReservedItem {
-    pub entity: Entity,
+    pub source: HaulSource,
     pub item: ItemSlot,
     pub translation: Vec3,
-    /// How many units to withdraw from this (possibly multi-unit pile)
-    /// entity on the pickup leg — `min(target's remaining need, carry
-    /// room, the stack's size)`. Loose items reserve `1`. The whole
-    /// entity is reserved regardless of `count` (one NPC works a stack
-    /// at a time).
+    /// How many units to withdraw from this source on the pickup leg —
+    /// `min(target's remaining need, carry room, what's there)`. Loose
+    /// items reserve `1`. The whole source is reserved regardless of
+    /// `count` (one NPC works a stack/container at a time).
     pub count: u32,
+}
+
+impl ReservedItem {
+    /// The `WorldItem` entity behind a ground reservation; `None` for
+    /// container stock. Tool reservations are always ground items.
+    pub fn ground_entity(&self) -> Option<Entity> {
+        match self.source {
+            HaulSource::Ground(e) => Some(e),
+            HaulSource::Container(_) => None,
+        }
+    }
 }
 
 /// Where the next deposit leg of a haul cycle delivers materials.
@@ -58,6 +81,9 @@ pub enum HaulTarget {
     /// A designated storage cell the NPC is tidying loose items into
     /// (S2). The deposit merges the carry into a pile at this cell.
     Storage(IVec3),
+    /// A container block the NPC is tidying loose items into (S3).
+    /// The deposit adds the carry to the container's stock.
+    Container(IVec3),
 }
 
 impl HaulTarget {
@@ -66,7 +92,10 @@ impl HaulTarget {
     /// kind.
     pub fn cell(&self) -> IVec3 {
         match self {
-            HaulTarget::Plan(c) | HaulTarget::Station(c) | HaulTarget::Storage(c) => *c,
+            HaulTarget::Plan(c)
+            | HaulTarget::Station(c)
+            | HaulTarget::Storage(c)
+            | HaulTarget::Container(c) => *c,
         }
     }
 }
@@ -113,6 +142,11 @@ pub struct HaulAssignment {
 pub struct HaulStore {
     assignments: HashMap<NpcId, HaulAssignment>,
     reservations: HashMap<Entity, NpcId>,
+    /// Container cells earmarked for withdrawal, keyed whole-cell (one
+    /// NPC works a container at a time — same coarseness as the
+    /// whole-stack rule for piles, fine at co-op scale). Deposits
+    /// don't reserve: adding stock can't invalidate anyone.
+    container_reservations: HashMap<IVec3, NpcId>,
     /// Targets whose last haul leg failed pathfinding, mapped to the
     /// `Time::elapsed_secs` timestamp when a retry is allowed. The
     /// scheduler skips memoized targets so one walled-off plan (or an
@@ -136,11 +170,15 @@ impl HaulStore {
         self.assignments.contains_key(&npc)
     }
 
-    /// True if `entity` is currently reserved by anyone other than
+    /// True if `source` is currently reserved by anyone other than
     /// `npc`. Used by the scheduler + arrival handlers to detect
     /// races against another NPC.
-    pub fn reservation_taken_by_other(&self, entity: Entity, npc: NpcId) -> bool {
-        match self.reservations.get(&entity) {
+    pub fn reservation_taken_by_other(&self, source: HaulSource, npc: NpcId) -> bool {
+        let holder = match source {
+            HaulSource::Ground(entity) => self.reservations.get(&entity),
+            HaulSource::Container(cell) => self.container_reservations.get(&cell),
+        };
+        match holder {
             Some(holder) => holder.0 != npc.0,
             None => false,
         }
@@ -150,19 +188,21 @@ impl HaulStore {
     /// reservation it held. Every cleanup path on the brain side
     /// calls this — abandon-on-stuck, planner-error, NPC-despawn,
     /// preempt-on-need. The two-table coupling is enforced here.
-    /// `release_all_for` belt-and-braces catches any stray
+    /// `retain` belt-and-braces catches any stray
     /// reservations not tracked by the assignment (shouldn't happen,
     /// but cheap to defend).
     pub fn release_for_npc(&mut self, npc: NpcId) {
         if let Some(assignment) = self.assignments.remove(&npc) {
             for item in &assignment.queue {
-                self.release_reservation_internal(item.entity, npc);
+                self.release_reservation_internal(item.source, npc);
             }
             if let Some(tool) = &assignment.pending_tool {
-                self.release_reservation_internal(tool.entity, npc);
+                self.release_reservation_internal(tool.source, npc);
             }
         }
         self.reservations.retain(|_, holder| holder.0 != npc.0);
+        self.container_reservations
+            .retain(|_, holder| holder.0 != npc.0);
     }
 
     /// Record that pathing toward `target` just failed; the scheduler
@@ -193,16 +233,16 @@ impl HaulStore {
         }
     }
 
-    /// Remove the queued reservation matching `entity` (NPC may
-    /// arrive at an item that's no longer the expected entity due to
-    /// a race; the brain calls this to skip past stale entries).
-    pub fn drop_queue_entry(&mut self, npc: NpcId, entity: Entity) {
+    /// Remove the queued reservation matching `source` (NPC may
+    /// arrive at a source that's no longer what the scheduler saw due
+    /// to a race; the brain calls this to skip past stale entries).
+    pub fn drop_queue_entry(&mut self, npc: NpcId, source: HaulSource) {
         if let Some(assignment) = self.assignments.get_mut(&npc) {
-            assignment.queue.retain(|r| r.entity != entity);
+            assignment.queue.retain(|r| r.source != source);
         }
         // Release reservation regardless of whether queue had it (a
         // canonical "remove this stale ref" call).
-        self.release_reservation_internal(entity, npc);
+        self.release_reservation_internal(source, npc);
     }
 
     /// Clear `npc`'s pending_tool slot and release its reservation.
@@ -210,29 +250,50 @@ impl HaulStore {
     pub fn clear_pending_tool(&mut self, npc: NpcId) {
         if let Some(assignment) = self.assignments.get_mut(&npc) {
             if let Some(tool) = assignment.pending_tool.take() {
-                self.release_reservation_internal(tool.entity, npc);
+                self.release_reservation_internal(tool.source, npc);
             }
         }
     }
 
     // --- internals; only the scheduler in this module reaches in. ---
 
-    pub(super) fn try_reserve_internal(&mut self, entity: Entity, npc: NpcId) -> bool {
-        match self.reservations.get(&entity) {
-            Some(holder) if holder.0 == npc.0 => true,
-            Some(_) => false,
-            None => {
-                self.reservations.insert(entity, npc);
-                true
-            }
+    pub(super) fn try_reserve_internal(&mut self, source: HaulSource, npc: NpcId) -> bool {
+        match source {
+            HaulSource::Ground(entity) => match self.reservations.get(&entity) {
+                Some(holder) if holder.0 == npc.0 => true,
+                Some(_) => false,
+                None => {
+                    self.reservations.insert(entity, npc);
+                    true
+                }
+            },
+            HaulSource::Container(cell) => match self.container_reservations.get(&cell) {
+                Some(holder) if holder.0 == npc.0 => true,
+                Some(_) => false,
+                None => {
+                    self.container_reservations.insert(cell, npc);
+                    true
+                }
+            },
         }
     }
 
-    pub(super) fn release_reservation_internal(&mut self, entity: Entity, npc: NpcId) {
-        if let Some(holder) = self.reservations.get(&entity)
-            && holder.0 == npc.0
-        {
-            self.reservations.remove(&entity);
+    pub(super) fn release_reservation_internal(&mut self, source: HaulSource, npc: NpcId) {
+        match source {
+            HaulSource::Ground(entity) => {
+                if let Some(holder) = self.reservations.get(&entity)
+                    && holder.0 == npc.0
+                {
+                    self.reservations.remove(&entity);
+                }
+            }
+            HaulSource::Container(cell) => {
+                if let Some(holder) = self.container_reservations.get(&cell)
+                    && holder.0 == npc.0
+                {
+                    self.container_reservations.remove(&cell);
+                }
+            }
         }
     }
 
@@ -294,6 +355,8 @@ pub fn try_schedule_haul_for_npc(
     chunk_map: &crate::voxel::ChunkMap,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
     storage: &crate::storage::StorageZones,
+    containers: &crate::containers::Containers,
+    container_index: &crate::containers::ContainerIndex,
     store: &mut HaulStore,
     now_secs: f32,
 ) -> bool {
@@ -391,20 +454,34 @@ pub fn try_schedule_haul_for_npc(
         return true;
     }
 
-    // Index every loose item by ItemSlot once per call. The pool is
-    // shared across this NPC's plan scan + final reservation pass;
-    // per-NPC rebuild is O(items) and items are sparse.
-    // Each pool entry is (entity, position, unit count) — a pile
-    // (count > 1) is a single reservation that yields multiple units.
+    // Index every available item source by ItemSlot once per call. The
+    // pool is shared across this NPC's plan scan + final reservation
+    // pass; per-NPC rebuild is O(items + stocked containers) and both
+    // are sparse. Each pool entry is (source, position, unit count) —
+    // a pile or a container's stock of one kind is a single
+    // reservation that yields multiple units. Container stock counts
+    // as a source unconditionally (the `accepts` filter gates what
+    // goes IN, not what comes out) — without this, stocked containers
+    // would deadlock the build/craft economy.
     let mut items_by_slot: std::collections::HashMap<
         crate::items::ItemSlot,
-        Vec<(Entity, Vec3, u32)>,
+        Vec<(HaulSource, Vec3, u32)>,
     > = std::collections::HashMap::new();
     for (entity, wi) in world_items.iter() {
         items_by_slot
             .entry(wi.item)
             .or_default()
-            .push((entity, wi.translation, wi.count));
+            .push((HaulSource::Ground(entity), wi.translation, wi.count));
+    }
+    for (cell, state) in containers.iter() {
+        let centre = cell.as_vec3() + Vec3::splat(0.5);
+        for (slot, count) in state.inventory.iter() {
+            items_by_slot.entry(*slot).or_default().push((
+                HaulSource::Container(*cell),
+                centre,
+                *count,
+            ));
+        }
     }
 
     // Pick the nearest viable target — Build plan or craft station.
@@ -522,11 +599,23 @@ pub fn try_schedule_haul_for_npc(
         ) {
             return true;
         }
-        // Last-resort idle-haul tier: sweep loose items into storage
-        // piles. Real pending work (material haul, tool fetch) always
-        // outranks cosmetic tidying — this only fires when there's
-        // nothing else useful to do.
-        return try_schedule_tidy(npc_id, pose, cap, item_registry, world_items, storage, store);
+        // Last-resort idle-haul tier: sweep loose items into containers
+        // or storage piles. Real pending work (material haul, tool
+        // fetch) always outranks cosmetic tidying — this only fires
+        // when there's nothing else useful to do.
+        return try_schedule_tidy(
+            npc_id,
+            pose,
+            cap,
+            item_registry,
+            block_registry,
+            world_items,
+            storage,
+            containers,
+            container_index,
+            store,
+            now_secs,
+        );
     };
 
     // Reserve the tool first (if any). Stations never carry a tool
@@ -555,11 +644,11 @@ pub fn try_schedule_haul_for_npc(
                 ) else {
                     return false;
                 };
-                if !store.try_reserve_internal(entity, npc_id) {
+                if !store.try_reserve_internal(HaulSource::Ground(entity), npc_id) {
                     return false;
                 }
                 Some(ReservedItem {
-                    entity,
+                    source: HaulSource::Ground(entity),
                     item,
                     translation,
                     count: 1,
@@ -574,42 +663,42 @@ pub fn try_schedule_haul_for_npc(
 
     let Some(pool) = items_by_slot.get(&item_slot) else {
         if let Some(tool) = &pending_tool {
-            store.release_reservation_internal(tool.entity, npc_id);
+            store.release_reservation_internal(tool.source, npc_id);
         }
         return false;
     };
 
-    // Sort by distance so closest items get reserved first.
-    let mut candidates: Vec<(Entity, Vec3, u32, f32)> = pool
+    // Sort by distance so closest sources get reserved first.
+    let mut candidates: Vec<(HaulSource, Vec3, u32, f32)> = pool
         .iter()
-        .filter_map(|(entity, translation, count)| {
-            if store.reservation_taken_by_other(*entity, npc_id) {
+        .filter_map(|(source, translation, count)| {
+            if store.reservation_taken_by_other(*source, npc_id) {
                 return None;
             }
             let d = (*translation - pose).length();
             if d > MAX_HAUL_ITEM_RADIUS_M {
                 return None;
             }
-            Some((*entity, *translation, *count, d))
+            Some((*source, *translation, *count, d))
         })
         .collect();
     candidates.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Reserve nearest stacks until we've covered `want` units. A pile
-    // (count > 1) is one reservation that yields several units, so a
-    // single nearby pile can satisfy the whole trip; loose items still
-    // reserve one entity per unit as before.
+    // Reserve nearest sources until we've covered `want` units. A pile
+    // or a stocked container (count > 1) is one reservation that
+    // yields several units, so a single nearby source can satisfy the
+    // whole trip; loose items still reserve one entity per unit.
     let want = cap.min(remaining_for_kind);
     let mut got: u32 = 0;
     let mut queue: Vec<ReservedItem> = Vec::new();
-    for (entity, translation, stack_count, _) in candidates {
+    for (source, translation, stack_count, _) in candidates {
         if got >= want {
             break;
         }
-        if store.try_reserve_internal(entity, npc_id) {
+        if store.try_reserve_internal(source, npc_id) {
             let take = (want - got).min(stack_count.max(1));
             queue.push(ReservedItem {
-                entity,
+                source,
                 item: item_slot,
                 translation,
                 count: take,
@@ -619,7 +708,7 @@ pub fn try_schedule_haul_for_npc(
     }
     if queue.is_empty() {
         if let Some(tool) = &pending_tool {
-            store.release_reservation_internal(tool.entity, npc_id);
+            store.release_reservation_internal(tool.source, npc_id);
         }
         return false;
     }
@@ -642,29 +731,42 @@ pub fn try_schedule_haul_for_npc(
     true
 }
 
-/// Idle-haul "tidy" scheduler (S2): sweep loose, pileable items that
-/// aren't already sitting in a storage cell into a designated storage
-/// cell, grouping by kind. Prefers topping up an existing same-kind
-/// pile with room; else fills an empty storage cell. Reserves the loose
-/// items (single-kind, up to carry cap and the destination's remaining
-/// room) and commits a [`HaulTarget::Storage`] assignment — the deposit
-/// leg ([`crate::npc::ArrivalAction::DepositAtStorage`]) merges the
-/// carry into a pile there.
+/// Idle-haul "tidy" scheduler (S2 piles, S3 containers): sweep loose,
+/// pileable items that aren't already sitting in a storage cell into
+/// a home, grouping by kind. Destination preference, per the S3
+/// design: **an accepting container with room beats any pile** —
+/// containers are deliberate player furniture, piles the open-air
+/// fallback. Within each class, nearest wins; among piles, topping up
+/// an existing same-kind pile beats starting a fresh cell.
+///
+/// Reserves the loose items (single-kind, up to carry cap and the
+/// destination's remaining room) and commits a
+/// [`HaulTarget::Container`] or [`HaulTarget::Storage`] assignment —
+/// the deposit leg ([`crate::npc::ArrivalAction::DepositAtContainer`] /
+/// [`crate::npc::ArrivalAction::DepositAtStorage`]) stows the carry.
 ///
 /// Runs only after material haul + tool fetch found nothing, so real
 /// work always wins. Assumes an empty carry (the deposit-only branch
 /// upstream handles a carrying NPC).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shares the scheduler's subsystem spread"
+)]
 fn try_schedule_tidy(
     npc_id: NpcId,
     pose: Vec3,
     cap: u32,
     item_registry: &crate::items::ItemRegistry,
+    block_registry: &crate::blocks::BlockRegistry,
     world_items: &Query<(Entity, &crate::protocol::WorldItem)>,
     storage: &crate::storage::StorageZones,
+    containers: &crate::containers::Containers,
+    container_index: &crate::containers::ContainerIndex,
     store: &mut HaulStore,
+    now_secs: f32,
 ) -> bool {
     let storage_cells: std::collections::HashSet<IVec3> = storage.iter().copied().collect();
-    if storage_cells.is_empty() {
+    if storage_cells.is_empty() && container_index.len() == 0 {
         return false;
     }
 
@@ -692,7 +794,7 @@ fn try_schedule_tidy(
         if !item_registry.def(wi.item).is_pileable() {
             continue;
         }
-        if store.reservation_taken_by_other(entity, npc_id) {
+        if store.reservation_taken_by_other(HaulSource::Ground(entity), npc_id) {
             continue;
         }
         let d = (wi.translation - pose).length();
@@ -717,42 +819,83 @@ fn try_schedule_tidy(
         }
     }
     let (kind, _) = best_kind.unwrap();
-    let capacity = item_registry.def(kind).pile_capacity();
 
-    // Destination: prefer an existing same-kind pile with room (nearest);
-    // else an empty storage cell (nearest). Cells occupied by another
-    // kind or already full are skipped.
-    let mut dest: Option<(IVec3, u32, bool, f32)> = None; // (cell, existing, has_pile, dist)
-    for cell in &storage_cells {
-        let existing = match occupancy.get(cell) {
-            None => 0,
-            Some((k, c)) if *k == kind && *c < capacity => *c,
-            Some(_) => continue, // another kind, or same kind but full
+    // Destination class 1 — containers: nearest placed container that
+    // accepts this kind and has bulk room for at least one unit.
+    // Skips containers memoized unreachable (walled-off) so the tidy
+    // tier honors the same backoff every other haul target gets.
+    let mut container_dest: Option<(IVec3, u32, f32)> = None; // (cell, room_units, dist)
+    for (cell, slot) in container_index.iter() {
+        let Some(cfg) = block_registry.def(slot).container.as_ref() else {
+            continue; // index/registry drift — stale entry, skip
         };
-        let has_pile = existing > 0;
+        if !item_registry.def(kind).accepted_by(&cfg.accepts) {
+            continue;
+        }
+        if store.is_unreachable(HaulTarget::Container(cell), now_secs) {
+            continue;
+        }
         let d = (cell.as_vec3() + Vec3::splat(0.5) - pose).length();
-        let better = match dest {
-            None => true,
-            Some((_, _, dest_has, dd)) => {
-                if has_pile != dest_has {
-                    has_pile // topping up an existing pile beats a fresh cell
-                } else {
-                    d < dd
-                }
-            }
-        };
-        if better {
-            dest = Some((*cell, existing, has_pile, d));
+        if d > MAX_HAUL_ITEM_RADIUS_M {
+            continue;
+        }
+        let room = crate::containers::room_for(containers.get(cell), cfg, item_registry, kind);
+        if room == 0 {
+            continue;
+        }
+        if container_dest.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+            container_dest = Some((cell, room, d));
         }
     }
-    let Some((dest_cell, dest_existing, _, _)) = dest else {
-        return false;
+
+    // Destination class 2 — open piles on storage cells: prefer an
+    // existing same-kind pile with room (nearest); else an empty
+    // storage cell (nearest). Cells occupied by another kind or
+    // already full are skipped. Only consulted when no container
+    // takes the kind.
+    let (target, room) = if let Some((cell, room, _)) = container_dest {
+        (HaulTarget::Container(cell), room)
+    } else {
+        let capacity = item_registry.def(kind).pile_capacity();
+        let mut dest: Option<(IVec3, u32, bool, f32)> = None; // (cell, existing, has_pile, dist)
+        for cell in &storage_cells {
+            let existing = match occupancy.get(cell) {
+                None => 0,
+                Some((k, c)) if *k == kind && *c < capacity => *c,
+                Some(_) => continue, // another kind, or same kind but full
+            };
+            if store.is_unreachable(HaulTarget::Storage(*cell), now_secs) {
+                continue;
+            }
+            let has_pile = existing > 0;
+            let d = (cell.as_vec3() + Vec3::splat(0.5) - pose).length();
+            let better = match dest {
+                None => true,
+                Some((_, _, dest_has, dd)) => {
+                    if has_pile != dest_has {
+                        has_pile // topping up an existing pile beats a fresh cell
+                    } else {
+                        d < dd
+                    }
+                }
+            };
+            if better {
+                dest = Some((*cell, existing, has_pile, d));
+            }
+        }
+        let Some((dest_cell, dest_existing, _, _)) = dest else {
+            return false;
+        };
+        (
+            HaulTarget::Storage(dest_cell),
+            capacity.saturating_sub(dest_existing),
+        )
     };
 
     // Reserve loose items of `kind` nearest-first, up to the smaller of
     // carry cap and the destination's remaining room (so we never
-    // over-fill the pile).
-    let room = capacity.saturating_sub(dest_existing).min(cap);
+    // over-fill it).
+    let room = room.min(cap);
     if room == 0 {
         return false;
     }
@@ -763,9 +906,9 @@ fn try_schedule_tidy(
         if queue.len() as u32 >= room {
             break;
         }
-        if store.try_reserve_internal(entity, npc_id) {
+        if store.try_reserve_internal(HaulSource::Ground(entity), npc_id) {
             queue.push(ReservedItem {
-                entity,
+                source: HaulSource::Ground(entity),
                 item: kind,
                 translation,
                 count: 1,
@@ -777,7 +920,7 @@ fn try_schedule_tidy(
     }
     info!(
         npc = npc_id.0,
-        dest = ?dest_cell.to_array(),
+        target = ?target,
         kind = kind.0,
         queued = queue.len(),
         "tidy assignment committed",
@@ -785,7 +928,7 @@ fn try_schedule_tidy(
     store.commit_assignment(
         npc_id,
         HaulAssignment {
-            target: HaulTarget::Storage(dest_cell),
+            target,
             queue,
             pending_tool: None,
         },
@@ -814,7 +957,10 @@ fn chebyshev(a: IVec3, b: IVec3) -> i32 {
 /// dead-end pickup leg.
 fn pick_haul_kind(
     demands: impl IntoIterator<Item = (crate::items::ItemSlot, u32)>,
-    items_by_slot: &std::collections::HashMap<crate::items::ItemSlot, Vec<(Entity, Vec3, u32)>>,
+    items_by_slot: &std::collections::HashMap<
+        crate::items::ItemSlot,
+        Vec<(HaulSource, Vec3, u32)>,
+    >,
     pose: Vec3,
     npc_id: NpcId,
     store: &HaulStore,
@@ -827,8 +973,8 @@ fn pick_haul_kind(
         let Some(pool) = items_by_slot.get(&slot) else {
             continue;
         };
-        let reachable = pool.iter().any(|(entity, translation, _count)| {
-            if store.reservation_taken_by_other(*entity, npc_id) {
+        let reachable = pool.iter().any(|(source, translation, _count)| {
+            if store.reservation_taken_by_other(*source, npc_id) {
                 return false;
             }
             (*translation - pose).length() <= MAX_HAUL_ITEM_RADIUS_M
@@ -981,7 +1127,7 @@ fn try_schedule_tool_fetch(
         // tool to exist.
         return false;
     };
-    if !store.try_reserve_internal(entity, npc_id) {
+    if !store.try_reserve_internal(HaulSource::Ground(entity), npc_id) {
         return false;
     }
     info!(
@@ -997,7 +1143,7 @@ fn try_schedule_tool_fetch(
             target: HaulTarget::Plan(plan_cell),
             queue: Vec::new(),
             pending_tool: Some(ReservedItem {
-                entity,
+                source: HaulSource::Ground(entity),
                 item,
                 translation,
                 count: 1,
@@ -1057,7 +1203,7 @@ fn find_nearest_unreserved_tool(
 ) -> Option<(Entity, crate::items::ItemSlot, Vec3)> {
     let mut best: Option<(Entity, crate::items::ItemSlot, Vec3, f32)> = None;
     for (entity, wi) in world_items.iter() {
-        if store.reservation_taken_by_other(entity, npc_id) {
+        if store.reservation_taken_by_other(HaulSource::Ground(entity), npc_id) {
             continue;
         }
         let def = item_registry.def(wi.item);
@@ -1101,7 +1247,7 @@ mod tests {
             queue: entities
                 .iter()
                 .map(|e| ReservedItem {
-                    entity: *e,
+                    source: HaulSource::Ground(*e),
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
                     count: 1,
@@ -1115,35 +1261,35 @@ mod tests {
     fn first_reserve_succeeds_second_fails() {
         let mut s = HaulStore::default();
         let e = entity(1);
-        assert!(s.try_reserve_internal(e, NPC_1));
-        assert!(!s.try_reserve_internal(e, NPC_2));
+        assert!(s.try_reserve_internal(HaulSource::Ground(e), NPC_1));
+        assert!(!s.try_reserve_internal(HaulSource::Ground(e), NPC_2));
     }
 
     #[test]
     fn reserve_by_same_npc_is_idempotent() {
         let mut s = HaulStore::default();
         let e = entity(1);
-        assert!(s.try_reserve_internal(e, NPC_1));
-        assert!(s.try_reserve_internal(e, NPC_1));
+        assert!(s.try_reserve_internal(HaulSource::Ground(e), NPC_1));
+        assert!(s.try_reserve_internal(HaulSource::Ground(e), NPC_1));
     }
 
     #[test]
     fn release_reservation_frees_for_other() {
         let mut s = HaulStore::default();
         let e = entity(1);
-        s.try_reserve_internal(e, NPC_1);
-        s.release_reservation_internal(e, NPC_1);
-        assert!(s.try_reserve_internal(e, NPC_2));
+        s.try_reserve_internal(HaulSource::Ground(e), NPC_1);
+        s.release_reservation_internal(HaulSource::Ground(e), NPC_1);
+        assert!(s.try_reserve_internal(HaulSource::Ground(e), NPC_2));
     }
 
     #[test]
     fn release_by_non_owner_is_no_op() {
         let mut s = HaulStore::default();
         let e = entity(1);
-        s.try_reserve_internal(e, NPC_1);
-        s.release_reservation_internal(e, NPC_2);
-        assert!(!s.try_reserve_internal(e, NPC_2));
-        assert!(s.try_reserve_internal(e, NPC_1));
+        s.try_reserve_internal(HaulSource::Ground(e), NPC_1);
+        s.release_reservation_internal(HaulSource::Ground(e), NPC_2);
+        assert!(!s.try_reserve_internal(HaulSource::Ground(e), NPC_2));
+        assert!(s.try_reserve_internal(HaulSource::Ground(e), NPC_1));
     }
 
     #[test]
@@ -1151,8 +1297,8 @@ mod tests {
         let mut s = HaulStore::default();
         let a = entity(1);
         let b = entity(2);
-        assert!(s.try_reserve_internal(a, NPC_1));
-        assert!(s.try_reserve_internal(b, NPC_1));
+        assert!(s.try_reserve_internal(HaulSource::Ground(a), NPC_1));
+        assert!(s.try_reserve_internal(HaulSource::Ground(b), NPC_1));
         s.commit_assignment(NPC_1, assignment_with_queue(&[a, b]));
         assert!(s.has_assignment(NPC_1));
 
@@ -1161,22 +1307,22 @@ mod tests {
         assert!(!s.has_assignment(NPC_1));
         // Both reservations are now free for anyone else — coupling
         // enforced regardless of which path the caller took.
-        assert!(s.try_reserve_internal(a, NPC_2));
-        assert!(s.try_reserve_internal(b, NPC_2));
+        assert!(s.try_reserve_internal(HaulSource::Ground(a), NPC_2));
+        assert!(s.try_reserve_internal(HaulSource::Ground(b), NPC_2));
     }
 
     #[test]
     fn release_for_npc_drops_pending_tool() {
         let mut s = HaulStore::default();
         let tool = entity(10);
-        assert!(s.try_reserve_internal(tool, NPC_1));
+        assert!(s.try_reserve_internal(HaulSource::Ground(tool), NPC_1));
         s.commit_assignment(
             NPC_1,
             HaulAssignment {
                 target: HaulTarget::Plan(IVec3::ZERO),
                 queue: vec![],
                 pending_tool: Some(ReservedItem {
-                    entity: tool,
+                    source: HaulSource::Ground(tool),
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
                     count: 1,
@@ -1187,7 +1333,7 @@ mod tests {
         s.release_for_npc(NPC_1);
 
         assert!(!s.has_assignment(NPC_1));
-        assert!(s.try_reserve_internal(tool, NPC_2));
+        assert!(s.try_reserve_internal(HaulSource::Ground(tool), NPC_2));
     }
 
     #[test]
@@ -1195,8 +1341,8 @@ mod tests {
         let mut s = HaulStore::default();
         let a = entity(1);
         let b = entity(2);
-        s.try_reserve_internal(a, NPC_1);
-        s.try_reserve_internal(b, NPC_2);
+        s.try_reserve_internal(HaulSource::Ground(a), NPC_1);
+        s.try_reserve_internal(HaulSource::Ground(b), NPC_2);
         s.commit_assignment(NPC_1, assignment_with_queue(&[a]));
         s.commit_assignment(NPC_2, assignment_with_queue(&[b]));
 
@@ -1205,7 +1351,7 @@ mod tests {
         assert!(!s.has_assignment(NPC_1));
         assert!(s.has_assignment(NPC_2));
         // NPC_2's reservation survives.
-        assert!(!s.try_reserve_internal(b, NPC_1));
+        assert!(!s.try_reserve_internal(HaulSource::Ground(b), NPC_1));
     }
 
     #[test]
@@ -1213,14 +1359,14 @@ mod tests {
         let mut s = HaulStore::default();
         let a = entity(1);
         let b = entity(2);
-        s.try_reserve_internal(a, NPC_1);
-        s.try_reserve_internal(b, NPC_1);
+        s.try_reserve_internal(HaulSource::Ground(a), NPC_1);
+        s.try_reserve_internal(HaulSource::Ground(b), NPC_1);
         s.commit_assignment(NPC_1, assignment_with_queue(&[a, b]));
 
-        s.drop_queue_entry(NPC_1, a);
+        s.drop_queue_entry(NPC_1, HaulSource::Ground(a));
         // a is free; b is still queued and reserved.
-        assert!(s.try_reserve_internal(a, NPC_2));
-        assert!(!s.try_reserve_internal(b, NPC_2));
+        assert!(s.try_reserve_internal(HaulSource::Ground(a), NPC_2));
+        assert!(!s.try_reserve_internal(HaulSource::Ground(b), NPC_2));
         assert_eq!(s.assignment_of(NPC_1).unwrap().queue.len(), 1);
     }
 
@@ -1228,14 +1374,14 @@ mod tests {
     fn clear_pending_tool_releases_its_reservation() {
         let mut s = HaulStore::default();
         let tool = entity(7);
-        s.try_reserve_internal(tool, NPC_1);
+        s.try_reserve_internal(HaulSource::Ground(tool), NPC_1);
         s.commit_assignment(
             NPC_1,
             HaulAssignment {
                 target: HaulTarget::Plan(IVec3::ZERO),
                 queue: vec![],
                 pending_tool: Some(ReservedItem {
-                    entity: tool,
+                    source: HaulSource::Ground(tool),
                     item: ItemSlot(0),
                     translation: Vec3::ZERO,
                     count: 1,
@@ -1248,7 +1394,7 @@ mod tests {
         // Assignment still exists (might have a queue), but tool is freed.
         assert!(s.has_assignment(NPC_1));
         assert!(s.assignment_of(NPC_1).unwrap().pending_tool.is_none());
-        assert!(s.try_reserve_internal(tool, NPC_2));
+        assert!(s.try_reserve_internal(HaulSource::Ground(tool), NPC_2));
     }
 
     #[test]

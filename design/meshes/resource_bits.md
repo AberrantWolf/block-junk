@@ -17,9 +17,12 @@ Names are the pack's mesh base names; each exists as `<Name>.gltf` +
 `Stone_Bricks_Stack_Medium`, `Stone_Bricks_Stack_Large`,
 `Stone_Chunks_Small`✅, `Stone_Chunks_Large`.
 
-**Containers** (S3) — `Containers_Box_{Small,Medium,Large,Large_Dirty}`,
+**Containers** (S3) — `Containers_Box_{Small,Medium,Large✅,Large_Dirty}`,
 `Containers_Crate_{Small_Green,Small_Grey,Medium_Wood,Medium_Grey,Medium_Tan,Large}`,
-`Containers_Pile_{Small,Medium,Large}` (generic loose-heap fallback).
+`Containers_Pile_{Small,Medium,Large}`✅ (generic loose-heap fallback).
+S3 shipped 2026-07-06: `Containers_Box_Large` = the `vanilla:box` block
+(native scale, bounds ±0.38 × 0.795 tall). Barrel + crate came from
+Dungeon Remastered instead (see that file).
 
 **Food** (S4) — `Food_Basket_A_Berries`✅ (imported as `berry_basket.gltf`),
 `Food_Basket_A_Empty`, `Food_Basket_B_{Berries,Empty}`,

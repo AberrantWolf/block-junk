@@ -82,7 +82,10 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v16 (2026-07-05): `SavedWorldItem` gained `count` (storage arc S2 —
 ///                  loose items merge into counted "pile" entities). v15
 ///                  and earlier migrate on load with `count = 1`.
-pub const SAVE_VERSION: u32 = 16;
+/// v17 (2026-07-06): added `containers` — per-cell container stock
+///                  (storage arc S3). v16 and earlier migrate on load
+///                  with an empty map.
+pub const SAVE_VERSION: u32 = 17;
 
 /// Sentinel `SavedPlayer::client_id` for state not yet bound to a real
 /// client id: v12-migrated legacy state. Real ids are never 0 (see
@@ -197,6 +200,11 @@ pub struct SaveFile {
     /// no slot/id indirection to remap.
     #[serde(default)]
     pub storage_cells: Vec<IVec3>,
+    /// Container stock at save time, per container cell (v17). Items
+    /// stored as ids for the same registry-stability reason stations
+    /// use. Empty for sessions with nothing stocked.
+    #[serde(default)]
+    pub containers: Vec<(IVec3, SavedContainerState)>,
 }
 
 /// One player's persisted state, keyed by their netcode client id (a
@@ -241,6 +249,52 @@ impl From<SavedNpcV13> for SavedNpc {
             carrying: old.carrying,
             tool: old.tool,
             stats: HashMap::new(),
+        }
+    }
+}
+
+/// The v16 `SaveFile` layout, kept verbatim (field order is the bincode
+/// wire order) so v16 saves can be decoded and migrated instead of
+/// refused. Identical to v17 minus `containers`.
+/// Serialize exists only so tests can author v16 bytes.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct SaveFileV16 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    block_slots: Vec<String>,
+    edited_chunks: Vec<SavedChunk>,
+    #[serde(default)]
+    players: Vec<SavedPlayer>,
+    #[serde(default)]
+    npcs: Vec<SavedNpc>,
+    #[serde(default)]
+    world_clock: Option<WorldClock>,
+    #[serde(default)]
+    plans: Vec<(IVec3, SavedPlanState)>,
+    #[serde(default)]
+    world_items: Vec<SavedWorldItem>,
+    #[serde(default)]
+    craft_stations: Vec<(IVec3, SavedStationState)>,
+    #[serde(default)]
+    storage_cells: Vec<IVec3>,
+}
+
+impl From<SaveFileV16> for SaveFile {
+    fn from(old: SaveFileV16) -> Self {
+        SaveFile {
+            version: SAVE_VERSION,
+            block_slots: old.block_slots,
+            edited_chunks: old.edited_chunks,
+            players: old.players,
+            npcs: old.npcs,
+            world_clock: old.world_clock,
+            plans: old.plans,
+            world_items: old.world_items,
+            craft_stations: old.craft_stations,
+            storage_cells: old.storage_cells,
+            containers: Vec::new(),
         }
     }
 }
@@ -291,6 +345,7 @@ impl From<SaveFileV15> for SaveFile {
                 .collect(),
             craft_stations: old.craft_stations,
             storage_cells: old.storage_cells,
+            containers: Vec::new(),
         }
     }
 }
@@ -338,6 +393,7 @@ impl From<SaveFileV14> for SaveFile {
                 .collect(),
             craft_stations: old.craft_stations,
             storage_cells: Vec::new(),
+            containers: Vec::new(),
         }
     }
 }
@@ -385,6 +441,7 @@ impl From<SaveFileV13> for SaveFile {
                 .collect(),
             craft_stations: old.craft_stations,
             storage_cells: Vec::new(),
+            containers: Vec::new(),
         }
     }
 }
@@ -450,6 +507,7 @@ impl From<SaveFileV12> for SaveFile {
                 .collect(),
             craft_stations: old.craft_stations,
             storage_cells: Vec::new(),
+            containers: Vec::new(),
         }
     }
 }
@@ -546,6 +604,15 @@ pub struct SavedCraftOrder {
 pub struct SavedStationItem {
     pub item_id: String,
     pub count: u32,
+}
+
+/// On-disk shape of a
+/// [`ContainerState`](crate::containers::ContainerState) (v17). Stock
+/// entries reuse the station item shape — same id-not-slot stability
+/// convention.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedContainerState {
+    pub inventory: Vec<SavedStationItem>,
 }
 
 /// On-disk shape of a [`PlanState`](crate::protocol::PlanState).
@@ -784,6 +851,7 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
     }
     let meta = read_metadata(&dir)?;
     if meta.version != SAVE_VERSION
+        && meta.version != 16
         && meta.version != 15
         && meta.version != 14
         && meta.version != 13
@@ -800,6 +868,14 @@ pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
         path: blob,
         source: e,
     })?;
+    if meta.version == 16 {
+        // In-memory migration only; the file upgrades on the next
+        // write, so a failed session never rewrites a good v16 save.
+        let (old, _): (SaveFileV16, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+        bevy::log::info!("migrated save {name:?} from v16 (gained container stock)");
+        return Ok(old.into());
+    }
     if meta.version == 15 {
         // In-memory migration only; the file upgrades on the next
         // write, so a failed session never rewrites a good v15 save.
@@ -995,6 +1071,15 @@ mod tests {
                 },
             )],
             storage_cells: vec![IVec3::new(0, 9, 4), IVec3::new(1, 9, 4)],
+            containers: vec![(
+                IVec3::new(5, 9, 4),
+                SavedContainerState {
+                    inventory: vec![SavedStationItem {
+                        item_id: "vanilla:wood_planks".to_owned(),
+                        count: 6,
+                    }],
+                },
+            )],
         };
 
         let bytes = bincode::serde::encode_to_vec(&original, bincode::config::standard()).unwrap();
@@ -1149,6 +1234,7 @@ mod tests {
             world_items: vec![],
             craft_stations: vec![],
             storage_cells: vec![],
+            containers: vec![],
         }
     }
 

@@ -34,6 +34,7 @@ engine.items.register {
     display_name = "Wood Log",
     mesh = "mods://vanilla/models/Wood_Log_B.gltf",
     color = { 0.55, 0.40, 0.22 },
+    tags = { "vanilla:resource" },
     bulk = 3,   -- pile cap = 12/3 = 4 logs
     pile = {
         tiers = {
@@ -50,6 +51,7 @@ engine.items.register {
     display_name = "Stone Chunk",
     mesh = "mods://vanilla/models/Stone_Chunks_Small.gltf",
     color = { 0.55, 0.55, 0.58 },
+    tags = { "vanilla:resource" },
     bulk = 2,   -- pile cap = 12/2 = 6 chunks
     pile = {
         -- Only two chunk meshes exist (Small = base for 1-2, Large for 3+).
@@ -118,6 +120,7 @@ engine.items.register {
     display_name = "Wood Planks",
     mesh = "mods://vanilla/models/Wood_Plank_A.gltf",
     color = { 0.72, 0.55, 0.32 },
+    tags = { "vanilla:resource" },
     bulk = 2,
     pile = {
         tiers = {
@@ -136,6 +139,7 @@ engine.items.register {
     display_name = "Stone Brick",
     mesh = "mods://vanilla/models/Stone_Brick.gltf",
     color = { 0.60, 0.58, 0.55 },
+    tags = { "vanilla:resource" },
     bulk = 2,
     pile = {
         tiers = {
@@ -522,6 +526,87 @@ register {
         need_restore = { need = "hunger", restores = 0.4 },
         duration_secs = 2.0,
         exclusive = false,
+    },
+    -- Storage arc S3: the basket is also a small food-only container.
+    -- Dormant until S4 introduces food *items* (nothing carries the
+    -- vanilla:food tag yet); the S4 food flip makes eating draw this
+    -- stock down and swaps the empty/full basket meshes.
+    container = { capacity_bulk = 16, accepts = { "vanilla:food" } },
+}
+
+-- Storage containers (storage arc S3). A container block keeps a
+-- per-cell inventory (replicated for the inspect panel): the NPC tidy
+-- job stows loose items into an accepting container in preference to
+-- open ground piles, and build/craft hauling withdraws from stock like
+-- any other source. Capacity is measured in bulk (log 3, planks 2,
+-- berry 1) so a crate of tools fills long before a crate of berries.
+-- Mining a stocked container spills its contents.
+--
+-- Meshes: the barrel + crate come from KayKit Dungeon Remastered
+-- (dungeon_texture.png, first use of that atlas) with a 0.5 uniform
+-- scale baked into the gltf node — the pack is authored on a 2 m
+-- dungeon grid, twice our cell. The box is Resource Bits, native
+-- scale. crates_stacked overhangs its cell by ~6 cm like the anvil
+-- does; the mesher skips footprint-cell faces so it reads as bulk,
+-- not clipping.
+register {
+    id = "vanilla:barrel",
+    display_name = "Barrel",
+    flags = {
+        solid = true,
+        support_below = true,
+    },
+    tags = { "vanilla:storage" },
+    color = { 0.52, 0.38, 0.24 },
+    mesh = "mods://vanilla/models/barrel_large.gltf",
+    entity_aabb = {
+        min = { -0.45, 0.0, -0.45 },
+        max = {  0.45, 1.0,  0.45 },
+    },
+    container = { capacity_bulk = 32, accepts = { "vanilla:food", "vanilla:resource" } },
+    materials = {
+        { item = "vanilla:wood_planks", count = 2 },
+    },
+}
+
+register {
+    id = "vanilla:box",
+    display_name = "Storage Box",
+    flags = {
+        solid = true,
+        support_below = true,
+    },
+    tags = { "vanilla:storage" },
+    color = { 0.62, 0.48, 0.30 },
+    mesh = "mods://vanilla/models/Containers_Box_Large.gltf",
+    entity_aabb = {
+        min = { -0.38, 0.0, -0.38 },
+        max = {  0.38, 0.80, 0.38 },
+    },
+    -- accepts omitted = takes anything.
+    container = { capacity_bulk = 40 },
+    materials = {
+        { item = "vanilla:wood_planks", count = 3 },
+    },
+}
+
+register {
+    id = "vanilla:crate",
+    display_name = "Crate Stack",
+    flags = {
+        solid = true,
+        support_below = true,
+    },
+    tags = { "vanilla:storage" },
+    color = { 0.58, 0.44, 0.26 },
+    mesh = "mods://vanilla/models/crates_stacked.gltf",
+    entity_aabb = {
+        min = { -0.55, 0.0, -0.58 },
+        max = {  0.50, 1.08, 0.55 },
+    },
+    container = { capacity_bulk = 64 },
+    materials = {
+        { item = "vanilla:wood_planks", count = 4 },
     },
 }
 

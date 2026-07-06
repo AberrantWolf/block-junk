@@ -34,9 +34,10 @@ use crate::protocol::{
 };
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{
-    SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk, SavedCraftOrder,
-    SavedMaterialEntry, SavedNpc, SavedPlanState, SavedPlayer, SavedStationItem, SavedStationState,
-    SavedTool, SavedWorldItem, UNCLAIMED_PLAYER_ID, read_save, remap_block_slots, write_save,
+    SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk,
+    SavedContainerState, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState,
+    SavedPlayer, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem,
+    UNCLAIMED_PLAYER_ID, read_save, remap_block_slots, write_save,
 };
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
@@ -63,6 +64,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::plan_claims::PlanClaimsPlugin);
         app.add_plugins(crate::haul::HaulPlugin);
         app.add_plugins(crate::craft_stations::CraftStationsServerPlugin);
+        app.add_plugins(crate::containers::ContainersServerPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
@@ -132,12 +134,15 @@ impl Plugin for ServerPlugin {
                 .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
         );
-        // Station teardown rides the same CellEdit bus. Separate
-        // add_systems call: the chained tuple above sits at the Bevy
-        // 0.18 trait-resolution limit already.
+        // Station + container teardown ride the same CellEdit bus.
+        // Separate add_systems call: the chained tuple above sits at
+        // the Bevy 0.18 trait-resolution limit already.
         app.add_systems(
             Update,
-            crate::craft_stations::clear_destroyed_stations
+            (
+                crate::craft_stations::clear_destroyed_stations,
+                crate::containers::clear_destroyed_containers,
+            )
                 .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
         );
@@ -281,6 +286,7 @@ fn load_from_save(
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
     mut stations: ResMut<CraftStations>,
+    mut containers: ResMut<crate::containers::Containers>,
     mut storage_zones: ResMut<crate::storage::StorageZones>,
     mut guard: ResMut<SaveWriteGuard>,
     mut npc_ids: ResMut<crate::npc::NpcIdAllocator>,
@@ -430,6 +436,30 @@ fn load_from_save(
             })
             .collect();
         stations.replace_all(restored);
+    }
+    // Restore container stock (v17). Same id→slot resolution as
+    // station inventories; unknown ids drop just that entry.
+    if !save.containers.is_empty() {
+        let restored: Vec<(IVec3, crate::containers::ContainerState)> = save
+            .containers
+            .into_iter()
+            .map(|(cell, saved)| {
+                let mut state = crate::containers::ContainerState::default();
+                for entry in saved.inventory {
+                    let id = block_junk_mod_api::items::ItemId::new(entry.item_id.clone());
+                    match item_registry.slot_of(&id) {
+                        Some(slot) => state.deposit(slot, entry.count),
+                        None => warn!(
+                            cell = ?cell.to_array(),
+                            item = %entry.item_id,
+                            "saved container stock references unknown item id; dropping entry",
+                        ),
+                    }
+                }
+                (cell, state)
+            })
+            .collect();
+        containers.replace_all(restored);
     }
     // Restore the world clock if the save carries one. Saves predating
     // v4 don't (Option::None); fall back to the resource's default
@@ -828,6 +858,32 @@ fn convert_saved_stations(
         .collect()
 }
 
+/// Convert the engine-side `Containers` snapshot to the on-disk
+/// shape. Stock entries sort by item id for deterministic bytes (the
+/// backing HashMap iterates in arbitrary order).
+fn convert_saved_containers(
+    containers: &crate::containers::Containers,
+    item_registry: &ItemRegistry,
+) -> Vec<(IVec3, SavedContainerState)> {
+    let mut out: Vec<(IVec3, SavedContainerState)> = containers
+        .iter()
+        .map(|(cell, state)| {
+            let mut inventory: Vec<SavedStationItem> = state
+                .inventory
+                .iter()
+                .map(|(slot, count)| SavedStationItem {
+                    item_id: item_registry.id_of(*slot).to_string(),
+                    count: *count,
+                })
+                .collect();
+            inventory.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+            (*cell, SavedContainerState { inventory })
+        })
+        .collect();
+    out.sort_by_key(|(c, _)| (c.x, c.y, c.z));
+    out
+}
+
 /// Convert the engine-side `Plans` snapshot to the on-disk shape.
 /// Item slots are resolved back to their stable [`ItemId`] strings so
 /// the save survives a registry rebuild that changes slot ordering.
@@ -1058,6 +1114,7 @@ pub struct SaveCtx<'w, 's> {
     clock: Res<'w, WorldClock>,
     plans: Res<'w, Plans>,
     stations: Res<'w, CraftStations>,
+    containers: Res<'w, crate::containers::Containers>,
     storage_zones: Res<'w, crate::storage::StorageZones>,
     chunks: Query<
         'w,
@@ -1111,6 +1168,7 @@ fn assemble_save_file(ctx: &SaveCtx) -> SaveFile {
             cells.sort_by_key(|c| (c.x, c.y, c.z));
             cells
         },
+        containers: convert_saved_containers(&ctx.containers, &ctx.item_registry),
     }
 }
 

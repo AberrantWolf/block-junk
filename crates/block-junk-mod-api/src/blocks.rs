@@ -245,6 +245,18 @@ pub struct BlockDef {
     /// not" gate.
     #[serde(default)]
     pub station_tier: u8,
+    /// Marks this block as a storage container (storage arc S3). When
+    /// `Some`, the engine keeps a per-cell inventory for every placed
+    /// instance: NPC tidy runs deposit matching loose items here in
+    /// preference to open piles, and build/craft hauling withdraws
+    /// from the stock like any other item source. `capacity_bulk` is
+    /// the total [`ItemDef::bulk`](crate::items::ItemDef::bulk) the
+    /// container holds (so 100 pickaxes ≠ 100 blueberries), `accepts`
+    /// filters by item category tag ([`ItemDef::tags`](crate::items::ItemDef::tags);
+    /// empty ⇒ accepts anything). Destroying the block spills its
+    /// stock as loose items. `None` ⇒ not a container.
+    #[serde(default)]
+    pub container: Option<ContainerConfig>,
     /// Items required to *build* this block via the Plan workflow. A
     /// player or NPC must deliver this many of each named item to the
     /// plan cell before the work-action can run. Same shape as
@@ -301,6 +313,21 @@ fn scale_drops(materials: &[ItemDrop], multiplier: f32) -> Vec<ItemDrop> {
         })
         .filter(|d| d.count > 0)
         .collect()
+}
+
+/// Storage-container tuning for a block (see [`BlockDef::container`]).
+/// Capacity is measured in bulk, not units, so heavy items (tools,
+/// logs) crowd a container faster than berries do.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContainerConfig {
+    /// Total [`ItemDef::bulk`](crate::items::ItemDef::bulk) this
+    /// container holds across all stocked kinds.
+    pub capacity_bulk: u32,
+    /// Item category tags this container takes
+    /// ([`ItemDef::tags`](crate::items::ItemDef::tags) must intersect).
+    /// Empty ⇒ accepts anything.
+    #[serde(default)]
+    pub accepts: Vec<TagId>,
 }
 
 /// Reference(s) from a block to procedural texture ids defined in a
