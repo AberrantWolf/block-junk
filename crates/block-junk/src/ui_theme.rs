@@ -37,6 +37,10 @@ pub const TEXT_DIM: Color = Color::srgba(0.92, 0.92, 0.88, 0.85);
 pub const CHIP_BG: Color = Color::srgba(0.05, 0.05, 0.05, 0.72);
 /// Hairline border for chips and key caps.
 pub const CHIP_BORDER: Color = Color::srgba(1.0, 1.0, 1.0, 0.22);
+/// Fill behind the *active* HUD chip (e.g. the current mode icon in the
+/// hint strip): a faint wash of the beige accent so the selection reads
+/// as lit rather than bordered-only. Pair with [`PANEL_BORDER`].
+pub const CHIP_ACTIVE_BG: Color = Color::srgba(0.95, 0.85, 0.55, 0.18);
 /// Craft-station accent (matches the Normal-mode station outline).
 pub const ACCENT_STATION: Color = Color::srgb(0.78, 0.42, 0.95);
 

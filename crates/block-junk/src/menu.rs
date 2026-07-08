@@ -289,6 +289,7 @@ impl Plugin for MenuPlugin {
         app.init_resource::<NewWorldName>();
         app.init_resource::<SaveListing>();
         app.init_resource::<SaveStatus>();
+        app.init_resource::<MenuPage>();
         app.add_systems(OnEnter(AppState::MainMenu), refresh_save_listing);
 
         // bevy_egui attaches its primary context to the FIRST camera that
@@ -373,6 +374,48 @@ struct SaveListing(Vec<SaveMetadata>);
 #[derive(Resource, Default)]
 struct SaveStatus(Option<String>);
 
+/// Which screen of the main menu is showing. The menu is split into a
+/// game-like landing page plus focused sub-pages, so the first thing a
+/// new player sees is a short list of big choices rather than a form.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
+enum MenuPage {
+    #[default]
+    Home,
+    Play,
+    Multiplayer,
+    Settings,
+}
+
+/// Scratch values for the placeholder Settings page. None of these are
+/// wired to anything yet — they exist so the page reads as a real
+/// options screen instead of an empty panel. Replace with real settings
+/// when the options pass happens.
+struct DummySettings {
+    master_volume: f32,
+    render_distance: u32,
+    invert_y: bool,
+}
+
+impl Default for DummySettings {
+    fn default() -> Self {
+        Self {
+            master_volume: 0.8,
+            render_distance: 8,
+            invert_y: false,
+        }
+    }
+}
+
+/// A big, fixed-width menu button. Centralises the size + font bump so
+/// every landing-page choice reads at the same weight.
+fn menu_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        [260.0, 46.0],
+        egui::Button::new(egui::RichText::new(label).size(22.0)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn main_menu_ui(
     mut contexts: EguiContexts,
     mut next_state: ResMut<NextState<AppState>>,
@@ -382,11 +425,14 @@ fn main_menu_ui(
     mut new_name: ResMut<NewWorldName>,
     mut listing: ResMut<SaveListing>,
     mut status: ResMut<SaveStatus>,
+    mut page: ResMut<MenuPage>,
     mut exit: MessageWriter<AppExit>,
     // World name awaiting delete confirmation. Delete is irreversible
     // and sits one row away from Load — a single misclick must not
     // destroy a world, so the first click only arms the confirm row.
     mut confirm_delete: Local<Option<String>>,
+    // Placeholder values for the not-yet-wired Settings page.
+    mut dummy: Local<DummySettings>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -395,162 +441,314 @@ fn main_menu_ui(
         addr_input.0 = LOCAL_CONNECT_ADDR.to_string();
     }
 
+    // Push content down from the top so the menu sits toward the middle
+    // of the window regardless of its size.
+    let screen_h = ctx.viewport_rect().height();
+
     let mut root = crate::ui_theme::root_ui(ctx, "main_menu_root");
     egui::CentralPanel::default().show_inside(&mut root, |ui| {
         ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.heading("block-junk");
-            ui.add_space(24.0);
-        });
-
-        ui.separator();
-        ui.add_space(8.0);
-        ui.heading("Worlds");
-
-        // Existing worlds list.
-        if listing.0.is_empty() {
-            ui.label(egui::RichText::new("(no saves yet)").italics().weak());
-        } else {
-            let mut load_request: Option<String> = None;
-            let mut delete_request: Option<String> = None;
-            egui::ScrollArea::vertical()
-                .max_height(180.0)
-                .show(ui, |ui| {
-                    for meta in &listing.0 {
-                        let confirming = confirm_delete.as_deref() == Some(meta.name.as_str());
-                        ui.horizontal(|ui| {
-                            if confirming {
-                                ui.label(
-                                    egui::RichText::new(format!("Delete {:?}?", meta.name))
-                                        .strong(),
-                                );
-                                let danger = egui::Button::new(
-                                    egui::RichText::new("Delete")
-                                        .color(egui::Color32::from_rgb(255, 120, 110)),
-                                );
-                                if ui.add(danger).clicked() {
-                                    delete_request = Some(meta.name.clone());
-                                    *confirm_delete = None;
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    *confirm_delete = None;
-                                }
-                                return;
-                            }
-                            if ui.button("Load").clicked() {
-                                load_request = Some(meta.name.clone());
-                            }
-                            if ui.button("Delete").clicked() {
-                                *confirm_delete = Some(meta.name.clone());
-                            }
-                            ui.label(egui::RichText::new(&meta.name).strong().monospace());
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "({})",
-                                    relative_time(meta.modified_at)
-                                ))
-                                .weak(),
-                            );
-                        });
-                    }
-                });
-            if let Some(name) = load_request {
-                commands.insert_resource(LaunchMode::HostLoad {
-                    save_name: name.clone(),
-                });
-                *join_target = JoinTarget(LOCAL_CONNECT_ADDR);
-                status.0 = None;
-                next_state.set(AppState::InGame);
-            }
-            if let Some(name) = delete_request {
-                match delete_save(&name) {
-                    Ok(()) => {
-                        status.0 = Some(format!("deleted {name:?}"));
-                        // Refresh inline so the list updates this frame.
-                        listing.0 = list_saves().unwrap_or_default();
-                    }
-                    Err(e) => {
-                        status.0 = Some(format!("delete failed: {e}"));
-                    }
-                }
-            }
-        }
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.label("New world name:");
-            ui.add(
-                egui::TextEdit::singleline(&mut new_name.0)
-                    .desired_width(160.0)
-                    .hint_text("worldN"),
-            );
-            if ui.button("Create").clicked() {
-                let trimmed = new_name.0.trim().to_string();
-                match validate_name(&trimmed) {
-                    Ok(()) => {
-                        if save_exists(&trimmed) {
-                            status.0 = Some(format!(
-                                "{trimmed:?} already exists — pick a different name or delete it"
-                            ));
-                        } else {
-                            commands.insert_resource(LaunchMode::HostNew {
-                                save_name: trimmed.clone(),
-                            });
-                            *join_target = JoinTarget(LOCAL_CONNECT_ADDR);
-                            status.0 = None;
-                            next_state.set(AppState::InGame);
-                        }
-                    }
-                    Err(e) => {
-                        status.0 = Some(format!("{e}"));
-                    }
-                }
-            }
-        });
-
-        if let Some(msg) = &status.0 {
-            ui.colored_label(egui::Color32::YELLOW, msg);
-        }
-
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.heading("Multiplayer");
-        ui.horizontal(|ui| {
-            ui.label("Server address:");
-            ui.add(
-                egui::TextEdit::singleline(&mut addr_input.0)
-                    .desired_width(180.0)
-                    .hint_text("127.0.0.1:5050"),
-            );
-            if ui.button("Connect").clicked() {
-                match addr_input.0.parse::<SocketAddr>() {
-                    Ok(addr) => {
-                        commands.insert_resource(LaunchMode::JoinRemote { addr });
-                        *join_target = JoinTarget(addr);
-                        next_state.set(AppState::InGame);
-                    }
-                    Err(e) => {
-                        status.0 = Some(format!("invalid address: {e}"));
-                    }
-                }
-            }
-        });
-
-        ui.add_space(24.0);
-        ui.separator();
-        ui.vertical_centered(|ui| {
-            if ui.button("Quit").clicked() {
-                exit.write(AppExit::Success);
-                // No server session at the main menu; 1s is plenty for a
-                // clean Bevy shutdown if it works at all.
-                arm_quit_watchdog(Duration::from_secs(1));
+            // Fixed column width keeps the buttons and forms from
+            // stretching edge-to-edge on a wide window.
+            ui.set_max_width(440.0);
+            match *page {
+                MenuPage::Home => home_page(ui, screen_h, &mut page, &mut exit),
+                MenuPage::Play => play_page(
+                    ui,
+                    screen_h,
+                    &mut page,
+                    &mut next_state,
+                    &mut commands,
+                    &mut join_target,
+                    &mut new_name,
+                    &mut listing,
+                    &mut status,
+                    &mut confirm_delete,
+                ),
+                MenuPage::Multiplayer => multiplayer_page(
+                    ui,
+                    screen_h,
+                    &mut page,
+                    &mut next_state,
+                    &mut commands,
+                    &mut join_target,
+                    &mut addr_input,
+                    &mut status,
+                ),
+                MenuPage::Settings => settings_page(ui, screen_h, &mut page, &mut dummy),
             }
         });
     });
 }
 
-fn refresh_save_listing(mut listing: ResMut<SaveListing>, mut new_name: ResMut<NewWorldName>) {
+/// Landing page: big title, a stack of large choices. This is the first
+/// thing a new player sees, so it stays to a handful of buttons.
+fn home_page(
+    ui: &mut egui::Ui,
+    screen_h: f32,
+    page: &mut MenuPage,
+    exit: &mut MessageWriter<AppExit>,
+) {
+    ui.add_space(screen_h * 0.15);
+    ui.label(egui::RichText::new("block-junk").size(68.0).strong());
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("a little voxel settlement")
+            .size(15.0)
+            .italics()
+            .weak(),
+    );
+    ui.add_space(36.0);
+    if menu_button(ui, "Play").clicked() {
+        *page = MenuPage::Play;
+    }
+    ui.add_space(10.0);
+    if menu_button(ui, "Multiplayer").clicked() {
+        *page = MenuPage::Multiplayer;
+    }
+    ui.add_space(10.0);
+    if menu_button(ui, "Settings").clicked() {
+        *page = MenuPage::Settings;
+    }
+    ui.add_space(10.0);
+    if menu_button(ui, "Quit").clicked() {
+        exit.write(AppExit::Success);
+        // No server session at the main menu; 1s is plenty for a clean
+        // Bevy shutdown if it works at all.
+        arm_quit_watchdog(Duration::from_secs(1));
+    }
+}
+
+/// Single-player page: the worlds list (load / delete) plus new-world
+/// creation. All the state transitions into a hosted session live here.
+#[allow(clippy::too_many_arguments)]
+fn play_page(
+    ui: &mut egui::Ui,
+    screen_h: f32,
+    page: &mut MenuPage,
+    next_state: &mut NextState<AppState>,
+    commands: &mut Commands,
+    join_target: &mut JoinTarget,
+    new_name: &mut NewWorldName,
+    listing: &mut SaveListing,
+    status: &mut SaveStatus,
+    confirm_delete: &mut Option<String>,
+) {
+    ui.add_space(screen_h * 0.08);
+    ui.label(egui::RichText::new("Play").size(40.0).strong());
+    ui.add_space(16.0);
+
+    if listing.0.is_empty() {
+        ui.label(egui::RichText::new("(no worlds yet — create one below)").italics().weak());
+    } else {
+        let mut load_request: Option<String> = None;
+        let mut delete_request: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .max_height(200.0)
+            .show(ui, |ui| {
+                for meta in &listing.0 {
+                    let confirming = confirm_delete.as_deref() == Some(meta.name.as_str());
+                    ui.horizontal(|ui| {
+                        if confirming {
+                            ui.label(
+                                egui::RichText::new(format!("Delete {:?}?", meta.name)).strong(),
+                            );
+                            let danger = egui::Button::new(
+                                egui::RichText::new("Delete")
+                                    .color(egui::Color32::from_rgb(255, 120, 110)),
+                            );
+                            if ui.add(danger).clicked() {
+                                delete_request = Some(meta.name.clone());
+                                *confirm_delete = None;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                *confirm_delete = None;
+                            }
+                            return;
+                        }
+                        if ui.button("Load").clicked() {
+                            load_request = Some(meta.name.clone());
+                        }
+                        if ui.button("Delete").clicked() {
+                            *confirm_delete = Some(meta.name.clone());
+                        }
+                        ui.label(egui::RichText::new(&meta.name).strong().monospace());
+                        ui.label(
+                            egui::RichText::new(format!("({})", relative_time(meta.modified_at)))
+                                .weak(),
+                        );
+                    });
+                }
+            });
+        if let Some(name) = load_request {
+            commands.insert_resource(LaunchMode::HostLoad {
+                save_name: name.clone(),
+            });
+            *join_target = JoinTarget(LOCAL_CONNECT_ADDR);
+            status.0 = None;
+            next_state.set(AppState::InGame);
+        }
+        if let Some(name) = delete_request {
+            match delete_save(&name) {
+                Ok(()) => {
+                    status.0 = Some(format!("deleted {name:?}"));
+                    // Refresh inline so the list updates this frame.
+                    listing.0 = list_saves().unwrap_or_default();
+                }
+                Err(e) => {
+                    status.0 = Some(format!("delete failed: {e}"));
+                }
+            }
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.label("New world name:");
+        ui.add(
+            egui::TextEdit::singleline(&mut new_name.0)
+                .desired_width(160.0)
+                .hint_text("worldN"),
+        );
+        if ui.button("Create").clicked() {
+            let trimmed = new_name.0.trim().to_string();
+            match validate_name(&trimmed) {
+                Ok(()) => {
+                    if save_exists(&trimmed) {
+                        status.0 = Some(format!(
+                            "{trimmed:?} already exists — pick a different name or delete it"
+                        ));
+                    } else {
+                        commands.insert_resource(LaunchMode::HostNew {
+                            save_name: trimmed.clone(),
+                        });
+                        *join_target = JoinTarget(LOCAL_CONNECT_ADDR);
+                        status.0 = None;
+                        next_state.set(AppState::InGame);
+                    }
+                }
+                Err(e) => {
+                    status.0 = Some(format!("{e}"));
+                }
+            }
+        }
+    });
+
+    if let Some(msg) = &status.0 {
+        ui.colored_label(egui::Color32::YELLOW, msg);
+    }
+
+    ui.add_space(20.0);
+    if menu_button(ui, "Back").clicked() {
+        status.0 = None;
+        *page = MenuPage::Home;
+    }
+}
+
+/// Multiplayer page: connect to a remote host by address.
+#[allow(clippy::too_many_arguments)]
+fn multiplayer_page(
+    ui: &mut egui::Ui,
+    screen_h: f32,
+    page: &mut MenuPage,
+    next_state: &mut NextState<AppState>,
+    commands: &mut Commands,
+    join_target: &mut JoinTarget,
+    addr_input: &mut ConnectAddrInput,
+    status: &mut SaveStatus,
+) {
+    ui.add_space(screen_h * 0.1);
+    ui.label(egui::RichText::new("Multiplayer").size(40.0).strong());
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Join a friend who's hosting a world.")
+            .size(13.0)
+            .weak(),
+    );
+    ui.add_space(20.0);
+    ui.horizontal(|ui| {
+        ui.label("Server address:");
+        ui.add(
+            egui::TextEdit::singleline(&mut addr_input.0)
+                .desired_width(180.0)
+                .hint_text("127.0.0.1:5050"),
+        );
+        if ui.button("Connect").clicked() {
+            match addr_input.0.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    commands.insert_resource(LaunchMode::JoinRemote { addr });
+                    *join_target = JoinTarget(addr);
+                    next_state.set(AppState::InGame);
+                }
+                Err(e) => {
+                    status.0 = Some(format!("invalid address: {e}"));
+                }
+            }
+        }
+    });
+
+    if let Some(msg) = &status.0 {
+        ui.colored_label(egui::Color32::YELLOW, msg);
+    }
+
+    ui.add_space(20.0);
+    if menu_button(ui, "Back").clicked() {
+        status.0 = None;
+        *page = MenuPage::Home;
+    }
+}
+
+/// Placeholder Settings page. Every control here is disabled — it exists
+/// to make the menu feel complete and to reserve a home for the real
+/// options pass. See [`DummySettings`].
+fn settings_page(
+    ui: &mut egui::Ui,
+    screen_h: f32,
+    page: &mut MenuPage,
+    dummy: &mut DummySettings,
+) {
+    ui.add_space(screen_h * 0.1);
+    ui.label(egui::RichText::new("Settings").size(40.0).strong());
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Nothing here works yet — placeholder for the real options pass.")
+            .size(13.0)
+            .italics()
+            .weak(),
+    );
+    ui.add_space(20.0);
+    ui.add_enabled_ui(false, |ui| {
+        egui::Grid::new("settings_grid")
+            .num_columns(2)
+            .spacing([16.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("Master volume");
+                ui.add(egui::Slider::new(&mut dummy.master_volume, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Render distance");
+                ui.add(egui::Slider::new(&mut dummy.render_distance, 2..=16).suffix(" chunks"));
+                ui.end_row();
+                ui.label("Invert Y");
+                ui.checkbox(&mut dummy.invert_y, "");
+                ui.end_row();
+            });
+    });
+
+    ui.add_space(24.0);
+    if menu_button(ui, "Back").clicked() {
+        *page = MenuPage::Home;
+    }
+}
+
+fn refresh_save_listing(
+    mut listing: ResMut<SaveListing>,
+    mut new_name: ResMut<NewWorldName>,
+    mut page: ResMut<MenuPage>,
+) {
+    // Always land on the home page — a fresh menu (or a future
+    // quit-to-menu) should start at the top of the tree, not wherever
+    // the player last was.
+    *page = MenuPage::Home;
     listing.0 = list_saves().unwrap_or_default();
     // Auto-pick a free default name so consecutive "Create" clicks don't
     // collide.

@@ -90,7 +90,7 @@ impl Plugin for PlayerModePlugin {
             .add_systems(OnEnter(AppState::InGame), spawn_mode_pill)
             .add_systems(
                 Update,
-                (handle_mode_input, refresh_mode_pill).in_set(GameSet::Input),
+                (handle_mode_input, refresh_mode_pill, refresh_mode_hints).in_set(GameSet::Input),
             );
     }
 }
@@ -154,7 +154,7 @@ fn spawn_mode_pill(
             ));
         });
 
-    spawn_mode_hints(&mut commands, &asset_server);
+    spawn_mode_hints(&mut commands, &asset_server, *mode);
     spawn_verb_hint(&mut commands, *mode);
 }
 
@@ -207,10 +207,11 @@ fn spawn_verb_hint(commands: &mut Commands, mode: PlayerMode) {
 
 /// Compact hint strip sitting just above the mode pill: one `Tab` key
 /// cap (the cycle binding) followed by the mode icons in cycle order.
-/// Digit keys belong to the hotbar now, so no per-mode key caps.
-/// Always-on; cheap to leave in the HUD because the player can stop
-/// reading once they've memorised it.
-fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer) {
+/// The icon for the *current* mode is lit (full colour + accent chip);
+/// the others are dimmed, so the strip doubles as a "you are here /
+/// what's next" indicator. Digit keys belong to the hotbar now, so no
+/// per-mode key caps. Always-on; cheap to leave in the HUD.
+fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer, current: PlayerMode) {
     commands
         .spawn((
             ModeHintsRoot,
@@ -226,16 +227,60 @@ fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer) {
         .with_children(|row| {
             spawn_key_cap(row, "Tab");
             for m in PlayerMode::ALL {
+                let (tint, bg, border) = mode_hint_visual(m == current);
                 row.spawn((
-                    ImageNode::new(asset_server.load(m.icon_path())),
+                    ModeHintIcon(m),
+                    ImageNode::new(asset_server.load(m.icon_path())).with_color(tint),
                     Node {
                         width: Val::Px(18.0),
                         height: Val::Px(18.0),
+                        // Always reserve the padding + border box so the
+                        // active/inactive swap only changes colour, never
+                        // layout (no reflow jitter as you Tab through).
+                        padding: UiRect::all(Val::Px(3.0)),
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(4.0)),
                         ..default()
                     },
+                    BackgroundColor(bg),
+                    BorderColor::all(border),
                 ));
             }
         });
+}
+
+/// Colours for a mode-hint icon in its active / inactive states, as
+/// `(image tint, chip background, chip border)`. Shared by the initial
+/// spawn and [`refresh_mode_hints`] so the two can never drift.
+fn mode_hint_visual(active: bool) -> (Color, Color, Color) {
+    if active {
+        (
+            Color::WHITE,
+            crate::ui_theme::CHIP_ACTIVE_BG,
+            crate::ui_theme::PANEL_BORDER,
+        )
+    } else {
+        // Tint the icon down toward transparent so unselected modes read
+        // as "available but not current" without a second background.
+        (Color::srgba(1.0, 1.0, 1.0, 0.4), Color::NONE, Color::NONE)
+    }
+}
+
+/// Repaint the mode-hint strip when the mode changes: light up the new
+/// mode's icon, dim the rest. Mirrors `update_hotbar_highlight`.
+fn refresh_mode_hints(
+    mode: Res<PlayerMode>,
+    mut icons: Query<(&ModeHintIcon, &mut ImageNode, &mut BackgroundColor, &mut BorderColor)>,
+) {
+    if !mode.is_changed() {
+        return;
+    }
+    for (hint, mut image, mut bg, mut border) in icons.iter_mut() {
+        let (tint, bg_c, border_c) = mode_hint_visual(hint.0 == *mode);
+        image.color = tint;
+        *bg = BackgroundColor(bg_c);
+        *border = BorderColor::all(border_c);
+    }
 }
 
 /// Small dark "key cap" chip. Used for kbd hint clusters.
@@ -268,6 +313,11 @@ fn spawn_key_cap(parent: &mut ChildSpawnerCommands<'_>, label: &str) {
 
 #[derive(Component)]
 struct ModeHintsRoot;
+
+/// One icon in the mode-hint strip, tagged with the mode it represents so
+/// [`refresh_mode_hints`] can find and light the current one.
+#[derive(Component)]
+struct ModeHintIcon(PlayerMode);
 
 #[derive(Component)]
 struct VerbHintRoot;
