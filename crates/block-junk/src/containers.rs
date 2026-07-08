@@ -62,6 +62,15 @@ impl ContainerState {
         self.inventory.get(&item).copied().unwrap_or(0)
     }
 
+    /// Any stocked item slot (counts are always > 0 — zeros are
+    /// scrubbed). Used by the S4 finite-food eat to pick something to
+    /// draw down from a food container: a food-only basket holds nothing
+    /// but food, so "any stocked item" is "a berry to eat." Iteration
+    /// order is unspecified; a mixed-food basket feeds an arbitrary kind.
+    pub fn any_stocked(&self) -> Option<ItemSlot> {
+        self.inventory.keys().copied().next()
+    }
+
     /// Remove up to `count` of `item`; returns how many actually came
     /// out (short stock withdraws what's there). Zero entries scrub.
     pub fn withdraw_up_to(&mut self, item: ItemSlot, count: u32) -> u32 {

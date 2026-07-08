@@ -65,6 +65,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::haul::HaulPlugin);
         app.add_plugins(crate::craft_stations::CraftStationsServerPlugin);
         app.add_plugins(crate::containers::ContainersServerPlugin);
+        app.add_plugins(crate::regrow::RegrowServerPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
@@ -131,6 +132,16 @@ impl Plugin for ServerPlugin {
                 push_actors_out_of_new_blocks,
             )
                 .chain()
+                .after(receive_block_edits)
+                .in_set(GameSet::Simulation),
+        );
+        // S4 bush-eat transform. Its own add_systems call — the tuple
+        // above is at the trait-resolution limit. Emits CellEdit/
+        // BlockEdit like apply_npc_work; no drops, so ordering vs
+        // spawn_drops_on_destroy is immaterial, only "after edits."
+        app.add_systems(
+            Update,
+            apply_npc_consumption
                 .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
         );
@@ -2042,6 +2053,28 @@ fn apply_break(
     {
         warn!("BlockEdit broadcast failed: {err}");
     }
+
+    // S4 forage harvest-transform: a resource block with `depleted_block`
+    // (a ripe berry bush) doesn't leave bare air when harvested — it
+    // leaves its depleted form behind (bare bush), which the regrow
+    // system then grows back. The clear above already emitted the
+    // destroy `CellEdit` that spawned the drops (berries) off `slot`;
+    // now stamp the depleted block into the just-emptied anchor cell.
+    // Single-cell only: we place the depleted block's own footprint at
+    // the anchor, so a multi-cell resource block would only restore its
+    // anchor cell — fine for bushes, revisit if a big harvestable lands.
+    if let Some(depleted_id) = registry.def(slot).depleted_block.clone()
+        && let Some(depleted_slot) = registry.slot_of(&depleted_id)
+    {
+        apply_place(
+            BlockEdit {
+                anchor,
+                slot: depleted_slot,
+                orientation: Cardinal::default(),
+            },
+            commands, chunks, map, registry, server, broadcast, bus,
+        );
+    }
 }
 
 /// Resolve a default-orientation footprint into world cells. Same shape
@@ -2109,6 +2142,82 @@ fn apply_npc_work(
             server,
             &mut broadcast,
             &mut bus,
+        );
+    }
+}
+
+/// NPC bush-eat consumer (S4 forage). Translates each
+/// [`NpcConsumedInteractable`] into an in-place swap of the block for
+/// its `depleted_block` — *without* spawning drops (the villager ate
+/// the berries; harvesting the same bush drops them instead).
+///
+/// The swap is done as a silent clear (no `CellEdit`, so
+/// `spawn_drops_on_destroy` never fires) followed by an `apply_place` of
+/// the depleted block, which emits the `CellEdit`/`BlockEdit` that
+/// updates the interactable index, arms the regrow timer, and reaches
+/// clients. Single-cell only — bushes have no footprint or sidecar.
+fn apply_npc_consumption(
+    mut reader: MessageReader<crate::npc::NpcConsumedInteractable>,
+    mut commands: Commands,
+    mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: Res<ChunkMap>,
+    registry: Res<BlockRegistry>,
+    servers: Query<&Server>,
+    mut broadcast: ServerMultiMessageSender,
+    mut bus: MessageWriter<CellEdit>,
+) {
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for msg in reader.read() {
+        let (coord, local) = world_to_chunk(msg.cell);
+        let Some(&entity) = map.0.get(&coord) else {
+            continue;
+        };
+        // Resolve the depleted target from whatever block is currently
+        // there — it may have been mined/regrown between eat and now.
+        let depleted_slot = {
+            let Ok((chunk, _)) = chunks.get(entity) else {
+                continue;
+            };
+            let slot = chunk.get(local);
+            if slot.is_empty() {
+                continue;
+            }
+            let Some(depleted_id) = registry.def(slot).depleted_block.clone() else {
+                continue;
+            };
+            match registry.slot_of(&depleted_id) {
+                Some(s) => s,
+                None => continue,
+            }
+        };
+        // Silently empty the cell (no CellEdit ⇒ no drops), then place
+        // the depleted block through the shared path.
+        {
+            let Ok((mut chunk, _)) = chunks.get_mut(entity) else {
+                continue;
+            };
+            chunk.set(local, BlockSlot::EMPTY);
+        }
+        apply_place(
+            BlockEdit {
+                anchor: msg.cell,
+                slot: depleted_slot,
+                orientation: Cardinal::default(),
+            },
+            &mut commands,
+            &mut chunks,
+            &map,
+            &registry,
+            server,
+            &mut broadcast,
+            &mut bus,
+        );
+        info!(
+            cell = ?msg.cell.to_array(),
+            depleted = %registry.id_of(depleted_slot),
+            "npc ate a self-consuming interactable; depleted it",
         );
     }
 }

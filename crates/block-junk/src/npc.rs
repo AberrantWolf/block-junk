@@ -655,6 +655,9 @@ impl Plugin for NpcServerPlugin {
         // BlockEdit + clears the plan tag. Splits these concerns so the
         // brain tick stays under the SystemParam cap.
         app.add_message::<NpcWorkCompleted>();
+        // Same split for the S4 eat-a-bush transform (see
+        // NpcConsumedInteractable): brain emits, server applies.
+        app.add_message::<NpcConsumedInteractable>();
         // Brain → mover order matters: the brain commits/advances goals
         // this tick, the kinematic mover executes them, and the brain
         // reads the results (edge cursor, blocked flag) next tick. Both
@@ -788,6 +791,18 @@ fn refresh_npc_activity(
 pub struct NpcWorkCompleted {
     pub cell: IVec3,
     pub plan_kind: PlanKind,
+}
+
+/// Server-internal signal that an NPC finished eating a self-consuming
+/// interactable at `cell` — a berry bush. `apply_npc_consumption`
+/// resolves the block's `depleted_block` and swaps it in place *without*
+/// spawning drops (the villager ate the berries), which is what
+/// separates eating from harvesting the same bush. Mirrors the
+/// [`NpcWorkCompleted`] → `apply_npc_work` split: the brain can't mutate
+/// chunks in place, so it emits and a server system applies.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct NpcConsumedInteractable {
+    pub cell: IVec3,
 }
 
 /// Observer: an NPC entity is despawning — release everything keyed by
@@ -2536,41 +2551,105 @@ fn npc_brain_tick(
                 ..
             } = &brain.goal
             {
-                if let Some(nr) = need_restore {
-                    if let Some(value) = needs.0.get_mut(&nr.need) {
-                        *value = (*value - nr.restores).max(0.0);
+                let need_restore = need_restore.clone();
+                let anchor_cell = *anchor_cell;
+                let target_cell = *target_cell;
+                let exclusive = *exclusive;
+
+                // Resolve the block we just used; finite-food behaviour
+                // keys off its def. A container-backed interactable (a
+                // food basket) draws stock down; a `depleted_block`
+                // interactable (a berry bush) self-consumes. These are
+                // mutually exclusive in vanilla — a block is one or the
+                // other — so they're handled independently below.
+                let (is_container, depleted) = match world.slot_at(target_cell) {
+                    Some(s) if !s.is_empty() => {
+                        let d = block_registry.def(s);
+                        (d.container.is_some(), d.depleted_block.is_some())
+                    }
+                    _ => (false, false),
+                };
+
+                // S4 finite food: eating from a container withdraws one
+                // unit of stock. If it emptied between planning and now
+                // (another villager took the last berry), the eat
+                // restores nothing — "empty basket = no restore." A
+                // successful withdraw broadcasts the new stock so the
+                // client inspect panel + planner stay in sync.
+                let mut restore_ok = true;
+                if is_container {
+                    restore_ok = false;
+                    if let Some(state) = haul.containers.get_mut(target_cell)
+                        && let Some(food) = state.any_stocked()
+                        && state.withdraw_up_to(food, 1) == 1
+                    {
+                        restore_ok = true;
+                        let after = state.clone();
+                        haul.containers.remove_if_empty(target_cell);
+                        if let Some(server) = server {
+                            crate::containers::broadcast_container(
+                                &mut haul.broadcast,
+                                server,
+                                target_cell,
+                                (!after.is_empty()).then_some(after),
+                            );
+                        }
+                    }
+                }
+
+                if restore_ok {
+                    if let Some(nr) = &need_restore {
+                        if let Some(value) = needs.0.get_mut(&nr.need) {
+                            *value = (*value - nr.restores).max(0.0);
+                            info!(
+                                npc = npc_id.0,
+                                need = %nr.need,
+                                restored = nr.restores,
+                                remaining_deficit = *value,
+                                "interaction complete",
+                            );
+                        } else {
+                            warn!(
+                                npc = npc_id.0,
+                                need = %nr.need,
+                                "interaction complete but NPC has no entry for need; ignoring",
+                            );
+                        }
+                        // Provisional home-cluster claim: finishing a
+                        // sleep anywhere claims the cluster that owns
+                        // that cell. Match is by need id ("sleep"), not
+                        // block kind, so any future sleep-restoring
+                        // interactable counts.
+                        if nr.need == "sleep" {
+                            sleep_cell = Some(target_cell);
+                        }
+                    } else {
                         info!(
                             npc = npc_id.0,
-                            need = %nr.need,
-                            restored = nr.restores,
-                            remaining_deficit = *value,
-                            "interaction complete",
+                            target = ?target_cell.to_array(),
+                            "interaction complete (no need change)",
                         );
-                    } else {
-                        warn!(
-                            npc = npc_id.0,
-                            need = %nr.need,
-                            "interaction complete but NPC has no entry for need; ignoring",
-                        );
-                    }
-                    // Provisional home-cluster claim: finishing a sleep
-                    // anywhere claims the cluster that owns that cell.
-                    // Match is by need id ("sleep"), not block kind, so
-                    // any future sleep-restoring interactable counts.
-                    if nr.need == "sleep" {
-                        sleep_cell = Some(*target_cell);
                     }
                 } else {
                     info!(
                         npc = npc_id.0,
-                        target = ?target_cell.to_array(),
-                        "interaction complete (no need change)",
+                        cell = ?target_cell.to_array(),
+                        "interaction complete against an empty container; no restore",
                     );
                 }
-                if *exclusive {
-                    interaction_claims.release(*anchor_cell, *npc_id);
+
+                // S4 forage: eating a self-consuming interactable (berry
+                // bush) depletes it to its bare form. No drops — the
+                // villager ate the berries — so it can't reuse the
+                // harvest path; a server system does the in-place swap.
+                if depleted {
+                    commands.write_message(NpcConsumedInteractable { cell: target_cell });
                 }
-                interact_done = Some(*target_cell);
+
+                if exclusive {
+                    interaction_claims.release(anchor_cell, *npc_id);
+                }
+                interact_done = Some(target_cell);
             }
             if let Some(cell) = sleep_cell
                 && let Some(cluster) = anchors
@@ -2900,6 +2979,7 @@ fn npc_brain_tick(
                 &anchors.rooms,
                 &interactable_index,
                 &interaction_claims,
+                &haul.containers,
                 &haul.plans,
                 &haul.plan_claims,
                 &haul.store,
@@ -3981,6 +4061,7 @@ fn build_snapshot(
     rooms: &RoomMap,
     interactables: &InteractableIndex,
     interaction_claims: &InteractionClaims,
+    containers: &crate::containers::Containers,
     plans: &Plans,
     plan_claims: &PlanClaims,
     haul_store: &HaulStore,
@@ -3998,6 +4079,7 @@ fn build_snapshot(
     let nearby_interactions = collect_nearby_interactions(
         interactables,
         interaction_claims,
+        containers,
         block_registry,
         chunk_entities,
         chunk_map,
@@ -4552,6 +4634,7 @@ fn compute_use_slot_snap(slot: &UseSlot, anchor_cell: IVec3, orientation: Cardin
 fn collect_nearby_interactions(
     index: &InteractableIndex,
     claims: &InteractionClaims,
+    containers: &crate::containers::Containers,
     block_registry: &BlockRegistry,
     chunk_entities: &Query<&'static ChunkEntities>,
     chunk_map: &ChunkMap,
@@ -4564,12 +4647,25 @@ fn collect_nearby_interactions(
     let mut seen_anchors: HashSet<IVec3> = HashSet::new();
     let mut out: Vec<NearbyInteraction> = Vec::new();
     for (cell, slot) in index.iter_within(foot, radius_cells) {
-        let Some(i) = block_registry.def(slot).interactable.as_ref() else {
+        let def = block_registry.def(slot);
+        let Some(i) = def.interactable.as_ref() else {
             // Defensive: stale index entry whose def is no longer
             // interactable (would happen if a future mod-reload
             // changed metadata under us). Just skip.
             continue;
         };
+        // S4 finite food: a container-backed interactable (a food
+        // basket) with no stock restores nothing, so an empty one must
+        // not be offered as a food source — the planner should route to
+        // a stocked basket or a wild bush instead. Containers are sparse
+        // (empty ⇒ no entry), so "no entry" means "empty." Non-container
+        // interactables (wild bushes, beds) never gate on stock; a ripe
+        // bush is edible for as long as it carries this metadata.
+        if def.container.is_some()
+            && containers.get(cell).map(|s| s.is_empty()).unwrap_or(true)
+        {
+            continue;
+        }
         let anchor = resolve_anchor_cell(cell, chunk_entities, chunk_map);
         // Collapse multi-cell blocks to one entry. Without this a
         // 2-cell bed's foot + head both surface as separate

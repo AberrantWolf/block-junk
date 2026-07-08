@@ -30,6 +30,7 @@ mod player_mode;
 mod preview;
 mod protocol;
 mod recipes;
+mod regrow;
 mod room_sync;
 mod rooms;
 mod save;

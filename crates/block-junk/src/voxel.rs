@@ -465,6 +465,13 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
             }
         }
     }
+    // No tree claimed this cell. A ripe berry bush may sit in the first
+    // air cell above the grass surface — the S4 wild-food stamp. A
+    // tree-root column already returned its trunk above, so a bush never
+    // lands on a trunk; skip gravel scree (bushes grow from grass).
+    if world.y == h_here && is_berry_bush(world.x, world.z) && !in_gravel_patch(world.x, world.z) {
+        return slots.berry_bush;
+    }
     slots.empty
 }
 
@@ -521,6 +528,16 @@ fn is_tree_root(x: i32, z: i32) -> bool {
     (tree_hash(x, z) & 0x1F) == 0
 }
 
+/// Whether column `(x, z)` grows a ripe berry bush — a single-cell
+/// forage stamp on the grass surface (storage-arc S4). Sparser than
+/// trees (~1 in 64 columns) so a bush is an occasional find, not a
+/// thicket. Reads bits 20+ of the shared hash, disjoint from tree
+/// roots (bits 0-4/8) and gravel (bits 5-13/16), so bushes don't
+/// correlate with either feature.
+fn is_berry_bush(x: i32, z: i32) -> bool {
+    (tree_hash(x, z) >> 20) & 0x3F == 0
+}
+
 /// Integer hash mixing (large primes, xorshift-style finalizer) shared
 /// by tree placement (low bits) and per-tree variation (higher bits).
 /// The specific constants are arbitrary; the only requirement is good
@@ -566,6 +583,63 @@ mod tests {
                 "mirror local {local} must be padding"
             );
         }
+    }
+
+    /// Distinct sentinel slots so `terrain_block` output is
+    /// unambiguous per block kind in the forage-stamp test.
+    fn test_slots() -> TerrainSlots {
+        TerrainSlots {
+            empty: BlockSlot::EMPTY,
+            stone: BlockSlot(1),
+            dirt: BlockSlot(2),
+            grass: BlockSlot(3),
+            wood: BlockSlot(4),
+            leaves: BlockSlot(5),
+            gravel: BlockSlot(6),
+            berry_bush: BlockSlot(7),
+        }
+    }
+
+    /// S4 forage stamp: every hash-selected bush column (that isn't a
+    /// tree trunk or gravel scree) grows a ripe bush in the first air
+    /// cell above a grass surface, and a bush never overwrites a trunk.
+    #[test]
+    fn berry_bushes_stamp_on_grass_above_surface() {
+        let slots = test_slots();
+        let mut bush_count = 0;
+        for x in -90..90 {
+            for z in -90..90 {
+                if !is_berry_bush(x, z) || in_gravel_patch(x, z) {
+                    continue;
+                }
+                let h = surface_height(x, z);
+                let at = terrain_block(IVec3::new(x, h, z), &slots);
+                if is_tree_root(x, z) {
+                    // A trunk owns its column's ground cell — the bush
+                    // stamp must yield to it, never overwrite it.
+                    assert_ne!(
+                        at, slots.berry_bush,
+                        "bush overwrote a tree trunk at ({x},{z})"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    at, slots.berry_bush,
+                    "expected a ripe bush at ({x},{z}) surface height {h}"
+                );
+                // It sits directly on grass — not floating, not on dirt.
+                assert_eq!(
+                    terrain_block(IVec3::new(x, h - 1, z), &slots),
+                    slots.grass,
+                    "bush at ({x},{z}) must rest on a grass surface"
+                );
+                bush_count += 1;
+            }
+        }
+        assert!(
+            bush_count > 5,
+            "expected several bushes in a 180x180 region, got {bush_count}"
+        );
     }
 
     #[test]

@@ -272,6 +272,28 @@ pub struct BlockDef {
     /// `drops` *defaults* to this list (see [`drops`](Self::drops)).
     #[serde(default)]
     pub materials: Vec<ItemDrop>,
+    /// Storage-arc S4 (finite food / foraging). The block this one
+    /// turns into when its resource is *consumed* — either an NPC eats
+    /// it in place (a berry bush is an [`interactable`](Self::interactable)
+    /// whose completion depletes it) or a player/NPC harvests it (a
+    /// mined block with `depleted_block` leaves this behind instead of
+    /// air, its `drops` still spawning). `None` ⇒ eating/mining behaves
+    /// normally (basket restores forever; mined block → air). Pairs with
+    /// [`regrow`](Self::regrow) on the depleted block to close the loop.
+    /// Cross-validated at boot against the block registry.
+    #[serde(default)]
+    pub depleted_block: Option<BlockId>,
+    /// Storage-arc S4. When present, a placed instance of this block
+    /// automatically transforms into `into` after `after_secs` of world
+    /// time — the regrow half of the forage loop (bare bush → ripe bush;
+    /// future crops). The server schedules the transition when the block
+    /// appears (placement, harvest-transform, or chunk load) and applies
+    /// it via a normal block edit, so clients see it replicate like any
+    /// other change. Timers are runtime-only and re-primed on load — a
+    /// reload restarts the clock, which reads as "the world paused."
+    /// Cross-validated at boot against the block registry.
+    #[serde(default)]
+    pub regrow: Option<Regrow>,
 }
 
 impl BlockDef {
@@ -328,6 +350,17 @@ pub struct ContainerConfig {
     /// Empty ⇒ accepts anything.
     #[serde(default)]
     pub accepts: Vec<TagId>,
+}
+
+/// Timed self-transition for a block (see [`BlockDef::regrow`]).
+/// The bare/depleted end of a forage loop carries this so the server
+/// knows to grow it back into a productive block after a delay.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Regrow {
+    /// The block this one becomes once the timer elapses.
+    pub into: BlockId,
+    /// World-time seconds a placed instance waits before transforming.
+    pub after_secs: f32,
 }
 
 /// Reference(s) from a block to procedural texture ids defined in a

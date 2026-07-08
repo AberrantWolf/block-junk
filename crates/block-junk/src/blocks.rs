@@ -84,6 +84,16 @@ pub enum BootstrapError {
     UseSlotApproachInsideFootprint { block: BlockId, cell: [i32; 3] },
     #[error("block {block} use_slot.animation references unregistered animation {anim}")]
     UseSlotAnimationUnknown { block: BlockId, anim: String },
+    #[error("block {block} {field} references unregistered block {target}")]
+    BlockRefUnknown {
+        block: BlockId,
+        field: &'static str,
+        target: BlockId,
+    },
+    #[error(
+        "block {block} regrow.after_secs = {value}; must be > 0 (a zero/negative delay would regrow instantly, thrashing the schedule)"
+    )]
+    RegrowDelayOutOfRange { block: BlockId, value: f32 },
 }
 
 /// The live, finalised registry. Held as a Bevy `Resource` on each side.
@@ -329,6 +339,41 @@ impl BlockRegistry {
         }
         Ok(())
     }
+
+    /// Cross-validate the storage-arc S4 block-reference fields
+    /// (`depleted_block`, `regrow.into`) against this registry, and
+    /// bound `regrow.after_secs` above zero. A dangling reference is a
+    /// data typo that would otherwise panic at first harvest/regrow;
+    /// catch it at boot like every other cross-registry link.
+    pub fn validate_transitions(&self) -> Result<(), BootstrapError> {
+        for def in &self.defs_by_slot {
+            if let Some(target) = &def.depleted_block
+                && !self.slot_by_id.contains_key(target)
+            {
+                return Err(BootstrapError::BlockRefUnknown {
+                    block: def.id.clone(),
+                    field: "depleted_block",
+                    target: target.clone(),
+                });
+            }
+            if let Some(regrow) = &def.regrow {
+                if !self.slot_by_id.contains_key(&regrow.into) {
+                    return Err(BootstrapError::BlockRefUnknown {
+                        block: def.id.clone(),
+                        field: "regrow.into",
+                        target: regrow.into.clone(),
+                    });
+                }
+                if regrow.after_secs <= 0.0 {
+                    return Err(BootstrapError::RegrowDelayOutOfRange {
+                        block: def.id.clone(),
+                        value: regrow.after_secs,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Slots the engine's terrain generator resolves once at startup so it
@@ -343,6 +388,12 @@ pub struct TerrainSlots {
     pub wood: BlockSlot,
     pub leaves: BlockSlot,
     pub gravel: BlockSlot,
+    /// Storage-arc S4 forage terrain: a ripe berry bush stamped in the
+    /// air cell above grass. Harvest/eat depletes it to a bare bush
+    /// (via `BlockDef.depleted_block`) which regrows back — those
+    /// transitions read block defs directly, so only the ripe stamp
+    /// needs a resolved slot here.
+    pub berry_bush: BlockSlot,
 }
 
 impl TerrainSlots {
@@ -355,6 +406,7 @@ impl TerrainSlots {
             wood: reg.require("vanilla:wood"),
             leaves: reg.require("vanilla:leaves"),
             gravel: reg.require("vanilla:gravel"),
+            berry_bush: reg.require("vanilla:berry_bush"),
         }
     }
 }

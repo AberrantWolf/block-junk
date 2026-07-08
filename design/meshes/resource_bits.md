@@ -25,11 +25,13 @@ S3 shipped 2026-07-06: `Containers_Box_Large` = the `vanilla:box` block
 Dungeon Remastered instead (see that file).
 
 **Food** (S4) — `Food_Basket_A_Berries`✅ (imported as `berry_basket.gltf`),
-`Food_Basket_A_Empty`, `Food_Basket_B_{Berries,Empty}`,
-`Food_Barrel_{Empty,Fish}`, `Food_Berry_{Blue,Orange}`,
-`Food_Apple_{Red,Green}`, `Food_Cheese`, `Food_Flour`,
+`Food_Basket_A_Empty`✅ (staged for the deferred empty/full basket swap,
+not yet wired), `Food_Basket_B_{Berries,Empty}`,
+`Food_Barrel_{Empty,Fish}`, `Food_Berry_Blue`✅ (the `vanilla:berry`
+item), `Food_Berry_Orange`, `Food_Apple_{Red,Green}` (apples deferred),
+`Food_Cheese`, `Food_Flour`,
 `Food_Crate_{Small_Berries,Small_Empty,Large_Apples,Large_Empty}`,
-`Food_Pile_{Small,Medium,Large}`.
+`Food_Pile_{Small,Medium,Large}`✅ (berry pile tiers).
 
 **Metals** (future minerals/bronze arc) — for each of Copper / Iron /
 Silver / Gold: `_Bar`, `_Bars`, `_Nugget_{Small,Medium,Large}`,

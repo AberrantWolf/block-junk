@@ -313,6 +313,11 @@ fn load_side(side: Side) -> LoadResult {
     if let Err(e) = blocks.validate_use_slots() {
         panic!("{} use_slot validation failed: {e}", side.as_str());
     }
+    // S4 forage loop: depleted_block / regrow.into must resolve, or a
+    // harvest/regrow would panic mid-game looking up a dangling id.
+    if let Err(e) = blocks.validate_transitions() {
+        panic!("{} block transition validation failed: {e}", side.as_str());
+    }
     // Animations need to exist before kinds + use-slots can reference
     // them. Build them before the cross-validators so the failure
     // mode is "unknown animation id," not "kind/use-slot references

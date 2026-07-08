@@ -869,6 +869,34 @@ mod tests {
         assert_eq!(blocks[0].drops.as_ref().unwrap()[0].count, 5);
     }
 
+    /// The S4 forage-transition knobs survive the Lua→serde boundary:
+    /// `depleted_block` (what a harvested/eaten block becomes) and the
+    /// `regrow` table (`into` + `after_secs`). Omitted ⇒ both None.
+    #[test]
+    fn lua_forage_transition_fields_deserialize() {
+        let (lua, ctx) = engine_fixture();
+        register_test_block(
+            &lua,
+            "depleted_block = 'test:bare', regrow = { into = 'test:ripe', after_secs = 90.0 },",
+        );
+        let blocks = ctx.take_blocks();
+        assert_eq!(
+            blocks[0].depleted_block.as_ref().map(|b| b.as_str()),
+            Some("test:bare"),
+            "depleted_block must parse to the named block id"
+        );
+        let regrow = blocks[0].regrow.as_ref().expect("regrow table parses");
+        assert_eq!(regrow.into.as_str(), "test:ripe");
+        assert_eq!(regrow.after_secs, 90.0);
+
+        // Omitted ⇒ both None (the non-forage default for every block).
+        let (lua, ctx) = engine_fixture();
+        register_test_block(&lua, "");
+        let blocks = ctx.take_blocks();
+        assert!(blocks[0].depleted_block.is_none());
+        assert!(blocks[0].regrow.is_none());
+    }
+
     /// The S2 pile knobs survive the Lua→serde boundary: `bulk`, the
     /// optional `pile` table with its `tiers` list, and the derived
     /// helpers (capacity from bulk, tier mesh by count). An item with no

@@ -62,6 +62,28 @@ engine.items.register {
     hold_transform = { scale = 0.4 },   -- ~1.1 m chunk → hand size (tune in-game)
 }
 
+-- Storage-arc S4: the first food item. `vanilla:food` is the category
+-- tag baskets/barrels accept and the finite-food loop draws down — a
+-- berry is what a bush yields when harvested and what an NPC eats out
+-- of a stocked basket. bulk 1 ⇒ a 16-bulk basket holds 16 berries;
+-- pile cap 12. Meshes from KayKit Resource Bits (single berry → loose
+-- food heaps for stacks), sharing resource_bits_texture.png.
+engine.items.register {
+    id = "vanilla:berry",
+    display_name = "Berries",
+    mesh = "mods://vanilla/models/Food_Berry_Blue.gltf",
+    color = { 0.28, 0.35, 0.72 },
+    tags = { "vanilla:food" },
+    bulk = 1,   -- pile cap = 12/1 = 12 berries
+    pile = {
+        tiers = {
+            { min = 2, mesh = "mods://vanilla/models/Food_Pile_Small.gltf" },
+            { min = 5, mesh = "mods://vanilla/models/Food_Pile_Medium.gltf" },
+            { min = 9, mesh = "mods://vanilla/models/Food_Pile_Large.gltf" },
+        },
+    },
+}
+
 -- Tools (Phase 5a/b). Each tool's `tool_tags` is the engine-side
 -- handle a block's `work_action.required_tool` matches against.
 -- Meshes from KayKit RPG Tools Bits 1.0; they share
@@ -532,6 +554,74 @@ register {
     -- vanilla:food tag yet); the S4 food flip makes eating draw this
     -- stock down and swaps the empty/full basket meshes.
     container = { capacity_bulk = 16, accepts = { "vanilla:food" } },
+}
+
+-- Storage-arc S4 forage terrain. A berry bush is hash-stamped onto
+-- grass (see voxel.rs, like gravel patches) and is the wild supply that
+-- keeps finite food from starving a settlement: villagers eat straight
+-- off a ripe bush when nothing's stocked, and players harvest bushes for
+-- the berries that stock baskets.
+--
+-- Two states wired as a loop via the S4 block-transition fields:
+--   ripe  (vanilla:berry_bush)      — edible + harvestable; both paths
+--                                      leave `depleted_block` behind.
+--   bare  (vanilla:bare_berry_bush) — `regrow`s back into ripe.
+--
+-- MVP visuals: a solid textured cube (green leaves ↔ brown bark) — the
+-- terrain mesher renders it with no extra plumbing. A proper bush mesh
+-- is a Lua one-line swap later (berry_bush.glb / berry_bush_bare.glb are
+-- already staged in models/ for that pass; terrain-generated *mesh*
+-- blocks need sidecar-anchor plumbing that cube blocks skip).
+--
+-- Not placeable (no build-menu clutter) — bushes only exist via terrain
+-- gen + the regrow transition.
+register {
+    id = "vanilla:berry_bush",
+    display_name = "Berry bush",
+    flags = {
+        solid = true,
+        support_below = true,
+        placeable = false,
+    },
+    color = { 0.24, 0.46, 0.26 },
+    texture = "vanilla:leaves",
+    -- Eaten in place by a hungry villager with nothing stocked: same
+    -- 0.4 hunger + 2 s hold as a basket, non-exclusive so a patch feeds
+    -- a queue. On completion the engine swaps the bush for its
+    -- depleted_block (see npc.rs interaction-complete).
+    interactable = {
+        need_restore = { need = "hunger", restores = 0.4 },
+        duration_secs = 2.0,
+        exclusive = false,
+    },
+    -- Harvested (player L-click / NPC remove) → 3 berries + a bare bush
+    -- (apply_break honors depleted_block instead of clearing to air).
+    -- Light, tool-free work like clearing leaves.
+    drops = {
+        { item = "vanilla:berry", count = 3 },
+    },
+    work_action = {
+        duration_secs = 1.5,
+        need_restore = { need = "work", restores = 0.05 },
+    },
+    depleted_block = "vanilla:bare_berry_bush",
+}
+
+register {
+    id = "vanilla:bare_berry_bush",
+    display_name = "Bare bush",
+    flags = {
+        solid = true,
+        support_below = true,
+        placeable = false,
+    },
+    color = { 0.40, 0.30, 0.20 },
+    texture = "vanilla:wood_bark",
+    -- Nothing to eat or harvest here — just wait. Regrows into a ripe
+    -- bush after two minutes of world time (the server schedules this
+    -- whenever a bare bush appears: harvest, eat, or chunk load).
+    drops = {},
+    regrow = { into = "vanilla:berry_bush", after_secs = 120.0 },
 }
 
 -- Storage containers (storage arc S3). A container block keeps a
