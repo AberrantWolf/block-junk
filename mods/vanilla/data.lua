@@ -375,6 +375,19 @@ register {
         duration_secs = 25.0,
         exclusive = true,
     },
+    -- F1 retrofit: beds joined the plank-furniture cost tier (they were
+    -- free before materials existed). Same hammer build-gate as the
+    -- other carpentry pieces below.
+    materials = {
+        { item = "vanilla:wood_planks", count = 4 },
+    },
+    work_action = {
+        duration_secs = 4.0,
+        need_restore = { need = "work", restores = 0.1 },
+        required_tool = "vanilla:axe",
+        no_tool_multiplier = 3.0,
+        build_required_tool = "vanilla:hammer",
+    },
     -- Snap-to-slot positioning for the sleep action. Without this the
     -- brain would try to derive "stand atop the foot cell + face the
     -- bed's extends axis" through the regular walk/collide pipeline,
@@ -490,16 +503,46 @@ engine.rooms.register {
 -- roof + headroom + size gates and deepest-match beats the plain house.
 -- The tag counts read placement units (a 2-cell bed = 1 bed), scanned
 -- across the room's interior including furniture sitting ON the floor.
+-- Sibling priority order (F1): bedroom 4 > dining 3 > study 2 >
+-- workshop 1. A house that qualifies for several reads as the most
+-- domestic one — where you sleep defines home, then where you eat.
 engine.rooms.register {
     id = "vanilla:bedroom",
     display_name = "Bedroom",
     parent = "vanilla:small_house",
     domain = "volumetric",
-    -- A house with both a bed and a crafting station reads as a bedroom
-    -- first (priority over workshop): where you sleep defines home.
-    priority = 2,
+    priority = 4,
     constraints = {
         { kind = "tag_count", tag = "vanilla:bed", min = 1 },
+    },
+}
+
+-- F1: a table with at least two seats pulled up to it. adjacent_pair
+-- counts seat placements whose cell touches a table cell (4-dir, same
+-- layer) — a lone chair in the corner doesn't make a dining room.
+engine.rooms.register {
+    id = "vanilla:dining",
+    display_name = "Dining room",
+    parent = "vanilla:small_house",
+    domain = "volumetric",
+    priority = 3,
+    constraints = {
+        { kind = "tag_count", tag = "vanilla:table", min = 1 },
+        { kind = "adjacent_pair", a = "vanilla:seat", b = "vanilla:table", min = 2 },
+    },
+}
+
+-- F1: desk + shelving. Co-presence is enough here (unlike dining) —
+-- a study is defined by what's in it, not how it's arranged.
+engine.rooms.register {
+    id = "vanilla:study",
+    display_name = "Study",
+    parent = "vanilla:small_house",
+    domain = "volumetric",
+    priority = 2,
+    constraints = {
+        { kind = "tag_count", tag = "vanilla:desk", min = 1 },
+        { kind = "tag_count", tag = "vanilla:shelf", min = 1 },
     },
 }
 
@@ -864,6 +907,384 @@ register {
         build_required_tool = "vanilla:hammer",
     },
 }
+
+-- ============================================================
+-- Furniture (storage arc F1).
+--
+-- Wood pieces are KayKit Furniture Bits (furniturebits_texture.png);
+-- stone pieces are KayKit Dungeon Remastered (dungeon_texture.png).
+-- Every gltf root node bakes a TRS so the mesh sits on its footprint
+-- box in default (+X-extends) orientation — see design/meshes/ for
+-- the per-mesh table. Cost tiers per the progression plan: crude
+-- pieces (stool, low table, stone bench) cost raw logs/chunks with
+-- no tool gate; carpentry pieces cost planks and hard-require a
+-- hammer to build (same gate as the planks block); masonry (pillar,
+-- column) costs stone bricks behind the same hammer gate.
+--
+-- Seats carry a *positional* interactable (no need_restore) + use_slot:
+-- the documented "sit in chair" shape. Nothing routes to them yet —
+-- the need-driven planner ignores need-less interactables — but when
+-- A2 lands its rest-seeking branch, chairs work without a data change.
+-- Sit-pose yaw/animation get tuned in A2 alongside the Sit_Chair clips.
+--
+-- nav_passable on seats/tables/rugs mirrors the bed rationale: NPCs
+-- may route through furniture cells at extra cost, so a furnished
+-- room never walls anyone in. Cabinets, bookcases, and pillars are
+-- proper obstacles.
+
+local carpentry_work = {
+    duration_secs = 4.0,
+    need_restore = { need = "work", restores = 0.1 },
+    required_tool = "vanilla:axe",
+    no_tool_multiplier = 3.0,
+    build_required_tool = "vanilla:hammer",
+}
+local masonry_work = {
+    duration_secs = 4.0,
+    need_restore = { need = "work", restores = 0.1 },
+    required_tool = "vanilla:pickaxe",
+    no_tool_multiplier = 10.0,
+    build_required_tool = "vanilla:hammer",
+}
+-- One sitter at a time; long enough to read as a proper sit-down.
+local sit_interact = { duration_secs = 10.0, exclusive = true }
+-- Chairs face +X (baked +90° rotation); approach from any neighbour.
+local seat_use_slot = {
+    pose = { 0.0, 0.5, 0.0 },
+    yaw = 0.0,
+    approach = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 0, -1 }, { 0, 0, 1 } },
+}
+
+local function wood_seat(id, name, mesh, aabb_min_x)
+    register {
+        id = id,
+        display_name = name,
+        flags = { solid = true, support_below = true, nav_passable = true },
+        tags = { "vanilla:seat" },
+        color = { 0.55, 0.40, 0.25 },
+        mesh = mesh,
+        entity_aabb = {
+            min = { aabb_min_x, 0.0, -0.38 },
+            max = { 0.38, 1.26, 0.38 },
+        },
+        interactable = sit_interact,
+        use_slot = seat_use_slot,
+        materials = { { item = "vanilla:wood_planks", count = 2 } },
+        work_action = carpentry_work,
+    }
+end
+
+-- Backrests lean slightly past the west cell face (chair_C most of
+-- all) — anvil-precedent overhang, the mesher keeps it clean.
+wood_seat("vanilla:chair_a", "Chair", "mods://vanilla/models/chair_A.gltf", -0.48)
+wood_seat("vanilla:chair_b", "Chair B", "mods://vanilla/models/chair_B.gltf", -0.48)
+wood_seat("vanilla:chair_c", "Chair C", "mods://vanilla/models/chair_C.gltf", -0.57)
+
+register {
+    id = "vanilla:stool",
+    display_name = "Stool",
+    flags = { solid = true, support_below = true, nav_passable = true },
+    tags = { "vanilla:seat" },
+    color = { 0.50, 0.36, 0.22 },
+    mesh = "mods://vanilla/models/chair_stool.gltf",
+    entity_aabb = {
+        min = { -0.38, 0.0, -0.38 },
+        max = {  0.38, 0.50, 0.38 },
+    },
+    interactable = sit_interact,
+    use_slot = seat_use_slot,
+    -- Crude tier: a log and no tools makes you a stool.
+    materials = { { item = "vanilla:wood_log", count = 1 } },
+}
+
+register {
+    id = "vanilla:bench",
+    display_name = "Stone Bench",
+    flags = { solid = true, support_below = true, nav_passable = true },
+    tags = { "vanilla:seat" },
+    color = { 0.55, 0.53, 0.50 },
+    mesh = "mods://vanilla/models/bench.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.38, 0.0, -0.38 },
+        max = {  1.38, 0.50, 0.38 },
+    },
+    interactable = sit_interact,
+    use_slot = {
+        pose = { 0.5, 0.5, 0.0 }, -- centre of the 2-cell slab
+        yaw = 0.0,
+        approach = {
+            { -1, 0, 0 }, { 2, 0, 0 },
+            { 0, 0, -1 }, { 0, 0, 1 },
+            { 1, 0, -1 }, { 1, 0, 1 },
+        },
+    },
+    -- Crude stone tier, like the anvil: chunks, no build gate.
+    materials = { { item = "vanilla:stone_chunk", count = 2 } },
+}
+
+local function wood_table(id, name, mesh, footprint, aabb, planks)
+    register {
+        id = id,
+        display_name = name,
+        flags = { solid = true, support_below = true, nav_passable = true },
+        tags = { "vanilla:table" },
+        color = { 0.58, 0.42, 0.26 },
+        mesh = mesh,
+        footprint = footprint,
+        entity_aabb = aabb,
+        materials = { { item = "vanilla:wood_planks", count = planks } },
+        work_action = carpentry_work,
+    }
+end
+
+wood_table("vanilla:table_small", "Table", "mods://vanilla/models/table_small.gltf",
+    { {0, 0, 0} },
+    { min = { -0.5, 0.0, -0.5 }, max = { 0.5, 1.0, 0.5 } }, 3)
+wood_table("vanilla:table_medium", "Big Table", "mods://vanilla/models/table_medium.gltf",
+    { {0, 0, 0}, {1, 0, 0}, {0, 0, 1}, {1, 0, 1} },
+    { min = { -0.5, 0.0, -0.5 }, max = { 1.5, 1.0, 1.5 } }, 4)
+wood_table("vanilla:table_long", "Long Table", "mods://vanilla/models/table_medium_long.gltf",
+    { {0, 0, 0}, {1, 0, 0}, {2, 0, 0}, {0, 0, 1}, {1, 0, 1}, {2, 0, 1} },
+    { min = { -0.5, 0.0, -0.5 }, max = { 2.5, 1.0, 1.5 } }, 6)
+
+-- Crude tier low table (logs, no gate); 0.42 m top with a small z
+-- overhang past its 2×1 cells.
+register {
+    id = "vanilla:table_low",
+    display_name = "Low Table",
+    flags = { solid = true, support_below = true, nav_passable = true },
+    tags = { "vanilla:table" },
+    color = { 0.48, 0.35, 0.22 },
+    mesh = "mods://vanilla/models/table_low.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.63 },
+        max = {  1.5, 0.42, 0.63 },
+    },
+    materials = { { item = "vanilla:wood_log", count = 2 } },
+}
+
+-- Storage furniture: cabinets join the S3 container economy (tidy
+-- stocks them, inspect shows stock, mining spills). Capacities sit
+-- between the basket (16) and the barrel (32) — furniture-sized, not
+-- warehouse-sized. accepts omitted = takes anything.
+register {
+    id = "vanilla:cabinet_small",
+    display_name = "Cabinet",
+    flags = { solid = true, support_below = true },
+    tags = { "vanilla:storage" },
+    color = { 0.52, 0.38, 0.24 },
+    mesh = "mods://vanilla/models/cabinet_small.gltf",
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.5 },
+        max = {  0.5, 1.0,  0.5 },
+    },
+    container = { capacity_bulk = 24 },
+    materials = { { item = "vanilla:wood_planks", count = 4 } },
+    work_action = carpentry_work,
+}
+
+register {
+    id = "vanilla:cabinet_medium",
+    display_name = "Big Cabinet",
+    flags = { solid = true, support_below = true },
+    tags = { "vanilla:storage" },
+    color = { 0.52, 0.38, 0.24 },
+    mesh = "mods://vanilla/models/cabinet_medium.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.5 },
+        max = {  1.5, 1.0,  0.5 },
+    },
+    container = { capacity_bulk = 32 },
+    materials = { { item = "vanilla:wood_planks", count = 6 } },
+    work_action = carpentry_work,
+}
+
+-- Bookcases are the study's "shelf" (Furniture Bits shelves are
+-- wall-mount brackets — no mount mechanics). 1.5 m tall in a 2-tall
+-- footprint; small book-scale container stock.
+register {
+    id = "vanilla:bookcase",
+    display_name = "Bookcase",
+    flags = { solid = true, support_below = true },
+    tags = { "vanilla:shelf", "vanilla:storage" },
+    color = { 0.46, 0.33, 0.22 },
+    mesh = "mods://vanilla/models/bookcase_single.gltf",
+    footprint = { {0, 0, 0}, {0, 1, 0} },
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.13 },
+        max = {  0.5, 1.5,  0.13 },
+    },
+    container = { capacity_bulk = 12 },
+    materials = { { item = "vanilla:wood_planks", count = 4 } },
+    work_action = carpentry_work,
+}
+
+register {
+    id = "vanilla:bookcase_double",
+    display_name = "Double Bookcase",
+    flags = { solid = true, support_below = true },
+    tags = { "vanilla:shelf", "vanilla:storage" },
+    color = { 0.46, 0.33, 0.22 },
+    mesh = "mods://vanilla/models/bookcase_double.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0} },
+    entity_aabb = {
+        min = { -0.5, 0.0, -0.13 },
+        max = {  1.5, 1.5,  0.13 },
+    },
+    container = { capacity_bulk = 24 },
+    materials = { { item = "vanilla:wood_planks", count = 6 } },
+    work_action = carpentry_work,
+}
+
+register {
+    id = "vanilla:desk",
+    display_name = "Desk",
+    flags = { solid = true, support_below = true, nav_passable = true },
+    tags = { "vanilla:desk" },
+    color = { 0.55, 0.40, 0.25 },
+    mesh = "mods://vanilla/models/desk.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.63, 0.0, -0.57 },
+        max = {  1.63, 0.75, 0.57 },
+    },
+    materials = { { item = "vanilla:wood_planks", count = 4 } },
+    work_action = carpentry_work,
+}
+
+register {
+    id = "vanilla:bed_b",
+    display_name = "Bed B",
+    flags = { solid = true, support_below = true, nav_passable = true },
+    tags = { "vanilla:bed" },
+    color = { 0.42, 0.22, 0.10 },
+    mesh = "mods://vanilla/models/bed_single_B.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0} },
+    entity_aabb = {
+        min = { -0.45, 0.0, -0.45 },
+        max = {  1.45, 1.0,  0.45 },
+    },
+    -- Same sleep numbers + slot layout as vanilla:bed (see the long
+    -- rationale on that def).
+    interactable = {
+        need_restore = { need = "sleep", restores = 0.7 },
+        duration_secs = 25.0,
+        exclusive = true,
+    },
+    use_slot = {
+        pose = { 0.0, 0.5, 0.0 },
+        yaw = 1.5707963,
+        approach = {
+            { -1, 0, 0 }, { 0, 0, -1 }, { 0, 0, 1 },
+            { 2, 0, 0 }, { 1, 0, -1 }, { 1, 0, 1 },
+        },
+        animation = "vanilla:lie_idle",
+    },
+    materials = { { item = "vanilla:wood_planks", count = 4 } },
+    work_action = carpentry_work,
+}
+
+-- 2×2 double bed. Still one sleeper (exclusive; the sleep slot lies
+-- along the z=0 half) — two-slot beds are a future feature, the
+-- footprint is ready for it.
+register {
+    id = "vanilla:bed_double",
+    display_name = "Double Bed",
+    flags = { solid = true, support_below = true, nav_passable = true },
+    tags = { "vanilla:bed" },
+    color = { 0.45, 0.20, 0.12 },
+    mesh = "mods://vanilla/models/bed_double_A.gltf",
+    footprint = { {0, 0, 0}, {1, 0, 0}, {0, 0, 1}, {1, 0, 1} },
+    entity_aabb = {
+        min = { -0.45, 0.0, -0.45 },
+        max = {  1.45, 1.0,  1.45 },
+    },
+    interactable = {
+        need_restore = { need = "sleep", restores = 0.7 },
+        duration_secs = 25.0,
+        exclusive = true,
+    },
+    use_slot = {
+        pose = { 0.0, 0.5, 0.0 },
+        yaw = 1.5707963,
+        approach = {
+            { -1, 0, 0 }, { 2, 0, 0 },
+            { -1, 0, 1 }, { 2, 0, 1 },
+            { 0, 0, -1 }, { 1, 0, -1 },
+            { 0, 0, 2 }, { 1, 0, 2 },
+        },
+        animation = "vanilla:lie_idle",
+    },
+    materials = { { item = "vanilla:wood_planks", count = 6 } },
+    work_action = carpentry_work,
+}
+
+-- Masonry verticals (2 m tall, 1×2 footprint). 2 stone_brick each per
+-- the settlement plan.
+local function stone_vertical(id, name, mesh, half_w)
+    register {
+        id = id,
+        display_name = name,
+        flags = { solid = true, support_below = true },
+        color = { 0.58, 0.56, 0.53 },
+        mesh = mesh,
+        footprint = { {0, 0, 0}, {0, 1, 0} },
+        entity_aabb = {
+            min = { -half_w, 0.0, -half_w },
+            max = {  half_w, 2.0,  half_w },
+        },
+        materials = { { item = "vanilla:stone_brick", count = 2 } },
+        work_action = masonry_work,
+    }
+end
+
+stone_vertical("vanilla:pillar", "Stone Pillar", "mods://vanilla/models/pillar.gltf", 0.38)
+stone_vertical("vanilla:column", "Stone Column", "mods://vanilla/models/column.gltf", 0.35)
+
+-- Decor. book_set dresses tables/desks/bookcase-adjacent cells; rugs
+-- are flat floor decor. Rugs are NOT solid and carry support_in_cell
+-- so the room detector keeps rug cells as floor (same flag ladders
+-- use) — a big rug must not carve up or split a room. Both cost a
+-- token plank until a textile/fiber economy exists.
+register {
+    id = "vanilla:book_set",
+    display_name = "Books",
+    flags = { solid = true, support_below = true, nav_passable = true },
+    color = { 0.45, 0.30, 0.50 },
+    mesh = "mods://vanilla/models/book_set.gltf",
+    entity_aabb = {
+        min = { -0.39, 0.0, -0.19 },
+        max = {  0.39, 0.50, 0.19 },
+    },
+    materials = { { item = "vanilla:wood_planks", count = 1 } },
+}
+
+local function rug(id, name, mesh, color)
+    register {
+        id = id,
+        display_name = name,
+        -- NO support_below: that flag means "the cell above me is
+        -- standable" (it's what makes block tops walkable) — on a
+        -- 0.1 m rug it would fake a full-height invisible platform.
+        -- support_in_cell (the ladder/rail flag) is what keeps the
+        -- rug's own cell standable floor.
+        flags = { solid = false, support_in_cell = true, nav_passable = true },
+        color = color,
+        mesh = mesh,
+        footprint = { {0, 0, 0}, {1, 0, 0} },
+        entity_aabb = {
+            min = { -0.5, 0.0, -0.5 },
+            max = {  1.5, 0.10, 0.5 },
+        },
+        materials = { { item = "vanilla:wood_planks", count = 1 } },
+    }
+end
+
+rug("vanilla:rug", "Rug", "mods://vanilla/models/rug_rectangle_A.gltf", { 0.60, 0.24, 0.20 })
+rug("vanilla:rug_oval", "Oval Rug", "mods://vanilla/models/rug_oval_A.gltf", { 0.26, 0.32, 0.55 })
 
 -- Recipes. One per station for the MVP; multi-recipe selection UI
 -- lands when a station gains its second recipe.

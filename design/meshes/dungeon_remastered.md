@@ -7,11 +7,14 @@ building set (future). Shared texture `dungeon_texture.png`
 block-junk-relevant subset is curated here (see the pack `contents.png`
 for the rest).
 
-**SCALE WARNING:** this pack is authored on a **2 m dungeon grid** —
-twice our 1 m cell. Every import needs a 0.5 uniform scale baked into
-the gltf root node (`"scale": [0.5, 0.5, 0.5]`), the same
-edit-the-node trick the workbench used. Raw probe bounds below are
-PRE-scale; halve them for in-game size.
+**SCALE — corrected 2026-07-09:** the **architecture** (walls 4×4 m,
+floor tiles 4×4 m) and oversized props (barrel_large 2 m tall,
+bookcases 3 m, pillar 4 m) are on the 2 m dungeon grid and need a 0.5
+scale baked into the gltf root node. But **human-scale props are
+already 1 m-grid** — chair (0.75×1.23), stool (0.5 h), table_small
+(1×1×1) probe byte-for-byte the same sizes as Furniture Bits. Probe
+before assuming either way; the earlier "every import needs 0.5" note
+was wrong (barrel/crates just happened to be oversized props).
 
 S3 imports (✅): `barrel_large`✅ (raw 1.8×2.0×1.8 → 0.9×1.0×0.9 at
 0.5; the `vanilla:barrel` block) and `crates_stacked`✅ (raw
@@ -22,12 +25,15 @@ cell overhang, intentional, anvil precedent). Probed but skipped:
 
 ## Curated subset
 
-**Stone seating / tables** (F1) — `bench`, `chair`, `stool`,
+**Stone seating / tables** (F1) — `bench`✅ (1.75×0.5×0.75 raw,
+imported UNSCALED, +0.5 x shift, 2×1 footprint), `chair`, `stool`,
 `stool_round`, `table_small`(`_decorated_A/B/C`),
 `table_medium`(`_decorated_A/B`, `_tablecloth`),
 `table_long`(`_decorated_A/B/C`, `_tablecloth`),
-`table_round_{small,medium,large}`. `column`, `pillar`,
-`pillar_decorated` (2 stone_brick each, per settlement plan).
+`table_round_{small,medium,large}`. `column`✅ (0.7×1.4 raw, y-stretch
+×1.43 → 0.7×2.0, 1×2-tall footprint), `pillar`✅ (1.5×4.0 raw, 0.5
+scale → 0.75×2.0, 1×2-tall footprint), `pillar_decorated` (2
+stone_brick each, per settlement plan).
 
 **Containers** (S3) — `barrel_small`, `barrel_large`,
 `barrel_large_decorated`, `barrel_small_stack`, `box_small`(`_decorated`),
@@ -36,8 +42,11 @@ cell overhang, intentional, anvil precedent). Probed but skipped:
 `chest_large_gold`, `keg`, `keg_decorated`, `bucket`, `bucket_pickaxes`,
 `trunk_{small,medium,large}_A/B/C`.
 
-**Shelving / books** — `bookcase_single`(`_decoratedA/B`),
-`bookcase_double`(`_decoratedA/B`), `shelf_small`(`_books`,`_candles`),
+**Shelving / books** — `bookcase_single`✅ and `bookcase_double`✅
+(2×3×0.5 / 4×3×0.5 raw, 0.5 scale → 1 and 2 wide × 1.5 tall × 0.25
+deep, on 1×2-tall / 2×2 footprints; the F1 "shelf" blocks — Furniture
+Bits shelves are wall-mount and we have no mount mechanics),
+`bookcase_*_decoratedA/B`, `shelf_small`(`_books`,`_candles`),
 `shelf_large`, `shelves`(`_decorated`), `book_{brown,grey,tan}`.
 
 **Beds** — `bed_A_single`, `bed_A_double`, `bed_A_stacked`,

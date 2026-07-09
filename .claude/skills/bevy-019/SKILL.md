@@ -257,7 +257,8 @@ In-repo: `menu.rs::pause_menu_ui`, `debug.rs::debug_panel_ui`.
   ```
 - `SidePanel`/`TopBottomPanel` → unified `egui::Panel::{left,right,top,bottom}(id)`; `.default_width/.default_height` → `.default_size`. See texture-studio `ui.rs` for the full four-panel layout.
 - `ctx.wants_pointer_input()` → `ctx.egui_wants_pointer_input()` (same for keyboard) — the input-gating pattern from plain Update systems still works.
-- `Ui` now derefs to `Context`; `SelectableLabel` removed; new `Popup`/`Tooltip` APIs; `ui.close()` closes the containing popup/menu (unchanged).
+- `Ui` now derefs to `Context`; `SelectableLabel` (the widget struct) removed but `ui.selectable_label(checked, text)` / `ui.selectable_value(..)` helpers survive, and `egui::Button::selected(bool)` covers the same need; new `Popup`/`Tooltip` APIs; `ui.close()` closes the containing popup/menu (unchanged).
+- **Bevy images in egui** (verified 2026-07-09, build_palette.rs): `EguiContexts::add_image(EguiTextureHandle::Strong(handle))` → `egui::TextureId`; dedupes per `AssetId`, so per-frame registration is a HashMap lookup, not a leak. Draw with `egui::Image::new(egui::load::SizedTexture::new(id, [w, h]))`. Register images BEFORE `ctx_mut()` — both need `&mut EguiContexts`.
 - Font backend swapped to skrifa + vello_cpu (hinting!). `FontDefinitions`/`set_fonts` API unchanged — the vendored DejaVu fallback (`block_junk_textures::egui_fonts::install(ctx)`) works as before; still BMP-only symbol coverage, pick BMP icons.
 - `EguiContexts::ctx_mut()` returns `Result` (unchanged from 0.39).
 - Styling: `CornerRadius` (u8), `visuals.window_corner_radius`, widget tiers at `visuals.widgets.{noninteractive,inactive,hovered,active}` — all unchanged from egui 0.33.

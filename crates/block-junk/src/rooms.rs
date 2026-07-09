@@ -17,9 +17,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
+use block_junk_mod_api::blocks::TagId;
 use block_junk_mod_api::rooms::{
-    BBox, Constraint, FloorComposition, FloorKind, PatternDomain, RoomEvent, RoomId, RoomPattern,
-    RoomPatternId, RoomSignature, TagCount,
+    AdjacentPairCount, BBox, Constraint, FloorComposition, FloorKind, PatternDomain, RoomEvent,
+    RoomId, RoomPattern, RoomPatternId, RoomSignature, TagCount,
 };
 use block_junk_mod_api::shared::BlockPos;
 use thiserror::Error;
@@ -930,13 +931,18 @@ fn compute_signature(
     // cell block entities are normalised to placement units by their
     // footprint size so a 2-cell bed counts as ONE bed.
     let mut slot_cell_counts: HashMap<BlockSlot, u32> = HashMap::new();
+    let mut tagged_cells: HashMap<IVec3, BlockSlot> = HashMap::new();
     let internal_perimeter = perimeter_xz.difference(&external_perimeter);
     let scan_top = enclosure_height.saturating_sub(1) as i32;
     for &(x, z) in floor_xz.iter().chain(internal_perimeter) {
         for dy in 0..=scan_top {
-            let slot = get_block(IVec3::new(x, floor_y + dy, z));
+            let cell = IVec3::new(x, floor_y + dy, z);
+            let slot = get_block(cell);
             if !slot.is_empty() {
                 *slot_cell_counts.entry(slot).or_insert(0) += 1;
+                if !reg.def(slot).tags.is_empty() {
+                    tagged_cells.insert(cell, slot);
+                }
             }
         }
     }
@@ -951,6 +957,50 @@ fn compute_signature(
             *tag_counts.entry(tag.clone()).or_insert(0) += units;
         }
     }
+
+    // Tag adjacency: for each ordered tag pair (a, b), how many tag-a
+    // placements stand directly next to a tag-b cell (4-dir horizontal,
+    // same layer). Counted in cells first — a cell contributes once per
+    // (a, b) key no matter how many b neighbours it touches — then
+    // normalised to placement units per slot with the same div_ceil rule
+    // as tag_counts. Exact for 1-cell a-blocks (seats); a multi-cell
+    // a-placement only partially touching b errs LOW, which is the safe
+    // direction for pattern matching.
+    let mut pair_slot_cells: HashMap<(TagId, TagId), HashMap<BlockSlot, u32>> = HashMap::new();
+    for (&cell, &slot_a) in &tagged_cells {
+        let mut seen_here: HashSet<(TagId, TagId)> = HashSet::new();
+        for dir in [IVec3::X, -IVec3::X, IVec3::Z, -IVec3::Z] {
+            let Some(&slot_b) = tagged_cells.get(&(cell + dir)) else {
+                continue;
+            };
+            for ta in &reg.def(slot_a).tags {
+                for tb in &reg.def(slot_b).tags {
+                    let key = (ta.clone(), tb.clone());
+                    if seen_here.insert(key.clone()) {
+                        *pair_slot_cells
+                            .entry(key)
+                            .or_default()
+                            .entry(slot_a)
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut adjacent_pairs: Vec<AdjacentPairCount> = pair_slot_cells
+        .into_iter()
+        .map(|((a, b), slots)| AdjacentPairCount {
+            a,
+            b,
+            count: slots
+                .into_iter()
+                .map(|(slot, cells)| {
+                    cells.div_ceil(reg.def(slot).footprint.len().max(1) as u32)
+                })
+                .sum(),
+        })
+        .collect();
+    adjacent_pairs.sort_by(|l, r| (&l.a.0, &l.b.0).cmp(&(&r.a.0, &r.b.0)));
 
     // Walkable cells = floor cells with player-height clearance above.
     // Floor set itself stays geometric (so the room stays enclosed even
@@ -992,6 +1042,7 @@ fn compute_signature(
             .into_iter()
             .map(|(tag, count)| TagCount { tag, count })
             .collect(),
+        adjacent_pairs,
     };
     (signature, SignatureExtras { max_probe_height })
 }
@@ -1091,10 +1142,15 @@ fn evaluate_constraint(c: &Constraint, sig: &RoomSignature) -> bool {
             let v = sig.door_count.unwrap_or(0);
             v >= *min && max.is_none_or(|m| v <= m)
         }
-        // Connective domain — no detector for it yet, so any pattern with
-        // an `AdjacentPair` constraint can't match. Returning false keeps
-        // the volumetric matcher from accidentally selecting one.
-        Constraint::AdjacentPair { .. } => false,
+        Constraint::AdjacentPair { a, b, min } => {
+            let count = sig
+                .adjacent_pairs
+                .iter()
+                .find(|p| &p.a == a && &p.b == b)
+                .map(|p| p.count)
+                .unwrap_or(0);
+            count >= *min
+        }
     }
 }
 
@@ -1111,6 +1167,8 @@ mod tests {
         stone: BlockSlot,
         door: BlockSlot,
         bed: BlockSlot,
+        seat: BlockSlot,
+        table: BlockSlot,
     }
 
     fn test_registry() -> (BlockRegistry, Slots) {
@@ -1140,6 +1198,21 @@ mod tests {
                 "tags": ["vanilla:bed"],
                 "footprint": [[0, 0, 0], [1, 0, 0]],
                 "color": [0.4, 0.2, 0.1]
+            },
+            {
+                "id": "test:seat",
+                "display_name": "Seat",
+                "flags": { "solid": true, "support_below": true },
+                "tags": ["vanilla:seat"],
+                "color": [0.4, 0.2, 0.1]
+            },
+            {
+                "id": "test:table",
+                "display_name": "Table",
+                "flags": { "solid": true, "support_below": true },
+                "tags": ["vanilla:table"],
+                "footprint": [[0, 0, 0], [1, 0, 0]],
+                "color": [0.4, 0.2, 0.1]
             }
         ]))
         .expect("test block defs deserialize");
@@ -1148,6 +1221,8 @@ mod tests {
             stone: reg.slot_of(&"test:stone".into()).unwrap(),
             door: reg.slot_of(&"test:door".into()).unwrap(),
             bed: reg.slot_of(&"test:bed".into()).unwrap(),
+            seat: reg.slot_of(&"test:seat".into()).unwrap(),
+            table: reg.slot_of(&"test:table".into()).unwrap(),
         };
         (reg, slots)
     }
@@ -1224,8 +1299,33 @@ mod tests {
                     max: None,
                 }],
             ),
+            p(
+                "dining",
+                Some("small_house"),
+                3,
+                vec![
+                    C::TagCount {
+                        tag: block_junk_mod_api::blocks::TagId("vanilla:table".into()),
+                        min: 1,
+                        max: None,
+                    },
+                    C::AdjacentPair {
+                        a: block_junk_mod_api::blocks::TagId("vanilla:seat".into()),
+                        b: block_junk_mod_api::blocks::TagId("vanilla:table".into()),
+                        min: 2,
+                    },
+                ],
+            ),
         ])
         .expect("test patterns build")
+    }
+
+    fn pair_count(sig: &RoomSignature, a: &str, b: &str) -> u32 {
+        sig.adjacent_pairs
+            .iter()
+            .find(|p| p.a.as_str() == a && p.b.as_str() == b)
+            .map(|p| p.count)
+            .unwrap_or(0)
     }
 
     #[derive(Default)]
@@ -1493,6 +1593,58 @@ mod tests {
             .map(|tc| tc.count);
         assert_eq!(beds, Some(1), "2-cell bed counts as ONE bed");
         assert_eq!(pattern_name(&pat), "bedroom");
+    }
+
+    #[test]
+    fn seats_flanking_a_table_make_a_dining_room() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        w.set(0, 1, 2, s.door);
+        // 2-cell table with a seat on the south side of each table cell.
+        // Compact cluster — a wall-to-wall furniture row would slice the
+        // 4×4 interior into two disconnected strips.
+        w.set(2, 1, 2, s.table);
+        w.set(3, 1, 2, s.table);
+        w.set(2, 1, 3, s.seat);
+        w.set(3, 1, 3, s.seat);
+        let seed = IVec3::new(1, 1, 1);
+        let (sig, pat) = detect(&w, &reg, &patterns, seed).expect("fill succeeds");
+        assert_eq!(
+            pair_count(&sig, "vanilla:seat", "vanilla:table"),
+            2,
+            "both seats touch the table"
+        );
+        assert_eq!(
+            pair_count(&sig, "vanilla:table", "vanilla:seat"),
+            1,
+            "the table itself is ONE placement even with both cells touched"
+        );
+        assert_eq!(pattern_name(&pat), "dining");
+    }
+
+    #[test]
+    fn seat_across_the_room_does_not_count_toward_dining() {
+        let (reg, s) = test_registry();
+        let patterns = vanilla_like_patterns();
+        let mut w = World::default();
+        walled_box(&mut w, &s, 2);
+        flat_roof(&mut w, &s, 3);
+        w.set(0, 1, 2, s.door);
+        w.set(2, 1, 2, s.table);
+        w.set(3, 1, 2, s.table);
+        w.set(2, 1, 3, s.seat); // at the table
+        w.set(4, 1, 4, s.seat); // corner, not touching
+        let seed = IVec3::new(1, 1, 1);
+        let (sig, pat) = detect(&w, &reg, &patterns, seed).expect("fill succeeds");
+        assert_eq!(pair_count(&sig, "vanilla:seat", "vanilla:table"), 1);
+        assert_eq!(
+            pattern_name(&pat),
+            "small_house",
+            "one adjacent seat is not a dining room"
+        );
     }
 
     // ---------- helpers ----------

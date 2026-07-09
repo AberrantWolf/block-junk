@@ -82,8 +82,11 @@ impl Plugin for ClientPlugin {
             PlaceablePalette(reg.iter_placeable().collect())
         };
         let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
+        let pins = HotbarPins::first_n(palette.0.len());
         app.insert_resource(palette);
+        app.insert_resource(pins);
         app.insert_resource(terrain_slots);
+        app.add_plugins(crate::build_palette::BuildPalettePlugin);
         app.init_resource::<ChunkMap>()
             .init_resource::<SelectedBlock>()
             .init_resource::<PlacementRotation>()
@@ -223,6 +226,7 @@ impl Plugin for ClientPlugin {
                 (
                     mesh_chunks,
                     refresh_block_entities,
+                    rebuild_hotbar_slots,
                     update_hotbar_highlight,
                     update_hotbar_visibility,
                     update_selected_block_hud,
@@ -333,12 +337,29 @@ pub struct PlaceablePalette(pub Vec<BlockSlot>);
 
 /// Index into [`PlaceablePalette`] of the currently selected entry, or
 /// `None` when the hand is empty (no Build ghost, R-click Build inert —
-/// the mode for pure demolition planning). Mouse wheel cycles; digit
-/// keys 1-9 jump-select, re-pressing the active digit deselects. Read
-/// only by Plan-mode R-click Build — Normal mode drives its verb from
-/// cursor context, not the hotbar.
+/// the mode for pure demolition planning). Mouse wheel cycles the
+/// pinned set; digit keys 1-9 jump-select pins, re-pressing the active
+/// digit deselects; the B build-palette overlay can select ANY
+/// placeable (pinned or not). Read only by Plan-mode R-click Build —
+/// Normal mode drives its verb from cursor context, not the hotbar.
 #[derive(Resource, Default)]
 pub struct SelectedBlock(pub Option<usize>);
+
+/// The player's hotbar favourites: up to 9 indices into
+/// [`PlaceablePalette`], in digit order. Since F1 the registry is far
+/// bigger than nine digits, so the hotbar shows this pinned subset and
+/// the B palette overlay is the full catalogue (R-click there toggles
+/// pins). Defaults to the first nine placeables — exactly the pre-F1
+/// hotbar, so muscle memory survives. Per-session for now; persisting
+/// pins belongs to the future settings pass.
+#[derive(Resource, Default)]
+pub struct HotbarPins(pub Vec<usize>);
+
+impl HotbarPins {
+    pub fn first_n(palette_len: usize) -> Self {
+        Self((0..palette_len.min(crate::build_palette::MAX_PINS)).collect())
+    }
+}
 
 impl SelectedBlock {
     /// The selected block, or `None` when deselected or the palette is
@@ -400,8 +421,108 @@ pub enum ActionKind {
 /// deliberate without being tedious — tune as the feature settles.
 pub const PLAYER_ACTION_DURATION_SECS: f32 = 0.6;
 
+/// A hotbar tile. Holds the PALETTE index it selects (not its position
+/// in the column), so the highlight compare against [`SelectedBlock`]
+/// stays a straight equality even though the column shows the pinned
+/// subset.
 #[derive(Component)]
 struct HotbarSlot(usize);
+
+/// Marker on the sub-column that holds only the slot tiles.
+/// `rebuild_hotbar_slots` clears + refills it whenever [`HotbarPins`]
+/// changes.
+#[derive(Component)]
+struct HotbarSlotsContainer;
+
+/// (Re)build the hotbar tiles from the pin set: once when the
+/// container spawns (session entry) and again on every pin change from
+/// the build-palette overlay.
+fn rebuild_hotbar_slots(
+    mut commands: Commands,
+    pins: Res<HotbarPins>,
+    palette: Res<PlaceablePalette>,
+    block_registry: Res<BlockRegistry>,
+    textures: Res<BlockTextures>,
+    containers: Query<Entity, With<HotbarSlotsContainer>>,
+    added: Query<(), Added<HotbarSlotsContainer>>,
+) {
+    if !pins.is_changed() && added.is_empty() {
+        return;
+    }
+    let Ok(container) = containers.single() else {
+        return;
+    };
+    commands.entity(container).despawn_related::<Children>();
+    for &palette_idx in &pins.0 {
+        let Some(slot) = palette.0.get(palette_idx).copied() else {
+            continue;
+        };
+        // Two icon paths:
+        //   - Block with mesh (workbench, anvil, bed, etc.) → white-bg
+        //     text label. The pattern-derived texture would look like
+        //     terrain and gets confused with real grass/stone/wood.
+        //   - Voxel block → its baked 16x16 pattern texture.
+        let def = block_registry.def(slot);
+        let icon_kind = if def.mesh.is_some() {
+            HotbarIconKind::Label(short_label(&def.display_name))
+        } else {
+            HotbarIconKind::Image(textures.icons[slot.0 as usize].clone())
+        };
+        let tile = commands
+            .spawn((
+                Node {
+                    width: Val::Px(44.0),
+                    height: Val::Px(44.0),
+                    border: UiRect::all(Val::Px(2.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BorderColor::all(Color::BLACK),
+                BackgroundColor(Color::srgba(0.1, 0.1, 0.1, 0.6)),
+                HotbarSlot(palette_idx),
+                ChildOf(container),
+            ))
+            .id();
+        match icon_kind {
+            HotbarIconKind::Image(handle) => {
+                commands.spawn((
+                    ImageNode::new(handle),
+                    Node {
+                        width: Val::Px(32.0),
+                        height: Val::Px(32.0),
+                        ..default()
+                    },
+                    ChildOf(tile),
+                ));
+            }
+            HotbarIconKind::Label(text) => {
+                let label_bg = commands
+                    .spawn((
+                        Node {
+                            width: Val::Px(32.0),
+                            height: Val::Px(32.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(Color::WHITE),
+                        ChildOf(tile),
+                    ))
+                    .id();
+                commands.spawn((
+                    Text::new(text),
+                    TextFont {
+                        font_size: FontSize::Px(14.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.12, 0.12, 0.12)),
+                    ChildOf(label_bg),
+                ));
+            }
+        }
+    }
+}
 
 /// Marker on the text naming the selected hotbar block (or the
 /// empty-hand state) at the bottom of the hotbar column.
@@ -436,7 +557,7 @@ enum HotbarIconKind {
 /// → "For", "Bed" → "Bed"). Ascii-only — non-ascii names fall through
 /// to whatever `take(3)` yields on the byte-stream, acceptable for
 /// the placeholder labels we use today.
-fn short_label(display_name: &str) -> String {
+pub(crate) fn short_label(display_name: &str) -> String {
     let first_word = display_name.split_whitespace().next().unwrap_or("");
     let mut out = String::with_capacity(3);
     for (i, ch) in first_word.chars().take(3).enumerate() {
@@ -518,9 +639,6 @@ fn setup_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut anim_graphs: ResMut<Assets<AnimationGraph>>,
     asset_server: Res<AssetServer>,
-    palette: Res<PlaceablePalette>,
-    textures: Res<BlockTextures>,
-    block_registry: Res<crate::blocks::BlockRegistry>,
     animations: Res<crate::npc_registry::AnimationRegistry>,
     kinds: Res<crate::npc_registry::NpcKindRegistry>,
     existing: Option<Res<AvatarAssets>>,
@@ -736,7 +854,7 @@ fn setup_scene(
                     ))
                     .with_children(|cap| {
                         cap.spawn((
-                            Text::new("scroll"),
+                            Text::new("scroll · B: all"),
                             TextFont {
                                 font_size: FontSize::Px(12.0),
                                 ..default()
@@ -744,71 +862,20 @@ fn setup_scene(
                             TextColor(crate::ui_theme::TEXT),
                         ));
                     });
-                for (i, slot) in palette.0.iter().enumerate() {
-                    // Two icon paths:
-                    //   - Block with mesh (workbench, anvil, bed, etc.) →
-                    //     white-bg text label. The pattern-derived texture
-                    //     would look like terrain and gets confused with
-                    //     real grass/stone/wood blocks.
-                    //   - Voxel block → its baked 16x16 pattern texture.
-                    let slot_bg = Color::srgba(0.1, 0.1, 0.1, 0.6);
-                    let def = block_registry.def(*slot);
-                    let icon_kind = if def.mesh.is_some() {
-                        HotbarIconKind::Label(short_label(&def.display_name))
-                    } else {
-                        HotbarIconKind::Image(textures.icons[slot.0 as usize].clone())
-                    };
-                    let bg = slot_bg;
-                    column
-                        .spawn((
-                            Node {
-                                width: Val::Px(44.0),
-                                height: Val::Px(44.0),
-                                border: UiRect::all(Val::Px(2.0)),
-                                justify_content: JustifyContent::Center,
-                                align_items: AlignItems::Center,
-                                ..default()
-                            },
-                            BorderColor::all(Color::BLACK),
-                            BackgroundColor(bg),
-                            HotbarSlot(i),
-                        ))
-                        .with_children(|slot_parent| match icon_kind {
-                            HotbarIconKind::Image(handle) => {
-                                slot_parent.spawn((
-                                    ImageNode::new(handle),
-                                    Node {
-                                        width: Val::Px(32.0),
-                                        height: Val::Px(32.0),
-                                        ..default()
-                                    },
-                                ));
-                            }
-                            HotbarIconKind::Label(text) => {
-                                slot_parent
-                                    .spawn((
-                                        Node {
-                                            width: Val::Px(32.0),
-                                            height: Val::Px(32.0),
-                                            justify_content: JustifyContent::Center,
-                                            align_items: AlignItems::Center,
-                                            ..default()
-                                        },
-                                        BackgroundColor(Color::WHITE),
-                                    ))
-                                    .with_children(|inner| {
-                                        inner.spawn((
-                                            Text::new(text),
-                                            TextFont {
-                                                font_size: FontSize::Px(14.0),
-                                                ..default()
-                                            },
-                                            TextColor(Color::srgb(0.12, 0.12, 0.12)),
-                                        ));
-                                    });
-                            }
-                        });
-                }
+                // The slot tiles live in their own sub-column so
+                // `rebuild_hotbar_slots` can clear + refill them when
+                // the pin set changes without disturbing the hint chip
+                // above or the labels below. Filled by that system on
+                // its first run (Added<...> counts as changed).
+                column.spawn((
+                    HotbarSlotsContainer,
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(4.0),
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                ));
                 // Selected-block name under the slots: the highlighted
                 // slot shows the icon, this names it (32 px patterns
                 // read ambiguously — the playtest's "what am I about
@@ -865,7 +932,11 @@ type ReplicatedEntitiesQuery<'w, 's> =
 ///      entity ids back to its fresh-launch value. Add yours here when
 ///      a new feature grows one — the invariant is "MainMenu state ==
 ///      pre-first-session state".
-fn cleanup_session(mut commands: Commands, replicated: ReplicatedEntitiesQuery) {
+fn cleanup_session(
+    mut commands: Commands,
+    replicated: ReplicatedEntitiesQuery,
+    palette: Res<PlaceablePalette>,
+) {
     let mut count = 0usize;
     for entity in replicated.iter() {
         commands.entity(entity).despawn();
@@ -881,6 +952,8 @@ fn cleanup_session(mut commands: Commands, replicated: ReplicatedEntitiesQuery) 
     commands.insert_resource(BlockEntities::default());
     commands.insert_resource(PreviewState::default());
     commands.insert_resource(SelectedBlock::default());
+    commands.insert_resource(HotbarPins::first_n(palette.0.len()));
+    commands.insert_resource(crate::build_palette::BuildPaletteState::default());
     commands.insert_resource(PlacementRotation::default());
     commands.insert_resource(PlayerActionState::default());
     commands.insert_resource(WorldClock {
@@ -914,6 +987,7 @@ fn cycle_selected_or_rotation(
     mut selected: ResMut<SelectedBlock>,
     mut rotation: ResMut<PlacementRotation>,
     palette: Res<PlaceablePalette>,
+    pins: Res<HotbarPins>,
 ) {
     // SSOT input gate: scroll only acts when no overlay holds the
     // cursor. See [`crate::ui_capture`] for the design rationale.
@@ -942,19 +1016,25 @@ fn cycle_selected_or_rotation(
         rotation.0 = rotation.0.rotated(step);
         return;
     }
-    let n = palette.0.len();
+    // The wheel cycles the PINNED tiles (the visible hotbar), not the
+    // whole registry — post-F1 the registry is ~40 entries and a full
+    // wheel lap would be a chore. Unpinned selections (made in the B
+    // palette) enter the ring at the nearest end on the next click.
+    let n = pins.0.len();
     if n == 0 {
         return;
     }
-    // Hotbar is laid out top→bottom (index 0 at top). Scroll up moves the
-    // highlight to the slot *above* the current one, i.e. toward index 0.
+    // Hotbar is laid out top→bottom (pin 0 at top). Scroll up moves the
+    // highlight to the slot *above* the current one, i.e. toward pin 0.
     // From the deselected state the wheel enters at the nearest end.
-    selected.0 = Some(match (selected.0, dy > 0.0) {
+    let pos = selected.0.and_then(|sel| pins.0.iter().position(|&p| p == sel));
+    let next = match (pos, dy > 0.0) {
         (Some(i), true) => (i + n - 1) % n,
         (Some(i), false) => (i + 1) % n,
         (None, true) => n - 1,
         (None, false) => 0,
-    });
+    };
+    selected.0 = Some(pins.0[next]);
 }
 
 /// Digit keys 1-9 jump-select hotbar slots in Plan mode; re-pressing
@@ -966,7 +1046,7 @@ fn hotbar_digit_select(
     keys: Res<ButtonInput<KeyCode>>,
     captures: Res<crate::ui_capture::UiCaptures>,
     mode: Res<PlayerMode>,
-    palette: Res<PlaceablePalette>,
+    pins: Res<HotbarPins>,
     mut selected: ResMut<SelectedBlock>,
 ) {
     if captures.is_captured() || !matches!(*mode, PlayerMode::Plan) {
@@ -984,8 +1064,14 @@ fn hotbar_digit_select(
         KeyCode::Digit9,
     ];
     for (i, key) in DIGITS.into_iter().enumerate() {
-        if keys.just_pressed(key) && i < palette.0.len() {
-            selected.0 = if selected.0 == Some(i) { None } else { Some(i) };
+        if keys.just_pressed(key)
+            && let Some(&palette_idx) = pins.0.get(i)
+        {
+            selected.0 = if selected.0 == Some(palette_idx) {
+                None
+            } else {
+                Some(palette_idx)
+            };
             return;
         }
     }
@@ -1272,8 +1358,11 @@ fn update_action_progress_ui(
 fn update_hotbar_highlight(
     selected: Res<SelectedBlock>,
     mut slots: Query<(&HotbarSlot, &mut BorderColor)>,
+    rebuilt: Query<(), Added<HotbarSlot>>,
 ) {
-    if !selected.is_changed() {
+    // Freshly-rebuilt tiles spawn with black borders, so a pin change
+    // must re-apply the highlight even when the selection didn't move.
+    if !selected.is_changed() && rebuilt.is_empty() {
         return;
     }
     for (slot, mut border) in slots.iter_mut() {

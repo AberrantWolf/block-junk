@@ -45,6 +45,8 @@ pub enum UiCapture {
     PauseMenu,
     /// Craft-order modal (F-key on a station).
     CraftModal,
+    /// Build-palette overlay (B in Plan mode).
+    BuildPalette,
     /// F3 dev panel.
     DebugPanel,
     /// Blocking fatal-error modal (mod-set mismatch etc.). Esc does
@@ -185,6 +187,7 @@ fn handle_escape(
     keys: Res<ButtonInput<KeyCode>>,
     mut captures: ResMut<UiCaptures>,
     mut craft_ui: ResMut<crate::craft_stations::CraftStationUiState>,
+    mut build_palette: ResMut<crate::build_palette::BuildPaletteState>,
     mut drag: ResMut<crate::plans::PlanDragState>,
     mut storage_drag: ResMut<crate::storage::StorageDragState>,
     session: Res<crate::menu::ServerSession>,
@@ -218,6 +221,12 @@ fn handle_escape(
         // the empty `open_cell` into the captures set next tick.
         craft_ui.open_cell = None;
         craft_ui.pending_quantities.clear();
+        return;
+    }
+    if captures.contains(UiCapture::BuildPalette) {
+        // Same mirror pattern: `sync_build_palette_capture` releases
+        // the capture next tick.
+        build_palette.open = false;
         return;
     }
     if captures.contains(UiCapture::DebugPanel) {

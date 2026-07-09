@@ -1,5 +1,6 @@
 mod block_textures;
 mod blocks;
+mod build_palette;
 mod camera;
 mod civilization;
 mod client;

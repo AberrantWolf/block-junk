@@ -1,9 +1,31 @@
 # KayKit Furniture Bits 1.0
 
 Wood furniture for **F1**. Shared texture `furniturebits_texture.png`
-(imported; alt palettes `_alt_A/B/C` exist). Only `bed_single_A` is
-imported so far. Multi-cell pieces need a frame-correction pass on
-import (see meshes/README → Coordinate frame).
+(imported; alt palettes `_alt_A/B/C` exist). Multi-cell pieces need a
+frame-correction pass on import (see meshes/README → Coordinate frame).
+
+**F1 imports (2026-07-09)** — all with TRS baked into the gltf root
+node so the mesh sits on its footprint box (bed_single_A precedent):
+
+| mesh | raw size | bake | footprint |
+|---|---|---|---|
+| `chair_A/B/C`✅ | 0.75×1.26×0.85 | rot +90°Y (face +X) | 1 |
+| `chair_stool`✅ | 0.75×0.50 | none | 1 |
+| `table_small`✅ | 1×1×1 | none | 1 |
+| `table_medium`✅ | 2×1×2 | +0.5 x/z | 2×2 |
+| `table_medium_long`✅ | 3×1×2 | +1.0 x, +0.5 z | 3×2 |
+| `table_low`✅ | 2.4×0.5×1.5 | ×5/6, +0.5 x | 2×1 |
+| `cabinet_small`✅ | 1×1×1 | none | 1 |
+| `cabinet_medium`✅ | 2×1×1 | +0.5 x | 2×1 |
+| `desk`✅ | 3×1×1.5 | ×0.75, +0.5 x | 2×1 |
+| `book_set`✅ | 0.78×0.5×0.37 | +0.25 y (origin was mid) | 1 |
+| `bed_single_A`✅ `bed_single_B`✅ | 1.6×1×3 | ×(0.625,1,⅔), rot −90°Y, +0.5 x | 2×1 |
+| `bed_double_A`✅ | 3.1×1×3 | ×(0.645,1,⅔), rot −90°Y, +0.5 x/z | 2×2 |
+| `rug_rectangle_A`✅ `rug_oval_A`✅ | 3×0.1×2 | ×(⅔,1,0.5) → exact 2×1 | 2×1 |
+
+`shelf_A_*`/`shelf_B_*` probed and **rejected**: they're wall-mount
+brackets (0.4 m tall, origin at the mount plane) and we have no
+wall-mount mechanics — DR bookcases serve as the F1 shelf blocks.
 
 ## Fantasy-appropriate subset (what we'd use)
 

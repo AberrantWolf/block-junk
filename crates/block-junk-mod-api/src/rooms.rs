@@ -173,8 +173,18 @@ pub enum Constraint {
         #[serde(default)]
         max: Option<u32>,
     },
-    /// Number of `(a, b)` adjacency pairs in the component (connective only).
-    /// Crossroads-style: `{ a = "vanilla:road", b = "vanilla:sign", min = 2 }`.
+    /// Required count of tag-`a` placements sitting directly next to a
+    /// tag-`b` block: `{ kind = "adjacent_pair", a = "vanilla:seat",
+    /// b = "vanilla:table", min = 2 }` reads "at least two seats at a
+    /// table". Adjacency is horizontal-orthogonal at the same layer
+    /// (the 4 cardinal neighbours — furniture standing side by side);
+    /// multi-cell placements are normalised by footprint size exactly
+    /// like [`Constraint::TagCount`], so a 2-cell table flanked on both
+    /// cells still counts each touching seat once. The pair is ordered:
+    /// the *count* is of `a` placements (each counted once no matter how
+    /// many `b` cells it touches). Avoid `a == b` with multi-cell blocks
+    /// — a placement's own cells are adjacent to each other and would
+    /// self-count.
     AdjacentPair { a: TagId, b: TagId, min: u32 },
 }
 
@@ -201,6 +211,17 @@ pub struct RoomPattern {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TagCount {
     pub tag: TagId,
+    pub count: u32,
+}
+
+/// Count of tag-`a` placements horizontally adjacent to a tag-`b` cell
+/// within a region — the precomputed data behind
+/// [`Constraint::AdjacentPair`]. Ordered: `(seat, table)` counts seats
+/// touching tables, `(table, seat)` counts tables touching seats.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdjacentPairCount {
+    pub a: TagId,
+    pub b: TagId,
     pub count: u32,
 }
 
@@ -264,6 +285,12 @@ pub struct RoomSignature {
     /// volume (furniture). For connective: tags on the component's blocks.
     #[serde(default)]
     pub tag_counts: Vec<TagCount>,
+
+    /// Ordered tag-adjacency counts between tagged blocks in the region
+    /// (see [`AdjacentPairCount`]). Only pairs with a nonzero count are
+    /// listed. Same interior scan as `tag_counts`.
+    #[serde(default)]
+    pub adjacent_pairs: Vec<AdjacentPairCount>,
 }
 
 /// Stable session-scoped room handle. Issued by the detector; lifetime
