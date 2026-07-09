@@ -345,19 +345,31 @@ pub struct PlaceablePalette(pub Vec<BlockSlot>);
 #[derive(Resource, Default)]
 pub struct SelectedBlock(pub Option<usize>);
 
-/// The player's hotbar favourites: up to 9 indices into
-/// [`PlaceablePalette`], in digit order. Since F1 the registry is far
-/// bigger than nine digits, so the hotbar shows this pinned subset and
-/// the B palette overlay is the full catalogue (R-click there toggles
-/// pins). Defaults to the first nine placeables — exactly the pre-F1
+/// The player's hotbar: nine fixed digit slots, each holding an index
+/// into [`PlaceablePalette`] or sitting empty. Since F1 the registry
+/// is far bigger than nine digits, so the hotbar shows this pinned
+/// subset and the B palette overlay is the full catalogue (R-click a
+/// tile toggles it in/out; hover a tile + digit binds it to that
+/// slot; digit over nothing clears the slot). Fixed slots — not a
+/// packed list — so "put the door on 4" and "leave 9 empty" both
+/// work. Defaults to the first nine placeables — exactly the pre-F1
 /// hotbar, so muscle memory survives. Per-session for now; persisting
 /// pins belongs to the future settings pass.
 #[derive(Resource, Default)]
-pub struct HotbarPins(pub Vec<usize>);
+pub struct HotbarPins(pub [Option<usize>; crate::build_palette::MAX_PINS]);
 
 impl HotbarPins {
     pub fn first_n(palette_len: usize) -> Self {
-        Self((0..palette_len.min(crate::build_palette::MAX_PINS)).collect())
+        let mut slots = [None; crate::build_palette::MAX_PINS];
+        for (i, slot) in slots.iter_mut().enumerate().take(palette_len) {
+            *slot = Some(i);
+        }
+        Self(slots)
+    }
+
+    /// The digit slot (0-based) currently holding `palette_idx`.
+    pub fn slot_of(&self, palette_idx: usize) -> Option<usize> {
+        self.0.iter().position(|&p| p == Some(palette_idx))
     }
 }
 
@@ -434,6 +446,13 @@ struct HotbarSlot(usize);
 #[derive(Component)]
 struct HotbarSlotsContainer;
 
+/// Marker on the empty-hand tile at the top of the hotbar (the `
+/// key): highlighted whenever nothing is selected, so "hands empty /
+/// no ghost" reads as a first-class hotbar state instead of an
+/// absence.
+#[derive(Component)]
+struct EmptyHandTile;
+
 /// (Re)build the hotbar tiles from the pin set: once when the
 /// container spawns (session entry) and again on every pin change from
 /// the build-palette overlay.
@@ -453,8 +472,62 @@ fn rebuild_hotbar_slots(
         return;
     };
     commands.entity(container).despawn_related::<Children>();
-    for &palette_idx in &pins.0 {
-        let Some(slot) = palette.0.get(palette_idx).copied() else {
+    // Empty-hand tile first: ` selects "nothing" (no ghost, pure
+    // demolition planning) the way digits select blocks.
+    let empty_hand = commands
+        .spawn((
+            Node {
+                width: Val::Px(44.0),
+                height: Val::Px(44.0),
+                border: UiRect::all(Val::Px(2.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BorderColor::all(Color::BLACK),
+            BackgroundColor(Color::srgba(0.1, 0.1, 0.1, 0.6)),
+            EmptyHandTile,
+            ChildOf(container),
+        ))
+        .id();
+    commands.spawn((
+        Text::new("`"),
+        TextFont {
+            font_size: FontSize::Px(16.0),
+            ..default()
+        },
+        TextColor(crate::ui_theme::TEXT_DIM),
+        ChildOf(empty_hand),
+    ));
+    for (digit, pin) in pins.0.iter().enumerate() {
+        let slot = pin.and_then(|idx| palette.0.get(idx).copied());
+        let (Some(palette_idx), Some(slot)) = (*pin, slot) else {
+            // Empty slot: dim placeholder with a faint digit so
+            // "assign to 4" has a visible 4 to aim for.
+            let placeholder = commands
+                .spawn((
+                    Node {
+                        width: Val::Px(44.0),
+                        height: Val::Px(44.0),
+                        border: UiRect::all(Val::Px(2.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+                    BackgroundColor(Color::srgba(0.1, 0.1, 0.1, 0.25)),
+                    ChildOf(container),
+                ))
+                .id();
+            commands.spawn((
+                Text::new(format!("{}", digit + 1)),
+                TextFont {
+                    font_size: FontSize::Px(12.0),
+                    ..default()
+                },
+                TextColor(Color::srgba(0.8, 0.8, 0.8, 0.35)),
+                ChildOf(placeholder),
+            ));
             continue;
         };
         // Two icon paths:
@@ -1018,30 +1091,46 @@ fn cycle_selected_or_rotation(
     }
     // The wheel cycles the PINNED tiles (the visible hotbar), not the
     // whole registry — post-F1 the registry is ~40 entries and a full
-    // wheel lap would be a chore. Unpinned selections (made in the B
-    // palette) enter the ring at the nearest end on the next click.
-    let n = pins.0.len();
+    // wheel lap would be a chore. Empty slots are skipped. Unpinned
+    // selections (made in the B palette) enter the ring at the nearest
+    // end on the next click.
+    let occupied: Vec<usize> = pins.0.iter().copied().flatten().collect();
+    let n = occupied.len();
     if n == 0 {
         return;
     }
     // Hotbar is laid out top→bottom (pin 0 at top). Scroll up moves the
     // highlight to the slot *above* the current one, i.e. toward pin 0.
     // From the deselected state the wheel enters at the nearest end.
-    let pos = selected.0.and_then(|sel| pins.0.iter().position(|&p| p == sel));
+    let pos = selected.0.and_then(|sel| occupied.iter().position(|&p| p == sel));
     let next = match (pos, dy > 0.0) {
         (Some(i), true) => (i + n - 1) % n,
         (Some(i), false) => (i + 1) % n,
         (None, true) => n - 1,
         (None, false) => 0,
     };
-    selected.0 = Some(pins.0[next]);
+    selected.0 = Some(occupied[next]);
 }
 
-/// Digit keys 1-9 jump-select hotbar slots in Plan mode; re-pressing
-/// the already-selected digit deselects (empty hand → no Build ghost,
-/// pure demolition planning). Digits are inert in Normal mode — the
-/// hotbar isn't visible there. Mode switching lives on Tab/Shift+Tab
-/// (`handle_mode_input`), which this system deliberately freed up.
+/// Digit keys 1-9 in Plan mode select the block pinned to that slot;
+/// re-pressing the already-selected digit deselects, and Backquote (`)
+/// is the dedicated empty-hand key — drops the selection (and its
+/// ghost) in one press instead of a digit double-tap. Empty slots are
+/// inert. Digits are inert in Normal mode — the hotbar isn't visible
+/// there. Mode switching lives on Tab/Shift+Tab (`handle_mode_input`),
+/// which this system deliberately freed up.
+pub(crate) const HOTBAR_DIGITS: [KeyCode; 9] = [
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+];
+
 fn hotbar_digit_select(
     keys: Res<ButtonInput<KeyCode>>,
     captures: Res<crate::ui_capture::UiCaptures>,
@@ -1052,20 +1141,15 @@ fn hotbar_digit_select(
     if captures.is_captured() || !matches!(*mode, PlayerMode::Plan) {
         return;
     }
-    const DIGITS: [KeyCode; 9] = [
-        KeyCode::Digit1,
-        KeyCode::Digit2,
-        KeyCode::Digit3,
-        KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
-        KeyCode::Digit7,
-        KeyCode::Digit8,
-        KeyCode::Digit9,
-    ];
-    for (i, key) in DIGITS.into_iter().enumerate() {
+    if keys.just_pressed(KeyCode::Backquote) {
+        if selected.0.is_some() {
+            selected.0 = None;
+        }
+        return;
+    }
+    for (i, key) in HOTBAR_DIGITS.into_iter().enumerate() {
         if keys.just_pressed(key)
-            && let Some(&palette_idx) = pins.0.get(i)
+            && let Some(palette_idx) = pins.0[i]
         {
             selected.0 = if selected.0 == Some(palette_idx) {
                 None
@@ -1358,7 +1442,8 @@ fn update_action_progress_ui(
 fn update_hotbar_highlight(
     selected: Res<SelectedBlock>,
     mut slots: Query<(&HotbarSlot, &mut BorderColor)>,
-    rebuilt: Query<(), Added<HotbarSlot>>,
+    mut empty_hand: Query<&mut BorderColor, (With<EmptyHandTile>, Without<HotbarSlot>)>,
+    rebuilt: Query<(), Or<(Added<HotbarSlot>, Added<EmptyHandTile>)>>,
 ) {
     // Freshly-rebuilt tiles spawn with black borders, so a pin change
     // must re-apply the highlight even when the selection didn't move.
@@ -1367,6 +1452,15 @@ fn update_hotbar_highlight(
     }
     for (slot, mut border) in slots.iter_mut() {
         *border = if Some(slot.0) == selected.0 {
+            BorderColor::all(Color::WHITE)
+        } else {
+            BorderColor::all(Color::BLACK)
+        };
+    }
+    // The ` tile lights up when the hand is empty — deselection is a
+    // state you chose, not a missing highlight.
+    for mut border in empty_hand.iter_mut() {
+        *border = if selected.0.is_none() {
             BorderColor::all(Color::WHITE)
         } else {
             BorderColor::all(Color::BLACK)

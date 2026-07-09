@@ -8,8 +8,15 @@
 //!   - L-click a tile → select it (drives the Plan-mode Build ghost,
 //!     same [`SelectedBlock`] the hotbar writes). The window stays
 //!     open for browsing; B or Esc closes.
-//!   - R-click a tile → toggle it into/out of the hotbar pins (max 9;
-//!     pinned tiles show their digit).
+//!   - R-click a tile → unpin it, or pin it to the first free slot.
+//!   - Hover a tile + digit 1-9 → bind it to exactly that slot
+//!     (moving it out of any slot it already holds; re-pressing its
+//!     own digit clears it). Digit over empty space clears the slot.
+//!   - ` empties the hand (works in-world too — the dedicated
+//!     deselect key, no digit double-tap needed).
+//!   - R-click in-world with an empty hand also opens this window
+//!     (`open_on_empty_hand_build`) — the probe of a palette-first,
+//!     hotbar-less Plan mode.
 //!
 //! Lifecycle follows the craft modal's pattern exactly: a state
 //! resource holds `open`, `sync_build_palette_capture` mirrors it into
@@ -61,6 +68,33 @@ fn category_of(def: &block_junk_mod_api::blocks::BlockDef) -> usize {
     } else {
         1
     }
+}
+
+/// The hotbar-less entry point: R-click in Plan mode with an empty
+/// hand opens the palette instead of doing nothing (plans.rs bails on
+/// Build with no selection, so nothing races this). Probes the
+/// "palette-first, no hotbar" direction without removing the hotbar —
+/// if playtests show all selection flowing through here, the hotbar
+/// can go later.
+fn open_on_empty_hand_build(
+    mouse: Res<ButtonInput<MouseButton>>,
+    captures: Res<UiCaptures>,
+    mode: Res<PlayerMode>,
+    selected: Res<SelectedBlock>,
+    drag: Res<crate::plans::PlanDragState>,
+    mut state: ResMut<BuildPaletteState>,
+) {
+    if !mouse.just_pressed(MouseButton::Right) {
+        return;
+    }
+    if captures.is_captured()
+        || !matches!(*mode, PlayerMode::Plan)
+        || selected.0.is_some()
+        || drag.active.is_some()
+    {
+        return;
+    }
+    state.open = true;
 }
 
 /// B toggles the palette. Opening requires Plan mode and no other
@@ -120,6 +154,7 @@ fn sync_build_palette_capture(
 )]
 fn draw_build_palette(
     mut contexts: EguiContexts,
+    keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<BuildPaletteState>,
     palette: Res<PlaceablePalette>,
     mut pins: ResMut<HotbarPins>,
@@ -130,6 +165,11 @@ fn draw_build_palette(
 ) {
     if !state.open {
         return;
+    }
+    // ` empties the hand here too — the in-world handler is gated off
+    // while we hold the capture.
+    if keys.just_pressed(KeyCode::Backquote) && selected.0.is_some() {
+        selected.0 = None;
     }
     // Register voxel icon textures with egui before borrowing the ctx.
     // add_image dedupes by asset id, so per-frame registration is a
@@ -154,6 +194,7 @@ fn draw_build_palette(
     };
 
     let mut open = true;
+    let mut hovered_tile: Option<usize> = None;
     egui::Window::new("Build palette")
         .open(&mut open)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -210,7 +251,7 @@ fn draw_build_palette(
                             }
                         };
                         // Pin digit badge, top-left of the tile.
-                        if let Some(pos) = pins.0.iter().position(|&p| p == idx) {
+                        if let Some(pos) = pins.slot_of(idx) {
                             ui.painter().text(
                                 resp.rect.left_top() + egui::vec2(4.0, 2.0),
                                 egui::Align2::LEFT_TOP,
@@ -218,6 +259,9 @@ fn draw_build_palette(
                                 egui::FontId::proportional(11.0),
                                 egui::Color32::YELLOW,
                             );
+                        }
+                        if resp.hovered() {
+                            hovered_tile = Some(idx);
                         }
                         let cost = if def.materials.is_empty() {
                             "free".to_owned()
@@ -235,17 +279,22 @@ fn draw_build_palette(
                                 .join(" + ")
                         };
                         let resp = resp.on_hover_text(format!(
-                            "{}\ncost: {cost}\nL-click select · R-click pin",
+                            "{}\ncost: {cost}\nL-click select · R-click pin · hover + 1-9 bind slot",
                             def.display_name
                         ));
                         if resp.clicked() {
                             selected.0 = if is_selected { None } else { Some(idx) };
                         }
+                        // R-click: unpin if pinned, else take the first
+                        // free slot. Slot-precise placement is the
+                        // hover + digit path below.
                         if resp.secondary_clicked() {
-                            if let Some(pos) = pins.0.iter().position(|&p| p == idx) {
-                                pins.0.remove(pos);
-                            } else if pins.0.len() < MAX_PINS {
-                                pins.0.push(idx);
+                            if let Some(pos) = pins.slot_of(idx) {
+                                pins.0[pos] = None;
+                            } else if let Some(free) =
+                                pins.0.iter().position(|p| p.is_none())
+                            {
+                                pins.0[free] = Some(idx);
                             }
                         }
                     }
@@ -254,7 +303,7 @@ fn draw_build_palette(
             ui.separator();
             ui.label(
                 egui::RichText::new(
-                    "L-click: select · R-click: pin to hotbar (digits 1-9) · B / Esc: close",
+                    "L-click: select · R-click: pin/unpin · hover + 1-9: bind that slot\n1-9 over nothing: clear slot · `: empty hand · B / Esc: close",
                 )
                 .small()
                 .weak(),
@@ -262,6 +311,35 @@ fn draw_build_palette(
         });
     if !open {
         state.open = false;
+    }
+
+    // Digit keys while the palette is open manage slots directly:
+    // over a tile they bind it to that slot (moving it if it lives in
+    // another slot; re-pressing its own slot clears it), over empty
+    // space they clear the slot. The in-world digit-select handler is
+    // capture-gated, so there's no double-fire.
+    for (k, key) in crate::client::HOTBAR_DIGITS.into_iter().enumerate() {
+        if !keys.just_pressed(key) {
+            continue;
+        }
+        match hovered_tile {
+            Some(idx) => {
+                if pins.0[k] == Some(idx) {
+                    pins.0[k] = None;
+                } else {
+                    if let Some(old) = pins.slot_of(idx) {
+                        pins.0[old] = None;
+                    }
+                    pins.0[k] = Some(idx);
+                }
+            }
+            None => {
+                if pins.0[k].is_some() {
+                    pins.0[k] = None;
+                }
+            }
+        }
+        break;
     }
 }
 
@@ -272,7 +350,11 @@ impl Plugin for BuildPalettePlugin {
         app.init_resource::<BuildPaletteState>();
         app.add_systems(
             Update,
-            (toggle_on_key, sync_build_palette_capture)
+            (
+                toggle_on_key,
+                open_on_empty_hand_build,
+                sync_build_palette_capture,
+            )
                 .chain()
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),

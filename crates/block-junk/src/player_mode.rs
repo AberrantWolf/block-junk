@@ -60,7 +60,7 @@ impl PlayerMode {
         match self {
             PlayerMode::Normal => "L: mine · R: interact",
             PlayerMode::Plan => {
-                "L: remove · R: build\n1-9/wheel: block · B: palette · Ctrl+wheel: rotate"
+                "L: remove · R: build\n1-9/wheel: block · `: empty hand · B: palette · Ctrl+wheel: rotate"
             }
             PlayerMode::Storage => "L: clear storage · R: mark storage (drag on ground)",
         }
