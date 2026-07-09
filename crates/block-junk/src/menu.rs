@@ -6,14 +6,13 @@
 //! `Connect`, and (in host mode) the server-side App is spawned on a worker
 //! thread. Exiting `InGame` tears both down.
 //!
-//! State cleanup on quit-to-menu is currently partial: we disconnect the
-//! client and stop the server thread, but in-world entities (replicated
-//! avatars, chunk entities, UI nodes) are left orphaned. Re-entering a game
-//! from the menu without a process restart is therefore not yet supported.
-//! Tracked as future work.
-//!
-//! See `project_npc_design.md` for the wider future-work backlog this slots
-//! into; this module's job is the "executable lifecycle" prerequisite.
+//! Quit-to-menu drains the same way quit-to-desktop does (server saves,
+//! exits, joins), then transitions back to `MainMenu` instead of writing
+//! `AppExit`. Session cleanup hangs off `OnExit(InGame)`: locally-spawned
+//! session entities carry `DespawnOnExit(AppState::InGame)`, replicated
+//! entities are swept by `client::cleanup_session`, and the lightyear
+//! client entity is disconnected here and despawned once back at the menu
+//! (see `network.rs`). Re-entering a world from the menu is supported.
 
 use core::net::SocketAddr;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -224,19 +223,23 @@ pub struct ServerSaveResultFlag(pub Arc<AtomicU8>);
 pub struct DebugNoSaveOnExit(pub bool);
 
 /// Set after an in-game quit button is clicked. `drive_pending_quit` keeps
-/// the client alive until the hosted server thread has saved, exited, and
-/// joined.
+/// the session alive until the hosted server thread has saved, exited, and
+/// joined — then either exits the process or transitions back to the main
+/// menu, per `to_menu`.
 #[derive(Resource, Debug)]
 struct PendingQuit {
     requested_at: f32,
     warned_slow: bool,
+    /// `true` ⇒ resolve to `AppState::MainMenu`; `false` ⇒ `AppExit`.
+    to_menu: bool,
 }
 
 impl PendingQuit {
-    fn new(requested_at: f32) -> Self {
+    fn new(requested_at: f32, to_menu: bool) -> Self {
         Self {
             requested_at,
             warned_slow: false,
+            to_menu,
         }
     }
 }
@@ -252,14 +255,6 @@ pub struct ConnectionFatal {
     /// Human-readable mismatch lines, already truncated by the producer.
     pub details: Vec<String>,
 }
-
-/// Marker for entities spawned during a game session that should be cleaned
-/// up on quit-to-menu. Phase A doesn't actually exercise the cleanup path
-/// (no quit-to-menu yet — see module docs), but tagging now means the cleanup
-/// system in phase A.7 just queries for this marker.
-#[derive(Component)]
-#[allow(dead_code)] // forward wiring for the A.7 quit-to-menu cleanup
-pub struct GameRoot;
 
 /// One-time egui context setup: register DejaVu Sans as a fallback font
 /// (egui's bundled fonts render arrows / triangles / die faces / ⌘ as
@@ -330,6 +325,7 @@ impl Plugin for MenuPlugin {
         // Chained so a ✕ press and the (fast-path) exit resolve in the
         // same frame when nothing needs saving.
         app.add_systems(Update, (quit_on_window_close, drive_pending_quit).chain());
+        app.add_systems(OnExit(AppState::InGame), cleanup_lifecycle_resources);
     }
 }
 
@@ -412,6 +408,21 @@ fn menu_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_sized(
         [260.0, 46.0],
         egui::Button::new(egui::RichText::new(label).size(22.0)),
+    )
+}
+
+/// Width of the pause-menu window's stacked action buttons. Narrower than
+/// the landing-page buttons (the window itself is compact) but wide enough
+/// that Resume / Quit read at the same weight as the start screen rather
+/// than as default egui chips.
+const PAUSE_BUTTON_SIZE: [f32; 2] = [220.0, 38.0];
+
+/// A pause-menu action button, sized to match the start screen's look so
+/// the two menus feel like one game rather than two different apps.
+fn pause_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        PAUSE_BUTTON_SIZE,
+        egui::Button::new(egui::RichText::new(label).size(17.0)),
     )
 }
 
@@ -553,29 +564,45 @@ fn play_page(
                             ui.label(
                                 egui::RichText::new(format!("Delete {:?}?", meta.name)).strong(),
                             );
-                            let danger = egui::Button::new(
-                                egui::RichText::new("Delete")
-                                    .color(egui::Color32::from_rgb(255, 120, 110)),
+                            // Keep the destructive confirm on the right,
+                            // where the Delete button lived — the eye is
+                            // already there from the click that armed it.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        *confirm_delete = None;
+                                    }
+                                    let danger = egui::Button::new(
+                                        egui::RichText::new("Delete")
+                                            .color(egui::Color32::from_rgb(255, 120, 110)),
+                                    );
+                                    if ui.add(danger).clicked() {
+                                        delete_request = Some(meta.name.clone());
+                                        *confirm_delete = None;
+                                    }
+                                },
                             );
-                            if ui.add(danger).clicked() {
-                                delete_request = Some(meta.name.clone());
-                                *confirm_delete = None;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                *confirm_delete = None;
-                            }
                             return;
                         }
                         if ui.button("Load").clicked() {
                             load_request = Some(meta.name.clone());
                         }
-                        if ui.button("Delete").clicked() {
-                            *confirm_delete = Some(meta.name.clone());
-                        }
                         ui.label(egui::RichText::new(&meta.name).strong().monospace());
                         ui.label(
                             egui::RichText::new(format!("({})", relative_time(meta.modified_at)))
                                 .weak(),
+                        );
+                        // Delete lives at the far right edge, well clear of
+                        // Load, so a misclick can't nuke a world. The first
+                        // click only arms the inline confirm row above.
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.button("Delete").clicked() {
+                                    *confirm_delete = Some(meta.name.clone());
+                                }
+                            },
                         );
                     });
                 }
@@ -837,12 +864,21 @@ fn pause_menu_ui(
         }
     }
     let mut close_request = false;
-    let mut quit_request = false;
+    // Some(to_menu): a quit button was clicked this frame.
+    let mut quit_request: Option<bool> = None;
     egui::Window::new("Paused")
         .collapsible(false)
         .resizable(false)
+        // Fixed width so the button column reads at a deliberate size to
+        // match the start screen, rather than shrink-wrapping to the
+        // shortest label.
+        .default_width(260.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Paused").size(28.0).strong());
+            });
+            ui.add_space(2.0);
             ui.label("The world is still running.");
             // Hosted worlds always bind all interfaces, so the only
             // thing a friend needs is this machine's LAN address.
@@ -867,14 +903,14 @@ fn pause_menu_ui(
                     ui.label(egui::RichText::new(label).weak());
                 }
                 ui.add_enabled_ui(!quit_pending, |ui| {
-                    if ui.button("Resume").clicked() {
+                    if pause_button(ui, "Resume").clicked() {
                         close_request = true;
                     }
                     // Save Now bypasses DebugNoSaveOnExit so you can verify a
                     // save without quitting. Disabled on JoinRemote (the
                     // local App isn't authoritative over the world).
                     ui.add_enabled_ui(hosting, |ui| {
-                        if ui.button("Save Now").clicked() {
+                        if pause_button(ui, "Save Now").clicked() {
                             session.request_save();
                             save_feedback.requested = true;
                             save_feedback.completed_at = None;
@@ -896,15 +932,11 @@ fn pause_menu_ui(
                                 .color(egui::Color32::from_rgb(180, 230, 150)),
                         );
                     }
-                    // Quit-to-menu is a stub: in-world state cleanup
-                    // (despawning replicated entities, resetting resources)
-                    // isn't built yet, so we exit the process the same way as
-                    // Quit-to-Desktop. See module docs.
-                    if ui.button("Quit to Menu (exits process for now)").clicked() {
-                        quit_request = true;
+                    if ui.button("Quit to Menu").clicked() {
+                        quit_request = Some(true);
                     }
                     if ui.button("Quit to Desktop").clicked() {
-                        quit_request = true;
+                        quit_request = Some(false);
                     }
                 });
             });
@@ -949,11 +981,11 @@ fn pause_menu_ui(
         // manual window touching, no separate "open" flag to update.
         captures.release(crate::ui_capture::UiCapture::PauseMenu);
     }
-    if quit_request {
+    if let Some(to_menu) = quit_request {
         session.request_shutdown();
         save_feedback.requested = false;
         save_feedback.completed_at = None;
-        commands.insert_resource(PendingQuit::new(time.elapsed_secs()));
+        commands.insert_resource(PendingQuit::new(time.elapsed_secs(), to_menu));
     }
 }
 
@@ -991,9 +1023,15 @@ fn fatal_error_ui(
             ui.vertical_centered(|ui| {
                 if pending.is_some() {
                     ui.label(egui::RichText::new("Shutting down...").weak());
-                } else if ui.button("Quit to Desktop").clicked() {
-                    session.request_shutdown();
-                    commands.insert_resource(PendingQuit::new(time.elapsed_secs()));
+                } else {
+                    if ui.button("Back to Menu").clicked() {
+                        session.request_shutdown();
+                        commands.insert_resource(PendingQuit::new(time.elapsed_secs(), true));
+                    }
+                    if ui.button("Quit to Desktop").clicked() {
+                        session.request_shutdown();
+                        commands.insert_resource(PendingQuit::new(time.elapsed_secs(), false));
+                    }
                 }
             });
         });
@@ -1015,6 +1053,7 @@ fn drive_pending_quit(
     pending: Option<ResMut<PendingQuit>>,
     time: Res<Time>,
     mut exit: MessageWriter<AppExit>,
+    mut next_state: ResMut<NextState<AppState>>,
 ) {
     let Some(mut pending) = pending else {
         return;
@@ -1023,8 +1062,14 @@ fn drive_pending_quit(
     session.request_shutdown();
     if session.join_if_finished() {
         commands.remove_resource::<PendingQuit>();
-        exit.write(AppExit::Success);
-        arm_quit_watchdog(Duration::from_secs(3));
+        if pending.to_menu {
+            // Session fully drained (save written, thread joined). The
+            // state transition fires the OnExit(InGame) teardown chain.
+            next_state.set(AppState::MainMenu);
+        } else {
+            exit.write(AppExit::Success);
+            arm_quit_watchdog(Duration::from_secs(3));
+        }
         return;
     }
 
@@ -1034,6 +1079,9 @@ fn drive_pending_quit(
         warn!("waiting for hosted server to save and shut down before exiting");
     }
     if waited > QUIT_FORCE_EXIT_SECS {
+        // Even for a quit-to-menu request: a hung server thread can't be
+        // re-hosted (port still bound, `is_hosting` still true), so the
+        // process exit is the only recovery either way.
         error!(
             "hosted server did not shut down within {QUIT_FORCE_EXIT_SECS}s — exiting anyway; \
              the quit-save may not have been written"
@@ -1069,7 +1117,7 @@ fn quit_on_window_close(
         return;
     }
     session.request_shutdown();
-    commands.insert_resource(PendingQuit::new(time.elapsed_secs()));
+    commands.insert_resource(PendingQuit::new(time.elapsed_secs(), false));
     // Bring up the pause menu so the player sees "Saving and shutting
     // down..." instead of a game that ignores the ✕, and so world input
     // is blocked while the server snapshots.
@@ -1107,6 +1155,16 @@ fn debug_overlay_ui(mut contexts: EguiContexts, avatar: Query<&AvatarPose, With<
             ));
             ui.label(format!("yaw   {:>7.2}", pose.yaw));
         });
+}
+
+/// Session-scoped lifecycle resources must not leak into the menu:
+/// `ConnectionFatal` would keep the blocking modal up over the menu
+/// (`fatal_error_ui` gates on the resource, not on state), and a stale
+/// `LaunchMode` could silently relaunch the wrong world if a future
+/// entry path forgets to set one.
+fn cleanup_lifecycle_resources(mut commands: Commands) {
+    commands.remove_resource::<ConnectionFatal>();
+    commands.remove_resource::<LaunchMode>();
 }
 
 /// On entering InGame in a host mode, spawn the server thread. On JoinRemote

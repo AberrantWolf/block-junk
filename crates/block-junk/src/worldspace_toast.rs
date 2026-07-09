@@ -95,6 +95,7 @@ fn drain_pending_toasts(
                     cell: toast.cell,
                     spawned_at: time.elapsed_secs(),
                 },
+                DespawnOnExit(AppState::InGame),
                 Node {
                     position_type: PositionType::Absolute,
                     left: Val::Px(0.0),

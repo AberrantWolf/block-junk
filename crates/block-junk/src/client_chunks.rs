@@ -165,6 +165,7 @@ pub(crate) fn refresh_block_entities(
                         ..default()
                     },
                     Name::new(format!("block_entity:{}{:?}", def.id, cell.to_array())),
+                    DespawnOnExit(crate::menu::AppState::InGame),
                 ))
                 .id();
             entities.by_cell.insert(*cell, entity);

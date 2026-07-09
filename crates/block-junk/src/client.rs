@@ -252,7 +252,8 @@ impl Plugin for ClientPlugin {
             // The owner's predicted avatar arrives via replication after
             // connect; this observer wires its camera, input marker, and
             // headlamp once it's there.
-            .add_observer(handle_predicted_spawn);
+            .add_observer(handle_predicted_spawn)
+            .add_systems(OnExit(AppState::InGame), cleanup_session);
     }
 }
 
@@ -612,6 +613,7 @@ fn setup_scene(
             0.0,
         )),
         SunLight,
+        DespawnOnExit(AppState::InGame),
     ));
     // Back light. Static cool fill that softens the side of geometry the
     // sun isn't on. Doesn't track the sun — it would just fight the key
@@ -624,18 +626,22 @@ fn setup_scene(
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, 0.5, 2.6, 0.0)),
+        DespawnOnExit(AppState::InGame),
     ));
 
     // Screen-centred crosshair.
     commands
-        .spawn(Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            position_type: PositionType::Absolute,
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            ..default()
-        })
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            DespawnOnExit(AppState::InGame),
+        ))
         .with_children(|parent| {
             parent.spawn((
                 Node {
@@ -671,6 +677,7 @@ fn setup_scene(
             BorderColor::all(Color::srgba(0.0, 0.0, 0.0, 0.7)),
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.4)),
             Visibility::Hidden,
+            DespawnOnExit(AppState::InGame),
         ))
         .with_children(|bar| {
             bar.spawn((
@@ -701,6 +708,7 @@ fn setup_scene(
                 padding: UiRect::right(Val::Px(20.0)),
                 ..default()
             },
+            DespawnOnExit(AppState::InGame),
         ))
         .with_children(|root| {
             root.spawn(Node {
@@ -832,6 +840,65 @@ fn setup_scene(
 
     spawn_carry_hud(&mut commands);
     spawn_tool_hud(&mut commands);
+}
+
+/// Everything the replication receiver spawned client-side: remote
+/// replicas plus the local prediction/interpolation copies.
+type ReplicatedEntitiesQuery<'w, 's> =
+    Query<'w, 's, Entity, Or<(With<client::Remote>, With<Predicted>, With<Interpolated>)>>;
+
+/// Client-side session teardown, run once on `OnExit(InGame)` (which only
+/// fires on quit-to-menu — quit-to-desktop exits the process before any
+/// transition). Together with the `DespawnOnExit(AppState::InGame)` tags
+/// on locally-spawned session entities, this returns the client App to
+/// its fresh-launch state so the next session starts clean.
+///
+/// Three jobs:
+///   1. Despawn everything lightyear replicated in (avatars + their
+///      camera, NPCs, world items, cluster bboxes — visual children go
+///      with their parents). These are spawned by the replication
+///      receiver, so they can't carry a `DespawnOnExit` tag.
+///   2. Remove the session-asset resources whose existence gates the
+///      `OnEnter(InGame)` setup systems — a leftover `AvatarAssets`
+///      would make `setup_scene` silently no-op next session.
+///   3. Reset every resource that mirrors world state or caches session
+///      entity ids back to its fresh-launch value. Add yours here when
+///      a new feature grows one — the invariant is "MainMenu state ==
+///      pre-first-session state".
+fn cleanup_session(mut commands: Commands, replicated: ReplicatedEntitiesQuery) {
+    let mut count = 0usize;
+    for entity in replicated.iter() {
+        commands.entity(entity).despawn();
+        count += 1;
+    }
+    info!("session teardown: despawned {count} replicated entities");
+
+    commands.remove_resource::<AvatarAssets>();
+    commands.remove_resource::<CharacterAssets>();
+    commands.remove_resource::<PreviewMaterials>();
+
+    commands.insert_resource(ChunkMap::default());
+    commands.insert_resource(BlockEntities::default());
+    commands.insert_resource(PreviewState::default());
+    commands.insert_resource(SelectedBlock::default());
+    commands.insert_resource(PlacementRotation::default());
+    commands.insert_resource(PlayerActionState::default());
+    commands.insert_resource(WorldClock {
+        day: 0,
+        time_of_day: 0.25,
+    });
+    commands.insert_resource(PlayerMode::default());
+    commands.insert_resource(crate::plans::Plans::default());
+    commands.insert_resource(crate::plans::PlanDragState::default());
+    commands.insert_resource(crate::storage::StorageZones::default());
+    commands.insert_resource(crate::storage::StorageDragState::default());
+    commands.insert_resource(crate::containers::Containers::default());
+    commands.insert_resource(crate::containers::ContainerIndex::default());
+    commands.insert_resource(crate::craft_stations::CraftStations::default());
+    commands.insert_resource(crate::craft_stations::CraftStationUiState::default());
+    commands.insert_resource(crate::room_sync::ClientRooms::default());
+    commands.insert_resource(crate::inspect_panel::InspectTarget::default());
+    commands.insert_resource(crate::worldspace_toast::PendingToasts::default());
 }
 
 /// One scroll handler covers both jobs because Ctrl gates which one fires:
@@ -966,6 +1033,7 @@ fn spawn_carry_hud(commands: &mut Commands) {
                 ..default()
             },
             Visibility::Hidden,
+            DespawnOnExit(AppState::InGame),
         ))
         .with_children(|root| {
             root.spawn((
@@ -1043,6 +1111,7 @@ fn spawn_tool_hud(commands: &mut Commands) {
                 ..default()
             },
             Visibility::Hidden,
+            DespawnOnExit(AppState::InGame),
         ))
         .with_children(|root| {
             root.spawn((
@@ -2354,6 +2423,7 @@ fn setup_placement_preview(
             Transform::default(),
             Visibility::Hidden,
             Name::new("preview_cube_root"),
+            DespawnOnExit(AppState::InGame),
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -2603,6 +2673,7 @@ fn update_placement_preview(
                     Transform::default(),
                     Visibility::Hidden,
                     Name::new(format!("preview_scene:{}", def.id)),
+                    DespawnOnExit(AppState::InGame),
                 ))
                 .id();
             state.scene_root = Some(entity);
@@ -2775,6 +2846,7 @@ fn receive_snapshots(
                             snapshot.coord,
                             Name::new(format!("chunk{:?}", snapshot.coord.0.to_array())),
                             crate::voxel::chunk_world_transform(snapshot.coord),
+                            DespawnOnExit(AppState::InGame),
                         ))
                         .id();
                     map.0.insert(snapshot.coord, entity);

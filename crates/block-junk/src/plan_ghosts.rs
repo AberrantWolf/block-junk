@@ -107,6 +107,11 @@ impl Plugin for PlanGhostsPlugin {
         app.init_resource::<PlanGhostIndex>();
         app.init_resource::<GhostMaterials>();
         app.add_systems(OnEnter(AppState::InGame), setup_ghost_assets);
+        // Overlay entities carry DespawnOnExit; the index tracking them
+        // must be dropped in the same transition or the sync diff would
+        // chase dead entity ids next session. (Private type, so the reset
+        // lives here rather than in client.rs::cleanup_session.)
+        app.add_systems(OnExit(AppState::InGame), reset_ghost_index);
         app.add_systems(
             Update,
             (sync_plan_ghosts, reveal_ready_ghost_scenes)
@@ -114,6 +119,10 @@ impl Plugin for PlanGhostsPlugin {
                 .run_if(in_state(AppState::InGame)),
         );
     }
+}
+
+fn reset_ghost_index(mut index: ResMut<PlanGhostIndex>) {
+    index.by_cell.clear();
 }
 
 fn setup_ghost_assets(
@@ -233,6 +242,7 @@ fn sync_plan_ghosts(
                 commands
                     .spawn((
                         PlanGhost,
+                        DespawnOnExit(AppState::InGame),
                         Mesh3d(cube.0.clone()),
                         MeshMaterial3d(material),
                         NotShadowCaster,
@@ -267,6 +277,7 @@ fn sync_plan_ghosts(
                     commands
                         .spawn((
                             PlanGhost,
+                            DespawnOnExit(AppState::InGame),
                             WorldAssetRoot(scene),
                             GhostMeshStyle {
                                 front: DitherParams::faded(
@@ -326,6 +337,7 @@ fn sync_plan_ghosts(
                     commands
                         .spawn((
                             PlanGhost,
+                            DespawnOnExit(AppState::InGame),
                             Transform {
                                 translation: centre,
                                 scale: extents,

@@ -109,6 +109,19 @@ impl Plugin for NetworkPlugin {
             NetMode::Client => {
                 app.insert_resource(crate::identity::load_or_create());
                 app.add_systems(OnEnter(AppState::InGame), start_netcode_client);
+                // Two-step client teardown on quit-to-menu: trigger the
+                // graceful Disconnect at the state boundary, despawn the
+                // connection entity once lightyear has marked it
+                // `Disconnected` (a frame later, after the disconnect
+                // packets have been flushed). The entity must be gone
+                // before the next session — `start_netcode_client`'s
+                // exists-guard would otherwise refuse to spawn a fresh
+                // client and the new world would connect to nothing.
+                app.add_systems(OnExit(AppState::InGame), disconnect_client_on_exit);
+                app.add_systems(
+                    Update,
+                    despawn_disconnected_clients.run_if(in_state(AppState::MainMenu)),
+                );
             }
         };
     }
@@ -301,6 +314,30 @@ fn start_netcode_server(mut commands: Commands, bind: Option<Res<ServerBindAddr>
         .id();
     commands.trigger(Start { entity: server });
     info!("netcode server listening on {addr}");
+}
+
+/// Ask lightyear to close the session's connection when leaving InGame.
+/// Idempotent: lightyear's disconnect observer ignores links that are
+/// already `Disconnected` (e.g. after the mod-mismatch gate already
+/// triggered one).
+fn disconnect_client_on_exit(clients: Query<Entity, With<Client>>, mut commands: Commands) {
+    for entity in clients.iter() {
+        commands.trigger(Disconnect { entity });
+    }
+}
+
+/// Remove dead connection entities while at the menu. Gated on
+/// `Disconnected` rather than despawning at the state boundary so the
+/// transport gets a frame to flush the disconnect packets first (only a
+/// courtesy to remote servers — a hosted server is already gone by now).
+fn despawn_disconnected_clients(
+    clients: Query<Entity, (With<Client>, With<Disconnected>)>,
+    mut commands: Commands,
+) {
+    for entity in clients.iter() {
+        info!("despawning disconnected netcode client {entity:?}");
+        commands.entity(entity).despawn();
+    }
 }
 
 fn start_netcode_client(

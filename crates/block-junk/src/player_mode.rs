@@ -119,6 +119,7 @@ fn spawn_mode_pill(
     commands
         .spawn((
             ModePillRoot,
+            DespawnOnExit(AppState::InGame),
             Node {
                 position_type: PositionType::Absolute,
                 bottom: Val::Px(16.0),
@@ -169,6 +170,7 @@ fn spawn_verb_hint(commands: &mut Commands, mode: PlayerMode) {
     commands
         .spawn((
             VerbHintRoot,
+            DespawnOnExit(AppState::InGame),
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Percent(50.0),
@@ -215,6 +217,7 @@ fn spawn_mode_hints(commands: &mut Commands, asset_server: &AssetServer, current
     commands
         .spawn((
             ModeHintsRoot,
+            DespawnOnExit(AppState::InGame),
             Node {
                 position_type: PositionType::Absolute,
                 bottom: Val::Px(64.0),

@@ -108,6 +108,7 @@ fn spawn_inspect_panel(mut commands: Commands, existing: Query<(), With<InspectP
     commands
         .spawn((
             InspectPanelRoot,
+            DespawnOnExit(AppState::InGame),
             Node {
                 position_type: PositionType::Absolute,
                 bottom: Val::Px(16.0),

@@ -80,7 +80,15 @@ impl Plugin for CraftProgressHudPlugin {
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),
         );
+        // Bar entities carry DespawnOnExit; the by-cell index must reset
+        // with them (private type, so the reset lives here rather than
+        // in client.rs::cleanup_session).
+        app.add_systems(OnExit(AppState::InGame), reset_progress_bars);
     }
+}
+
+fn reset_progress_bars(mut bars: ResMut<WorldspaceProgressBars>) {
+    bars.by_cell.clear();
 }
 
 /// Per-frame system: ensure each station with `active_work` has a
@@ -191,6 +199,7 @@ fn spawn_bar_entity(commands: &mut Commands, station_cell: IVec3) -> Entity {
     commands
         .spawn((
             WorldspaceProgressBar { station_cell },
+            DespawnOnExit(AppState::InGame),
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),

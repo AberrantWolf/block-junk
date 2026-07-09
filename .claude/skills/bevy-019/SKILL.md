@@ -69,6 +69,10 @@ For mouse motion specifically, **prefer `Res<AccumulatedMouseMotion>`** (resourc
 
 **The old lightyear `Message`-derive collision is RESOLVED as of lightyear 0.28** (verified by compile experiment 2026-07-02): lightyear no longer exports a `#[derive(Message)]` proc-macro, only a blanket `Message` trait. `#[derive(Message)]` + `MessageReader<T>` now work in files that glob-import `lightyear::prelude::*`. New in-process buffered events can use bevy's native message system; the `PendingToasts`-style `Vec<T>`-in-a-`Resource` queues (worldspace_toast.rs) are a historical workaround, fine to leave but not required for new code. Only naming the bare `Message` *trait* (e.g. `T: Message`) is still ambiguous under both globs — qualify it if you ever need to.
 
+## State-scoped despawn: `DespawnOnExit(state)` / `DespawnOnEnter(state)`
+
+`StateScoped` is gone; the 0.19 names are `DespawnOnExit<S>(pub S)` and `DespawnOnEnter<S>(pub S)` (bevy_state, in the prelude). Tag a spawn with `DespawnOnExit(AppState::InGame)` and it (plus descendants — despawn is recursive) dies automatically during the exit transition. Used repo-wide for quit-to-menu teardown (2026-07-08): every locally-spawned session entity carries the tag; only lightyear-replicated entities need a query-driven sweep (`client::cleanup_session`) because the replication receiver spawns them untagged. Convention: any resource caching session entity ids or world mirrors gets reset in `cleanup_session` (public types) or a module-local `OnExit(InGame)` system (private types) — invariant is "MainMenu state == pre-first-session state".
+
 ## Window split: `CursorOptions` is its own component (unchanged from 0.18)
 
 `Window.cursor_options` does not exist. The window entity carries both `Window` and a separate `CursorOptions` component.
