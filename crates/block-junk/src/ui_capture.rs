@@ -65,6 +65,15 @@ pub struct UiCaptures {
 impl UiCaptures {
     /// Mark `capture` as active. Idempotent — re-acquiring an already-
     /// held capture is a no-op (no extra cursor toggling).
+    ///
+    /// PITFALL: idempotent is not free. Calling this (or `release`)
+    /// every frame through a `ResMut` flags the resource changed every
+    /// frame — Bevy's change detection fires on `&mut` access, not on
+    /// actual mutation — which makes [`apply_cursor_mode`] re-lock +
+    /// recentre the cursor and re-arm the motion discard each frame,
+    /// killing mouse-look. Mirror-style sync systems must gate on
+    /// their own state's `is_changed()` first (see
+    /// `sync_craft_modal_capture` / `sync_build_palette_capture`).
     pub fn acquire(&mut self, capture: UiCapture) {
         self.active.insert(capture);
     }

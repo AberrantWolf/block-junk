@@ -97,6 +97,16 @@ fn sync_build_palette_capture(
     if state.open && !matches!(*mode, PlayerMode::Plan) {
         state.open = false;
     }
+    // Only touch the captures set on an actual state change. An
+    // unconditional acquire/release flags `UiCaptures` changed EVERY
+    // frame (any &mut method through ResMut trips change detection,
+    // mutation or not), which makes apply_cursor_mode re-lock +
+    // recentre the cursor and re-arm DiscardNextMotion each frame —
+    // discarding every mouse delta and killing mouse-look. Same guard
+    // as sync_craft_modal_capture.
+    if !state.is_changed() {
+        return;
+    }
     if state.open {
         captures.acquire(UiCapture::BuildPalette);
     } else {
