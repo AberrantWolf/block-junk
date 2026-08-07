@@ -74,9 +74,14 @@ enum CliMode {
     DedicatedServer {
         save_name: String,
         bind: core::net::SocketAddr,
+        requested_access: Option<(crate::network::ServerAccess, Option<[u8; 32]>)>,
+        administrator_keys: Vec<[u8; 32]>,
     },
     /// Pure client connecting to `addr`. Skips the main menu.
-    Client { addr: Option<core::net::SocketAddr> },
+    Client {
+        addr: Option<core::net::SocketAddr>,
+        invite_secret: Option<[u8; 32]>,
+    },
     /// Hosted session loading `save_name`, skipping the main menu — the
     /// same path as menu → Load, for dev/debug of real saves.
     HostLoad { save_name: String },
@@ -96,6 +101,8 @@ fn parse_cli() -> CliMode {
         "server" | "s" => {
             let mut save_name = DEDICATED_DEFAULT_SAVE.to_string();
             let mut bind = crate::network::DEFAULT_BIND_ADDR;
+            let mut requested_access = None;
+            let mut administrator_keys = Vec::new();
             while let Some(arg) = args.next() {
                 if arg == "--bind" {
                     match args.next().map(|raw| (raw.parse(), raw)) {
@@ -105,21 +112,57 @@ fn parse_cli() -> CliMode {
                         }
                         None => eprintln!("--bind needs an ip:port argument; using {bind}"),
                     }
+                } else if arg == "--open" {
+                    if requested_access.is_some() {
+                        panic!("--open conflicts with --invite-secret");
+                    }
+                    requested_access = Some((crate::network::ServerAccess::Open, None));
+                } else if arg == "--invite-secret" {
+                    if requested_access.is_some() {
+                        panic!("--invite-secret conflicts with --open or a duplicate flag");
+                    }
+                    let raw = args.next().expect("--invite-secret needs a HEX argument");
+                    let key = crate::network::decode_key_hex(&raw)
+                        .unwrap_or_else(|error| panic!("invalid --invite-secret: {error}"));
+                    requested_access = Some((crate::network::ServerAccess::Invite, Some(key)));
+                } else if arg == "--admin-key" {
+                    let raw = args.next().expect("--admin-key needs a HEX argument");
+                    administrator_keys.push(
+                        crate::network::decode_key_hex(&raw)
+                            .unwrap_or_else(|error| panic!("invalid --admin-key: {error}")),
+                    );
                 } else {
                     save_name = arg;
                 }
             }
-            CliMode::DedicatedServer { save_name, bind }
+            CliMode::DedicatedServer {
+                save_name,
+                bind,
+                requested_access,
+                administrator_keys,
+            }
         }
         "client" | "c" => {
-            let addr = args.next().and_then(|raw| match raw.parse() {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    eprintln!("invalid client addr {raw:?}: {e}; falling back to default");
-                    None
+            let mut addr = None;
+            let mut invite_secret = None;
+            while let Some(arg) = args.next() {
+                if arg == "--invite-secret" {
+                    let raw = args.next().expect("--invite-secret needs a HEX argument");
+                    invite_secret = Some(
+                        crate::network::decode_key_hex(&raw)
+                            .unwrap_or_else(|error| panic!("invalid --invite-secret: {error}")),
+                    );
+                } else {
+                    addr = match arg.parse() {
+                        Ok(value) => Some(value),
+                        Err(error) => panic!("invalid client addr {arg:?}: {error}"),
+                    };
                 }
-            });
-            CliMode::Client { addr }
+            }
+            CliMode::Client {
+                addr,
+                invite_secret,
+            }
         }
         "host" | "h" => match args.next() {
             Some(save_name) => CliMode::HostLoad { save_name },
@@ -134,23 +177,43 @@ fn parse_cli() -> CliMode {
 
 fn main() {
     match parse_cli() {
-        CliMode::DedicatedServer { save_name, bind } => run_dedicated_server(save_name, bind),
-        CliMode::Client { addr } => {
+        CliMode::DedicatedServer {
+            save_name,
+            bind,
+            requested_access,
+            administrator_keys,
+        } => run_dedicated_server(save_name, bind, requested_access, administrator_keys),
+        CliMode::Client {
+            addr,
+            invite_secret,
+        } => {
             let target = addr.unwrap_or(crate::network::LOCAL_CONNECT_ADDR);
-            run_client(Some(LaunchMode::JoinRemote { addr: target }));
+            run_client(Some(LaunchMode::JoinRemote { addr: target }), invite_secret);
         }
         CliMode::HostLoad { save_name } => {
-            run_client(Some(LaunchMode::HostLoad { save_name }));
+            run_client(Some(LaunchMode::HostLoad { save_name }), None);
         }
-        CliMode::Solo => run_client(None),
+        CliMode::Solo => run_client(None, None),
     }
 }
 
 /// Dedicated server: same save lifecycle as a hosted session, with
 /// Ctrl-C standing in for the quit button. The signal handler sets the
 /// shutdown flag; `save_then_shutdown` (server.rs) does the rest.
-fn run_dedicated_server(save_name: String, bind: core::net::SocketAddr) {
+fn run_dedicated_server(
+    save_name: String,
+    bind: core::net::SocketAddr,
+    requested_access: Option<(crate::network::ServerAccess, Option<[u8; 32]>)>,
+    administrator_keys: Vec<[u8; 32]>,
+) {
     let load_existing = crate::save::save_exists(&save_name);
+    let credentials = crate::network::world_credentials(
+        &save_name,
+        load_existing,
+        requested_access,
+        administrator_keys,
+    )
+    .unwrap_or_else(|error| panic!("cannot configure server access: {error}"));
     let shutdown = Arc::new(AtomicBool::new(false));
     let handler_flag = shutdown.clone();
     if let Err(e) = ctrlc::set_handler(move || {
@@ -175,6 +238,7 @@ fn run_dedicated_server(save_name: String, bind: core::net::SocketAddr) {
         config,
         /*install_log_plugin*/ true,
         bind,
+        credentials,
     );
 }
 
@@ -189,6 +253,7 @@ pub fn run_server_with_shutdown(
     save_request: Arc<AtomicBool>,
     save_result: Arc<AtomicU8>,
     config: ServerSaveConfig,
+    credentials: crate::network::ServerCredentials,
 ) {
     run_server_inner(
         Some(shutdown),
@@ -197,6 +262,7 @@ pub fn run_server_with_shutdown(
         /*install_log_plugin*/ false,
         // Hosted worlds are always LAN-joinable — no private solo bind.
         crate::network::DEFAULT_BIND_ADDR,
+        credentials,
     );
 }
 
@@ -206,6 +272,7 @@ fn run_server_inner(
     save_config: ServerSaveConfig,
     install_log_plugin: bool,
     bind: core::net::SocketAddr,
+    credentials: crate::network::ServerCredentials,
 ) {
     let tick = tick_duration();
     let mut app = App::new();
@@ -230,6 +297,7 @@ fn run_server_inner(
         tick_duration: tick,
     });
     configure_shared_schedule(&mut app);
+    app.insert_resource(credentials);
     app.add_plugins(NetworkPlugin {
         mode: NetMode::Server,
     });
@@ -249,7 +317,7 @@ fn run_server_inner(
     app.run();
 }
 
-fn run_client(preset: Option<LaunchMode>) {
+fn run_client(preset: Option<LaunchMode>, invite_secret: Option<[u8; 32]>) {
     let tick = tick_duration();
     let mut app = App::new();
 
@@ -296,6 +364,10 @@ fn run_client(preset: Option<LaunchMode>) {
     );
     app.add_plugins(ui_capture::UiCapturesPlugin);
     app.add_plugins(MenuPlugin);
+    app.init_resource::<crate::network::JoinCredentials>();
+    if let Some(secret) = invite_secret {
+        app.insert_resource(crate::network::JoinCredentials(secret));
+    }
     app.add_plugins(NetworkPlugin {
         mode: NetMode::Client,
     });

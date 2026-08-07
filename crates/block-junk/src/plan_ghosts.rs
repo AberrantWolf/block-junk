@@ -362,7 +362,13 @@ fn sync_plan_ghosts(
                 }
             }
         };
-        index.by_cell.insert(cell, GhostEntry { entity, desired: want });
+        index.by_cell.insert(
+            cell,
+            GhostEntry {
+                entity,
+                desired: want,
+            },
+        );
     }
 }
 

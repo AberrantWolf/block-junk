@@ -9,6 +9,9 @@ members = [
 ]
 default-members = ["crates/block-junk"]
 
+[patch.crates-io]
+lightyear_transport = { path = "vendor/lightyear_transport" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

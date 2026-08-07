@@ -31,15 +31,15 @@ use crate::physics::{
 use crate::plans::{Plans, PlansClientPlugin};
 use crate::player_mode::{PlayerMode, PlayerModePlugin};
 use crate::preview::{
-    DitherExt, DitherMeshMaterial, DitherParams, GhostMeshMaterials, GhostMeshStyle,
-    PreviewPlugin, PreviewSceneReady,
+    DitherExt, DitherMeshMaterial, DitherParams, GhostMeshMaterials, GhostMeshStyle, PreviewPlugin,
+    PreviewSceneReady,
 };
 use crate::protocol::{
-    ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
-    ModSetManifest, Carrying, ChunkData, ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest,
-    DropToolRequest, EquippedTool, GameSet, INTERACT_REACH, MovementIntent, MovementMode,
-    NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, PlanState, WorldChannel, WorldClock,
-    WorldClockSync, WorldItem,
+    ActionRejected, Actor, AppliedBlockEdit, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity,
+    BlockEdit, BlockWorkIntent, BlockWorkTarget, Carrying, ChunkData, ChunkSnapshot, ChunkUnload,
+    ClientReady, DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameReady, GameSet,
+    INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, PLAN_REACH, PickupRequest,
+    PlanKind, PlanState, ServerHello, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::target_outline::TargetOutlinePlugin;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
@@ -91,6 +91,9 @@ impl Plugin for ClientPlugin {
             .init_resource::<SelectedBlock>()
             .init_resource::<PlacementRotation>()
             .init_resource::<PlayerActionState>()
+            .init_resource::<BlockWorkIntentState>()
+            .init_resource::<StationWorkHold>()
+            .init_resource::<MovementToggleLatch>()
             .init_resource::<BlockEntities>()
             .init_resource::<PreviewState>()
             // Client mirror of the server's day/night clock. Starts at
@@ -115,6 +118,12 @@ impl Plugin for ClientPlugin {
             // Bevy's trait-resolution chain for system tuples (cap 3 in
             // bevy-018 skill).
             .add_systems(Update, normal_mode_action_input.in_set(GameSet::Input))
+            .add_systems(
+                Update,
+                send_block_work_intent
+                    .after(normal_mode_action_input)
+                    .in_set(GameSet::Input),
+            )
             .add_systems(
                 Update,
                 (
@@ -168,7 +177,7 @@ impl Plugin for ClientPlugin {
             .add_systems(
                 Update,
                 (
-                    receive_modset_manifest,
+                    receive_server_hello,
                     receive_snapshots,
                     receive_block_edit_broadcasts,
                     receive_chunk_unloads,
@@ -206,7 +215,7 @@ impl Plugin for ClientPlugin {
                     .after(FrameInterpolationSystems::Interpolate)
                     .run_if(in_state(AppState::InGame)),
             )
-            // Split into multiple add_systems calls — Bevy 0.18 hits a
+            // Split into multiple add_systems calls — Bevy 0.19 hits a
             // trait-resolution cap when the tuple's combined system
             // signatures grow large. `update_placement_preview` carries
             // ~17 params; lumping it with anything else here pushes us
@@ -257,7 +266,15 @@ impl Plugin for ClientPlugin {
             // connect; this observer wires its camera, input marker, and
             // headlamp once it's there.
             .add_observer(handle_predicted_spawn)
-            .add_systems(OnExit(AppState::InGame), cleanup_session);
+            .add_systems(OnExit(AppState::InGame), cleanup_session)
+            .add_systems(
+                OnExit(AppState::InGame),
+                (
+                    reset_block_work_intent,
+                    reset_station_work_hold,
+                    reset_movement_toggle_latch,
+                ),
+            );
     }
 }
 
@@ -405,6 +422,12 @@ pub struct PlayerActionState {
     /// immediately started mining whatever the ray hit next.
     pub hold_latch: Option<HoldLatch>,
 }
+
+#[derive(Resource, Default)]
+struct StationWorkHold(Option<IVec3>);
+
+#[derive(Resource, Default)]
+struct MovementToggleLatch(bool);
 
 /// See [`PlayerActionState::hold_latch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1063,10 +1086,7 @@ fn cleanup_session(
 ///
 /// We keep them in one system so the wheel never double-fires (rotating
 /// AND cycling) on a frame where the modifier flips mid-scroll.
-fn cycle_selected_or_rotation(
-    scroll: Res<AccumulatedMouseScroll>,
-    mut selection: ScrollSelection,
-) {
+fn cycle_selected_or_rotation(scroll: Res<AccumulatedMouseScroll>, mut selection: ScrollSelection) {
     // SSOT input gate: scroll only acts when no overlay holds the
     // cursor. See [`crate::ui_capture`] for the design rationale.
     if selection.captures.is_captured() {
@@ -1085,7 +1105,11 @@ fn cycle_selected_or_rotation(
         || selection.keys.pressed(KeyCode::ControlRight);
     if ctrl {
         // Empty palette ⇒ no orientation to rotate; swallow the wheel.
-        if selection.selected.current_block(&selection.palette).is_none() {
+        if selection
+            .selected
+            .current_block(&selection.palette)
+            .is_none()
+        {
             return;
         }
         // CCW step on scroll-up matches the right-hand rule for +Y rotation
@@ -1515,10 +1539,7 @@ fn update_selected_block_hud(
 /// tally under the hotbar. Remove plans are excluded — they're never
 /// materials-gated, and the tally exists to answer "why isn't anyone
 /// building?".
-fn update_plan_status_hud(
-    plans: Res<Plans>,
-    mut labels: Query<&mut Text, With<PlanStatusLabel>>,
-) {
+fn update_plan_status_hud(plans: Res<Plans>, mut labels: Query<&mut Text, With<PlanStatusLabel>>) {
     let (mut ready, mut waiting) = (0usize, 0usize);
     for (_, state) in plans.iter() {
         if matches!(state.kind, PlanKind::Build { .. }) {
@@ -1706,13 +1727,12 @@ pub(crate) fn world_footprint(
     reason = "input system spans many subsystems"
 )]
 /// Senders + local-player reads for `normal_mode_action_input`,
-/// bundled to keep the system under Bevy 0.18's 16-SystemParam cap.
+/// bundled to keep the system under Bevy 0.19's 16-SystemParam cap.
 /// Adding tool gating to the function pushed it over; consolidating
 /// the message senders + avatar queries into one slot apiece restores
 /// headroom. Same pattern as `npc::HaulCtx` in the brain tick.
 #[derive(bevy::ecs::system::SystemParam)]
 struct NormalActionIo<'w, 's> {
-    edit: Query<'w, 's, &'static mut MessageSender<BlockEdit>>,
     pickup: Query<'w, 's, &'static mut MessageSender<PickupRequest>>,
     deposit: Query<'w, 's, &'static mut MessageSender<DepositRequest>>,
     deposit_station:
@@ -1729,7 +1749,7 @@ struct LocalPlayerState<'w, 's> {
 
 /// Read-only world + registries bundle for `normal_mode_action_input`.
 /// Eight resources/queries collapsed into one `SystemParam` slot —
-/// without this the system overflows Bevy 0.18's 16-param cap on
+/// without this the system overflows Bevy 0.19's 16-param cap on
 /// `IntoSystem` resolution (cap 1 in the bevy-018 skill).
 #[derive(bevy::ecs::system::SystemParam)]
 struct InputContext<'w, 's> {
@@ -1782,7 +1802,7 @@ fn normal_mode_action_input(
     mut action: ResMut<PlayerActionState>,
     mut io: NormalActionIo,
     mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
-    mut work_cell: Local<Option<IVec3>>,
+    mut work_cell: ResMut<StationWorkHold>,
 ) {
     // Inline-expanded "stop the active work-hold if any" — Rust's
     // nested-fn signatures don't compose well with `Local` + `Query`
@@ -1790,7 +1810,7 @@ fn normal_mode_action_input(
     // wrestling the borrow checker on every branch.
     macro_rules! stop_work {
         () => {
-            if let Some(cell) = work_cell.take()
+            if let Some(cell) = work_cell.0.take()
                 && let Ok(mut s) = io.work_stop.single_mut()
             {
                 s.send::<WorldChannel>(crate::craft_stations::WorkStop { station_cell: cell });
@@ -1935,7 +1955,7 @@ fn normal_mode_action_input(
         if work_ready {
             // If cursor moved between work-ready stations, send Stop
             // for the previous before Start on the new.
-            if let Some(active) = *work_cell
+            if let Some(active) = work_cell.0
                 && active != hit.cell
             {
                 if let Ok(mut s) = io.work_stop.single_mut() {
@@ -1943,9 +1963,9 @@ fn normal_mode_action_input(
                         station_cell: active,
                     });
                 }
-                *work_cell = None;
+                work_cell.0 = None;
             }
-            if *work_cell != Some(hit.cell) && (l_just_pressed || work_cell.is_none()) {
+            if work_cell.0 != Some(hit.cell) && (l_just_pressed || work_cell.0.is_none()) {
                 // `work_cell.is_none()` covers the case where the
                 // player started a hold over a non-station cell and
                 // swept onto a station mid-hold — we don't have a
@@ -1956,7 +1976,7 @@ fn normal_mode_action_input(
                     s.send::<WorldChannel>(crate::craft_stations::WorkStart {
                         station_cell: hit.cell,
                     });
-                    *work_cell = Some(hit.cell);
+                    work_cell.0 = Some(hit.cell);
                 }
             }
             action.active = None;
@@ -2071,12 +2091,14 @@ fn normal_mode_action_input(
         });
     }
 
-    // Instant-builds debug toggle: single send on the press edge.
+    // The debug toggle only changes local progress presentation. The
+    // server still owns completion and validates the same intent lease.
     if instant_builds.0 {
-        if l_just_pressed && let Ok(mut s) = io.edit.single_mut() {
-            s.send::<WorldChannel>(edit);
-        }
-        action.active = None;
+        action.active = Some(ActiveAction {
+            target_cell,
+            kind,
+            progress: 1.0,
+        });
         return;
     }
 
@@ -2088,13 +2110,10 @@ fn normal_mode_action_input(
         _ => step,
     };
     if progress >= 1.0 {
-        if let Ok(mut s) = io.edit.single_mut() {
-            s.send::<WorldChannel>(edit);
-        }
-        action.active = None;
-        action.hold_latch = Some(HoldLatch {
-            verb: kind,
-            block: target_block,
+        action.active = Some(ActiveAction {
+            target_cell,
+            kind,
+            progress: 1.0,
         });
     } else {
         action.active = Some(ActiveAction {
@@ -2103,6 +2122,77 @@ fn normal_mode_action_input(
             progress,
         });
     }
+}
+
+const BLOCK_WORK_REFRESH_SECS: f32 = 0.250;
+
+#[derive(Resource, Debug)]
+struct BlockWorkIntentState {
+    sequence: u64,
+    last_sent_at: f32,
+    last_target: Option<BlockWorkTarget>,
+}
+
+impl Default for BlockWorkIntentState {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            last_sent_at: f32::NEG_INFINITY,
+            last_target: None,
+        }
+    }
+}
+
+fn send_block_work_intent(
+    time: Res<Time>,
+    action: Res<PlayerActionState>,
+    plans: Res<Plans>,
+    mut state: ResMut<BlockWorkIntentState>,
+    mut senders: Query<&mut MessageSender<BlockWorkIntent>, With<GameReady>>,
+) {
+    let target = action.active.map(|active| match active.kind {
+        ActionKind::Place => BlockWorkTarget::Plan {
+            cell: active.target_cell,
+        },
+        ActionKind::Break if matches!(plans.kind(active.target_cell), Some(PlanKind::Remove)) => {
+            BlockWorkTarget::Plan {
+                cell: active.target_cell,
+            }
+        }
+        ActionKind::Break => BlockWorkTarget::Break {
+            cell: active.target_cell,
+        },
+    });
+    let now = time.elapsed_secs();
+    if target == state.last_target && now - state.last_sent_at < BLOCK_WORK_REFRESH_SECS {
+        return;
+    }
+    // Do not emit an initial stop before any work has ever begun.
+    if target.is_none() && state.last_target.is_none() && state.sequence == 0 {
+        return;
+    }
+    let Ok(mut sender) = senders.single_mut() else {
+        return;
+    };
+    state.sequence = state.sequence.wrapping_add(1).max(1);
+    sender.send::<WorldChannel>(BlockWorkIntent {
+        sequence: state.sequence,
+        target,
+    });
+    state.last_target = target;
+    state.last_sent_at = now;
+}
+
+fn reset_block_work_intent(mut state: ResMut<BlockWorkIntentState>) {
+    *state = BlockWorkIntentState::default();
+}
+
+fn reset_station_work_hold(mut hold: ResMut<StationWorkHold>) {
+    hold.0 = None;
+}
+
+fn reset_movement_toggle_latch(mut latch: ResMut<MovementToggleLatch>) {
+    latch.0 = false;
 }
 
 /// Q key → send a `DropRequest`. Works in any mode (carry exists
@@ -2192,8 +2282,7 @@ fn resolve_left_hold(
 ) -> LeftHoldResolution {
     // Closest tag under the cursor, whether the world ray hit it (tag
     // on a solid cell) or the plan ray did (Build tag floating in air).
-    let world_dist =
-        world_hit.map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
+    let world_dist = world_hit.map(|h| (h.cell.as_vec3() + Vec3::splat(0.5) - cam_pos).length());
     let tagged = |cell: IVec3, dist: f32| plans.get(cell).map(|state| (dist, cell, state));
     let world_candidate =
         world_hit.and_then(|h| tagged(h.cell, world_dist.unwrap_or(f32::INFINITY)));
@@ -2242,14 +2331,18 @@ fn resolve_left_hold(
 /// Feeds the "Waiting on materials" toast; `None` when nothing is
 /// missing (callers only ask about unsatisfied plans).
 fn first_missing_material(state: &PlanState, items: &ItemRegistry) -> Option<String> {
-    state.materials.iter().find(|m| m.present < m.needed).map(|m| {
-        format!(
-            "{} {}/{}",
-            items.def(m.item).display_name,
-            m.present,
-            m.needed
-        )
-    })
+    state
+        .materials
+        .iter()
+        .find(|m| m.present < m.needed)
+        .map(|m| {
+            format!(
+                "{} {}/{}",
+                items.def(m.item).display_name,
+                m.present,
+                m.needed
+            )
+        })
 }
 
 /// Human name for a tool requirement: the display name of the first
@@ -2774,7 +2867,7 @@ fn update_placement_preview(
     scene_ready: Query<(), With<PreviewSceneReady>>,
 ) {
     // `Res<PlayerMode>` would push this past the 16-param `SystemParam`
-    // cap in Bevy 0.18. Mode gating lives in a `run_if` on the system
+    // cap in Bevy 0.19. Mode gating lives in a `run_if` on the system
     // registration plus `hide_preview_on_mode_change` for the leave-Build
     // transition. SSOT input gating still happens here.
     let hide = |entity: Option<Entity>, q: &mut Query<(&mut Visibility, &mut Transform)>| {
@@ -3007,54 +3100,133 @@ fn receive_snapshots(
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     mut map: ResMut<ChunkMap>,
     terrain_slots: Res<TerrainSlots>,
+    registry: Res<BlockRegistry>,
 ) {
+    let mut staged = bevy::platform::collections::HashMap::new();
+    let mut invalid = false;
     for mut receiver in receivers.iter_mut() {
         for snapshot in receiver.receive() {
-            let mut chunk = match snapshot.data {
+            if staged.contains_key(&snapshot.coord) {
+                warn!(coord = ?snapshot.coord.0, "duplicate chunk coordinate in snapshot batch");
+                invalid = true;
+                continue;
+            }
+            let chunk = match snapshot.data {
                 ChunkData::Procedural => Chunk::from_terrain(snapshot.coord, &terrain_slots),
-                ChunkData::Edited(blocks) => Chunk { blocks },
-            };
-            // Seam sync against already-loaded neighbours, both ways.
-            // Pull: a Procedural regen knows only the terrain function,
-            // so its padding misses any edits in loaded neighbours.
-            // Push: a loaded neighbour's padding misses edits made to
-            // THIS chunk while it was outside our AoI (those broadcasts
-            // were dropped). Same-batch arrivals can't see each other
-            // (spawns flush after the system) and don't need to — the
-            // server cut them at the same tick, mutually consistent.
-            chunk.refresh_padding(snapshot.coord, |world| {
-                let (ncoord, nlocal) = crate::voxel::world_to_chunk(world);
-                map.0
-                    .get(&ncoord)
-                    .and_then(|&e| chunks.get(e).ok())
-                    .map(|(c, _)| c.get(nlocal))
-            });
-            let borders = chunk.border_cells(snapshot.coord);
-            crate::voxel::apply_padding_mirrors(&borders, &map, &mut chunks);
-            let entities = ChunkEntities {
-                entries: snapshot.entities,
-            };
-            match map.0.get(&snapshot.coord).copied() {
-                Some(entity) => {
-                    if let Ok((mut existing_chunk, mut existing_entities)) = chunks.get_mut(entity)
-                    {
-                        *existing_chunk = chunk;
-                        *existing_entities = entities;
+                ChunkData::Raw(blocks) => {
+                    let blocks = blocks.into_inner();
+                    let expected = crate::protocol::CHUNK_PADDED_CELLS;
+                    if blocks.len() != expected {
+                        warn!(coord = ?snapshot.coord.0, got = blocks.len(), expected, "invalid edited chunk length");
+                        invalid = true;
+                        continue;
                     }
+                    if blocks.iter().any(|&slot| registry.try_def(slot).is_none()) {
+                        warn!(coord = ?snapshot.coord.0, "snapshot contains an unknown block slot");
+                        invalid = true;
+                        continue;
+                    }
+                    Chunk { blocks }
                 }
-                None => {
-                    let entity = commands
-                        .spawn((
-                            chunk,
-                            entities,
-                            snapshot.coord,
-                            Name::new(format!("chunk{:?}", snapshot.coord.0.to_array())),
-                            crate::voxel::chunk_world_transform(snapshot.coord),
-                            DespawnOnExit(AppState::InGame),
-                        ))
-                        .id();
-                    map.0.insert(snapshot.coord, entity);
+                ChunkData::Rle(runs) => {
+                    let mut blocks = Vec::with_capacity(crate::protocol::CHUNK_PADDED_CELLS);
+                    let mut valid = true;
+                    for run in runs {
+                        let Ok(count) = usize::try_from(run.count) else {
+                            valid = false;
+                            break;
+                        };
+                        let Some(next_len) = blocks.len().checked_add(count) else {
+                            valid = false;
+                            break;
+                        };
+                        if count == 0
+                            || next_len > crate::protocol::CHUNK_PADDED_CELLS
+                            || registry.try_def(run.slot).is_none()
+                        {
+                            valid = false;
+                            break;
+                        }
+                        blocks.resize(next_len, run.slot);
+                    }
+                    if !valid || blocks.len() != crate::protocol::CHUNK_PADDED_CELLS {
+                        warn!(coord = ?snapshot.coord.0, "invalid edited chunk RLE");
+                        invalid = true;
+                        continue;
+                    }
+                    Chunk { blocks }
                 }
+            };
+            let mut seen_entries = bevy::platform::collections::HashSet::new();
+            if snapshot.entities.iter().any(|entry| {
+                !seen_entries.insert(entry.cell)
+                    || crate::voxel::world_to_chunk(entry.cell).0 != snapshot.coord
+            }) {
+                warn!(coord = ?snapshot.coord.0, "snapshot has duplicate or foreign sidecar entries");
+                invalid = true;
+                continue;
+            }
+            staged.insert(
+                snapshot.coord,
+                (
+                    chunk,
+                    ChunkEntities {
+                        entries: snapshot.entities,
+                    },
+                ),
+            );
+        }
+    }
+    if invalid {
+        warn!("discarding the entire invalid snapshot batch before ECS mutation");
+        return;
+    }
+
+    // Reconcile all staged neighbours from immutable copies first. This is
+    // the same-frame case deferred Commands could not represent safely.
+    let staged_chunks: bevy::platform::collections::HashMap<_, _> = staged
+        .iter()
+        .map(|(&coord, (chunk, _))| (coord, chunk.clone()))
+        .collect();
+    for (&coord, (chunk, _)) in &mut staged {
+        chunk.refresh_padding(coord, |world| {
+            let (ncoord, nlocal) = crate::voxel::world_to_chunk(world);
+            staged_chunks
+                .get(&ncoord)
+                .map(|c| c.get(nlocal))
+                .or_else(|| {
+                    map.0
+                        .get(&ncoord)
+                        .and_then(|&entity| chunks.get(entity).ok())
+                        .map(|(c, _)| c.get(nlocal))
+                })
+        });
+    }
+
+    for (coord, (chunk, entities)) in staged {
+        // Push missed edits into already-loaded neighbour padding before a
+        // newly spawned staged entity enters the deferred ECS world.
+        let borders = chunk.border_cells(coord);
+        crate::voxel::apply_padding_mirrors(&borders, &map, &mut chunks);
+        match map.0.get(&coord).copied() {
+            Some(entity) => {
+                if let Ok((mut existing_chunk, mut existing_entities)) = chunks.get_mut(entity) {
+                    *existing_chunk = chunk;
+                    *existing_entities = entities;
+                }
+            }
+            None => {
+                let entity = commands
+                    .spawn((
+                        chunk,
+                        entities,
+                        coord,
+                        Name::new(format!("chunk{:?}", coord.0.to_array())),
+                        crate::voxel::chunk_world_transform(coord),
+                        DespawnOnExit(AppState::InGame),
+                    ))
+                    .id();
+                map.0.insert(coord, entity);
             }
         }
     }
@@ -3076,7 +3248,7 @@ fn buffer_input(
     captures: Res<crate::ui_capture::UiCaptures>,
     mut flycam: Query<&mut FlyCam>,
     mut q: Query<&mut ActionState<MovementIntent>, With<InputMarker<MovementIntent>>>,
-    mut prev_toggle: Local<bool>,
+    mut prev_toggle: ResMut<MovementToggleLatch>,
 ) {
     let Ok(mut state) = q.single_mut() else {
         return;
@@ -3124,10 +3296,10 @@ fn buffer_input(
         input.jump = keys.pressed(KeyCode::Space);
 
         let toggle_now = keys.pressed(KeyCode::F1);
-        if toggle_now && !*prev_toggle {
+        if toggle_now && !prev_toggle.0 {
             input.toggle_mode = true;
         }
-        *prev_toggle = toggle_now;
+        prev_toggle.0 = toggle_now;
     }
 
     state.0 = input;
@@ -3299,19 +3471,23 @@ fn handle_predicted_spawn(
     clippy::too_many_arguments,
     reason = "diffs every registry the wire references"
 )]
-fn receive_modset_manifest(
+fn receive_server_hello(
     mut commands: Commands,
-    mut receivers: Query<&mut MessageReceiver<ModSetManifest>>,
+    mut connections: Query<(
+        Entity,
+        &mut MessageReceiver<ServerHello>,
+        &mut MessageSender<ClientReady>,
+    )>,
+    identity: Res<crate::identity::ClientIdentity>,
     registry: Res<BlockRegistry>,
     item_registry: Res<ItemRegistry>,
     recipe_registry: Res<crate::recipes::RecipeRegistry>,
     npc_kind_registry: Res<NpcKindRegistry>,
     room_pattern_registry: Res<crate::rooms::RoomPatternRegistry>,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
-    clients: Query<Entity, With<Client>>,
 ) {
-    for mut receiver in receivers.iter_mut() {
-        for manifest in receiver.receive() {
+    for (connection, mut receiver, mut sender) in connections.iter_mut() {
+        for hello in receiver.receive() {
             let local = crate::modset::local_manifest(
                 &registry,
                 &item_registry,
@@ -3319,15 +3495,36 @@ fn receive_modset_manifest(
                 &npc_kind_registry,
                 &room_pattern_registry,
             );
-            let mismatches = crate::modset::diff(&manifest, &local);
+            let mut mismatches = crate::modset::diff(&hello.manifest, &local);
+            if hello.protocol_id != crate::network::NETCODE_PROTOCOL_ID {
+                mismatches.push(format!(
+                    "protocol differs: server {}, client {}",
+                    hello.protocol_id,
+                    crate::network::NETCODE_PROTOCOL_ID
+                ));
+            }
+            if hello.manifest_hash != crate::protocol::manifest_hash(&hello.manifest) {
+                mismatches.push("server manifest hash does not match its payload".to_owned());
+            }
             if mismatches.is_empty() {
                 info!(
                     "mod-set manifest OK ({} block(s), {} item(s), {} recipe(s), {} npc kind(s))",
-                    manifest.blocks.len(),
-                    manifest.items.len(),
-                    manifest.recipes.len(),
-                    manifest.npc_kinds.len(),
+                    hello.manifest.blocks.len(),
+                    hello.manifest.items.len(),
+                    hello.manifest.recipes.len(),
+                    hello.manifest.npc_kinds.len(),
                 );
+                let payload = crate::protocol::ready_payload(
+                    hello.protocol_id,
+                    &hello.connection_nonce,
+                    &hello.manifest_hash,
+                );
+                sender.send::<WorldChannel>(ClientReady {
+                    public_key: identity.public_key(),
+                    signature: crate::protocol::BoundedVec::new(identity.sign(&payload).to_vec())
+                        .expect("Ed25519 signatures are exactly 64 bytes"),
+                });
+                commands.entity(connection).insert(GameReady);
                 continue;
             }
             for line in &mismatches {
@@ -3339,9 +3536,7 @@ fn receive_modset_manifest(
             });
             captures.acquire(crate::ui_capture::UiCapture::FatalError);
             // Stop streaming a world we can't correctly represent.
-            for entity in clients.iter() {
-                commands.trigger(Disconnect { entity });
-            }
+            commands.trigger(Disconnect { entity: connection });
         }
     }
 }
@@ -3412,97 +3607,44 @@ fn receive_world_toasts(
 }
 
 fn receive_block_edit_broadcasts(
-    mut receivers: Query<&mut MessageReceiver<BlockEdit>>,
+    mut receivers: Query<&mut MessageReceiver<AppliedBlockEdit>>,
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
-    registry: Res<BlockRegistry>,
 ) {
     for mut receiver in receivers.iter_mut() {
-        let edits: Vec<BlockEdit> = receiver.receive().collect();
+        let edits: Vec<AppliedBlockEdit> = receiver.receive().collect();
         for edit in edits {
-            apply_broadcast_edit(edit, &mut chunks, &map, &registry);
+            apply_broadcast_edit(edit, &mut chunks, &map);
         }
     }
 }
 
 fn apply_broadcast_edit(
-    edit: BlockEdit,
+    edit: AppliedBlockEdit,
     chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
     map: &ChunkMap,
-    registry: &BlockRegistry,
 ) {
-    // For a break we need the slot that *was* at the anchor — the wire
-    // doesn't carry it (the broadcast says "anchor + EMPTY"), so we read
-    // it from the local chunk. The wire DOES carry `orientation` (the
-    // orientation the entity had at the time of the break), so we trust
-    // that directly rather than re-deriving it from our sidecar.
-    let slot = if edit.slot.is_empty() {
-        let (anchor_coord, anchor_local) = crate::voxel::world_to_chunk(edit.anchor);
-        let Some(&anchor_entity) = map.0.get(&anchor_coord) else {
-            // The owning chunk isn't loaded, but loaded neighbours may
-            // mirror this cell in their padding. We can't expand the
-            // footprint without reading the anchor slot, so multi-cell
-            // ghosts are missed here — acceptable: the owner chunk
-            // ships correct padding whenever it enters AoI, and the
-            // single-cell case (the common one) is covered.
-            crate::voxel::apply_padding_mirrors(&[(edit.anchor, BlockSlot::EMPTY)], map, chunks);
-            return;
-        };
-        let Ok((chunk, _)) = chunks.get(anchor_entity) else {
-            return;
-        };
-        let anchor_slot = chunk.get(anchor_local);
-        if anchor_slot.is_empty() {
-            // Already cleared (a previous broadcast applied). No-op.
-            return;
-        }
-        anchor_slot
-    } else {
-        edit.slot
-    };
-
-    let def = registry.def(slot);
-    let cells = world_footprint(edit.anchor, &def.footprint, edit.orientation);
-    let new_slot = if edit.slot.is_empty() {
-        BlockSlot::EMPTY
-    } else {
-        edit.slot
-    };
-    let needs_sidecar = def.mesh.is_some();
-
-    for &cell in &cells {
-        let (coord, local) = crate::voxel::world_to_chunk(cell);
+    let mut mirrors = Vec::with_capacity(edit.cells.len());
+    for state in edit.cells {
+        mirrors.push((state.world, state.slot));
+        let (coord, local) = crate::voxel::world_to_chunk(state.world);
         let Some(&entity) = map.0.get(&coord) else {
             continue;
         };
         let Ok((mut chunk, mut entities)) = chunks.get_mut(entity) else {
             continue;
         };
-        chunk.set(local, new_slot);
-        if edit.slot.is_empty() {
-            // remove() is a no-op if no entry — covers both block-entity
-            // breaks and plain-cube breaks uniformly.
-            entities.remove(cell);
-        } else if needs_sidecar {
-            let kind = if cell == edit.anchor {
-                EntryKind::Anchor {
-                    orientation: edit.orientation,
-                }
-            } else {
-                EntryKind::Ghost {
-                    anchor: edit.anchor,
-                }
-            };
-            entities.insert(cell, kind);
+        chunk.set(local, state.slot);
+        match state.entity {
+            Some(kind) => {
+                entities.insert(state.world, kind);
+            }
+            None => {
+                entities.remove(state.world);
+            }
         }
     }
-    // Echo into loaded neighbours' padding so their seam faces re-cull.
-    // Runs over ALL footprint cells, not just the ones whose owning
-    // chunk is loaded — a border cell's owner can be outside our AoI
-    // while its mirror sits in a chunk we render right now.
-    let mirror_cells: Vec<(IVec3, BlockSlot)> =
-        cells.iter().map(|&cell| (cell, new_slot)).collect();
-    crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
+    crate::voxel::apply_padding_mirrors(&mirrors, map, chunks);
 }
 
 /// Paint replicated avatar entities with the shared cuboid mesh, EXCEPT
@@ -3973,7 +4115,9 @@ fn setup_npc_skeleton_anim(
         visuals.hand_l = hand_l;
     }
     if hand_r.is_none() || hand_l.is_none() {
-        warn!("npc rig missing a handslot node: {scene_bearer:?} (r={hand_r:?} l={hand_l:?}); held item falls back to the floating cube");
+        warn!(
+            "npc rig missing a handslot node: {scene_bearer:?} (r={hand_r:?} l={hand_l:?}); held item falls back to the floating cube"
+        );
     }
 
     info!(

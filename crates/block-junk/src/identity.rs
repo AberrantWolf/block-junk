@@ -1,126 +1,232 @@
-//! Persistent per-install client identity.
+//! Persistent Ed25519 client identity.
 //!
-//! A random u64 generated once and stored as text in `./client_id.txt`
-//! (workspace-relative for dev, same convention as `save::SAVE_ROOT` —
-//! both move to platform dirs in the pre-ship pass). This id is what the
-//! netcode layer presents as `client_id` and what the server keys
-//! per-player persistence on, so copying the file to another machine is
-//! "playing as yourself there" — the SSH-key model.
-//!
-//! Spoof-resistance is deliberately deferred: the id file is a claim,
-//! not a proof. When strangers-on-servers becomes a real threat model,
-//! the server binds each id to a public key on first use (TOFU) and
-//! challenges afterwards — an additive change that keeps this u64 as
-//! the persistence key, so there is no migration.
-//!
-//! The file is held under an advisory exclusive lock for the lifetime
-//! of the process. A second client launched from the same directory
-//! (the standard local two-client smoke test) fails the lock and falls
-//! back to an *ephemeral* random id, so both instances can connect to
-//! one server without a `ClientIdInUse` collision.
+//! The public key is the identity. A compact non-zero `u64` derived from
+//! BLAKE3(public key) is presented to Lightyear and is also the save key;
+//! the post-connect challenge proves possession of the corresponding secret.
 
-use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use bevy::prelude::*;
+use ed25519_dalek::{Signer, SigningKey};
 
-const ID_FILE: &str = "client_id.txt";
+const IDENTITY_FILE: &str = "client_identity.v1";
+const IDENTITY_LOCK: &str = "client_identity.lock";
+const IDENTITY_VERSION: u8 = 1;
+const IDENTITY_BYTES: usize = 1 + 32;
 
-/// The u64 this install presents as its netcode client id. Inserted as
-/// a resource on the client App at plugin-build time; read once by
-/// `start_netcode_client`.
-#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClientIdentity(pub u64);
+#[derive(Resource, Clone)]
+pub struct ClientIdentity {
+    signing_key: SigningKey,
+    player_id: u64,
+    persistent: bool,
+}
 
-/// Keeps the id file's advisory lock alive for the process lifetime.
-/// Dropping the handle would release the lock and let a second local
-/// instance read the same id.
+impl std::fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientIdentity")
+            .field("player_id", &self.player_id)
+            .field("persistent", &self.persistent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientIdentity {
+    pub fn player_id(&self) -> u64 {
+        self.player_id
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    pub fn sign(&self, payload: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(payload).to_bytes()
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+}
+
 static ID_FILE_LOCK: OnceLock<File> = OnceLock::new();
 
-/// Load the persistent id, creating the file on first run. Every
-/// failure path (locked by another instance, unreadable file, readonly
-/// filesystem) degrades to an ephemeral random id with a log line —
-/// identity is a persistence nicety, never a reason to refuse to play.
 pub fn load_or_create() -> ClientIdentity {
-    let mut file = match OpenOptions::new()
+    let lock = match OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(ID_FILE)
+        .open(IDENTITY_LOCK)
     {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("cannot open {ID_FILE} ({e}); using an ephemeral client id this session");
-            return ClientIdentity(random_id());
+        Ok(file) => file,
+        Err(error) => {
+            warn!("cannot open {IDENTITY_LOCK} ({error}); using a clearly ephemeral identity");
+            return ephemeral();
         }
     };
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            info!(
-                "{ID_FILE} is locked by another running instance; \
-                 using an ephemeral client id this session"
-            );
-            return ClientIdentity(random_id());
-        }
-        Err(TryLockError::Error(e)) => {
-            warn!("cannot lock {ID_FILE} ({e}); using an ephemeral client id this session");
-            return ClientIdentity(random_id());
-        }
+    if let Err(error) = lock.try_lock() {
+        info!("{IDENTITY_LOCK} is held by another process ({error}); using an ephemeral identity");
+        return ephemeral();
     }
 
-    let mut contents = String::new();
-    let parsed = file
-        .read_to_string(&mut contents)
-        .ok()
-        .and_then(|_| contents.trim().parse::<u64>().ok())
-        .filter(|id| *id != 0);
-    let id = match parsed {
-        Some(id) => id,
-        None => {
-            let id = random_id();
-            // Empty on first run; anything else is corrupt — either way
-            // the file's new content is this id.
-            if let Err(e) = file
-                .seek(SeekFrom::Start(0))
-                .and_then(|_| file.set_len(0))
-                .and_then(|_| file.write_all(id.to_string().as_bytes()))
-            {
-                warn!("cannot write {ID_FILE} ({e}); id will regenerate next launch");
-            } else {
-                info!("generated new persistent client id in {ID_FILE}");
-            }
-            id
+    let identity = match load_or_create_at(Path::new(IDENTITY_FILE)) {
+        Ok(identity) => identity,
+        Err(IdentityError::Corrupt(error)) => {
+            // Never replace a corrupt persistent credential: doing so would
+            // strand player ownership on every server that knows the key.
+            error!(
+                "{IDENTITY_FILE} is corrupt ({error}); refusing to replace it and using an ephemeral identity"
+            );
+            ephemeral()
+        }
+        Err(error) => {
+            warn!("cannot persist {IDENTITY_FILE} ({error}); using an ephemeral identity");
+            ephemeral()
         }
     };
-    // Hold the lock forever. A second load_or_create in this process
-    // (there isn't one today) would just re-read the same file.
-    let _ = ID_FILE_LOCK.set(file);
-    ClientIdentity(id)
+    let _ = ID_FILE_LOCK.set(lock);
+    identity
 }
 
-/// Random non-zero u64 from OS entropy. Zero is excluded because it
-/// reads as "unset" in netcode logs and tooling.
-fn random_id() -> u64 {
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
-    u64::from_le_bytes(bytes).max(1)
+#[derive(Debug, thiserror::Error)]
+enum IdentityError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Corrupt(String),
+}
+
+fn load_or_create_at(path: &Path) -> Result<ClientIdentity, IdentityError> {
+    match File::open(path) {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            decode_identity(&bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let identity = new_identity(true);
+            write_identity_atomic(path, &identity)?;
+            Ok(identity)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn decode_identity(bytes: &[u8]) -> Result<ClientIdentity, IdentityError> {
+    if bytes.len() != IDENTITY_BYTES {
+        return Err(IdentityError::Corrupt(format!(
+            "expected {IDENTITY_BYTES} bytes, found {}",
+            bytes.len()
+        )));
+    }
+    if bytes[0] != IDENTITY_VERSION {
+        return Err(IdentityError::Corrupt(format!(
+            "unsupported identity version {}",
+            bytes[0]
+        )));
+    }
+    let secret: [u8; 32] = bytes[1..]
+        .try_into()
+        .map_err(|_| IdentityError::Corrupt("invalid secret length".into()))?;
+    Ok(from_signing_key(SigningKey::from_bytes(&secret), true))
+}
+
+fn write_identity_atomic(path: &Path, identity: &ClientIdentity) -> Result<(), std::io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temp = PathBuf::from(path);
+    temp.set_extension(format!("tmp-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&temp)?;
+    let mut bytes = [0u8; IDENTITY_BYTES];
+    bytes[0] = IDENTITY_VERSION;
+    bytes[1..].copy_from_slice(&identity.signing_key.to_bytes());
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn ephemeral() -> ClientIdentity {
+    new_identity(false)
+}
+
+fn new_identity(persistent: bool) -> ClientIdentity {
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).expect("OS entropy source unavailable");
+    from_signing_key(SigningKey::from_bytes(&secret), persistent)
+}
+
+fn from_signing_key(signing_key: SigningKey, persistent: bool) -> ClientIdentity {
+    let public = signing_key.verifying_key().to_bytes();
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&blake3::hash(&public).as_bytes()[..8]);
+    ClientIdentity {
+        signing_key,
+        player_id: u64::from_le_bytes(id_bytes).max(1),
+        persistent,
+    }
+}
+
+pub fn player_id_from_public_key(public_key: &[u8; 32]) -> u64 {
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&blake3::hash(public_key).as_bytes()[..8]);
+    u64::from_le_bytes(id_bytes).max(1)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::random_id;
+    use super::*;
 
     #[test]
-    fn random_ids_are_nonzero_and_distinct() {
-        let a = random_id();
-        let b = random_id();
-        assert_ne!(a, 0);
-        assert_ne!(b, 0);
-        // 64-bit collision odds are negligible; a repeat here means the
-        // entropy source is broken, which is worth a test failure.
-        assert_ne!(a, b);
+    fn identity_round_trip_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        let first = load_or_create_at(&path).unwrap();
+        let second = load_or_create_at(&path).unwrap();
+        assert_eq!(first.player_id(), second.player_id());
+        assert_eq!(first.public_key(), second.public_key());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            IDENTITY_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn corrupt_identity_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(matches!(
+            load_or_create_at(&path),
+            Err(IdentityError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn signature_verifies_and_id_matches_public_key() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let identity = new_identity(false);
+        let payload = b"block-junk-ready";
+        let signature = Signature::from_bytes(&identity.sign(payload));
+        VerifyingKey::from_bytes(&identity.public_key())
+            .unwrap()
+            .verify(payload, &signature)
+            .unwrap();
+        assert_eq!(
+            identity.player_id(),
+            player_id_from_public_key(&identity.public_key())
+        );
     }
 }

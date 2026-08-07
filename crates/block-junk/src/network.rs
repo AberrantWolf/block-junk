@@ -25,12 +25,12 @@ use crate::craft_stations::{
 use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
-    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, ModSetManifest, Carrying,
-    ChunkChannel, ChunkSnapshot, ChunkUnload, DebugAdvanceTime, DebugBumpNeed,
-    DebugFillNearestPlan, DebugSpawnTools, DebugSpawnWorkbench, DepositRequest, DropRequest,
-    DropToolRequest, EquippedTool, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
-    PeriodicSyncChannel, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync, RequestNpcDetails,
-    StateSyncChannel, WorldChannel, WorldClockSync, WorldItem,
+    Actor, AppliedBlockEdit, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockWorkIntent,
+    Carrying, ChunkChannel, ChunkSnapshot, ChunkUnload, ClientReady, DebugAdvanceTime,
+    DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools, DebugSpawnWorkbench, DepositRequest,
+    DropRequest, DropToolRequest, EquippedTool, MovementIntent, MovementMode, NpcAnimOverride,
+    NpcDetails, PeriodicSyncChannel, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync,
+    RequestNpcDetails, ServerHello, StateSyncChannel, WorldChannel, WorldClockSync, WorldItem,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,150 @@ pub const LOCAL_CONNECT_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SERVER_PORT);
 
 pub const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+pub const OPEN_NETCODE_KEY: [u8; 32] = [0; 32];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ServerAccess {
+    Invite,
+    Open,
+}
+
+#[derive(Resource, Clone, Debug)]
+pub struct ServerCredentials {
+    pub access: ServerAccess,
+    pub netcode_key: [u8; 32],
+    pub administrators: Vec<[u8; 32]>,
+}
+
+#[derive(Resource, Clone, Debug)]
+pub struct JoinCredentials(pub [u8; 32]);
+
+impl Default for JoinCredentials {
+    fn default() -> Self {
+        Self(OPEN_NETCODE_KEY)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedAccess {
+    version: u32,
+    access: ServerAccess,
+    invite_secret: Option<String>,
+    administrators: Vec<String>,
+}
+
+pub fn decode_key_hex(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("expected exactly 64 hexadecimal characters".to_owned());
+    }
+    let mut key = [0u8; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "secret contains non-hexadecimal characters".to_owned())?;
+    }
+    Ok(key)
+}
+
+pub fn encode_key_hex(key: &[u8; 32]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Resolve and persist world transport access. Existing credentials are
+/// authoritative; flags may confirm them but cannot silently rotate them.
+pub fn world_credentials(
+    save_name: &str,
+    load_existing: bool,
+    requested: Option<(ServerAccess, Option<[u8; 32]>)>,
+    mut administrator_keys: Vec<[u8; 32]>,
+) -> Result<ServerCredentials, String> {
+    let dir = crate::save::save_dir_for(save_name);
+    let path = dir.join("access.json");
+    if path.is_file() {
+        let bytes = std::fs::read(&path).map_err(|error| format!("read {path:?}: {error}"))?;
+        let mut stored: PersistedAccess =
+            serde_json::from_slice(&bytes).map_err(|error| format!("parse {path:?}: {error}"))?;
+        if stored.version != 1 {
+            return Err(format!(
+                "unsupported access settings version {}",
+                stored.version
+            ));
+        }
+        let netcode_key = match stored.access {
+            ServerAccess::Open => OPEN_NETCODE_KEY,
+            ServerAccess::Invite => decode_key_hex(
+                stored
+                    .invite_secret
+                    .as_deref()
+                    .ok_or("invite world is missing its secret")?,
+            )?,
+        };
+        if let Some((access, supplied)) = requested
+            && (access != stored.access || supplied.is_some_and(|key| key != netcode_key))
+        {
+            return Err("CLI access flags conflict with the world's persisted credentials".into());
+        }
+        let mut administrators = stored
+            .administrators
+            .iter()
+            .map(|key| decode_key_hex(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in administrator_keys.drain(..) {
+            if !administrators.contains(&key) {
+                administrators.push(key);
+                stored.administrators.push(encode_key_hex(&key));
+            }
+        }
+        persist_access(&path, &stored)?;
+        return Ok(ServerCredentials {
+            access: stored.access,
+            netcode_key,
+            administrators,
+        });
+    }
+    if load_existing {
+        return Err("existing world has no access settings; refusing to invent credentials".into());
+    }
+    let (access, supplied) = requested.unwrap_or((ServerAccess::Invite, None));
+    let netcode_key = match access {
+        ServerAccess::Open => OPEN_NETCODE_KEY,
+        ServerAccess::Invite => supplied.unwrap_or_else(|| {
+            let mut key = [0u8; 32];
+            getrandom::fill(&mut key).expect("OS entropy source unavailable");
+            key
+        }),
+    };
+    administrator_keys.sort_unstable();
+    administrator_keys.dedup();
+    let stored = PersistedAccess {
+        version: 1,
+        access,
+        invite_secret: (access == ServerAccess::Invite).then(|| encode_key_hex(&netcode_key)),
+        administrators: administrator_keys.iter().map(encode_key_hex).collect(),
+    };
+    persist_access(&path, &stored)?;
+    Ok(ServerCredentials {
+        access,
+        netcode_key,
+        administrators: administrator_keys,
+    })
+}
+
+fn persist_access(path: &std::path::Path, access: &PersistedAccess) -> Result<(), String> {
+    use std::io::Write as _;
+    let parent = path.parent().ok_or("access path has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("create {parent:?}: {error}"))?;
+    let temporary = path.with_extension("tmp");
+    let bytes = serde_json::to_vec_pretty(access).map_err(|error| error.to_string())?;
+    let mut file = std::fs::File::create(&temporary)
+        .map_err(|error| format!("create {temporary:?}: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("write {temporary:?}: {error}"))?;
+    std::fs::rename(&temporary, path).map_err(|error| format!("rename {path:?}: {error}"))?;
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| format!("fsync {parent:?}: {error}"))
+}
 
 /// Netcode protocol discriminator, checked during the handshake before
 /// any app code runs. Both sides must present the same value; a client
@@ -71,7 +215,7 @@ pub const CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECI
 //  berry/bush registrations are caught by the mod-set gate — so the id
 //  stays 0006. Save format is likewise unchanged: new blocks/items are
 //  appended and remapped by id, so v17 saves load without migration.)
-pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0006;
+pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0007;
 
 /// Which address the server socket binds. Inserted by
 /// `run_server_inner`; the dedicated CLI can override the default.
@@ -108,7 +252,10 @@ impl Plugin for NetworkPlugin {
             // locked-id fallback is decided before the menu even shows.
             NetMode::Client => {
                 app.insert_resource(crate::identity::load_or_create());
-                app.add_systems(OnEnter(AppState::InGame), start_netcode_client);
+                app.add_systems(
+                    OnEnter(AppState::InGame),
+                    start_netcode_client.after(crate::menu::spawn_server_if_hosting),
+                );
                 // Two-step client teardown on quit-to-menu: trigger the
                 // graceful Disconnect at the state boundary, despawn the
                 // connection entity once lightyear has marked it
@@ -157,8 +304,10 @@ impl Plugin for ProtocolPlugin {
         })
         .add_direction(NetworkDirection::ServerToClient);
 
-        app.register_message::<BlockEdit>()
-            .add_direction(NetworkDirection::Bidirectional);
+        app.register_message::<BlockWorkIntent>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<AppliedBlockEdit>()
+            .add_direction(NetworkDirection::ServerToClient);
         // Targeted reply to a refused request (reach gate etc.); feeds
         // the rejection-toast UI on the requesting client only.
         app.register_message::<crate::protocol::ActionRejected>()
@@ -190,8 +339,10 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ChunkUnload>()
             .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<ModSetManifest>()
+        app.register_message::<ServerHello>()
             .add_direction(NetworkDirection::ServerToClient);
+        app.register_message::<ClientReady>()
+            .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<WorldClockSync>()
             .add_direction(NetworkDirection::ServerToClient);
         // Debug-only client→server requests. No auth gate yet — see the
@@ -257,7 +408,8 @@ impl Plugin for ProtocolPlugin {
         app.component::<crate::npc::NpcKind>().replicate();
         app.component::<NpcAnimOverride>().replicate();
         app.component::<NpcPath>().replicate();
-        app.component::<crate::civilization::ClusterBboxReplica>().replicate();
+        app.component::<crate::civilization::ClusterBboxReplica>()
+            .replicate();
         // Loose items in the world. No prediction (clients never drive
         // item motion) and no interpolation (movement is occasional
         // settle snaps, not continuous per-tick motion worth lerping).
@@ -298,7 +450,11 @@ impl Plugin for ProtocolPlugin {
     }
 }
 
-fn start_netcode_server(mut commands: Commands, bind: Option<Res<ServerBindAddr>>) {
+fn start_netcode_server(
+    mut commands: Commands,
+    bind: Option<Res<ServerBindAddr>>,
+    credentials: Res<ServerCredentials>,
+) {
     use lightyear::prelude::server::{NetcodeConfig, NetcodeServer, ServerUdpIo};
 
     let addr = bind.map(|b| b.0).unwrap_or(DEFAULT_BIND_ADDR);
@@ -306,6 +462,7 @@ fn start_netcode_server(mut commands: Commands, bind: Option<Res<ServerBindAddr>
         .spawn((
             NetcodeServer::new(NetcodeConfig {
                 protocol_id: NETCODE_PROTOCOL_ID,
+                private_key: credentials.netcode_key,
                 ..default()
             }),
             LocalAddr(addr),
@@ -344,9 +501,9 @@ fn start_netcode_client(
     mut commands: Commands,
     target: Res<JoinTarget>,
     identity: Res<crate::identity::ClientIdentity>,
+    credentials: Res<JoinCredentials>,
     existing: Query<(), With<Client>>,
 ) {
-    use lightyear::netcode::Key;
     use lightyear::prelude::client::{NetcodeClient, NetcodeConfig};
     // Authentication and UdpIo come from the top-level prelude (already
     // imported via `lightyear::prelude::*`).
@@ -360,6 +517,12 @@ fn start_netcode_client(
     }
 
     let server_addr = target.0;
+    info!(
+        player_id = identity.player_id(),
+        persistent_identity = identity.is_persistent(),
+        "starting authenticated netcode client"
+    );
+    debug_assert_eq!(crate::protocol::MAX_REASSEMBLED_MESSAGE_BYTES, 1 << 20);
 
     // Persistent per-install id (see `identity.rs`): collision-proof
     // across machines AND stable across launches, which is what keys
@@ -368,8 +531,8 @@ fn start_netcode_client(
     // file-lock fallback.
     let auth = Authentication::Manual {
         server_addr,
-        client_id: identity.0,
-        private_key: Key::default(),
+        client_id: identity.player_id(),
+        private_key: credentials.0,
         protocol_id: NETCODE_PROTOCOL_ID,
     };
     let client = match NetcodeClient::new(auth, NetcodeConfig::default()) {

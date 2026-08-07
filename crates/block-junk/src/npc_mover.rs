@@ -315,16 +315,12 @@ pub(crate) fn npc_mover_step(
                                 // brain fires arrival off the cursor.
                                 pose.translation = standing_pose_translation(to);
                             } else {
-                                pose.translation =
-                                    Vec3::new(target_xz.x, level_y, target_xz.y);
+                                pose.translation = Vec3::new(target_xz.x, level_y, target_xz.y);
                             }
                         } else {
                             let advance = remaining.normalize() * step;
-                            pose.translation = Vec3::new(
-                                pose_xz.x + advance.x,
-                                level_y,
-                                pose_xz.y + advance.y,
-                            );
+                            pose.translation =
+                                Vec3::new(pose_xz.x + advance.x, level_y, pose_xz.y + advance.y);
                         }
                     }
                 }
@@ -472,10 +468,18 @@ mod tests {
         assert!(edge_traversable(&world, a, IVec3::new(1, 1, 0)));
         // Step up onto a ledge.
         world.solid.insert(IVec3::new(2, 1, 0));
-        assert!(edge_traversable(&world, IVec3::new(1, 1, 0), IVec3::new(2, 2, 0)));
+        assert!(edge_traversable(
+            &world,
+            IVec3::new(1, 1, 0),
+            IVec3::new(2, 2, 0)
+        ));
         // Climb blocked by a canopy over the climber's head.
         world.solid.insert(IVec3::new(1, 3, 0));
-        assert!(!edge_traversable(&world, IVec3::new(1, 1, 0), IVec3::new(2, 2, 0)));
+        assert!(!edge_traversable(
+            &world,
+            IVec3::new(1, 1, 0),
+            IVec3::new(2, 2, 0)
+        ));
         // Anything beyond ±1 Y is never a legal edge.
         assert!(!edge_traversable(&world, a, IVec3::new(0, 3, 0)));
     }

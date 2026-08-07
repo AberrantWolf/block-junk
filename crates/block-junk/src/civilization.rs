@@ -311,7 +311,7 @@ fn sync_cluster_entities(
                 let entity = commands
                     .spawn((
                         next,
-                        Replicate::to_clients(NetworkTarget::All),
+                        Replicate::to_clients(NetworkTarget::None),
                         Name::new(format!("ClusterBbox({})", cluster_id.0)),
                     ))
                     .id();

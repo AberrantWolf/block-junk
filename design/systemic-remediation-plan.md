@@ -33,6 +33,27 @@ findings plus bugs found while tracing their adjacent data flows.
 
 ## Issue register
 
+Implementation status (2026-08-07):
+
+- Resolved: `BND-01`, `BND-02`, `AUTH-01`, `NET-01`, `SEC-01`,
+  `WORLD-01`, `WORLD-02`, `CRAFT-01`, `SAVE-01`–`SAVE-04`, and
+  `MAINT-01`. Their owning boundaries now have fallible registries, bounded
+  decoding, authenticated readiness, server-owned work, staged snapshots,
+  transactional version-18 generations, or strict CI as applicable.
+- Substantially resolved: `AOI-01`. `SpatialSubscriptions` now owns both
+  indexes and targets block/plan/storage/container traffic; actors, items, and
+  civilization bounds use immediate visibility; chunk payloads are bounded
+  raw/RLE with near-first 32 KiB/s streaming. Room reference-counted
+  partitions and station heartbeat partitioning remain follow-up work.
+- Substantially resolved: `SESSION-01`. Work leases and input latches are
+  resettable resources with exit cleanup, and connection-owned indexes and
+  budgets clear on disconnect. Moving the remaining presentation-only menu
+  `Local` values into plugin-owned resources remains follow-up work.
+- Dependency hardening: the pinned Lightyear transport is locally patched to
+  reject declarations over 1 MiB before allocation and cap a receiver at 64
+  incomplete messages / 4 MiB reserved storage. Crafted `u64::MAX`, excessive
+  count, storage, and flood tests cover the boundary.
+
 ### Critical
 
 **BND-01: unchecked registry slots can panic the server.** `BlockRegistry::def`

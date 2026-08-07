@@ -2,13 +2,257 @@ use bevy::ecs::entity::{EntityMapper, MapEntities};
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::{BlockId, Cardinal};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::ops::{Deref, DerefMut};
 
 use crate::blocks::BlockSlot;
 use crate::items::ItemSlot;
-use crate::voxel::EntityEntry;
+use crate::voxel::{EntityEntry, EntryKind};
 
 pub const CHUNK_SIZE: u32 = 32;
 pub const CHUNK_PADDED: u32 = CHUNK_SIZE + 2;
+pub const CHUNK_PADDED_CELLS: usize = CHUNK_PADDED.pow(3) as usize;
+pub const MAX_WIRE_ID_BYTES: usize = 128;
+pub const MAX_BLOCK_FOOTPRINT_CELLS: usize = 256;
+pub const MAX_APPLIED_BLOCK_CELLS: usize = 512;
+pub const MAX_REASSEMBLED_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// A string whose UTF-8 byte length is rejected during deserialization.
+/// This keeps an attacker-controlled length prefix from allocating an
+/// unbounded `String` before a handler gets a chance to validate it.
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct BoundedString<const N: usize>(String);
+
+impl<const N: usize> BoundedString<N> {
+    pub fn new(value: impl Into<String>) -> Result<Self, BoundExceeded> {
+        let value = value.into();
+        if value.len() > N {
+            return Err(BoundExceeded {
+                limit: N,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<const N: usize> Deref for BoundedString<N> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> fmt::Debug for BoundedString<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<const N: usize> fmt::Display for BoundedString<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<const N: usize> AsRef<str> for BoundedString<N> {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de, const N: usize> Deserialize<'de> for BoundedString<N> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor<const N: usize>;
+
+        impl<'de, const N: usize> serde::de::Visitor<'de> for Visitor<N> {
+            type Value = BoundedString<N>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a UTF-8 string of at most {N} bytes")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                BoundedString::new(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                BoundedString::new(value).map_err(E::custom)
+            }
+
+            fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > N {
+                    return Err(E::custom(BoundExceeded {
+                        limit: N,
+                        actual: value.len(),
+                    }));
+                }
+                let value = std::str::from_utf8(value).map_err(E::custom)?;
+                BoundedString::new(value).map_err(E::custom)
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > N {
+                    return Err(E::custom(BoundExceeded {
+                        limit: N,
+                        actual: value.len(),
+                    }));
+                }
+                let value = std::str::from_utf8(value).map_err(E::custom)?;
+                BoundedString::new(value).map_err(E::custom)
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > N {
+                    return Err(E::custom(BoundExceeded {
+                        limit: N,
+                        actual: value.len(),
+                    }));
+                }
+                let value = String::from_utf8(value).map_err(E::custom)?;
+                BoundedString::new(value).map_err(E::custom)
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_string(Visitor::<N>)
+        } else {
+            deserializer.deserialize_bytes(Visitor::<N>)
+        }
+    }
+}
+
+/// A vector capped at `N` elements during deserialization. The visitor
+/// checks a declared length before reserving and also checks every element,
+/// covering formats that omit or lie about their size hint.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct BoundedVec<T, const N: usize>(Vec<T>);
+
+impl<T, const N: usize> BoundedVec<T, N> {
+    pub fn new(value: Vec<T>) -> Result<Self, BoundExceeded> {
+        if value.len() > N {
+            return Err(BoundExceeded {
+                limit: N,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T, const N: usize> Deref for BoundedVec<T, N> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T, const N: usize> DerefMut for BoundedVec<T, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T, const N: usize> IntoIterator for BoundedVec<T, N> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a BoundedVec<T, N> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'de, T, const N: usize> Deserialize<'de> for BoundedVec<T, N>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor<T, const N: usize>(std::marker::PhantomData<T>);
+
+        impl<'de, T, const N: usize> serde::de::Visitor<'de> for Visitor<T, N>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = BoundedVec<T, N>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a sequence of at most {N} elements")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                if let Some(size) = seq.size_hint()
+                    && size > N
+                {
+                    return Err(serde::de::Error::custom(BoundExceeded {
+                        limit: N,
+                        actual: size,
+                    }));
+                }
+                let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(N));
+                while let Some(value) = seq.next_element()? {
+                    if values.len() == N {
+                        return Err(serde::de::Error::custom(BoundExceeded {
+                            limit: N,
+                            actual: N.saturating_add(1),
+                        }));
+                    }
+                    values.push(value);
+                }
+                Ok(BoundedVec(values))
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor::<T, N>(std::marker::PhantomData))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("wire collection bound exceeded: limit {limit}, got {actual}")]
+pub struct BoundExceeded {
+    pub limit: usize,
+    pub actual: usize,
+}
 
 /// Stable identifier for a chunk in the world grid. Both client and server
 /// key their `ChunkMap` by this — see the networking-design skill for why
@@ -34,11 +278,42 @@ pub struct ChunkCoord(pub IVec3);
 ///     anchor of whatever was removed (single-cell or entity), and
 ///     `orientation` is the removed entity's orientation. Recipients use
 ///     this to rotate the def's footprint and clear all of its cells.
-#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BlockEdit {
     pub anchor: IVec3,
     pub slot: BlockSlot,
     pub orientation: Cardinal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockWorkTarget {
+    Plan { cell: IVec3 },
+    Break { cell: IVec3 },
+}
+
+/// Client intent lease. The client refreshes an unchanged target every
+/// 250 ms; the server expires it after 500 ms and owns all progress.
+#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BlockWorkIntent {
+    pub sequence: u64,
+    pub target: Option<BlockWorkTarget>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritativeCellState {
+    pub world: IVec3,
+    pub slot: BlockSlot,
+    pub entity: Option<EntryKind>,
+}
+
+/// Server fact containing every affected cell. Clients apply this payload
+/// directly and never reconstruct a destructive footprint from stale state.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct AppliedBlockEdit {
+    pub anchor: IVec3,
+    pub old_slot: BlockSlot,
+    pub orientation: Cardinal,
+    pub cells: BoundedVec<AuthoritativeCellState, MAX_APPLIED_BLOCK_CELLS>,
 }
 
 /// The ONE reach for direct world interactions — mine, place, pickup,
@@ -150,6 +425,58 @@ pub struct ModSetManifest {
     pub defs_hash: u64,
 }
 
+pub const READY_DOMAIN: &[u8] = b"block-junk/client-ready/v1\0";
+
+/// First application message sent after the transport connects. No game
+/// state, replication, or subscriptions are enabled before its challenge is
+/// answered and verified.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct ServerHello {
+    pub protocol_id: u64,
+    pub connection_nonce: [u8; 32],
+    pub manifest_hash: [u8; 32],
+    pub manifest: ModSetManifest,
+}
+
+/// Signed proof of identity and content agreement.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub struct ClientReady {
+    pub public_key: [u8; 32],
+    pub signature: BoundedVec<u8, 64>,
+}
+
+/// Verified player identity attached to the server connection entity.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedPlayer {
+    pub player_id: u64,
+    pub public_key: [u8; 32],
+    pub administrator: bool,
+}
+
+/// Application readiness. This, not Lightyear's `Connected`, is the sole
+/// lifecycle gate for avatar creation, replication, AoI, and feature sync.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct GameReady;
+
+pub fn ready_payload(
+    protocol_id: u64,
+    connection_nonce: &[u8; 32],
+    manifest_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(READY_DOMAIN.len() + 8 + 32 + 32);
+    payload.extend_from_slice(READY_DOMAIN);
+    payload.extend_from_slice(&protocol_id.to_le_bytes());
+    payload.extend_from_slice(connection_nonce);
+    payload.extend_from_slice(manifest_hash);
+    payload
+}
+
+pub fn manifest_hash(manifest: &ModSetManifest) -> [u8; 32] {
+    let bytes = bincode::serde::encode_to_vec(manifest, bincode::config::standard())
+        .expect("the mod-set manifest is serializable");
+    *blake3::hash(&bytes).as_bytes()
+}
+
 /// Server → client only: tells a client what to put in a chunk it just
 /// entered AoI of. Two payload variants — see `ChunkData`. Subsequent
 /// changes arrive as `BlockEdit` broadcasts; this message fires once
@@ -172,9 +499,17 @@ pub enum ChunkData {
     /// from the deterministic terrain function (`Chunk::from_terrain`).
     /// ~13 B on the wire.
     Procedural,
-    /// The chunk has been edited; the client must use these blocks rather
-    /// than regenerating. ~64 KB on the wire (RLE later).
-    Edited(Vec<BlockSlot>),
+    /// Exact padded slot grid for an edited chunk.
+    Raw(BoundedVec<BlockSlot, CHUNK_PADDED_CELLS>),
+    /// Run-length encoded padded grid. The decoded run counts must sum
+    /// to exactly [`CHUNK_PADDED_CELLS`].
+    Rle(BoundedVec<BlockRun, CHUNK_PADDED_CELLS>),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BlockRun {
+    pub slot: BlockSlot,
+    pub count: u32,
 }
 
 /// Marker component for "thing with a body that can move and interact" —
@@ -618,7 +953,7 @@ pub struct RoomsFullSync {
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct PlanEditBatch {
     pub kind: Option<PlanKind>,
-    pub cells: Vec<IVec3>,
+    pub cells: BoundedVec<IVec3, PLAN_EDIT_BATCH_MAX>,
     #[serde(default)]
     pub materials: Vec<MaterialEntry>,
 }
@@ -656,7 +991,7 @@ pub const PLAN_EDIT_BATCH_MAX: usize = 4096;
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct StorageEditBatch {
     pub add: bool,
-    pub cells: Vec<IVec3>,
+    pub cells: BoundedVec<IVec3, PLAN_EDIT_BATCH_MAX>,
 }
 
 /// Server → client on connect: every storage-zone cell. Shares the
@@ -665,7 +1000,9 @@ pub struct StorageEditBatch {
 /// coherent, and add-only application makes splits commutative).
 #[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StorageFullSync {
-    pub cells: Vec<IVec3>,
+    /// True on the first part so the client clears its previous mirror.
+    pub reset: bool,
+    pub cells: BoundedVec<IVec3, PLAN_EDIT_BATCH_MAX>,
 }
 
 /// Small critical world-command lane. Ordered reliable so edit *requests*,
@@ -829,7 +1166,7 @@ pub struct DebugAdvanceTime {
 /// (e.g. a typo from the UI).
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct DebugBumpNeed {
-    pub need: String,
+    pub need: BoundedString<MAX_WIRE_ID_BYTES>,
     pub delta: f32,
 }
 
@@ -928,6 +1265,7 @@ pub struct NpcDetails {
 mod tests {
     use super::*;
     use crate::items::ItemSlot;
+    use proptest::prelude::*;
 
     /// `pickup_many` is the withdrawal primitive for both NPC and player
     /// pile grabs — it must never exceed the cap, mix kinds, or miscount.
@@ -959,5 +1297,48 @@ mod tests {
 
         // want == 0 is a no-op.
         assert_eq!(c2.pickup_many(log, 0, cap), 0);
+    }
+
+    #[test]
+    fn bounded_wire_values_reject_oversize_payloads() {
+        let oversized = vec![7_u16; 9];
+        let bytes = bincode::serde::encode_to_vec(&oversized, bincode::config::standard()).unwrap();
+        let decoded = bincode::serde::decode_from_slice::<BoundedVec<u16, 8>, _>(
+            &bytes,
+            bincode::config::standard(),
+        );
+        assert!(decoded.is_err());
+
+        let oversized = "x".repeat(129);
+        let bytes = bincode::serde::encode_to_vec(&oversized, bincode::config::standard()).unwrap();
+        let decoded = bincode::serde::decode_from_slice::<BoundedString<128>, _>(
+            &bytes,
+            bincode::config::standard(),
+        );
+        assert!(decoded.is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn bounded_vec_decode_never_accepts_more_than_limit(values in proptest::collection::vec(any::<u16>(), 0..256)) {
+            let bytes = bincode::serde::encode_to_vec(&values, bincode::config::standard()).unwrap();
+            let result = bincode::serde::decode_from_slice::<BoundedVec<u16, 64>, _>(
+                &bytes,
+                bincode::config::standard(),
+            );
+            prop_assert_eq!(result.is_ok(), values.len() <= 64);
+        }
+
+        #[test]
+        fn arbitrary_bytes_do_not_panic_bounded_decoders(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = bincode::serde::decode_from_slice::<BoundedVec<u32, 64>, _>(
+                &bytes,
+                bincode::config::standard(),
+            );
+            let _ = bincode::serde::decode_from_slice::<BoundedString<128>, _>(
+                &bytes,
+                bincode::config::standard(),
+            );
+        }
     }
 }

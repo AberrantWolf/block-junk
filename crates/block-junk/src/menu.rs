@@ -44,7 +44,10 @@ use lightyear::prelude::Predicted;
 
 use crate::network::LOCAL_CONNECT_ADDR;
 use crate::protocol::AvatarPose;
-use crate::save::{SaveMetadata, delete_save, list_saves, save_exists, validate_name};
+use crate::save::{
+    SaveListEntry, SaveStatus as SaveEntryStatus, delete_save, list_saves, save_exists,
+    validate_name,
+};
 use crate::voxel::world_to_chunk;
 
 /// Top-level lifecycle states for the client App. The server App, when
@@ -281,6 +284,9 @@ impl Plugin for MenuPlugin {
         app.init_resource::<ServerSession>();
         app.init_resource::<DebugNoSaveOnExit>();
         app.init_resource::<ConnectAddrInput>();
+        app.init_resource::<InviteSecretInput>();
+        app.init_resource::<HostAccessSelection>();
+        app.init_resource::<HostedJoinCode>();
         app.init_resource::<NewWorldName>();
         app.init_resource::<SaveListing>();
         app.init_resource::<SaveStatus>();
@@ -347,6 +353,21 @@ fn spawn_ui_camera(mut commands: Commands) {
 #[derive(Resource, Default)]
 struct ConnectAddrInput(String);
 
+#[derive(Resource, Default)]
+struct InviteSecretInput(String);
+
+#[derive(Resource)]
+pub(crate) struct HostAccessSelection(crate::network::ServerAccess);
+
+impl Default for HostAccessSelection {
+    fn default() -> Self {
+        Self(crate::network::ServerAccess::Invite)
+    }
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct HostedJoinCode(Option<String>);
+
 /// Buffer for the "New world name" text field. Validated as a save name on
 /// Create (file-safe charset, non-empty).
 #[derive(Resource)]
@@ -363,7 +384,7 @@ impl Default for NewWorldName {
 /// the directory wouldn't normally change while the user is at the menu,
 /// and it's polite to filesystems we might be reading from.
 #[derive(Resource, Default)]
-struct SaveListing(Vec<SaveMetadata>);
+struct SaveListing(Vec<SaveListEntry>);
 
 /// Most-recent save error (delete failed, create with bad name, etc.) so
 /// the main menu can surface it. Cleared on next valid action.
@@ -433,6 +454,9 @@ fn main_menu_ui(
     mut commands: Commands,
     mut join_target: ResMut<JoinTarget>,
     mut addr_input: ResMut<ConnectAddrInput>,
+    mut invite_input: ResMut<InviteSecretInput>,
+    mut join_credentials: ResMut<crate::network::JoinCredentials>,
+    mut host_access: ResMut<HostAccessSelection>,
     mut new_name: ResMut<NewWorldName>,
     mut listing: ResMut<SaveListing>,
     mut status: ResMut<SaveStatus>,
@@ -475,6 +499,7 @@ fn main_menu_ui(
                     &mut listing,
                     &mut status,
                     &mut confirm_delete,
+                    &mut host_access,
                 ),
                 MenuPage::Multiplayer => multiplayer_page(
                     ui,
@@ -484,6 +509,8 @@ fn main_menu_ui(
                     &mut commands,
                     &mut join_target,
                     &mut addr_input,
+                    &mut invite_input,
+                    &mut join_credentials,
                     &mut status,
                 ),
                 MenuPage::Settings => settings_page(ui, screen_h, &mut page, &mut dummy),
@@ -544,13 +571,18 @@ fn play_page(
     listing: &mut SaveListing,
     status: &mut SaveStatus,
     confirm_delete: &mut Option<String>,
+    host_access: &mut HostAccessSelection,
 ) {
     ui.add_space(screen_h * 0.08);
     ui.label(egui::RichText::new("Play").size(40.0).strong());
     ui.add_space(16.0);
 
     if listing.0.is_empty() {
-        ui.label(egui::RichText::new("(no worlds yet — create one below)").italics().weak());
+        ui.label(
+            egui::RichText::new("(no worlds yet — create one below)")
+                .italics()
+                .weak(),
+        );
     } else {
         let mut load_request: Option<String> = None;
         let mut delete_request: Option<String> = None;
@@ -585,7 +617,13 @@ fn play_page(
                             );
                             return;
                         }
-                        if ui.button("Load").clicked() {
+                        if ui
+                            .add_enabled(
+                                meta.status == SaveEntryStatus::Valid,
+                                egui::Button::new("Load"),
+                            )
+                            .clicked()
+                        {
                             load_request = Some(meta.name.clone());
                         }
                         ui.label(egui::RichText::new(&meta.name).strong().monospace());
@@ -593,17 +631,31 @@ fn play_page(
                             egui::RichText::new(format!("({})", relative_time(meta.modified_at)))
                                 .weak(),
                         );
+                        match meta.status {
+                            SaveEntryStatus::Valid => {}
+                            SaveEntryStatus::Incompatible => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "incompatible v{}",
+                                        meta.version.unwrap_or_default()
+                                    ))
+                                    .color(egui::Color32::YELLOW),
+                                );
+                            }
+                            SaveEntryStatus::Corrupt => {
+                                ui.label(
+                                    egui::RichText::new("corrupt").color(egui::Color32::LIGHT_RED),
+                                );
+                            }
+                        }
                         // Delete lives at the far right edge, well clear of
                         // Load, so a misclick can't nuke a world. The first
                         // click only arms the inline confirm row above.
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.button("Delete").clicked() {
-                                    *confirm_delete = Some(meta.name.clone());
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Delete").clicked() {
+                                *confirm_delete = Some(meta.name.clone());
+                            }
+                        });
                     });
                 }
             });
@@ -660,6 +712,19 @@ fn play_page(
             }
         }
     });
+    ui.horizontal(|ui| {
+        ui.label("Access:");
+        ui.selectable_value(
+            &mut host_access.0,
+            crate::network::ServerAccess::Invite,
+            "Invite",
+        );
+        ui.selectable_value(
+            &mut host_access.0,
+            crate::network::ServerAccess::Open,
+            "Open",
+        );
+    });
 
     if let Some(msg) = &status.0 {
         ui.colored_label(egui::Color32::YELLOW, msg);
@@ -682,6 +747,8 @@ fn multiplayer_page(
     commands: &mut Commands,
     join_target: &mut JoinTarget,
     addr_input: &mut ConnectAddrInput,
+    invite_input: &mut InviteSecretInput,
+    join_credentials: &mut crate::network::JoinCredentials,
     status: &mut SaveStatus,
 ) {
     ui.add_space(screen_h * 0.1);
@@ -703,6 +770,16 @@ fn multiplayer_page(
         if ui.button("Connect").clicked() {
             match addr_input.0.parse::<SocketAddr>() {
                 Ok(addr) => {
+                    let key = if invite_input.0.trim().is_empty() {
+                        Ok(crate::network::OPEN_NETCODE_KEY)
+                    } else {
+                        crate::network::decode_key_hex(invite_input.0.trim())
+                    };
+                    let Ok(key) = key else {
+                        status.0 = Some("invite secret must be 64 hexadecimal characters".into());
+                        return;
+                    };
+                    join_credentials.0 = key;
                     commands.insert_resource(LaunchMode::JoinRemote { addr });
                     *join_target = JoinTarget(addr);
                     next_state.set(AppState::InGame);
@@ -712,6 +789,15 @@ fn multiplayer_page(
                 }
             }
         }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Join secret:");
+        ui.add(
+            egui::TextEdit::singleline(&mut invite_input.0)
+                .desired_width(300.0)
+                .password(true)
+                .hint_text("blank for Open worlds"),
+        );
     });
 
     if let Some(msg) = &status.0 {
@@ -728,12 +814,7 @@ fn multiplayer_page(
 /// Placeholder Settings page. Every control here is disabled — it exists
 /// to make the menu feel complete and to reserve a home for the real
 /// options pass. See [`DummySettings`].
-fn settings_page(
-    ui: &mut egui::Ui,
-    screen_h: f32,
-    page: &mut MenuPage,
-    dummy: &mut DummySettings,
-) {
+fn settings_page(ui: &mut egui::Ui, screen_h: f32, page: &mut MenuPage, dummy: &mut DummySettings) {
     ui.add_space(screen_h * 0.1);
     ui.label(egui::RichText::new("Settings").size(40.0).strong());
     ui.add_space(6.0);
@@ -784,7 +865,7 @@ fn refresh_save_listing(
     }
 }
 
-fn next_free_world_name(existing: &[SaveMetadata]) -> String {
+fn next_free_world_name(existing: &[SaveListEntry]) -> String {
     let taken: std::collections::HashSet<&str> = existing.iter().map(|m| m.name.as_str()).collect();
     for n in 1..1000 {
         let candidate = format!("world{n}");
@@ -835,6 +916,10 @@ struct PauseMenuLocal<'s> {
     lan_addr: Local<'s, Option<Option<core::net::IpAddr>>>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pause UI coordinates session and save controls"
+)]
 fn pause_menu_ui(
     mut contexts: EguiContexts,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
@@ -842,6 +927,7 @@ fn pause_menu_ui(
     mut session: ResMut<ServerSession>,
     debug_no_save: Res<DebugNoSaveOnExit>,
     time: Res<Time>,
+    join_code: Res<HostedJoinCode>,
     local: PauseMenuLocal,
 ) {
     let PauseMenuLocal {
@@ -899,6 +985,9 @@ fn pause_menu_ui(
                     None => "LAN address unavailable (offline?)".to_string(),
                 };
                 ui.label(egui::RichText::new(text).weak());
+                if let Some(code) = &join_code.0 {
+                    ui.label(egui::RichText::new(format!("Join code: {code}")).monospace());
+                }
             }
             ui.add_space(4.0);
             ui.vertical_centered(|ui| {
@@ -1177,10 +1266,14 @@ fn cleanup_lifecycle_resources(mut commands: Commands) {
 
 /// On entering InGame in a host mode, spawn the server thread. On JoinRemote
 /// this is a no-op.
-fn spawn_server_if_hosting(
+pub(crate) fn spawn_server_if_hosting(
     launch: Option<Res<LaunchMode>>,
     debug_no_save: Res<DebugNoSaveOnExit>,
     mut session: ResMut<ServerSession>,
+    identity: Res<crate::identity::ClientIdentity>,
+    mut join_credentials: ResMut<crate::network::JoinCredentials>,
+    host_access: Res<HostAccessSelection>,
+    mut join_code: ResMut<HostedJoinCode>,
 ) {
     // Already hosting — Resume from pause re-enters InGame and must not
     // double-spawn.
@@ -1195,7 +1288,12 @@ fn spawn_server_if_hosting(
             load_existing: false,
             no_save_on_exit,
         };
-        spawn_server_thread(cfg, &mut session);
+        let credentials =
+            crate::network::world_credentials("autosave", false, None, vec![identity.public_key()])
+                .unwrap_or_else(|error| panic!("cannot configure hosted access: {error}"));
+        join_credentials.0 = credentials.netcode_key;
+        join_code.0 = Some(crate::network::encode_key_hex(&credentials.netcode_key));
+        spawn_server_thread(cfg, credentials, &mut session);
         return;
     };
     let cfg = match &*launch {
@@ -1214,10 +1312,37 @@ fn spawn_server_if_hosting(
             return;
         }
     };
-    spawn_server_thread(cfg, &mut session);
+    let save_name = cfg
+        .save_name
+        .as_deref()
+        .expect("hosted sessions always have a save name");
+    let credentials = crate::network::world_credentials(
+        save_name,
+        cfg.load_existing,
+        (!cfg.load_existing).then_some((host_access.0, None)),
+        vec![identity.public_key()],
+    )
+    .unwrap_or_else(|error| panic!("cannot configure hosted access: {error}"));
+    join_credentials.0 = credentials.netcode_key;
+    join_code.0 = Some(match credentials.access {
+        crate::network::ServerAccess::Invite => {
+            crate::network::encode_key_hex(&credentials.netcode_key)
+        }
+        crate::network::ServerAccess::Open => "OPEN".to_owned(),
+    });
+    info!(
+        access = ?credentials.access,
+        join_code = %crate::network::encode_key_hex(&credentials.netcode_key),
+        "hosted world access configured"
+    );
+    spawn_server_thread(cfg, credentials, &mut session);
 }
 
-fn spawn_server_thread(config: ServerSaveConfig, session: &mut ServerSession) {
+fn spawn_server_thread(
+    config: ServerSaveConfig,
+    credentials: crate::network::ServerCredentials,
+    session: &mut ServerSession,
+) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let save_request = Arc::new(AtomicBool::new(false));
     let save_result = Arc::new(AtomicU8::new(SAVE_RESULT_NONE));
@@ -1232,6 +1357,7 @@ fn spawn_server_thread(config: ServerSaveConfig, session: &mut ServerSession) {
                 save_for_thread,
                 result_for_thread,
                 config,
+                credentials,
             );
         })
         .expect("spawn server thread");

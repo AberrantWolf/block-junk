@@ -468,10 +468,11 @@ pub fn try_schedule_haul_for_npc(
         Vec<(HaulSource, Vec3, u32)>,
     > = std::collections::HashMap::new();
     for (entity, wi) in world_items.iter() {
-        items_by_slot
-            .entry(wi.item)
-            .or_default()
-            .push((HaulSource::Ground(entity), wi.translation, wi.count));
+        items_by_slot.entry(wi.item).or_default().push((
+            HaulSource::Ground(entity),
+            wi.translation,
+            wi.count,
+        ));
     }
     for (cell, state) in containers.iter() {
         let centre = cell.as_vec3() + Vec3::splat(0.5);
@@ -813,7 +814,10 @@ fn try_schedule_tidy(
     // Tidy the kind of the nearest loose item.
     let mut best_kind: Option<(crate::items::ItemSlot, f32)> = None;
     for (slot, items) in &loose_by_kind {
-        let nearest = items.iter().map(|(_, _, d)| *d).fold(f32::INFINITY, f32::min);
+        let nearest = items
+            .iter()
+            .map(|(_, _, d)| *d)
+            .fold(f32::INFINITY, f32::min);
         if best_kind.map(|(_, bd)| nearest < bd).unwrap_or(true) {
             best_kind = Some((*slot, nearest));
         }
@@ -957,10 +961,7 @@ fn chebyshev(a: IVec3, b: IVec3) -> i32 {
 /// dead-end pickup leg.
 fn pick_haul_kind(
     demands: impl IntoIterator<Item = (crate::items::ItemSlot, u32)>,
-    items_by_slot: &std::collections::HashMap<
-        crate::items::ItemSlot,
-        Vec<(HaulSource, Vec3, u32)>,
-    >,
+    items_by_slot: &std::collections::HashMap<crate::items::ItemSlot, Vec<(HaulSource, Vec3, u32)>>,
     pose: Vec3,
     npc_id: NpcId,
     store: &HaulStore,

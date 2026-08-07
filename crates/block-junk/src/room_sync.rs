@@ -16,7 +16,9 @@ use lightyear::prelude::*;
 use std::collections::HashMap;
 
 use crate::menu::AppState;
-use crate::protocol::{GameSet, RoomRemove, RoomSummary, RoomSync, RoomsFullSync, StateSyncChannel};
+use crate::protocol::{
+    GameReady, GameSet, RoomRemove, RoomSummary, RoomSync, RoomsFullSync, StateSyncChannel,
+};
 use crate::rooms::{RoomEventMsg, RoomMap, RoomPatternRegistry};
 use crate::worldspace_toast::{PendingToasts, SpawnToast};
 use block_junk_mod_api::rooms::{RoomEvent, RoomPatternId};
@@ -42,7 +44,7 @@ impl Plugin for RoomSyncServerPlugin {
 /// syncs still send — the receive side treats the message as "the full
 /// state is now exactly this."
 fn send_rooms_full_sync_on_connect(
-    trigger: On<Add, Connected>,
+    trigger: On<Add, GameReady>,
     rooms: Res<RoomMap>,
     mut senders: Query<&mut MessageSender<RoomsFullSync>>,
 ) {
@@ -109,9 +111,7 @@ impl ClientRooms {
     pub fn room_at(&self, cell: IVec3) -> Option<&RoomSummary> {
         self.rooms
             .values()
-            .filter(|r| {
-                cell.cmpge(r.bbox_min).all() && cell.cmple(r.bbox_max).all()
-            })
+            .filter(|r| cell.cmpge(r.bbox_min).all() && cell.cmple(r.bbox_max).all())
             .min_by_key(|r| {
                 let d = r.bbox_max - r.bbox_min + IVec3::ONE;
                 d.x as i64 * d.y as i64 * d.z as i64

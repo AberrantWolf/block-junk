@@ -27,10 +27,10 @@ use crate::menu::AppState;
 use crate::plans::{cell_is_solid, project_to_face_plane, rect_cells_on_plane};
 use crate::player_mode::PlayerMode;
 use crate::protocol::{
-    ActionRejected, Avatar, AvatarPose, GameSet, PLAN_EDIT_BATCH_MAX, PLAN_REACH, RejectReason,
-    StateSyncChannel, StorageEditBatch, StorageFullSync,
+    ActionRejected, Avatar, AvatarPose, GameReady, GameSet, PLAN_EDIT_BATCH_MAX, PLAN_REACH,
+    RejectReason, StateSyncChannel, StorageEditBatch, StorageFullSync,
 };
-use crate::server::{send_rejection, within_reach};
+use crate::server::{RequestClass, ValidatedRequestContext, send_rejection, within_reach};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
 /// The set of designated storage cells. Sparse and unordered; zone
@@ -165,8 +165,9 @@ fn storage_mode_input(
         let l_pressed = mouse.just_pressed(MouseButton::Left);
         let r_pressed = mouse.just_pressed(MouseButton::Right);
         if l_pressed || r_pressed {
-            let hit =
-                entity_aware_raycast(origin, dir, PLAN_REACH, &chunks, &chunk_map, &registry, None);
+            let hit = entity_aware_raycast(
+                origin, dir, PLAN_REACH, &chunks, &chunk_map, &registry, None,
+            );
             if let Some(hit) = hit
                 && hit.face_normal == IVec3::Y
             {
@@ -211,7 +212,8 @@ fn storage_mode_input(
         if let Ok(mut sender) = sender.single_mut() {
             sender.send::<StateSyncChannel>(StorageEditBatch {
                 add: active.add,
-                cells,
+                cells: crate::protocol::BoundedVec::new(cells)
+                    .expect("client storage batches are truncated before send"),
             });
         }
     }
@@ -228,7 +230,10 @@ fn storage_mode_input(
     reason = "wire handler + reach gate + rejection reply"
 )]
 fn receive_storage_edit_batches(
-    mut receivers: Query<(Entity, &mut MessageReceiver<StorageEditBatch>)>,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<StorageEditBatch>),
+        With<crate::protocol::GameReady>,
+    >,
     mut zones: ResMut<StorageZones>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
@@ -237,27 +242,26 @@ fn receive_storage_edit_batches(
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: ValidatedRequestContext,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
     for (connection, mut receiver) in receivers.iter_mut() {
         let batches: Vec<StorageEditBatch> = receiver.receive().collect();
-        for mut batch in batches {
+        for batch in batches {
+            if validation
+                .authorize(connection, RequestClass::BatchCells(batch.cells.len()))
+                .is_none()
+            {
+                continue;
+            }
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
             let Ok(pose) = poses.get(avatar) else {
                 continue;
             };
-            if batch.cells.len() > PLAN_EDIT_BATCH_MAX {
-                warn!(
-                    got = batch.cells.len(),
-                    cap = PLAN_EDIT_BATCH_MAX,
-                    "storage batch over server cap; truncating",
-                );
-                batch.cells.truncate(PLAN_EDIT_BATCH_MAX);
-            }
             let mut accepted: Vec<IVec3> = Vec::with_capacity(batch.cells.len());
             let mut first_out_of_reach: Option<IVec3> = None;
             for cell in batch.cells {
@@ -284,13 +288,13 @@ fn receive_storage_edit_batches(
             }
             let reply = StorageEditBatch {
                 add: batch.add,
-                cells: accepted,
+                cells: crate::protocol::BoundedVec::new(accepted)
+                    .expect("accepted cells are a subset of a bounded request"),
             };
-            if let Err(err) = broadcast.send::<StorageEditBatch, StateSyncChannel>(
-                &reply,
-                server,
-                &NetworkTarget::All,
-            ) {
+            let target = validation.target_for_cells(reply.cells.iter().copied());
+            if let Err(err) =
+                broadcast.send::<StorageEditBatch, StateSyncChannel>(&reply, server, &target)
+            {
                 warn!("StorageEditBatch broadcast failed: {err}");
             }
         }
@@ -300,7 +304,7 @@ fn receive_storage_edit_batches(
 /// Server: push the whole zone set to a fresh connection. One message
 /// — the client applies it as a replace, so it must not be split.
 fn send_storage_full_sync_on_connect(
-    trigger: On<Add, Connected>,
+    trigger: On<Add, GameReady>,
     zones: Res<StorageZones>,
     mut senders: Query<&mut MessageSender<StorageFullSync>>,
 ) {
@@ -308,9 +312,21 @@ fn send_storage_full_sync_on_connect(
     let Ok(mut sender) = senders.get_mut(connection) else {
         return;
     };
-    sender.send::<StateSyncChannel>(StorageFullSync {
-        cells: zones.snapshot(),
-    });
+    let snapshot = zones.snapshot();
+    if snapshot.is_empty() {
+        sender.send::<StateSyncChannel>(StorageFullSync {
+            reset: true,
+            cells: crate::protocol::BoundedVec::default(),
+        });
+        return;
+    }
+    for (index, part) in snapshot.chunks(PLAN_EDIT_BATCH_MAX).enumerate() {
+        sender.send::<StateSyncChannel>(StorageFullSync {
+            reset: index == 0,
+            cells: crate::protocol::BoundedVec::new(part.to_vec())
+                .expect("storage full-sync chunks use the wire bound"),
+        });
+    }
 }
 
 /// Client: replace the mirror with the connect-time snapshot.
@@ -320,7 +336,12 @@ fn receive_storage_full_sync(
 ) {
     for mut receiver in receivers.iter_mut() {
         for sync in receiver.receive() {
-            zones.replace_all(sync.cells);
+            if sync.reset {
+                zones.replace_all(Vec::new());
+            }
+            for cell in sync.cells {
+                zones.insert(cell);
+            }
         }
     }
 }

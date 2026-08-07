@@ -120,7 +120,13 @@ impl ItemRegistry {
     }
 
     pub fn def(&self, slot: ItemSlot) -> &ItemDef {
-        &self.defs_by_slot[slot.0 as usize]
+        self.try_def(slot)
+            .unwrap_or_else(|| panic!("invalid item slot {}", slot.0))
+    }
+
+    /// Fallible lookup for values originating on the wire or disk.
+    pub fn try_def(&self, slot: ItemSlot) -> Option<&ItemDef> {
+        self.defs_by_slot.get(slot.0 as usize)
     }
 
     pub fn slot_of(&self, id: &ItemId) -> Option<ItemSlot> {
@@ -128,7 +134,12 @@ impl ItemRegistry {
     }
 
     pub fn id_of(&self, slot: ItemSlot) -> &ItemId {
-        &self.defs_by_slot[slot.0 as usize].id
+        self.try_id_of(slot)
+            .unwrap_or_else(|| panic!("invalid item slot {}", slot.0))
+    }
+
+    pub fn try_id_of(&self, slot: ItemSlot) -> Option<&ItemId> {
+        self.try_def(slot).map(|def| &def.id)
     }
 
     /// Does the item in `slot` carry `tag` in its `tool_tags`? A `None`
@@ -143,7 +154,8 @@ impl ItemRegistry {
         let Some(slot) = slot else {
             return false;
         };
-        self.def(slot).tool_tags.iter().any(|t| t == tag)
+        self.try_def(slot)
+            .is_some_and(|def| def.tool_tags.iter().any(|t| t == tag))
     }
 
     pub fn slot_count(&self) -> usize {

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-# Bevy 0.18 made input sources opt-in features; "default" is just 2d/3d/ui rendering.
+# Bevy input sources are opt-in features; "default" is just 2d/3d/ui rendering.
 bevy = { version = "0.19", features = ["mouse", "keyboard"] }
 block-mesh = "0.2"
 ndshape = "0.3"
@@ -29,7 +29,13 @@ thiserror = "2"
 # Ctrl-C → quit-save path.
 getrandom = "0.3"
 ctrlc = "3"
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 block-junk-mod-api = { path = "../block-junk-mod-api" }
 block-junk-scripting = { path = "../block-junk-scripting" }
 block-junk-textures = { path = "../block-junk-textures", features = ["render", "egui-fonts"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

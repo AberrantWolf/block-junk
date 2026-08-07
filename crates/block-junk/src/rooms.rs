@@ -362,8 +362,7 @@ pub fn process_dirty(
     // Quiet-window debounce, with a staleness ceiling: continuous editing
     // refreshes `most_recent` forever, so without the second clause a
     // long building burst starves detection until the player stops.
-    if now.duration_since(most_recent) < DEBOUNCE
-        && now.duration_since(oldest) < DEBOUNCE_MAX_WAIT
+    if now.duration_since(most_recent) < DEBOUNCE && now.duration_since(oldest) < DEBOUNCE_MAX_WAIT
     {
         return;
     }
@@ -994,9 +993,7 @@ fn compute_signature(
             b,
             count: slots
                 .into_iter()
-                .map(|(slot, cells)| {
-                    cells.div_ceil(reg.def(slot).footprint.len().max(1) as u32)
-                })
+                .map(|(slot, cells)| cells.div_ceil(reg.def(slot).footprint.len().max(1) as u32))
                 .sum(),
         })
         .collect();

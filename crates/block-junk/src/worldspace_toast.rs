@@ -6,7 +6,7 @@
 //! ~2s with an alpha fade in the last 0.5s so the toast doesn't
 //! linger or harshly pop out.
 //!
-//! Spawning goes through a `PendingToasts` resource queue. Bevy 0.18's
+//! Spawning goes through a `PendingToasts` resource queue. Bevy 0.19's
 //! local "buffered events" trait was renamed to `Message`, which
 //! conflicts with lightyear's networked `Message` macro — using a
 //! plain resource sidesteps the collision and keeps spawn requests

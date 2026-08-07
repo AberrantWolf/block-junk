@@ -48,6 +48,12 @@ pub enum BootstrapError {
     DuplicateBlockId(BlockId),
     #[error("registry exceeds u16 slot space ({slots} blocks registered)")]
     SlotOverflow { slots: usize },
+    #[error("block {block} footprint has {cells} cells; maximum is {max}")]
+    FootprintTooLarge {
+        block: BlockId,
+        cells: usize,
+        max: usize,
+    },
     #[error("block {block} interactable.need_restore references unregistered need {need}")]
     InteractableNeedUnknown { block: BlockId, need: String },
     #[error(
@@ -121,6 +127,13 @@ impl BlockRegistry {
         let mut slot_by_id = HashMap::with_capacity(pending.len());
         let mut entries = Vec::with_capacity(pending.len());
         for (i, def) in pending.iter().enumerate() {
+            if def.footprint.len() > crate::protocol::MAX_BLOCK_FOOTPRINT_CELLS {
+                return Err(BootstrapError::FootprintTooLarge {
+                    block: def.id.clone(),
+                    cells: def.footprint.len(),
+                    max: crate::protocol::MAX_BLOCK_FOOTPRINT_CELLS,
+                });
+            }
             let slot = BlockSlot(i as u16);
             if slot_by_id.insert(def.id.clone(), slot).is_some() {
                 return Err(BootstrapError::DuplicateBlockId(def.id.clone()));
@@ -140,7 +153,14 @@ impl BlockRegistry {
     }
 
     pub fn def(&self, slot: BlockSlot) -> &BlockDef {
-        &self.defs_by_slot[slot.0 as usize]
+        self.try_def(slot)
+            .unwrap_or_else(|| panic!("invalid block slot {}", slot.0))
+    }
+
+    /// Resolve a slot received from an untrusted boundary. Network, save,
+    /// and runtime lookup paths must use this instead of [`Self::def`].
+    pub fn try_def(&self, slot: BlockSlot) -> Option<&BlockDef> {
+        self.defs_by_slot.get(slot.0 as usize)
     }
 
     pub fn slot_of(&self, id: &BlockId) -> Option<BlockSlot> {
@@ -156,7 +176,12 @@ impl BlockRegistry {
     }
 
     pub fn id_of(&self, slot: BlockSlot) -> &BlockId {
-        &self.defs_by_slot[slot.0 as usize].id
+        self.try_id_of(slot)
+            .unwrap_or_else(|| panic!("invalid block slot {}", slot.0))
+    }
+
+    pub fn try_id_of(&self, slot: BlockSlot) -> Option<&BlockId> {
+        self.try_def(slot).map(|def| &def.id)
     }
 
     pub fn iter_placeable(&self) -> impl Iterator<Item = BlockSlot> + '_ {

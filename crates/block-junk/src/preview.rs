@@ -30,8 +30,8 @@
 use bevy::asset::embedded_asset;
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::{
-    ExtendedMaterial, Material, MaterialExtension, MaterialExtensionKey,
-    MaterialExtensionPipeline, MaterialPlugin,
+    ExtendedMaterial, Material, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+    MaterialPlugin,
 };
 use bevy::prelude::*;
 use bevy::render::render_resource::{

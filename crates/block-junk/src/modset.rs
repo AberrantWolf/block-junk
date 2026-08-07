@@ -58,10 +58,7 @@ pub fn local_manifest(
     ModSetManifest {
         blocks: blocks.iter().map(|(_, def)| def.id.clone()).collect(),
         items: items.iter().map(|(_, def)| def.id.clone()).collect(),
-        recipes: recipes
-            .iter()
-            .map(|(_, def)| def.id.0.clone())
-            .collect(),
+        recipes: recipes.iter().map(|(_, def)| def.id.0.clone()).collect(),
         npc_kinds: npc_kinds.ids_sorted(),
         room_patterns: rooms.iter().map(|p| p.id.as_str().to_owned()).collect(),
         defs_hash: hash,

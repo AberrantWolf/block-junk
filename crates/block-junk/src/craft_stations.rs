@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::items::ItemSlot;
 use crate::menu::AppState;
-use crate::protocol::{ActionRejected, GameSet, INTERACT_REACH, RejectReason, StateSyncChannel};
+use crate::protocol::{
+    ActionRejected, GameReady, GameSet, INTERACT_REACH, RejectReason, StateSyncChannel,
+};
 use crate::server::{send_rejection, within_reach};
 
 /// One queued craft at a station. `total` is what the player asked
@@ -686,7 +688,7 @@ impl CraftStationUiState {
 /// connect. Wired alongside the existing PlanFullSync flow so
 /// reconnects come up with the full craft-order state.
 fn send_stations_full_sync_on_connect(
-    trigger: On<Add, Connected>,
+    trigger: On<Add, GameReady>,
     stations: Res<CraftStations>,
     mut senders: Query<&mut MessageSender<StationsFullSync>>,
 ) {
@@ -761,7 +763,10 @@ const MAX_ORDER_QUANTITY: u32 = 99;
     reason = "wire handler joins many subsystems"
 )]
 fn receive_queue_orders(
-    mut receivers: Query<(Entity, &mut MessageReceiver<QueueOrder>)>,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<QueueOrder>),
+        With<crate::protocol::GameReady>,
+    >,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
@@ -772,6 +777,7 @@ fn receive_queue_orders(
     mut stations: ResMut<CraftStations>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
     let Ok(server) = servers.single() else {
@@ -779,6 +785,12 @@ fn receive_queue_orders(
     };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
+            if validation
+                .authorize(connection, crate::server::RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
@@ -824,6 +836,7 @@ fn receive_queue_orders(
                 server,
                 req.station_cell,
                 Some(state.clone()),
+                Some(validation.subscriptions()),
             );
             info!(
                 cell = ?req.station_cell.to_array(),
@@ -840,7 +853,10 @@ fn receive_queue_orders(
     reason = "cancel refunds need item registry + recipes"
 )]
 fn receive_cancel_orders(
-    mut receivers: Query<(Entity, &mut MessageReceiver<CancelOrder>)>,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<CancelOrder>),
+        With<crate::protocol::GameReady>,
+    >,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
@@ -849,6 +865,7 @@ fn receive_cancel_orders(
     mut stations: ResMut<CraftStations>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
     let Ok(server) = servers.single() else {
@@ -856,6 +873,12 @@ fn receive_cancel_orders(
     };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
+            if validation
+                .authorize(connection, crate::server::RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             // Same reach gate as every other station verb — cancel was
             // the one handler accepting any cell from any connection
             // (it force-clears active work, so it's mutating too).
@@ -919,6 +942,7 @@ fn receive_cancel_orders(
                 server,
                 req.station_cell,
                 if now_empty { None } else { Some(snapshot) },
+                Some(validation.subscriptions()),
             );
             info!(
                 cell = ?req.station_cell.to_array(),
@@ -935,7 +959,10 @@ fn receive_cancel_orders(
     reason = "wire handler joins many subsystems"
 )]
 fn receive_deposit_to_station(
-    mut receivers: Query<(Entity, &mut MessageReceiver<DepositToStation>)>,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<DepositToStation>),
+        With<crate::protocol::GameReady>,
+    >,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     mut players: Query<
@@ -948,12 +975,19 @@ fn receive_deposit_to_station(
     mut stations: ResMut<CraftStations>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
+            if validation
+                .authorize(connection, crate::server::RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
@@ -985,6 +1019,7 @@ fn receive_deposit_to_station(
                 server,
                 req.station_cell,
                 Some(state.clone()),
+                Some(validation.subscriptions()),
             );
             info!(
                 cell = ?req.station_cell.to_array(),
@@ -1015,7 +1050,10 @@ fn receive_deposit_to_station(
     reason = "wire handler joins many subsystems"
 )]
 fn receive_work_start(
-    mut receivers: Query<(Entity, &mut MessageReceiver<WorkStart>)>,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<WorkStart>),
+        With<crate::protocol::GameReady>,
+    >,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<
@@ -1031,12 +1069,19 @@ fn receive_work_start(
     mut bookings: ResMut<CraftBookings>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
+            if validation
+                .authorize(connection, crate::server::RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
@@ -1059,14 +1104,37 @@ fn receive_work_start(
                 continue;
             };
             let worker_tool = tool.item;
-            // Case 1: existing active_work — just re-register the
-            // worker. The recipe + station agreement was validated
-            // when active_work was first created; trust that here.
-            // A different player taking over a paused craft is also
-            // fine — they just pick up where the previous one left.
-            if let Some(state) = stations.get(req.station_cell)
-                && state.active_work.is_some()
+            // Case 1: resume only after revalidating the live station,
+            // recipe and current tool. A different worker may take over
+            // only after the previous registration has become invalid and
+            // the tick predicate released it.
+            if let Some(active) = stations
+                .get(req.station_cell)
+                .and_then(|state| state.active_work.as_ref())
             {
+                if bookings
+                    .worker_at(req.station_cell)
+                    .is_some_and(|worker| worker != connection)
+                {
+                    continue;
+                }
+                let recipe_id =
+                    block_junk_mod_api::recipes::RecipeId::new(active.recipe_id.clone());
+                let Some(recipe) = recipes
+                    .slot_of(&recipe_id)
+                    .and_then(|slot| recipes.try_def(slot))
+                else {
+                    continue;
+                };
+                if recipe.station != station_def.tag
+                    || recipe.tier > station_def.tier
+                    || recipe
+                        .required_tool
+                        .as_ref()
+                        .is_some_and(|tag| !item_registry.tool_has_tag(worker_tool, tag))
+                {
+                    continue;
+                }
                 bookings.register_worker(req.station_cell, connection);
                 continue;
             }
@@ -1091,7 +1159,13 @@ fn receive_work_start(
             .is_some();
             if started {
                 let snapshot = stations.get(req.station_cell).cloned();
-                broadcast_station(&mut broadcast, server, req.station_cell, snapshot);
+                broadcast_station(
+                    &mut broadcast,
+                    server,
+                    req.station_cell,
+                    snapshot,
+                    Some(validation.subscriptions()),
+                );
             } else {
                 // The get_or_insert above may have left an empty
                 // state behind — clean up so the by-cell map stays
@@ -1105,11 +1179,21 @@ fn receive_work_start(
 /// Handle `WorkStop`: clear the worker registration. `active_work`
 /// itself persists so a resume picks up where this paused.
 fn receive_work_stop(
-    mut receivers: Query<(Entity, &mut MessageReceiver<WorkStop>)>,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<WorkStop>),
+        With<crate::protocol::GameReady>,
+    >,
     mut bookings: ResMut<CraftBookings>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
+            if validation
+                .authorize(connection, crate::server::RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             bookings.release_worker(req.station_cell, connection);
         }
     }
@@ -1139,6 +1223,7 @@ pub(crate) fn clear_destroyed_stations(
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut commands: Commands,
+    subscriptions: Res<crate::server::SpatialSubscriptions>,
 ) {
     let DestroyedStationContext {
         block_registry,
@@ -1189,7 +1274,7 @@ pub(crate) fn clear_destroyed_stations(
                     },
                     Transform::from_translation(translation),
                     GlobalTransform::default(),
-                    Replicate::to_clients(NetworkTarget::All),
+                    Replicate::to_clients(NetworkTarget::None),
                     Name::new(format!("WorldItem(station_spill:{})", slot.0)),
                 ));
             }
@@ -1200,7 +1285,13 @@ pub(crate) fn clear_destroyed_stations(
             dropped_orders = state.orders.len(),
             "station destroyed; cleared state and spilled inventory",
         );
-        broadcast_station(&mut broadcast, server, edit.world, None);
+        broadcast_station(
+            &mut broadcast,
+            server,
+            edit.world,
+            None,
+            Some(&subscriptions),
+        );
     }
 }
 
@@ -1249,6 +1340,8 @@ fn tick_station_work(
     block_registry: Res<crate::blocks::BlockRegistry>,
     npc_q: Query<(), With<crate::npc::Npc>>,
     tools: Query<&crate::protocol::EquippedTool>,
+    actor_state: Query<(&crate::protocol::AvatarPose, &crate::protocol::EquippedTool)>,
+    client_avatars: Res<crate::server::ClientAvatars>,
     mut next_broadcast_in: Local<f32>,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
@@ -1274,6 +1367,45 @@ fn tick_station_work(
         .map(|(cell, _)| *cell)
         .collect();
     for cell in active_cells {
+        let Some(worker) = bookings.worker_at(cell) else {
+            continue;
+        };
+        let actor = client_avatars.0.get(&worker).copied().unwrap_or(worker);
+        let Some(active_recipe) = stations
+            .get(cell)
+            .and_then(|state| state.active_work.as_ref())
+            .map(|active| active.recipe_id.clone())
+        else {
+            bookings.force_clear_worker(cell);
+            continue;
+        };
+        let recipe_id = RecipeId::new(active_recipe);
+        let valid = recipes
+            .slot_of(&recipe_id)
+            .and_then(|slot| recipes.try_def(slot))
+            .zip(lookup_station_def(
+                cell,
+                &chunks,
+                &chunk_map,
+                &block_registry,
+            ))
+            .zip(actor_state.get(actor).ok())
+            .is_some_and(|((recipe, station), (pose, tool))| {
+                recipe.station == station.tag
+                    && recipe.tier <= station.tier
+                    && within_reach(pose, cell.as_vec3() + Vec3::splat(0.5), INTERACT_REACH)
+                    && recipe
+                        .required_tool
+                        .as_ref()
+                        .is_none_or(|tag| item_registry.tool_has_tag(tool.item, tag))
+            });
+        if !valid {
+            // Pause without producing output or consuming anything else.
+            // The already-locked inputs remain in `active_work` until a
+            // valid worker resumes or cancellation refunds them.
+            bookings.force_clear_worker(cell);
+            continue;
+        }
         let Some(state) = stations.get_mut(cell) else {
             continue;
         };
@@ -1286,7 +1418,7 @@ fn tick_station_work(
             // the modal's progress label advances without per-tick
             // wire chatter.
             if do_progress_broadcast {
-                broadcast_station(&mut broadcast, server, cell, Some(state.clone()));
+                broadcast_station(&mut broadcast, server, cell, Some(state.clone()), None);
             }
             continue;
         }
@@ -1301,7 +1433,7 @@ fn tick_station_work(
                 recipe = %recipe_id_str,
                 "work complete: recipe id missing from registry; skipping output",
             );
-            broadcast_station(&mut broadcast, server, cell, Some(state.clone()));
+            broadcast_station(&mut broadcast, server, cell, Some(state.clone()), None);
             continue;
         };
         let recipe = recipes.def(recipe_slot);
@@ -1311,7 +1443,7 @@ fn tick_station_work(
                 output = %recipe.output.item,
                 "work complete: output item missing from registry; skipping",
             );
-            broadcast_station(&mut broadcast, server, cell, Some(state.clone()));
+            broadcast_station(&mut broadcast, server, cell, Some(state.clone()), None);
             continue;
         };
         // Spawn output(s) in the first EMPTY cell around the station —
@@ -1370,7 +1502,7 @@ fn tick_station_work(
                 },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
-                Replicate::to_clients(NetworkTarget::All),
+                Replicate::to_clients(NetworkTarget::None),
                 Name::new(format!("WorldItem(crafted:{})", recipe.output.item)),
             ));
         }
@@ -1453,6 +1585,7 @@ fn tick_station_work(
             server,
             cell,
             if now_empty { None } else { snapshot },
+            None,
         );
     }
 }
@@ -1596,11 +1729,13 @@ pub(crate) fn broadcast_station(
     server: &Server,
     cell: IVec3,
     state: Option<StationState>,
+    subscriptions: Option<&crate::server::SpatialSubscriptions>,
 ) {
     let msg = StationUpdate { cell, state };
-    if let Err(err) =
-        broadcast.send::<StationUpdate, StateSyncChannel>(&msg, server, &NetworkTarget::All)
-    {
+    let target = subscriptions.map_or(NetworkTarget::All, |subscriptions| {
+        subscriptions.target_for_cells([cell])
+    });
+    if let Err(err) = broadcast.send::<StationUpdate, StateSyncChannel>(&msg, server, &target) {
         warn!("station update broadcast failed: {err}");
     }
 }

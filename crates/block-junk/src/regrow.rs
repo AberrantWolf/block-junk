@@ -141,6 +141,7 @@ fn fire_due_regrows(
     servers: Query<&Server>,
     mut broadcast: ServerMultiMessageSender,
     mut bus: MessageWriter<CellEdit>,
+    subscriptions: Res<crate::server::SpatialSubscriptions>,
 ) {
     let now = time.elapsed_secs();
     // Collect due cells first — we can't mutate the schedule while
@@ -177,6 +178,7 @@ fn fire_due_regrows(
             server,
             &mut broadcast,
             &mut bus,
+            &subscriptions,
         );
         info!(cell = ?cell.to_array(), block = %registry.id_of(into_slot), "block regrew");
     }

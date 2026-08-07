@@ -50,9 +50,9 @@ use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, standing_pose_
 use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
-    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, CellEdit, EquippedTool,
-    KinematicLock, MovementMode, NpcAnimOverride, PlanEdit, PlanKind,
-    StateSyncChannel, WorldClock, WorldItem,
+    Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, CellEdit, EquippedTool, GameSet,
+    KinematicLock, MovementMode, NpcAnimOverride, PlanEdit, PlanKind, StateSyncChannel, WorldClock,
+    WorldItem,
 };
 use crate::rooms::RoomMap;
 use crate::scripting::ServerMods;
@@ -98,6 +98,28 @@ pub(crate) struct PathDirty;
 /// to the server in a RequestNpcDetails).
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NpcId(pub u64);
+
+#[derive(Resource, Default)]
+pub(crate) struct NpcEntityIndex {
+    pub(crate) by_id: HashMap<NpcId, Entity>,
+    by_entity: HashMap<Entity, NpcId>,
+}
+
+fn maintain_npc_entity_index(
+    mut index: ResMut<NpcEntityIndex>,
+    added: Query<(Entity, &NpcId), Added<NpcId>>,
+    mut removed: RemovedComponents<NpcId>,
+) {
+    for entity in removed.read() {
+        if let Some(id) = index.by_entity.remove(&entity) {
+            index.by_id.remove(&id);
+        }
+    }
+    for (entity, &id) in added.iter() {
+        index.by_id.insert(id, entity);
+        index.by_entity.insert(entity, id);
+    }
+}
 
 /// Mod-namespaced kind, e.g. `vanilla:wanderer`. Selects which planner
 /// the engine calls on goal completion and which need table the spawn
@@ -639,6 +661,7 @@ pub struct NpcServerPlugin;
 impl Plugin for NpcServerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NpcIdAllocator>();
+        app.init_resource::<NpcEntityIndex>();
         app.init_resource::<SmokeClusterSpawned>();
         // Spawn deferred to first client connect rather than Startup —
         // chunks aren't loaded until a client's AoI requests them, and
@@ -651,6 +674,10 @@ impl Plugin for NpcServerPlugin {
         // item reservations would lock permanently — every claim table
         // assumes this observer exists.
         app.add_observer(release_claims_on_npc_despawn);
+        app.add_systems(
+            Update,
+            maintain_npc_entity_index.in_set(GameSet::PostSimulation),
+        );
         // Local-bus message: brain emits on Working timer completion;
         // server-side consumer (in server.rs) applies the underlying
         // BlockEdit + clears the plan tag. Splits these concerns so the
@@ -883,7 +910,7 @@ struct SmokeClusterSpawned(bool);
 /// smoke tests" is — same entity, the brain just falls back to native
 /// logic when there's no Lua planner.
 fn spawn_initial_npc_on_first_connect(
-    _: On<Add, Connected>,
+    _: On<Add, crate::protocol::GameReady>,
     mut commands: Commands,
     kinds: Res<NpcKindRegistry>,
     existing: Query<(), With<Npc>>,
@@ -959,7 +986,7 @@ fn spawn_initial_npc_on_first_connect(
             crate::npc_mover::NavMover::default(),
             NpcPath::default(),
             NpcAnimOverride::default(),
-            Replicate::to_clients(NetworkTarget::All),
+            Replicate::to_clients(NetworkTarget::None),
             InterpolationTarget::to_clients(NetworkTarget::All),
             Name::new(format!("npc:{}", id.0)),
         ));
@@ -1053,7 +1080,7 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
 ///
 /// SystemParam bundle for the craft-station scheduler + arrival
 /// handlers (Phase 6c-A). Folded into one slot to keep the brain tick
-/// under Bevy 0.18's 16-SystemParam ceiling — same reason
+/// under Bevy 0.19's 16-SystemParam ceiling — same reason
 /// [`HaulCtx`] is bundled. Group is "everything the craft scheduler
 /// and the WorkStation arrival need to mutate or read."
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1065,7 +1092,7 @@ struct CraftCtx<'w> {
 
 /// SystemParam bundle for plan + haul resources that the brain tick
 /// reaches for in phase 3. Folded into one slot because the brain tick
-/// is already at the Bevy 0.18 16-SystemParam ceiling — every loose
+/// is already at the Bevy 0.19 16-SystemParam ceiling — every loose
 /// `Res`/`Query` we'd otherwise add against this fn would trip the
 /// trait-impl limit. Group is "stuff the haul scheduler and arrival
 /// handlers share, plus the plan-claim state they coexist with."
@@ -1082,6 +1109,7 @@ struct HaulCtx<'w, 's> {
     storage: Res<'w, crate::storage::StorageZones>,
     containers: ResMut<'w, crate::containers::Containers>,
     container_index: Res<'w, crate::containers::ContainerIndex>,
+    subscriptions: Res<'w, crate::server::SpatialSubscriptions>,
 }
 
 /// Read-only world-anchor bundle: room registry plus civilization
@@ -1335,9 +1363,7 @@ fn preempt_current_goal(
     // Interacting-only — but keying off `is_locked` rather than the
     // Goal variant keeps the helper symmetric with the post-completion
     // eject site below.
-    if is_locked
-        && let Goal::Interacting { target_cell, .. } = &brain.goal
-    {
+    if is_locked && let Goal::Interacting { target_cell, .. } = &brain.goal {
         let slot = slot_at_cell(*target_cell, chunks, chunk_map, block_registry);
         let (anchor, orientation) =
             resolve_anchor_with_orientation(*target_cell, chunk_entities_q, chunk_map);
@@ -1620,9 +1646,14 @@ fn npc_brain_tick(
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     let goal_cell = *path.last().expect("path non-empty");
-                    let repath =
-                        find_path(foot, goal_cell, &world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
-                            .map(|raw| smooth_path(raw, &world));
+                    let repath = find_path(
+                        foot,
+                        goal_cell,
+                        &world,
+                        ASTAR_NODE_BUDGET,
+                        ASTAR_PATH_BUDGET,
+                    )
+                    .map(|raw| smooth_path(raw, &world));
                     match repath {
                         Some(new_path) => {
                             info!(
@@ -1917,11 +1948,11 @@ fn npc_brain_tick(
                                 kind: Some(state.kind),
                                 materials: state.materials,
                             };
-                            if let Err(err) = haul.broadcast.send::<PlanEdit, StateSyncChannel>(
-                                &reply,
-                                server,
-                                &NetworkTarget::All,
-                            ) {
+                            let target = haul.subscriptions.target_for_cells([plan_cell]);
+                            if let Err(err) = haul
+                                .broadcast
+                                .send::<PlanEdit, StateSyncChannel>(&reply, server, &target)
+                            {
                                 warn!("haul deposit PlanEdit broadcast failed: {err}");
                             }
                         }
@@ -2033,6 +2064,7 @@ fn npc_brain_tick(
                             server,
                             station_cell,
                             Some(state_after),
+                            Some(&haul.subscriptions),
                         );
                     }
                     // Pick next leg from the (possibly still active)
@@ -2094,7 +2126,7 @@ fn npc_brain_tick(
                         },
                         Transform::from_translation(pile_pos),
                         GlobalTransform::default(),
-                        Replicate::to_clients(NetworkTarget::All),
+                        Replicate::to_clients(NetworkTarget::None),
                         Name::new(format!("WorldItem(pile:{}x{})", carry_item.0, new_total)),
                     ));
                     carrying.item = None;
@@ -2181,6 +2213,7 @@ fn npc_brain_tick(
                             server,
                             cell,
                             (!state_after.is_empty()).then_some(state_after),
+                            &haul.subscriptions,
                         );
                     }
                     info!(
@@ -2272,6 +2305,7 @@ fn npc_brain_tick(
                             server,
                             cell,
                             Some(state_after),
+                            &haul.subscriptions,
                         );
                     }
                     info!(
@@ -2349,7 +2383,7 @@ fn npc_brain_tick(
                             },
                             Transform::from_translation(pickup_pos),
                             GlobalTransform::default(),
-                            Replicate::to_clients(NetworkTarget::All),
+                            Replicate::to_clients(NetworkTarget::None),
                             Name::new(format!("WorldItem(npc_tool_swap:{})", prev_slot.0)),
                         ));
                     }
@@ -2437,6 +2471,7 @@ fn npc_brain_tick(
                                 server,
                                 station_cell,
                                 snapshot,
+                                Some(&haul.subscriptions),
                             );
                         }
                         brain.goal = Goal::CraftingAtStation { station_cell };
@@ -2456,72 +2491,66 @@ fn npc_brain_tick(
         // claim needs to release it — the brain took the claim at
         // goal commit and a stuck/timeout abandon never reaches
         // the arrival branch that would otherwise own the release.
-        if move_abandoned
-            && let Goal::MoveTo { on_arrive, .. } = &brain.goal
-        {
+        if move_abandoned && let Goal::MoveTo { on_arrive, .. } = &brain.goal {
             match on_arrive {
-                    ArrivalAction::Interact {
-                        anchor_cell,
-                        exclusive,
-                        ..
-                    } => {
-                        // Physically stuck en route despite a valid
-                        // path (wedged on furniture, jammed in a
-                        // doorway) — back off like the haul/work arms
-                        // below, or a starving NPC re-picks the same
-                        // blocked target every stuck-release forever.
-                        interaction_claims.memo_unreachable(
-                            *anchor_cell,
-                            now_secs + HAUL_UNREACHABLE_RETRY_SECS,
-                        );
-                        if *exclusive {
-                            interaction_claims.release(*anchor_cell, *npc_id);
-                        }
+                ArrivalAction::Interact {
+                    anchor_cell,
+                    exclusive,
+                    ..
+                } => {
+                    // Physically stuck en route despite a valid
+                    // path (wedged on furniture, jammed in a
+                    // doorway) — back off like the haul/work arms
+                    // below, or a starving NPC re-picks the same
+                    // blocked target every stuck-release forever.
+                    interaction_claims
+                        .memo_unreachable(*anchor_cell, now_secs + HAUL_UNREACHABLE_RETRY_SECS);
+                    if *exclusive {
+                        interaction_claims.release(*anchor_cell, *npc_id);
                     }
-                    ArrivalAction::Work { target_cell, .. } => {
-                        // Physically stuck/timed out en route, even
-                        // though A* found a path — memoize like the
-                        // A*-failure branch does, or the planner
-                        // re-picks the same plan next tick and the NPC
-                        // ping-pongs against the same obstacle.
-                        haul.store.memo_unreachable(
-                            crate::haul::HaulTarget::Plan(*target_cell),
-                            now_secs + HAUL_UNREACHABLE_RETRY_SECS,
-                        );
-                        haul.plan_claims.release(*target_cell, *npc_id);
+                }
+                ArrivalAction::Work { target_cell, .. } => {
+                    // Physically stuck/timed out en route, even
+                    // though A* found a path — memoize like the
+                    // A*-failure branch does, or the planner
+                    // re-picks the same plan next tick and the NPC
+                    // ping-pongs against the same obstacle.
+                    haul.store.memo_unreachable(
+                        crate::haul::HaulTarget::Plan(*target_cell),
+                        now_secs + HAUL_UNREACHABLE_RETRY_SECS,
+                    );
+                    haul.plan_claims.release(*target_cell, *npc_id);
+                }
+                ArrivalAction::PickupForPlan { .. }
+                | ArrivalAction::WithdrawFromContainer { .. }
+                | ArrivalAction::DepositAtPlan { .. }
+                | ArrivalAction::DepositAtStation { .. }
+                | ArrivalAction::DepositAtStorage { .. }
+                | ArrivalAction::DepositAtContainer { .. }
+                | ArrivalAction::PickupTool { .. } => {
+                    // Blocked-with-no-route or timed out mid-haul:
+                    // free the entire assignment + every
+                    // reservation it holds. Memoize the
+                    // assignment's target first — without the same
+                    // backoff the A*-failure branch gets, the
+                    // scheduler re-commits the identical target on
+                    // every retry (the playtest's "haul assignment
+                    // committed" spam).
+                    if let Some(a) = haul.store.assignment_of(*npc_id) {
+                        let target = a.target;
+                        haul.store
+                            .memo_unreachable(target, now_secs + HAUL_UNREACHABLE_RETRY_SECS);
                     }
-                    ArrivalAction::PickupForPlan { .. }
-                    | ArrivalAction::WithdrawFromContainer { .. }
-                    | ArrivalAction::DepositAtPlan { .. }
-                    | ArrivalAction::DepositAtStation { .. }
-                    | ArrivalAction::DepositAtStorage { .. }
-                    | ArrivalAction::DepositAtContainer { .. }
-                    | ArrivalAction::PickupTool { .. } => {
-                        // Blocked-with-no-route or timed out mid-haul:
-                        // free the entire assignment + every
-                        // reservation it holds. Memoize the
-                        // assignment's target first — without the same
-                        // backoff the A*-failure branch gets, the
-                        // scheduler re-commits the identical target on
-                        // every retry (the playtest's "haul assignment
-                        // committed" spam).
-                        if let Some(a) = haul.store.assignment_of(*npc_id) {
-                            let target = a.target;
-                            haul.store.memo_unreachable(
-                                target,
-                                now_secs + HAUL_UNREACHABLE_RETRY_SECS,
-                            );
-                        }
-                        haul.store.release_for_npc(*npc_id);
-                    }
-                    ArrivalAction::WorkStation { .. } => {
-                        // Stuck mid-walk-to-station: release the
-                        // booking so another NPC (or this one next
-                        // tick) can take it. No worker registration
-                        // exists yet — arrival is what registers —
-                        // but `release_npc_booking` handles both.
-                        craft.bookings.release_npc_booking(*npc_id, entity);
-                    }
+                    haul.store.release_for_npc(*npc_id);
+                }
+                ArrivalAction::WorkStation { .. } => {
+                    // Stuck mid-walk-to-station: release the
+                    // booking so another NPC (or this one next
+                    // tick) can take it. No worker registration
+                    // exists yet — arrival is what registers —
+                    // but `release_npc_booking` handles both.
+                    craft.bookings.release_npc_booking(*npc_id, entity);
+                }
                 _ => {}
             }
         }
@@ -2596,6 +2625,7 @@ fn npc_brain_tick(
                                 server,
                                 target_cell,
                                 (!after.is_empty()).then_some(after),
+                                &haul.subscriptions,
                             );
                         }
                     }
@@ -3151,8 +3181,7 @@ fn npc_brain_tick(
                             // basically every time, but the guard is
                             // free if it doesn't.
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal =
-                                Goal::move_to(path, timeout, ArrivalAction::None, None);
+                            brain.goal = Goal::move_to(path, timeout, ArrivalAction::None, None);
                         }
                         None => {
                             warn!(
@@ -3213,8 +3242,7 @@ fn npc_brain_tick(
                     match path {
                         Some(path) => {
                             npc_path.set_if_neq(NpcPath(path.clone()));
-                            brain.goal =
-                                Goal::move_to(path, timeout, ArrivalAction::None, None);
+                            brain.goal = Goal::move_to(path, timeout, ArrivalAction::None, None);
                         }
                         None => {
                             warn!(
@@ -4661,9 +4689,7 @@ fn collect_nearby_interactions(
         // (empty ⇒ no entry), so "no entry" means "empty." Non-container
         // interactables (wild bushes, beds) never gate on stock; a ripe
         // bush is edible for as long as it carries this metadata.
-        if def.container.is_some()
-            && containers.get(cell).map(|s| s.is_empty()).unwrap_or(true)
-        {
+        if def.container.is_some() && containers.get(cell).map(|s| s.is_empty()).unwrap_or(true) {
             continue;
         }
         let anchor = resolve_anchor_cell(cell, chunk_entities, chunk_map);
@@ -5063,7 +5089,11 @@ mod tests {
     #[test]
     fn remaining_path_valid_skips_walked_prefix() {
         let mut world = TestGrid::floored();
-        let path = vec![IVec3::new(0, 1, 0), IVec3::new(4, 1, 0), IVec3::new(4, 1, 3)];
+        let path = vec![
+            IVec3::new(0, 1, 0),
+            IVec3::new(4, 1, 0),
+            IVec3::new(4, 1, 3),
+        ];
         assert!(remaining_path_valid(&path, 0, &world));
 
         // Wall dropped onto the FIRST segment breaks the path from the
@@ -5252,7 +5282,9 @@ mod tests {
 
         assert!(!haul_store.has_assignment(npc));
         let other = NpcId(8);
-        assert!(haul_store.try_reserve_internal(crate::haul::HaulSource::Ground(item_entity), other));
+        assert!(
+            haul_store.try_reserve_internal(crate::haul::HaulSource::Ground(item_entity), other)
+        );
     }
 
     #[test]

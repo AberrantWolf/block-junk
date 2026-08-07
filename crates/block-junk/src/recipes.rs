@@ -160,11 +160,21 @@ impl RecipeRegistry {
     }
 
     pub fn def(&self, slot: RecipeSlot) -> &RecipeDef {
-        &self.defs_by_slot[slot.0 as usize]
+        self.try_def(slot)
+            .unwrap_or_else(|| panic!("invalid recipe slot {}", slot.0))
+    }
+
+    /// Fallible lookup for values originating on the wire or disk.
+    pub fn try_def(&self, slot: RecipeSlot) -> Option<&RecipeDef> {
+        self.defs_by_slot.get(slot.0 as usize)
     }
 
     pub fn slot_of(&self, id: &RecipeId) -> Option<RecipeSlot> {
         self.slot_by_id.get(id).copied()
+    }
+
+    pub fn try_id_of(&self, slot: RecipeSlot) -> Option<&RecipeId> {
+        self.try_def(slot).map(|def| &def.id)
     }
 
     pub fn slot_count(&self) -> usize {

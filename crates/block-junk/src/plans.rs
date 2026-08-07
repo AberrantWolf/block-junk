@@ -24,10 +24,11 @@ use crate::client::{
 use crate::menu::AppState;
 use crate::player_mode::PlayerMode;
 use crate::protocol::{
-    ActionRejected, Avatar, AvatarPose, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX, PLAN_REACH,
-    PlanEdit, PlanEditBatch, PlanFullSync, PlanKind, PlanState, RejectReason, StateSyncChannel,
+    ActionRejected, Avatar, AvatarPose, GameReady, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX,
+    PLAN_REACH, PlanEdit, PlanEditBatch, PlanFullSync, PlanKind, PlanState, RejectReason,
+    StateSyncChannel,
 };
-use crate::server::{send_rejection, within_reach};
+use crate::server::{RequestClass, ValidatedRequestContext, send_rejection, within_reach};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
 
 #[derive(Resource, Default, Debug)]
@@ -478,7 +479,8 @@ fn commit_batch(
     // Client request: materials is server-set. Empty on the wire here.
     sender.send::<StateSyncChannel>(PlanEditBatch {
         kind,
-        cells,
+        cells: crate::protocol::BoundedVec::new(cells)
+            .expect("client plan batches are truncated before send"),
         materials: Vec::new(),
     });
 }
@@ -644,7 +646,11 @@ fn build_initial_materials(
     reason = "wire handler + reach gate + rejection reply"
 )]
 fn receive_plan_edits(
-    mut receivers: Query<(Entity, &mut MessageReceiver<PlanEdit>)>,
+    mut commands: Commands,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<PlanEdit>),
+        With<crate::protocol::GameReady>,
+    >,
     mut plans: ResMut<Plans>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
@@ -655,6 +661,7 @@ fn receive_plan_edits(
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: ValidatedRequestContext,
 ) {
     let Ok(server) = servers.single() else {
         return;
@@ -662,6 +669,12 @@ fn receive_plan_edits(
     for (connection, mut receiver) in receivers.iter_mut() {
         let edits: Vec<PlanEdit> = receiver.receive().collect();
         for edit in edits {
+            if validation
+                .authorize(connection, RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             // Designation reach: deliberately looser than INTERACT_REACH
             // (tags are NPC orders, not direct mutations) but bounded so
             // a client can't tag cells far beyond anything it can see.
@@ -694,6 +707,15 @@ fn receive_plan_edits(
                     if cell_is_solid(edit.cell, &chunks, &chunk_map) {
                         continue;
                     }
+                    let PlanKind::Build { slot, .. } = kind else {
+                        unreachable!()
+                    };
+                    if block_registry.try_def(slot).is_none() {
+                        if validation.malformed(connection) {
+                            commands.trigger(lightyear::prelude::Disconnect { entity: connection });
+                        }
+                        continue;
+                    }
                     let materials = build_initial_materials(kind, &block_registry, &item_registry);
                     (Some(PlanState::new(kind, materials.clone())), materials)
                 }
@@ -710,8 +732,8 @@ fn receive_plan_edits(
                 kind: edit.kind,
                 materials: materials_for_broadcast,
             };
-            if let Err(err) =
-                broadcast.send::<PlanEdit, StateSyncChannel>(&reply, server, &NetworkTarget::All)
+            let target = validation.target_for_cells([edit.cell]);
+            if let Err(err) = broadcast.send::<PlanEdit, StateSyncChannel>(&reply, server, &target)
             {
                 warn!("PlanEdit broadcast failed: {err}");
             }
@@ -725,7 +747,11 @@ fn receive_plan_edits(
 /// cells so clients see exactly what the server accepted.
 #[allow(clippy::too_many_arguments)]
 fn receive_plan_edit_batches(
-    mut receivers: Query<(Entity, &mut MessageReceiver<PlanEditBatch>)>,
+    mut commands: Commands,
+    mut receivers: Query<
+        (Entity, &mut MessageReceiver<PlanEditBatch>),
+        With<crate::protocol::GameReady>,
+    >,
     mut plans: ResMut<Plans>,
     chunks: Query<&Chunk>,
     chunk_map: Res<ChunkMap>,
@@ -736,36 +762,42 @@ fn receive_plan_edit_batches(
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: ValidatedRequestContext,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
     for (connection, mut receiver) in receivers.iter_mut() {
         let batches: Vec<PlanEditBatch> = receiver.receive().collect();
-        for mut batch in batches {
+        for batch in batches {
+            if validation
+                .authorize(connection, RequestClass::BatchCells(batch.cells.len()))
+                .is_none()
+            {
+                continue;
+            }
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
             let Ok(pose) = poses.get(avatar) else {
                 continue;
             };
-            // Server-of-record batch cap. A well-behaved client
-            // truncates before sending; anything past the cap here is
-            // a bug or a hostile peer, so drop the excess loudly
-            // rather than relaying an unbounded vec to every client.
-            if batch.cells.len() > PLAN_EDIT_BATCH_MAX {
-                warn!(
-                    got = batch.cells.len(),
-                    cap = PLAN_EDIT_BATCH_MAX,
-                    "plan batch over server cap; truncating",
-                );
-                batch.cells.truncate(PLAN_EDIT_BATCH_MAX);
-            }
+            // Oversize batches are rejected by `BoundedVec` while decoding,
+            // before a handler can allocate or process them.
             // Compute the shared materials list once per batch — every
             // Build cell in the batch shares the same `kind` and
             // therefore the same materials_needed.
             let shared_materials = match batch.kind {
                 Some(kind @ PlanKind::Build { .. }) => {
+                    let PlanKind::Build { slot, .. } = kind else {
+                        unreachable!()
+                    };
+                    if block_registry.try_def(slot).is_none() {
+                        if validation.malformed(connection) {
+                            commands.trigger(lightyear::prelude::Disconnect { entity: connection });
+                        }
+                        continue;
+                    }
                     build_initial_materials(kind, &block_registry, &item_registry)
                 }
                 _ => Vec::new(),
@@ -807,14 +839,14 @@ fn receive_plan_edit_batches(
             }
             let reply = PlanEditBatch {
                 kind: batch.kind,
-                cells: accepted,
+                cells: crate::protocol::BoundedVec::new(accepted)
+                    .expect("accepted cells are a subset of a bounded request"),
                 materials: shared_materials,
             };
-            if let Err(err) = broadcast.send::<PlanEditBatch, StateSyncChannel>(
-                &reply,
-                server,
-                &NetworkTarget::All,
-            ) {
+            let target = validation.target_for_cells(reply.cells.iter().copied());
+            if let Err(err) =
+                broadcast.send::<PlanEditBatch, StateSyncChannel>(&reply, server, &target)
+            {
                 warn!("PlanEditBatch broadcast failed: {err}");
             }
         }
@@ -836,7 +868,7 @@ pub(crate) fn cell_is_solid(cell: IVec3, chunks: &Query<&Chunk>, chunk_map: &Chu
 /// broadcasts. Empty snapshots still send — the receive side relies on
 /// the message to know "the full state is now what I've seen."
 fn send_plan_full_sync_on_connect(
-    trigger: On<Add, Connected>,
+    trigger: On<Add, GameReady>,
     plans: Res<Plans>,
     mut senders: Query<&mut MessageSender<PlanFullSync>>,
 ) {

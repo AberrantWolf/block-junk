@@ -510,11 +510,7 @@ fn render_body(
             // what's inside without opening anything.
             if let Some(cfg) = &registry.def(*slot).container {
                 out.push('\n');
-                out.push_str(&format_container_inner(
-                    cfg,
-                    containers.get(*cell),
-                    items,
-                ));
+                out.push_str(&format_container_inner(cfg, containers.get(*cell), items));
             }
             // Append plan info when the inspected block is tagged
             // (Remove plans live on solid cells, so the block raycast

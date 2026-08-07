@@ -926,8 +926,16 @@ mod tests {
         assert!(def.is_pileable());
         assert_eq!(def.pile_capacity(), 6, "12 bulk / 2 = 6 units");
         assert_eq!(def.pile_mesh(1), "mods://test/base.gltf", "single = base");
-        assert_eq!(def.pile_mesh(3), "mods://test/small.gltf", "2-3 = small tier");
-        assert_eq!(def.pile_mesh(9), "mods://test/large.gltf", "4+ = large tier");
+        assert_eq!(
+            def.pile_mesh(3),
+            "mods://test/small.gltf",
+            "2-3 = small tier"
+        );
+        assert_eq!(
+            def.pile_mesh(9),
+            "mods://test/large.gltf",
+            "4+ = large tier"
+        );
 
         let (lua, ctx) = engine_fixture();
         lua.load(
@@ -976,7 +984,11 @@ mod tests {
         );
 
         let (pos, rot, scale) = items[1].hold_pose();
-        assert_eq!((pos, rot, scale), ([0.0; 3], [0.0; 3], 1.0), "no knob ⇒ identity");
+        assert_eq!(
+            (pos, rot, scale),
+            ([0.0; 3], [0.0; 3], 1.0),
+            "no knob ⇒ identity"
+        );
     }
 
     /// Multiplier setter: value lands in the context; a second caller

@@ -24,20 +24,22 @@ use crate::physics::{
 };
 use crate::plans::Plans;
 use crate::protocol::{
-    ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
-    ModSetManifest, CHUNK_PADDED, Carrying, CellEdit, ChunkChannel, ChunkCoord, ChunkData,
-    ChunkSnapshot, ChunkUnload, DepositRequest, DropRequest, DropToolRequest, EquippedTool,
-    GameSet, INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
+    ActionRejected, Actor, AppliedBlockEdit, AuthenticatedPlayer, AuthoritativeCellState, Avatar,
+    AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockWorkIntent, BlockWorkTarget,
+    CHUNK_PADDED, Carrying, CellEdit, ChunkChannel, ChunkCoord, ChunkData, ChunkSnapshot,
+    ChunkUnload, ClientReady, DepositRequest, DropRequest, DropToolRequest, EquippedTool,
+    GameReady, GameSet, INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
     PeriodicSyncChannel, PickupRequest, PlanEdit, PlanKind, REACH_SLACK, RejectReason,
-    RequestNpcDetails, StateSyncChannel, WorldChannel, WorldClock, WorldClockSync, WorldItem,
-    WorldToast,
+    RequestNpcDetails, ServerHello, StateSyncChannel, WorldChannel, WorldClock, WorldClockSync,
+    WorldItem, WorldToast,
 };
+use crate::recipes::RecipeRegistry;
 use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
 use crate::save::{
     SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk,
     SavedContainerState, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState,
-    SavedPlayer, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem,
-    UNCLAIMED_PLAYER_ID, read_save, remap_block_slots, write_save,
+    SavedPlayer, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save,
+    remap_block_slots, write_save,
 };
 use crate::voxel::{
     Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
@@ -76,9 +78,13 @@ impl Plugin for ServerPlugin {
         app.insert_resource(ReplicationMetadata::new(REPLICATION_INTERVAL));
         app.init_resource::<ChunkMap>();
         app.init_resource::<ClientAvatars>();
-        app.init_resource::<ClientChunks>();
+        app.init_resource::<SpatialSubscriptions>();
+        app.init_resource::<SpatialVisibilityState>();
         app.init_resource::<PendingChunks>();
         app.init_resource::<PlayerStates>();
+        app.init_resource::<BlockWorkLeases>();
+        app.init_resource::<RequestBudgets>();
+        app.init_resource::<SnapshotBudgets>();
         app.init_resource::<SaveWriteGuard>();
         app.init_resource::<RoomMap>();
         app.init_resource::<DetectionDirty>();
@@ -102,7 +108,7 @@ impl Plugin for ServerPlugin {
         app.add_message::<CellEdit>();
         app.add_message::<RoomEventMsg>();
         // Two chained groups in Simulation. Splitting into two `add_systems`
-        // calls works around a Bevy 0.18 trait-resolution wall on chained
+        // calls works around a Bevy 0.19 trait-resolution wall on chained
         // tuples beyond ~5 systems. The room group reads chunks updated by
         // `receive_block_edits`, so its order is "after edits"; the AoI
         // group is independent.
@@ -147,7 +153,7 @@ impl Plugin for ServerPlugin {
         );
         // Station + container teardown ride the same CellEdit bus.
         // Separate add_systems call: the chained tuple above sits at
-        // the Bevy 0.18 trait-resolution limit already.
+        // the Bevy 0.19 trait-resolution limit already.
         app.add_systems(
             Update,
             (
@@ -184,7 +190,7 @@ impl Plugin for ServerPlugin {
         );
         app.add_systems(
             Update,
-            (poll_chunk_gen, update_aoi)
+            (poll_chunk_gen, update_aoi, update_spatial_visibility)
                 .chain()
                 .in_set(GameSet::Simulation),
         );
@@ -198,10 +204,7 @@ impl Plugin for ServerPlugin {
         // through) runs after the player step has moved everyone for
         // this tick. The pairwise push nudges overlapping players
         // apart 50/50 — gentle pushing instead of hard contact-stop.
-        app.add_systems(
-            FixedUpdate,
-            soft_separate_actors.after(server_player_step),
-        );
+        app.add_systems(FixedUpdate, soft_separate_actors.after(server_player_step));
         // Block-stuck NPCs from a save (or any load-time edge case
         // where an actor is inside a solid cell) get one pushout
         // attempt on the first Update tick after chunks have flushed
@@ -225,9 +228,122 @@ impl Plugin for ServerPlugin {
         // every tick — when it fires, writes the world and exits the App.
         app.add_systems(Startup, load_from_save);
         app.add_systems(Update, (save_then_shutdown, save_on_request));
+        app.add_systems(Update, (verify_client_ready, expire_ready_challenges));
+        app.add_observer(send_server_hello);
         app.add_observer(install_replication_sender);
         app.add_observer(register_new_client);
         app.add_observer(forget_disconnected_client);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RequestClass {
+    Ordinary,
+    BatchCells(usize),
+    NpcInspection,
+}
+
+#[derive(Resource, Default)]
+struct RequestBudgets(HashMap<Entity, PeerRequestBudget>);
+
+#[derive(Resource, Default)]
+struct SnapshotBudgets(HashMap<Entity, SnapshotBudget>);
+
+struct SnapshotBudget {
+    updated_at: Instant,
+    bytes: f32,
+}
+
+impl Default for SnapshotBudget {
+    fn default() -> Self {
+        Self {
+            updated_at: Instant::now(),
+            bytes: 128.0 * 1024.0,
+        }
+    }
+}
+
+struct PeerRequestBudget {
+    updated_at: Instant,
+    ordinary: f32,
+    batch_cells: f32,
+    npc_inspection: f32,
+    malformed: std::collections::VecDeque<Instant>,
+}
+
+impl Default for PeerRequestBudget {
+    fn default() -> Self {
+        Self {
+            updated_at: Instant::now(),
+            ordinary: 120.0,
+            batch_cells: 8192.0,
+            npc_inspection: 10.0,
+            malformed: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+/// Shared C2S mutation boundary. It resolves readiness/authenticated
+/// identity and charges the request's central per-peer token bucket before
+/// a feature handler examines world state.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct ValidatedRequestContext<'w, 's> {
+    authenticated: Query<'w, 's, &'static AuthenticatedPlayer, With<GameReady>>,
+    budgets: ResMut<'w, RequestBudgets>,
+    subscriptions: Res<'w, SpatialSubscriptions>,
+}
+
+impl ValidatedRequestContext<'_, '_> {
+    pub(crate) fn target_for_cells(&self, cells: impl IntoIterator<Item = IVec3>) -> NetworkTarget {
+        self.subscriptions.target_for_cells(cells)
+    }
+
+    pub(crate) fn subscriptions(&self) -> &SpatialSubscriptions {
+        &self.subscriptions
+    }
+
+    pub(crate) fn authorize(
+        &mut self,
+        connection: Entity,
+        class: RequestClass,
+    ) -> Option<AuthenticatedPlayer> {
+        let auth = *self.authenticated.get(connection).ok()?;
+        let budget = self.budgets.0.entry(connection).or_default();
+        let now = Instant::now();
+        let elapsed = now.duration_since(budget.updated_at).as_secs_f32();
+        budget.updated_at = now;
+        budget.ordinary = (budget.ordinary + elapsed * 60.0).min(120.0);
+        budget.batch_cells = (budget.batch_cells + elapsed * 8192.0).min(8192.0);
+        budget.npc_inspection = (budget.npc_inspection + elapsed * 10.0).min(10.0);
+        let tokens = match class {
+            RequestClass::Ordinary => &mut budget.ordinary,
+            RequestClass::BatchCells(_) => &mut budget.batch_cells,
+            RequestClass::NpcInspection => &mut budget.npc_inspection,
+        };
+        let cost = match class {
+            RequestClass::BatchCells(cells) => cells as f32,
+            _ => 1.0,
+        };
+        if *tokens < cost {
+            return None;
+        }
+        *tokens -= cost;
+        Some(auth)
+    }
+
+    /// Record malformed input. Returns true at three strikes inside the
+    /// ten-second window, at which point the caller disconnects the peer.
+    pub(crate) fn malformed(&mut self, connection: Entity) -> bool {
+        let now = Instant::now();
+        let strikes = &mut self.budgets.0.entry(connection).or_default().malformed;
+        while strikes
+            .front()
+            .is_some_and(|strike| now.duration_since(*strike) > Duration::from_secs(10))
+        {
+            strikes.pop_front();
+        }
+        strikes.push_back(now);
+        strikes.len() >= 3
     }
 }
 
@@ -243,9 +359,7 @@ pub struct PlayerState {
 /// on load and by disconnects during the session; an entry is *removed*
 /// when its player connects (their live avatar is authoritative until
 /// they disconnect again — the save assembler reads connected players
-/// straight from their avatars). The [`save::UNCLAIMED_PLAYER_ID`]
-/// entry is v12-migrated legacy state; the first client id connecting
-/// without an entry of its own claims it.
+/// straight from their avatars).
 #[derive(Resource, Default)]
 pub struct PlayerStates(pub HashMap<u64, PlayerState>);
 
@@ -256,7 +370,10 @@ fn client_id_u64(remote: &RemoteId) -> Option<u64> {
     match remote.0 {
         PeerId::Netcode(id) => Some(id),
         other => {
-            warn!(?other, "connection has a non-netcode peer id; not persisting it");
+            warn!(
+                ?other,
+                "connection has a non-netcode peer id; not persisting it"
+            );
             None
         }
     }
@@ -273,7 +390,6 @@ pub struct SaveWriteGuard {
     pub reason: Option<String>,
 }
 
-
 /// Server App Startup: if `ServerSaveConfig::load_existing`, read the save
 /// file and pre-populate `ChunkMap` with the persisted edited chunks. They
 /// land with the `ChunkEdited` marker so subsequent AoI sends ship the
@@ -285,9 +401,18 @@ pub struct SaveWriteGuard {
 /// But the failure arms [`SaveWriteGuard`], so nothing this session
 /// writes back over the file that failed to load — the empty world is
 /// throwaway, the original save is not.
+#[derive(bevy::ecs::system::SystemParam)]
+struct SaveRegistries<'w> {
+    blocks: Res<'w, BlockRegistry>,
+    items: Res<'w, ItemRegistry>,
+    kinds: Res<'w, crate::npc_registry::NpcKindRegistry>,
+    needs: Res<'w, crate::npc_registry::NeedRegistry>,
+    recipes: Res<'w, RecipeRegistry>,
+}
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "load_from_save touches every persisted system"
+    reason = "load_from_save applies one fully preflighted transaction across persisted resources"
 )]
 fn load_from_save(
     mut commands: Commands,
@@ -302,9 +427,7 @@ fn load_from_save(
     mut guard: ResMut<SaveWriteGuard>,
     mut npc_ids: ResMut<crate::npc::NpcIdAllocator>,
     config: Option<Res<ServerSaveConfig>>,
-    block_registry: Res<BlockRegistry>,
-    item_registry: Res<ItemRegistry>,
-    kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
+    registries: SaveRegistries,
 ) {
     let Some(config) = config else {
         return;
@@ -341,11 +464,30 @@ fn load_from_save(
     // anything downstream reads a slot. Refuses (load fails, guard
     // arms) if the save references a block id that's no longer
     // registered — loading would silently transmute those cells.
-    let lookup = |id: &str| block_registry.slot_of(&block_junk_mod_api::blocks::BlockId::new(id));
+    let lookup = |id: &str| {
+        registries
+            .blocks
+            .slot_of(&block_junk_mod_api::blocks::BlockId::new(id))
+    };
     if let Err(e) = remap_block_slots(&mut save, lookup) {
         fail(&e, &mut guard);
         return;
     }
+    if let Err(e) = validate_runtime_save_references(
+        name,
+        &save,
+        &registries.blocks,
+        &registries.items,
+        &registries.recipes,
+        &registries.kinds,
+        &registries.needs,
+    ) {
+        fail(&e, &mut guard);
+        return;
+    }
+    let block_registry = &registries.blocks;
+    let item_registry = &registries.items;
+    let kind_registry = &registries.kinds;
     info!(
         "loading {} edited chunks + {} NPCs + {} plans + {} world items from save {name:?}",
         save.edited_chunks.len(),
@@ -556,7 +698,7 @@ fn load_from_save(
         // Keep the runtime allocator ahead of every persisted id so a
         // post-load spawn can't collide (claim tables key on NpcId).
         npc_ids.reserve_through(npc.id);
-        spawn_loaded_npc(&mut commands, npc, &kind_registry, &item_registry);
+        spawn_loaded_npc(&mut commands, npc, kind_registry, item_registry);
     }
     // Loose items in the world. Resolve item ids → slots through the
     // current registry. An item id missing from the registry (mod
@@ -581,7 +723,7 @@ fn load_from_save(
             },
             Transform::from_translation(translation),
             GlobalTransform::default(),
-            Replicate::to_clients(NetworkTarget::All),
+            Replicate::to_clients(NetworkTarget::None),
             Name::new(format!("WorldItem(loaded:{})", id)),
         ));
         loaded_items += 1;
@@ -594,16 +736,177 @@ fn load_from_save(
     // with a warning, not the whole entry). Entries sit here until
     // their client id connects; `register_new_client` consumes them.
     for saved in save.players {
-        let state = resolve_saved_player(&saved, &item_registry);
+        let state = resolve_saved_player(&saved, item_registry);
         player_states.0.insert(saved.client_id, state);
     }
     if !player_states.0.is_empty() {
         info!(
             "restored {} player state entr{} from save",
             player_states.0.len(),
-            if player_states.0.len() == 1 { "y" } else { "ies" },
+            if player_states.0.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
         );
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "save preflight spans every registry-backed persisted subsystem"
+)]
+fn validate_runtime_save_references(
+    name: &str,
+    save: &SaveFile,
+    blocks: &BlockRegistry,
+    items: &ItemRegistry,
+    recipes: &RecipeRegistry,
+    kinds: &crate::npc_registry::NpcKindRegistry,
+    needs: &crate::npc_registry::NeedRegistry,
+) -> Result<(), SaveError> {
+    let corrupt = |reason: String| SaveError::Corrupt {
+        name: name.to_owned(),
+        reason,
+    };
+    let item_slot = |id: &str| {
+        items
+            .slot_of(&block_junk_mod_api::items::ItemId::new(id))
+            .ok_or_else(|| corrupt(format!("unknown item id {id:?}")))
+    };
+    let recipe = |id: &str| {
+        let slot = recipes
+            .slot_of(&block_junk_mod_api::recipes::RecipeId::new(id))
+            .ok_or_else(|| corrupt(format!("unknown recipe id {id:?}")))?;
+        recipes
+            .try_id_of(slot)
+            .filter(|resolved| resolved.as_str() == id)
+            .ok_or_else(|| corrupt(format!("recipe registry mismatch for {id:?}")))?;
+        recipes
+            .try_def(slot)
+            .ok_or_else(|| corrupt(format!("invalid recipe slot {} for {id:?}", slot.0)))
+    };
+
+    for player in &save.players {
+        if let Some(carry) = &player.carry {
+            item_slot(&carry.item_id)?;
+            if carry.count == 0 {
+                return Err(corrupt(format!(
+                    "player {} has a zero-count carry",
+                    player.client_id
+                )));
+            }
+        }
+        if let Some(tool) = &player.tool {
+            item_slot(&tool.item_id)?;
+        }
+    }
+    for npc in &save.npcs {
+        if kinds.get(&npc.kind).is_none() {
+            return Err(corrupt(format!(
+                "NPC {} has unknown kind {:?}",
+                npc.id, npc.kind
+            )));
+        }
+        for need in npc.needs.keys() {
+            if !needs.contains(need) {
+                return Err(corrupt(format!("NPC {} has unknown need {need:?}", npc.id)));
+            }
+        }
+        if let Some(carry) = &npc.carrying {
+            item_slot(&carry.item_id)?;
+            if carry.count == 0 {
+                return Err(corrupt(format!("NPC {} has a zero-count carry", npc.id)));
+            }
+        }
+        if let Some(tool) = &npc.tool {
+            item_slot(&tool.item_id)?;
+        }
+    }
+    for (_, plan) in &save.plans {
+        if let PlanKind::Build { slot, .. } = plan.kind
+            && blocks.try_def(slot).is_none()
+        {
+            return Err(corrupt(format!("plan has invalid block slot {}", slot.0)));
+        }
+        for material in &plan.materials {
+            item_slot(&material.item_id)?;
+        }
+    }
+    for world_item in &save.world_items {
+        item_slot(&world_item.item_id)?;
+    }
+
+    let saved_slot_at = |cell: IVec3| {
+        let (coord, local) = world_to_chunk(cell);
+        save.edited_chunks
+            .iter()
+            .find(|chunk| chunk.coord == coord)
+            .map(|chunk| chunk.chunk.get(local))
+    };
+    for (cell, station) in &save.craft_stations {
+        let slot = saved_slot_at(*cell)
+            .ok_or_else(|| corrupt(format!("station state at {cell:?} has no saved chunk")))?;
+        let station_def = blocks.try_def(slot).ok_or_else(|| {
+            corrupt(format!(
+                "station at {cell:?} has invalid block slot {}",
+                slot.0
+            ))
+        })?;
+        let station_tag = station_def.station_tag.as_ref().ok_or_else(|| {
+            corrupt(format!(
+                "station state at {cell:?} is not on a station block"
+            ))
+        })?;
+        for order in &station.orders {
+            let def = recipe(&order.recipe_id)?;
+            if &def.station != station_tag || order.total == 0 || order.completed > order.total {
+                return Err(corrupt(format!("invalid craft order at {cell:?}")));
+            }
+        }
+        if let Some(work) = &station.active_work {
+            let def = recipe(&work.recipe_id)?;
+            if &def.station != station_tag
+                || !work.total_secs.is_finite()
+                || work.total_secs <= 0.0
+                || !work.elapsed_secs.is_finite()
+                || work.elapsed_secs < 0.0
+                || work.elapsed_secs > work.total_secs
+            {
+                return Err(corrupt(format!("invalid active craft work at {cell:?}")));
+            }
+        }
+        let mut total = 0_u32;
+        for entry in &station.inventory {
+            item_slot(&entry.item_id)?;
+            total = total
+                .checked_add(entry.count)
+                .ok_or_else(|| corrupt(format!("station inventory overflows at {cell:?}")))?;
+        }
+    }
+    for (cell, container) in &save.containers {
+        let slot = saved_slot_at(*cell)
+            .ok_or_else(|| corrupt(format!("container state at {cell:?} has no saved chunk")))?;
+        let def = blocks.try_def(slot).ok_or_else(|| {
+            corrupt(format!(
+                "container at {cell:?} has invalid block slot {}",
+                slot.0
+            ))
+        })?;
+        if def.container.is_none() {
+            return Err(corrupt(format!(
+                "container state at {cell:?} is not on a container block"
+            )));
+        }
+        let mut total = 0_u32;
+        for entry in &container.inventory {
+            item_slot(&entry.item_id)?;
+            total = total
+                .checked_add(entry.count)
+                .ok_or_else(|| corrupt(format!("container inventory overflows at {cell:?}")))?;
+        }
+    }
+    Ok(())
 }
 
 /// On-disk player entry → runtime types. Carry/tool item ids that no
@@ -764,7 +1067,7 @@ fn spawn_loaded_npc(
         crate::npc_mover::NavMover::default(),
         NpcPath::default(),
         NpcAnimOverride::default(),
-        Replicate::to_clients(NetworkTarget::All),
+        Replicate::to_clients(NetworkTarget::None),
         InterpolationTarget::to_clients(NetworkTarget::All),
         Name::new(format!("npc:{}", npc.id)),
     ));
@@ -967,7 +1270,7 @@ pub fn shrink_or_despawn_stack(
             },
             Transform::from_translation(translation),
             GlobalTransform::default(),
-            Replicate::to_clients(NetworkTarget::All),
+            Replicate::to_clients(NetworkTarget::None),
             Name::new(format!("WorldItem(remainder:{})", item.0)),
         ));
     }
@@ -1033,17 +1336,19 @@ fn collect_saved_players(ctx: &SaveCtx) -> Vec<SavedPlayer> {
 /// tick after load (and log loudly each time).
 fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec<SavedNpc> {
     npcs.iter()
-        .map(|(id, kind, pose, mode, needs, brain, carry, tool, stats)| SavedNpc {
-            id: id.0,
-            kind: kind.0.clone(),
-            pose: *pose,
-            movement_mode: *mode,
-            needs: needs.0.clone(),
-            rng: brain.rng,
-            carrying: saved_carry_of(carry, item_registry),
-            tool: saved_tool_of(tool, item_registry),
-            stats: stats.0.clone(),
-        })
+        .map(
+            |(id, kind, pose, mode, needs, brain, carry, tool, stats)| SavedNpc {
+                id: id.0,
+                kind: kind.0.clone(),
+                pose: *pose,
+                movement_mode: *mode,
+                needs: needs.0.clone(),
+                rng: brain.rng,
+                carrying: saved_carry_of(carry, item_registry),
+                tool: saved_tool_of(tool, item_registry),
+                stats: stats.0.clone(),
+            },
+        )
         .collect()
 }
 
@@ -1117,7 +1422,7 @@ type SavedNpcQuery<'w, 's> = Query<
 >;
 
 /// Everything the save assembler reads, bundled into one SystemParam so
-/// the two save systems stay under Bevy 0.18's 16-param ceiling (same
+/// the two save systems stay under Bevy 0.19's 16-param ceiling (same
 /// pattern as `HaulCtx` in npc.rs) and can't drift on what gets
 /// persisted.
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1142,7 +1447,11 @@ pub struct SaveCtx<'w, 's> {
     avatar_states: Query<
         'w,
         's,
-        (&'static AvatarPose, &'static Carrying, &'static EquippedTool),
+        (
+            &'static AvatarPose,
+            &'static Carrying,
+            &'static EquippedTool,
+        ),
         With<Avatar>,
     >,
     player_states: Res<'w, PlayerStates>,
@@ -1216,7 +1525,43 @@ pub struct ClientAvatars(pub HashMap<Entity, Entity>);
 /// Chunks currently believed to be loaded on each client. Used by `update_aoi`
 /// to compute deltas (which snapshots/unloads to send each tick).
 #[derive(Resource, Default)]
-pub struct ClientChunks(pub HashMap<Entity, HashSet<ChunkCoord>>);
+pub struct SpatialSubscriptions {
+    client_to_chunks: HashMap<Entity, HashSet<ChunkCoord>>,
+    chunk_to_clients: HashMap<ChunkCoord, HashSet<PeerId>>,
+    client_to_peer: HashMap<Entity, PeerId>,
+}
+
+#[derive(Resource, Default)]
+struct SpatialVisibilityState(HashSet<(Entity, Entity)>);
+
+impl SpatialSubscriptions {
+    pub(crate) fn target_for_cells(&self, cells: impl IntoIterator<Item = IVec3>) -> NetworkTarget {
+        let mut peers: HashSet<PeerId> = HashSet::default();
+        for cell in cells {
+            let coord = world_to_chunk(cell).0;
+            if let Some(subscribers) = self.chunk_to_clients.get(&coord) {
+                peers.extend(subscribers.iter().copied());
+            }
+        }
+        NetworkTarget::Only(peers.into_iter().collect())
+    }
+
+    fn remove_client(&mut self, connection: Entity) {
+        let peer = self.client_to_peer.remove(&connection);
+        if let Some(chunks) = self.client_to_chunks.remove(&connection) {
+            for coord in chunks {
+                if let Some(clients) = self.chunk_to_clients.get_mut(&coord) {
+                    if let Some(peer) = peer {
+                        clients.remove(&peer);
+                    }
+                    if clients.is_empty() {
+                        self.chunk_to_clients.remove(&coord);
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Chunks whose generation is currently in flight on a worker thread.
 /// `update_aoi` skips coords already in here so we don't queue duplicate
@@ -1240,8 +1585,144 @@ const REPLICATION_INTERVAL: Duration = Duration::from_millis(50);
 ///
 /// Since lightyear 0.28 the sender is a plain marker; the send interval
 /// lives in the app-wide `ReplicationMetadata` resource instead.
-fn install_replication_sender(trigger: On<Add, LinkOf>, mut commands: Commands) {
+fn install_replication_sender(trigger: On<Add, GameReady>, mut commands: Commands) {
     commands.entity(trigger.entity).insert(ReplicationSender);
+}
+
+const READY_CHALLENGE_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Component)]
+struct PendingReadyChallenge {
+    nonce: [u8; 32],
+    manifest_hash: [u8; 32],
+    issued_at: Instant,
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct HelloContext<'w, 's> {
+    blocks: Res<'w, BlockRegistry>,
+    items: Res<'w, ItemRegistry>,
+    recipes: Res<'w, crate::recipes::RecipeRegistry>,
+    npc_kinds: Res<'w, crate::npc_registry::NpcKindRegistry>,
+    rooms: Res<'w, crate::rooms::RoomPatternRegistry>,
+    senders: Query<'w, 's, &'static mut MessageSender<ServerHello>>,
+}
+
+/// A raw transport connection receives exactly one compatibility/identity
+/// challenge. All gameplay bootstrap observes `GameReady` instead.
+fn send_server_hello(trigger: On<Add, Connected>, mut commands: Commands, context: HelloContext) {
+    let connection = trigger.entity;
+    let HelloContext {
+        blocks,
+        items,
+        recipes,
+        npc_kinds,
+        rooms,
+        mut senders,
+    } = context;
+    let manifest = crate::modset::local_manifest(&blocks, &items, &recipes, &npc_kinds, &rooms);
+    let hash = crate::protocol::manifest_hash(&manifest);
+    let mut nonce = [0u8; 32];
+    if let Err(error) = getrandom::fill(&mut nonce) {
+        error!("cannot create client-ready challenge: {error}");
+        commands.trigger(Disconnect { entity: connection });
+        return;
+    }
+    let Ok(mut sender) = senders.get_mut(connection) else {
+        warn!("connected peer has no ServerHello sender");
+        commands.trigger(Disconnect { entity: connection });
+        return;
+    };
+    sender.send::<WorldChannel>(ServerHello {
+        protocol_id: crate::network::NETCODE_PROTOCOL_ID,
+        connection_nonce: nonce,
+        manifest_hash: hash,
+        manifest,
+    });
+    commands.entity(connection).insert(PendingReadyChallenge {
+        nonce,
+        manifest_hash: hash,
+        issued_at: Instant::now(),
+    });
+}
+
+fn verify_client_ready(
+    mut commands: Commands,
+    credentials: Res<crate::network::ServerCredentials>,
+    mut connections: Query<(
+        Entity,
+        &RemoteId,
+        &PendingReadyChallenge,
+        &mut MessageReceiver<ClientReady>,
+    )>,
+) {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    for (connection, remote, challenge, mut receiver) in connections.iter_mut() {
+        let messages: Vec<ClientReady> = receiver.receive().collect();
+        if let Some(message) = messages.into_iter().next() {
+            let valid = (|| {
+                if challenge.issued_at.elapsed() > READY_CHALLENGE_TTL {
+                    return false;
+                }
+                let PeerId::Netcode(remote_id) = remote.0 else {
+                    return false;
+                };
+                let player_id = crate::identity::player_id_from_public_key(&message.public_key);
+                if player_id != remote_id || message.signature.len() != 64 {
+                    return false;
+                }
+                let Ok(key) = VerifyingKey::from_bytes(&message.public_key) else {
+                    return false;
+                };
+                let Ok(signature_bytes) = <[u8; 64]>::try_from(&message.signature[..]) else {
+                    return false;
+                };
+                let signature = Signature::from_bytes(&signature_bytes);
+                let payload = crate::protocol::ready_payload(
+                    crate::network::NETCODE_PROTOCOL_ID,
+                    &challenge.nonce,
+                    &challenge.manifest_hash,
+                );
+                key.verify(&payload, &signature).is_ok()
+            })();
+
+            if !valid {
+                warn!(
+                    ?connection,
+                    "rejecting invalid or replayed client-ready proof"
+                );
+                commands.trigger(Disconnect { entity: connection });
+                continue;
+            }
+            let player_id = crate::identity::player_id_from_public_key(&message.public_key);
+            let administrator = credentials.administrators.contains(&message.public_key);
+            commands
+                .entity(connection)
+                .remove::<PendingReadyChallenge>();
+            commands.entity(connection).insert((
+                AuthenticatedPlayer {
+                    player_id,
+                    public_key: message.public_key,
+                    administrator,
+                },
+                GameReady,
+            ));
+            info!(player_id, "client identity and content manifest verified");
+        }
+    }
+}
+
+fn expire_ready_challenges(
+    mut commands: Commands,
+    challenges: Query<(Entity, &PendingReadyChallenge)>,
+) {
+    for (connection, challenge) in challenges.iter() {
+        if challenge.issued_at.elapsed() > READY_CHALLENGE_TTL {
+            warn!(?connection, "client-ready challenge expired");
+            commands.trigger(Disconnect { entity: connection });
+        }
+    }
 }
 
 /// On client connect: spawn an avatar entity carrying the authoritative
@@ -1256,18 +1737,12 @@ fn install_replication_sender(trigger: On<Add, LinkOf>, mut commands: Commands) 
 struct ClientRegistration<'w, 's> {
     remote_ids: Query<'w, 's, &'static RemoteId>,
     avatars: ResMut<'w, ClientAvatars>,
-    sent: ResMut<'w, ClientChunks>,
+    sent: ResMut<'w, SpatialSubscriptions>,
     player_states: ResMut<'w, PlayerStates>,
-    registry: Res<'w, BlockRegistry>,
-    item_registry: Res<'w, ItemRegistry>,
-    recipe_registry: Res<'w, crate::recipes::RecipeRegistry>,
-    npc_kind_registry: Res<'w, crate::npc_registry::NpcKindRegistry>,
-    room_pattern_registry: Res<'w, crate::rooms::RoomPatternRegistry>,
-    manifests: Query<'w, 's, &'static mut MessageSender<ModSetManifest>>,
 }
 
 fn register_new_client(
-    trigger: On<Add, Connected>,
+    trigger: On<Add, GameReady>,
     mut commands: Commands,
     registration: ClientRegistration,
 ) {
@@ -1276,12 +1751,6 @@ fn register_new_client(
         mut avatars,
         mut sent,
         mut player_states,
-        registry,
-        item_registry,
-        recipe_registry,
-        npc_kind_registry,
-        room_pattern_registry,
-        mut manifests,
     } = registration;
     let connection = trigger.entity;
     let Ok(remote) = remote_ids.get(connection) else {
@@ -1297,26 +1766,13 @@ fn register_new_client(
     //
     // Spawn state, in priority order:
     //   1. This client id's own persisted entry (returning player).
-    //   2. The save's unclaimed pre-identity entry, if any (first
-    //      claimant wins — the v12 single-slot convention).
-    //   3. Fresh defaults: spawn above the sine-wave terrain (peaks
+    //   2. Fresh defaults: spawn above the sine-wave terrain (peaks
     //      ~y=16) so the first physics tick lands the player on the
     //      surface, empty carry, starter axe. Eye height =
     //      AvatarPose.translation by convention.
     // Entries are removed on claim: while connected, the live avatar is
     // authoritative and the disconnect observer writes it back.
-    let persisted = client_id_u64(remote).and_then(|id| {
-        player_states.0.remove(&id).or_else(|| {
-            let legacy = player_states.0.remove(&UNCLAIMED_PLAYER_ID);
-            if legacy.is_some() {
-                info!(
-                    client_id = id,
-                    "claimed the save's pre-identity player state"
-                );
-            }
-            legacy
-        })
-    });
+    let persisted = client_id_u64(remote).and_then(|id| player_states.0.remove(&id));
     let (spawn_pose, spawn_carry, spawn_tool) = match persisted {
         Some(state) => (state.pose, state.carry, state.tool),
         None => {
@@ -1344,7 +1800,7 @@ fn register_new_client(
             spawn_carry,
             spawn_tool,
             ActionState::<MovementIntent>::default(),
-            Replicate::to_clients(NetworkTarget::All),
+            Replicate::to_clients(NetworkTarget::None),
             PredictionTarget::to_clients(NetworkTarget::Single(remote.0)),
             InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
             ControlledBy {
@@ -1360,21 +1816,7 @@ fn register_new_client(
         ))
         .id();
     avatars.0.insert(connection, avatar);
-    sent.0.entry(connection).or_default();
-
-    // Send the mod-set fingerprint once so the client can validate its
-    // registries against ours. The client refuses the session on any
-    // disagreement — see `receive_modset_manifest` in client.rs.
-    if let Ok(mut sender) = manifests.get_mut(connection) {
-        let manifest = crate::modset::local_manifest(
-            &registry,
-            &item_registry,
-            &recipe_registry,
-            &npc_kind_registry,
-            &room_pattern_registry,
-        );
-        sender.send::<WorldChannel>(manifest);
-    }
+    sent.client_to_chunks.entry(connection).or_default();
 }
 
 /// Server-authoritative simulation tick. Reads each avatar's current
@@ -1471,11 +1913,17 @@ fn server_player_step(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "disconnect cleanup atomically releases identity, avatar, subscriptions, budgets, and work"
+)]
 fn forget_disconnected_client(
     trigger: On<Remove, ClientOf>,
     mut commands: Commands,
     mut avatars: ResMut<ClientAvatars>,
-    mut sent: ResMut<ClientChunks>,
+    mut sent: ResMut<SpatialSubscriptions>,
+    mut work_leases: ResMut<BlockWorkLeases>,
+    mut snapshot_budgets: ResMut<SnapshotBudgets>,
     mut player_states: ResMut<PlayerStates>,
     remote_ids: Query<&RemoteId>,
     states: Query<(&AvatarPose, &Carrying, &EquippedTool), With<Avatar>>,
@@ -1520,7 +1968,7 @@ fn forget_disconnected_client(
                             },
                             Transform::from_translation(translation),
                             GlobalTransform::default(),
-                            Replicate::to_clients(NetworkTarget::All),
+                            Replicate::to_clients(NetworkTarget::None),
                             Name::new(format!("WorldItem(disconnect:{})", slot.0)),
                         ));
                     }
@@ -1536,7 +1984,9 @@ fn forget_disconnected_client(
         }
         commands.entity(avatar).despawn();
     }
-    sent.0.remove(&trigger.entity);
+    sent.remove_client(trigger.entity);
+    snapshot_budgets.0.remove(&trigger.entity);
+    work_leases.0.remove(&trigger.entity);
 }
 
 /// Drains completed chunk-generation tasks off the AsyncComputeTaskPool,
@@ -1619,10 +2069,12 @@ struct AoiContext<'w, 's> {
     pending: ResMut<'w, PendingChunks>,
     avatars: Res<'w, ClientAvatars>,
     poses: Query<'w, 's, &'static AvatarPose>,
-    sent: ResMut<'w, ClientChunks>,
+    sent: ResMut<'w, SpatialSubscriptions>,
+    remote_ids: Query<'w, 's, &'static RemoteId>,
     snapshots: Query<'w, 's, &'static mut MessageSender<ChunkSnapshot>>,
     unloads: Query<'w, 's, &'static mut MessageSender<ChunkUnload>>,
     terrain_slots: Res<'w, TerrainSlots>,
+    budgets: ResMut<'w, SnapshotBudgets>,
 }
 
 fn update_aoi(context: AoiContext) {
@@ -1636,6 +2088,8 @@ fn update_aoi(context: AoiContext) {
         mut snapshots,
         mut unloads,
         terrain_slots,
+        remote_ids,
+        mut budgets,
     } = context;
     for (&client_entity, &avatar_entity) in avatars.0.iter() {
         let Ok(avatar_pose) = poses.get(avatar_entity) else {
@@ -1643,10 +2097,24 @@ fn update_aoi(context: AoiContext) {
         };
         let player_chunk = world_to_chunk_coord(avatar_pose.translation);
         let desired = aoi_around(player_chunk);
-        let current = sent.0.entry(client_entity).or_default();
+        let Ok(remote) = remote_ids.get(client_entity) else {
+            continue;
+        };
+        sent.client_to_peer.insert(client_entity, remote.0);
+        let (mut candidates, removed) = {
+            let current = sent.client_to_chunks.entry(client_entity).or_default();
+            (
+                desired.difference(current).copied().collect::<Vec<_>>(),
+                current.difference(&desired).copied().collect::<Vec<_>>(),
+            )
+        };
+        candidates.sort_by_key(|coord| (coord.0 - player_chunk.0).length_squared());
 
-        let candidates: Vec<ChunkCoord> = desired.difference(current).copied().collect();
-        let removed: Vec<ChunkCoord> = current.difference(&desired).copied().collect();
+        let budget = budgets.0.entry(client_entity).or_default();
+        let now = Instant::now();
+        let elapsed = now.duration_since(budget.updated_at).as_secs_f32();
+        budget.updated_at = now;
+        budget.bytes = (budget.bytes + elapsed * 32.0 * 1024.0).min(128.0 * 1024.0);
 
         for coord in &candidates {
             // Resolve the chunk's wire payload. Three states:
@@ -1657,7 +2125,7 @@ fn update_aoi(context: AoiContext) {
                 if let Some(&entity) = chunk_map.0.get(coord) {
                     chunks.get(entity).ok().map(|(chunk, entities, edited)| {
                         let data = if edited {
-                            ChunkData::Edited(chunk.blocks.clone())
+                            encode_chunk_data(&chunk.blocks)
                         } else {
                             ChunkData::Procedural
                         };
@@ -1680,13 +2148,28 @@ fn update_aoi(context: AoiContext) {
             let Some((data, entities)) = payload else {
                 continue; // still generating; try again next tick
             };
+            let snapshot = ChunkSnapshot {
+                coord: *coord,
+                data,
+                entities,
+            };
+            let encoded_bytes =
+                bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
+                    .map_or(usize::MAX, |bytes| bytes.len());
+            if encoded_bytes as f32 > budget.bytes {
+                continue;
+            }
             if let Ok(mut sender) = snapshots.get_mut(client_entity) {
-                sender.send::<ChunkChannel>(ChunkSnapshot {
-                    coord: *coord,
-                    data,
-                    entities,
-                });
-                current.insert(*coord);
+                sender.send::<ChunkChannel>(snapshot);
+                budget.bytes -= encoded_bytes as f32;
+                sent.client_to_chunks
+                    .entry(client_entity)
+                    .or_default()
+                    .insert(*coord);
+                sent.chunk_to_clients
+                    .entry(*coord)
+                    .or_default()
+                    .insert(remote.0);
             }
         }
 
@@ -1694,9 +2177,90 @@ fn update_aoi(context: AoiContext) {
             if let Ok(mut sender) = unloads.get_mut(client_entity) {
                 sender.send::<ChunkChannel>(ChunkUnload { coord: *coord });
             }
-            current.remove(coord);
+            if let Some(current) = sent.client_to_chunks.get_mut(&client_entity) {
+                current.remove(coord);
+            }
+            if let Some(clients) = sent.chunk_to_clients.get_mut(coord) {
+                clients.remove(&remote.0);
+                if clients.is_empty() {
+                    sent.chunk_to_clients.remove(coord);
+                }
+            }
         }
     }
+}
+
+fn encode_chunk_data(blocks: &[BlockSlot]) -> ChunkData {
+    let mut runs: Vec<crate::protocol::BlockRun> = Vec::new();
+    for &slot in blocks {
+        if let Some(last) = runs.last_mut()
+            && last.slot == slot
+        {
+            last.count += 1;
+        } else {
+            runs.push(crate::protocol::BlockRun { slot, count: 1 });
+        }
+    }
+    let raw = crate::protocol::BoundedVec::new(blocks.to_vec())
+        .expect("server chunks always have the exact padded cell count");
+    let rle = crate::protocol::BoundedVec::new(runs)
+        .expect("RLE cannot have more runs than source cells");
+    let raw_size = bincode::serde::encode_to_vec(&raw, bincode::config::standard())
+        .map_or(usize::MAX, |bytes| bytes.len());
+    let rle_size = bincode::serde::encode_to_vec(&rle, bincode::config::standard())
+        .map_or(usize::MAX, |bytes| bytes.len());
+    if rle_size < raw_size {
+        ChunkData::Rle(rle)
+    } else {
+        ChunkData::Raw(raw)
+    }
+}
+
+fn update_spatial_visibility(
+    mut commands: Commands,
+    subscriptions: Res<SpatialSubscriptions>,
+    actors: Query<(Entity, &AvatarPose), With<Actor>>,
+    items: Query<(Entity, &WorldItem)>,
+    clusters: Query<(Entity, &crate::civilization::ClusterBboxReplica)>,
+    mut state: ResMut<SpatialVisibilityState>,
+) {
+    use lightyear::prelude::VisibilityExt as _;
+
+    let mut desired = HashSet::default();
+    for (&connection, chunks) in &subscriptions.client_to_chunks {
+        for (entity, pose) in &actors {
+            if chunks.contains(&world_to_chunk_coord(pose.translation)) {
+                desired.insert((entity, connection));
+            }
+        }
+        for (entity, item) in &items {
+            if chunks.contains(&world_to_chunk_coord(item.translation)) {
+                desired.insert((entity, connection));
+            }
+        }
+        for (entity, bounds) in &clusters {
+            let min = world_to_chunk(bounds.min).0.0;
+            let max = world_to_chunk(bounds.max).0.0;
+            if chunks.iter().any(|coord| {
+                let value = coord.0;
+                value.x >= min.x
+                    && value.y >= min.y
+                    && value.z >= min.z
+                    && value.x <= max.x
+                    && value.y <= max.y
+                    && value.z <= max.z
+            }) {
+                desired.insert((entity, connection));
+            }
+        }
+    }
+    for &(entity, connection) in desired.difference(&state.0) {
+        commands.gain_visibility(entity, connection);
+    }
+    for &(entity, connection) in state.0.difference(&desired) {
+        commands.lose_visibility(entity, connection);
+    }
+    state.0 = desired;
 }
 
 fn world_to_chunk_coord(pos: Vec3) -> ChunkCoord {
@@ -1750,53 +2314,203 @@ pub(crate) fn within_reach(pose: &AvatarPose, target: Vec3, reach: f32) -> bool 
 )]
 fn receive_block_edits(
     mut commands: Commands,
-    mut receivers: Query<(Entity, &mut MessageReceiver<BlockEdit>)>,
+    time: Res<Time>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<BlockWorkIntent>), With<GameReady>>,
+    mut leases: ResMut<BlockWorkLeases>,
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
+    items: Res<ItemRegistry>,
+    plans: Res<Plans>,
     avatars: Res<ClientAvatars>,
-    poses: Query<&AvatarPose, With<Avatar>>,
+    actors: Query<(&AvatarPose, &EquippedTool), With<Avatar>>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut bus: MessageWriter<CellEdit>,
+    mut validation: ValidatedRequestContext,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
     for (connection, mut receiver) in receivers.iter_mut() {
-        let edits: Vec<BlockEdit> = receiver.receive().collect();
-        for edit in edits {
-            // Reach gate — the server half of the INTERACT_REACH
-            // contract. Mining/placing was the one mutating verb with
-            // no server-side validation at all.
-            let Some(&avatar) = avatars.0.get(&connection) else {
-                continue;
-            };
-            let Ok(pose) = poses.get(avatar) else {
-                continue;
-            };
-            let centre = edit.anchor.as_vec3() + Vec3::splat(0.5);
-            if !within_reach(pose, centre, INTERACT_REACH) {
-                send_rejection(
-                    &mut rejections,
-                    connection,
-                    edit.anchor,
-                    RejectReason::OutOfReach,
-                );
+        for intent in receiver.receive() {
+            if validation
+                .authorize(connection, RequestClass::Ordinary)
+                .is_none()
+            {
                 continue;
             }
-            apply_block_edit(
-                edit,
-                &mut commands,
-                &mut chunks,
-                BlockEditWorld::new(&map, &registry),
-                server,
-                &mut broadcast,
-                &mut bus,
-            );
+            let previous = leases.0.get(&connection);
+            if previous.is_some_and(|lease| intent.sequence <= lease.sequence) {
+                continue;
+            }
+            match intent.target {
+                Some(target) => {
+                    let progress = previous
+                        .filter(|lease| lease.target == target)
+                        .map_or(0.0, |lease| lease.progress_secs);
+                    leases.0.insert(
+                        connection,
+                        BlockWorkLease {
+                            sequence: intent.sequence,
+                            target,
+                            refreshed_at: Instant::now(),
+                            progress_secs: progress,
+                        },
+                    );
+                }
+                None => {
+                    leases.0.remove(&connection);
+                }
+            }
         }
     }
+
+    let mut completed = Vec::new();
+    let mut invalid = Vec::new();
+    for (&connection, lease) in &mut leases.0 {
+        if lease.refreshed_at.elapsed() > Duration::from_millis(500) {
+            invalid.push(connection);
+            continue;
+        }
+        let Some(&avatar) = avatars.0.get(&connection) else {
+            invalid.push(connection);
+            continue;
+        };
+        let Ok((pose, tool)) = actors.get(avatar) else {
+            invalid.push(connection);
+            continue;
+        };
+        let (cell, edit, work_slot, verb) = match lease.target {
+            BlockWorkTarget::Plan { cell } => {
+                let Some(state) = plans.get(cell) else {
+                    invalid.push(connection);
+                    continue;
+                };
+                if !state.is_satisfied() {
+                    invalid.push(connection);
+                    continue;
+                }
+                match state.kind {
+                    PlanKind::Build { slot, orientation } => (
+                        cell,
+                        BlockEdit {
+                            anchor: cell,
+                            slot,
+                            orientation,
+                        },
+                        slot,
+                        block_junk_mod_api::blocks::WorkVerb::Build,
+                    ),
+                    PlanKind::Remove => {
+                        let Some(slot) = server_slot_at(cell, &chunks, &map) else {
+                            invalid.push(connection);
+                            continue;
+                        };
+                        (
+                            cell,
+                            BlockEdit {
+                                anchor: cell,
+                                slot: BlockSlot::EMPTY,
+                                orientation: Cardinal::default(),
+                            },
+                            slot,
+                            block_junk_mod_api::blocks::WorkVerb::Destroy,
+                        )
+                    }
+                }
+            }
+            BlockWorkTarget::Break { cell } => {
+                let Some(slot) = server_slot_at(cell, &chunks, &map) else {
+                    invalid.push(connection);
+                    continue;
+                };
+                (
+                    cell,
+                    BlockEdit {
+                        anchor: cell,
+                        slot: BlockSlot::EMPTY,
+                        orientation: Cardinal::default(),
+                    },
+                    slot,
+                    block_junk_mod_api::blocks::WorkVerb::Destroy,
+                )
+            }
+        };
+        if !within_reach(pose, cell.as_vec3() + Vec3::splat(0.5), INTERACT_REACH) {
+            send_rejection(&mut rejections, connection, cell, RejectReason::OutOfReach);
+            invalid.push(connection);
+            continue;
+        }
+        let Some(def) = registry.try_def(work_slot) else {
+            invalid.push(connection);
+            continue;
+        };
+        let has_tool = def
+            .work_action
+            .as_ref()
+            .and_then(|work| work.tool_for(verb))
+            .is_none_or(|tag| items.tool_has_tag(tool.item, tag));
+        let multiplier = def
+            .work_action
+            .as_ref()
+            .and_then(|work| work.duration_multiplier(verb, has_tool))
+            .or_else(|| def.work_action.is_none().then_some(1.0));
+        let Some(multiplier) = multiplier else {
+            invalid.push(connection);
+            continue;
+        };
+        let duration = def
+            .work_action
+            .as_ref()
+            .map_or(crate::client::PLAYER_ACTION_DURATION_SECS, |work| {
+                work.duration_secs
+            })
+            * multiplier;
+        lease.progress_secs += time.delta_secs();
+        if lease.progress_secs >= duration {
+            completed.push((connection, edit));
+        }
+    }
+    for connection in invalid {
+        leases.0.remove(&connection);
+    }
+    for (connection, edit) in completed {
+        leases.0.remove(&connection);
+        apply_block_edit(
+            edit,
+            &mut commands,
+            &mut chunks,
+            BlockEditWorld::new(&map, &registry),
+            server,
+            &mut broadcast,
+            &mut bus,
+            &validation.subscriptions,
+        );
+    }
+}
+
+#[derive(Resource, Default)]
+struct BlockWorkLeases(HashMap<Entity, BlockWorkLease>);
+
+struct BlockWorkLease {
+    sequence: u64,
+    target: BlockWorkTarget,
+    refreshed_at: Instant,
+    progress_secs: f32,
+}
+
+fn server_slot_at(
+    cell: IVec3,
+    chunks: &Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: &ChunkMap,
+) -> Option<BlockSlot> {
+    let (coord, local) = world_to_chunk(cell);
+    let entity = *map.0.get(&coord)?;
+    let (chunk, _) = chunks.get(entity).ok()?;
+    let slot = chunk.get(local);
+    (!slot.is_empty()).then_some(slot)
 }
 
 /// Validate + apply a single client request, then broadcast the canonical
@@ -1821,6 +2535,10 @@ impl<'a> BlockEditWorld<'a> {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared authoritative edit transaction"
+)]
 pub(crate) fn apply_block_edit(
     edit: BlockEdit,
     commands: &mut Commands,
@@ -1829,11 +2547,30 @@ pub(crate) fn apply_block_edit(
     server: &Server,
     broadcast: &mut ServerMultiMessageSender,
     bus: &mut MessageWriter<CellEdit>,
+    subscriptions: &SpatialSubscriptions,
 ) {
     if edit.slot.is_empty() {
-        apply_break(edit, commands, chunks, world, server, broadcast, bus);
+        apply_break(
+            edit,
+            commands,
+            chunks,
+            world,
+            server,
+            broadcast,
+            bus,
+            subscriptions,
+        );
     } else {
-        apply_place(edit, commands, chunks, world, server, broadcast, bus);
+        apply_place(
+            edit,
+            commands,
+            chunks,
+            world,
+            server,
+            broadcast,
+            bus,
+            subscriptions,
+        );
     }
 }
 
@@ -1842,6 +2579,10 @@ pub(crate) fn apply_block_edit(
 /// `Anchor` entry at the anchor cell + `Ghost` entries at every other
 /// footprint cell. Cross-chunk footprints are handled naturally — each
 /// affected chunk gets the cells that fall inside it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared authoritative edit transaction"
+)]
 fn apply_place(
     edit: BlockEdit,
     commands: &mut Commands,
@@ -1850,6 +2591,7 @@ fn apply_place(
     server: &Server,
     broadcast: &mut ServerMultiMessageSender,
     bus: &mut MessageWriter<CellEdit>,
+    subscriptions: &SpatialSubscriptions,
 ) {
     let BlockEditWorld { map, registry } = world;
     let def = registry.def(edit.slot);
@@ -1959,9 +2701,32 @@ fn apply_place(
     // state. That only holds if snapshot and edit share one ordered stream —
     // on separate channels a small edit can overtake a fragmented snapshot
     // cut *after* it and be lost until the chunk re-enters AoI.
-    if let Err(err) = broadcast.send::<BlockEdit, ChunkChannel>(&edit, server, &NetworkTarget::All)
-    {
-        warn!("BlockEdit broadcast failed: {err}");
+    let states = cells
+        .iter()
+        .map(|&world| AuthoritativeCellState {
+            world,
+            slot: edit.slot,
+            entity: needs_sidecar.then_some(if world == edit.anchor {
+                EntryKind::Anchor {
+                    orientation: edit.orientation,
+                }
+            } else {
+                EntryKind::Ghost {
+                    anchor: edit.anchor,
+                }
+            }),
+        })
+        .collect();
+    let applied = AppliedBlockEdit {
+        anchor: edit.anchor,
+        old_slot: BlockSlot::EMPTY,
+        orientation: edit.orientation,
+        cells: crate::protocol::BoundedVec::new(states)
+            .expect("validated block footprints fit the applied-edit wire bound"),
+    };
+    let target = subscriptions.target_for_cells(cells.iter().copied());
+    if let Err(err) = broadcast.send::<AppliedBlockEdit, ChunkChannel>(&applied, server, &target) {
+        warn!("AppliedBlockEdit broadcast failed: {err}");
     }
 }
 
@@ -1969,6 +2734,10 @@ fn apply_place(
 /// cell blocks resolve to themselves with default orientation; multi-
 /// cell entities walk the chunk sidecar). Clears every footprint cell
 /// in the affected chunks + drops the entries.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared authoritative edit transaction"
+)]
 fn apply_break(
     edit: BlockEdit,
     commands: &mut Commands,
@@ -1977,6 +2746,7 @@ fn apply_break(
     server: &Server,
     broadcast: &mut ServerMultiMessageSender,
     bus: &mut MessageWriter<CellEdit>,
+    subscriptions: &SpatialSubscriptions,
 ) {
     let BlockEditWorld { map, registry } = world;
     let click_cell = edit.anchor;
@@ -2081,15 +2851,25 @@ fn apply_break(
     // Broadcast the canonical applied break with the resolved anchor +
     // orientation, so other clients can compute the footprint themselves.
     // ChunkChannel for snapshot/edit ordering — see apply_place.
-    let applied = BlockEdit {
+    let applied = AppliedBlockEdit {
         anchor,
-        slot: BlockSlot::EMPTY,
+        old_slot: slot,
         orientation,
+        cells: crate::protocol::BoundedVec::new(
+            cells
+                .iter()
+                .map(|&world| AuthoritativeCellState {
+                    world,
+                    slot: BlockSlot::EMPTY,
+                    entity: None,
+                })
+                .collect(),
+        )
+        .expect("validated block footprints fit the applied-edit wire bound"),
     };
-    if let Err(err) =
-        broadcast.send::<BlockEdit, ChunkChannel>(&applied, server, &NetworkTarget::All)
-    {
-        warn!("BlockEdit broadcast failed: {err}");
+    let target = subscriptions.target_for_cells(cells.iter().copied());
+    if let Err(err) = broadcast.send::<AppliedBlockEdit, ChunkChannel>(&applied, server, &target) {
+        warn!("AppliedBlockEdit broadcast failed: {err}");
     }
 
     // S4 forage harvest-transform: a resource block with `depleted_block`
@@ -2116,6 +2896,7 @@ fn apply_break(
             server,
             broadcast,
             bus,
+            subscriptions,
         );
     }
 }
@@ -2148,6 +2929,7 @@ fn apply_npc_work(
     servers: Query<&Server>,
     mut broadcast: ServerMultiMessageSender,
     mut bus: MessageWriter<CellEdit>,
+    subscriptions: Res<SpatialSubscriptions>,
 ) {
     let Ok(server) = servers.single() else {
         return;
@@ -2184,6 +2966,7 @@ fn apply_npc_work(
             server,
             &mut broadcast,
             &mut bus,
+            &subscriptions,
         );
     }
 }
@@ -2204,6 +2987,7 @@ struct NpcConsumptionWorld<'w, 's> {
     map: Res<'w, ChunkMap>,
     registry: Res<'w, BlockRegistry>,
     servers: Query<'w, 's, &'static Server>,
+    subscriptions: Res<'w, SpatialSubscriptions>,
 }
 
 fn apply_npc_consumption(
@@ -2218,6 +3002,7 @@ fn apply_npc_consumption(
         map,
         registry,
         servers,
+        subscriptions,
     } = world;
     let Ok(server) = servers.single() else {
         return;
@@ -2265,6 +3050,7 @@ fn apply_npc_consumption(
             server,
             &mut broadcast,
             &mut bus,
+            &subscriptions,
         );
         info!(
             cell = ?msg.cell.to_array(),
@@ -2289,16 +3075,25 @@ type NpcInspectionData<'a> = (
 );
 
 fn receive_npc_inspection_requests(
-    mut receivers: Query<(Entity, &mut MessageReceiver<RequestNpcDetails>)>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<RequestNpcDetails>), With<GameReady>>,
     npcs: Query<NpcInspectionData, With<Npc>>,
+    npc_index: Res<crate::npc::NpcEntityIndex>,
     mut senders: Query<&mut MessageSender<NpcDetails>>,
+    mut validation: ValidatedRequestContext,
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
         let requests: Vec<RequestNpcDetails> = receiver.receive().collect();
         for req in requests {
-            let Some((id, kind, needs, stats, brain, _pose)) =
-                npcs.iter().find(|(id, _, _, _, _, _)| id.0 == req.npc_id)
-            else {
+            if validation
+                .authorize(connection, RequestClass::NpcInspection)
+                .is_none()
+            {
+                continue;
+            }
+            let Some(&npc_entity) = npc_index.by_id.get(&NpcId(req.npc_id)) else {
+                continue;
+            };
+            let Ok((id, kind, needs, stats, brain, _pose)) = npcs.get(npc_entity) else {
                 // NPC despawned between client raycast and server
                 // receive. Silently drop — the requester will time
                 // out and the panel will close on its own.
@@ -2339,14 +3134,19 @@ const PICKUP_MATCH_RADIUS: f32 = 0.5;
 ///
 /// Carry + tool replication broadcasts new state back to the owner;
 /// HUD picks it up next frame.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wire handler joins validated gameplay state"
+)]
 fn receive_pickup_requests(
-    mut receivers: Query<(Entity, &mut MessageReceiver<PickupRequest>)>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<PickupRequest>), With<GameReady>>,
     avatars: Res<ClientAvatars>,
     mut players: Query<(&AvatarPose, &mut Carrying, &mut EquippedTool), With<Avatar>>,
     world_items: Query<(Entity, &WorldItem)>,
     item_registry: Res<ItemRegistry>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     mut commands: Commands,
+    mut validation: ValidatedRequestContext,
 ) {
     // Despawns are deferred Commands, so the world_items query stays
     // stale for the whole system run — two requests matching the same
@@ -2357,6 +3157,12 @@ fn receive_pickup_requests(
     for (connection, mut receiver) in receivers.iter_mut() {
         let requests: Vec<PickupRequest> = receiver.receive().collect();
         for req in requests {
+            if validation
+                .authorize(connection, RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
@@ -2426,7 +3232,7 @@ fn receive_pickup_requests(
                         },
                         Transform::from_translation(req.target),
                         GlobalTransform::default(),
-                        Replicate::to_clients(NetworkTarget::All),
+                        Replicate::to_clients(NetworkTarget::None),
                         Name::new(format!("WorldItem(tool_swap:{})", prev_slot.0)),
                     ));
                 }
@@ -2459,14 +3265,19 @@ fn receive_pickup_requests(
 /// feet (sliding off a cliff edge or facing a wall both degrade to
 /// "right here"). A tight per-unit fan jitter keeps a stack from
 /// z-fighting at the same point.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wire handler joins validated gameplay state"
+)]
 fn receive_drop_requests(
-    mut receivers: Query<(Entity, &mut MessageReceiver<DropRequest>)>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<DropRequest>), With<GameReady>>,
     avatars: Res<ClientAvatars>,
     mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
     mut commands: Commands,
+    mut validation: ValidatedRequestContext,
 ) {
     let world = crate::npc::WorldWalk {
         chunks: &chunks,
@@ -2474,7 +3285,14 @@ fn receive_drop_requests(
         registry: &block_registry,
     };
     for (connection, mut receiver) in receivers.iter_mut() {
-        let request_count = receiver.receive().count();
+        let request_count = receiver
+            .receive()
+            .filter(|_| {
+                validation
+                    .authorize(connection, RequestClass::Ordinary)
+                    .is_some()
+            })
+            .count();
         if request_count == 0 {
             continue;
         }
@@ -2506,7 +3324,7 @@ fn receive_drop_requests(
                 },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
-                Replicate::to_clients(NetworkTarget::All),
+                Replicate::to_clients(NetworkTarget::None),
                 Name::new(format!("WorldItem(dropped:{})", item.0)),
             ));
         }
@@ -2519,14 +3337,19 @@ fn receive_drop_requests(
 /// feet). No-op when the tool slot is empty. Mirrors
 /// `receive_drop_requests` (carry) — the only differences are the
 /// component touched and the single-unit drop (tools never stack).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wire handler joins validated gameplay state"
+)]
 fn receive_drop_tool_requests(
-    mut receivers: Query<(Entity, &mut MessageReceiver<DropToolRequest>)>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<DropToolRequest>), With<GameReady>>,
     avatars: Res<ClientAvatars>,
     mut players: Query<(&AvatarPose, &mut EquippedTool), With<Avatar>>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
     mut commands: Commands,
+    mut validation: ValidatedRequestContext,
 ) {
     let world = crate::npc::WorldWalk {
         chunks: &chunks,
@@ -2534,7 +3357,14 @@ fn receive_drop_tool_requests(
         registry: &block_registry,
     };
     for (connection, mut receiver) in receivers.iter_mut() {
-        let request_count = receiver.receive().count();
+        let request_count = receiver
+            .receive()
+            .filter(|_| {
+                validation
+                    .authorize(connection, RequestClass::Ordinary)
+                    .is_some()
+            })
+            .count();
         if request_count == 0 {
             continue;
         }
@@ -2558,7 +3388,7 @@ fn receive_drop_tool_requests(
             },
             Transform::from_translation(target),
             GlobalTransform::default(),
-            Replicate::to_clients(NetworkTarget::All),
+            Replicate::to_clients(NetworkTarget::None),
             Name::new(format!("WorldItem(tool_dropped:{})", slot.0)),
         ));
     }
@@ -2622,9 +3452,10 @@ struct DepositContext<'w, 's> {
 }
 
 fn receive_deposit_requests(
-    mut receivers: Query<(Entity, &mut MessageReceiver<DepositRequest>)>,
+    mut receivers: Query<(Entity, &mut MessageReceiver<DepositRequest>), With<GameReady>>,
     context: DepositContext,
     mut broadcast: ServerMultiMessageSender,
+    mut validation: ValidatedRequestContext,
 ) {
     let DepositContext {
         avatars,
@@ -2641,6 +3472,12 @@ fn receive_deposit_requests(
     for (connection, mut receiver) in receivers.iter_mut() {
         let requests: Vec<DepositRequest> = receiver.receive().collect();
         for req in requests {
+            if validation
+                .authorize(connection, RequestClass::Ordinary)
+                .is_none()
+            {
+                continue;
+            }
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
@@ -2697,11 +3534,10 @@ fn receive_deposit_requests(
                     kind: Some(state.kind),
                     materials: state.materials,
                 };
-                if let Err(err) = broadcast.send::<PlanEdit, StateSyncChannel>(
-                    &reply,
-                    server,
-                    &NetworkTarget::All,
-                ) {
+                let target = validation.target_for_cells([req.cell]);
+                if let Err(err) =
+                    broadcast.send::<PlanEdit, StateSyncChannel>(&reply, server, &target)
+                {
                     warn!("deposit PlanEdit broadcast failed: {err}");
                 }
             }
@@ -2717,9 +3553,10 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
     match goal {
         Goal::Idle => ("idle".into(), None),
         Goal::Resting { remaining_secs } => (format!("resting ({remaining_secs:.1}s)"), None),
-        Goal::SleepingGround { remaining_secs, .. } => {
-            (format!("sleeping on the ground ({remaining_secs:.1}s)"), None)
-        }
+        Goal::SleepingGround { remaining_secs, .. } => (
+            format!("sleeping on the ground ({remaining_secs:.1}s)"),
+            None,
+        ),
         Goal::MoveTo { path, .. } => {
             let target = path.last().copied();
             (format!("moving ({} cells)", path.len()), target)
@@ -2766,6 +3603,7 @@ fn auto_clear_stale_plans(
     mut plans: ResMut<Plans>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    subscriptions: Res<SpatialSubscriptions>,
 ) {
     let Ok(server) = servers.single() else {
         return;
@@ -2785,9 +3623,8 @@ fn auto_clear_stale_plans(
             kind: None,
             materials: Vec::new(),
         };
-        if let Err(err) =
-            broadcast.send::<PlanEdit, StateSyncChannel>(&msg, server, &NetworkTarget::All)
-        {
+        let target = subscriptions.target_for_cells([edit.world]);
+        if let Err(err) = broadcast.send::<PlanEdit, StateSyncChannel>(&msg, server, &target) {
             warn!("auto-clear PlanEdit broadcast failed: {err}");
         }
     }
@@ -2896,7 +3733,7 @@ fn spawn_drops_on_destroy(
                     },
                     Transform::from_translation(translation),
                     GlobalTransform::default(),
-                    Replicate::to_clients(NetworkTarget::All),
+                    Replicate::to_clients(NetworkTarget::None),
                     Name::new(format!("WorldItem({})", item_id)),
                 ));
             }

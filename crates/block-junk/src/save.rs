@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use bevy::math::IVec3;
+use ndshape::ConstShape;
 
 use crate::protocol::{AvatarPose, ChunkCoord, MovementMode, PlanKind, WorldClock};
 // `PlanState` and `MaterialEntry` are engine-side types; the on-disk
@@ -31,8 +32,8 @@ use crate::protocol::{AvatarPose, ChunkCoord, MovementMode, PlanKind, WorldClock
 // sessions doesn't corrupt a save.
 use crate::voxel::{Chunk, ChunkEntities};
 
-/// Bump on any breaking shape change. Loaders will refuse mismatched
-/// versions; a future migration layer can branch on this.
+/// Current pre-release format. Only version 18 is decoded; older world
+/// directories remain visible as incompatible and are never rewritten.
 /// v2 (2026-05-13): added `last_player_pose` to `SaveFile`.
 /// v3 (2026-05-15): added `npcs` to `SaveFile`.
 /// v4 (2026-05-15): added `world_clock` to `SaveFile`.
@@ -85,12 +86,8 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v17 (2026-07-06): added `containers` — per-cell container stock
 ///                  (storage arc S3). v16 and earlier migrate on load
 ///                  with an empty map.
-pub const SAVE_VERSION: u32 = 17;
-
-/// Sentinel `SavedPlayer::client_id` for state not yet bound to a real
-/// client id: v12-migrated legacy state. Real ids are never 0 (see
-/// `identity::random_id`).
-pub const UNCLAIMED_PLAYER_ID: u64 = 0;
+pub const SAVE_VERSION: u32 = 18;
+const MAX_SAVE_BYTES: u64 = 1024 * 1024;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -98,6 +95,8 @@ const SAVE_ROOT: &str = "saves";
 
 const METADATA_FILE: &str = "metadata.json";
 const BLOB_FILE: &str = "save.bin";
+const GENERATIONS_DIR: &str = "generations";
+const CURRENT_FILE: &str = "CURRENT";
 
 #[derive(Debug, Error)]
 pub enum SaveError {
@@ -134,6 +133,8 @@ pub enum SaveError {
     BincodeDecode(#[from] bincode::error::DecodeError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("save {name:?} is corrupt: {reason}")]
+    Corrupt { name: String, reason: String },
     #[error("system time before unix epoch (clock skew?)")]
     BadClock,
 }
@@ -145,9 +146,28 @@ pub struct SaveMetadata {
     pub created_at: u64,
     pub modified_at: u64,
     pub version: u32,
+    #[serde(default)]
+    pub byte_len: u64,
+    #[serde(default)]
+    pub checksum: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveStatus {
+    Valid,
+    Incompatible,
+    Corrupt,
+}
+
+#[derive(Debug, Clone)]
+pub struct SaveListEntry {
+    pub name: String,
+    pub modified_at: u64,
+    pub version: Option<u32>,
+    pub status: SaveStatus,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SaveFile {
     pub version: u32,
     /// Block id per slot, indexed by `BlockSlot.0`, as registered when
@@ -162,8 +182,8 @@ pub struct SaveFile {
     /// Pose + carry + tool per client id — everyone connected at save
     /// time plus everyone the server remembered from earlier
     /// disconnects this session. Sorted by id for deterministic bytes.
-    /// An entry under [`UNCLAIMED_PLAYER_ID`] is v12-migrated legacy
-    /// state waiting for its first claimant.
+    /// Version 18 requires every entry to belong to an authenticated
+    /// public-key-derived player id.
     #[serde(default)]
     pub players: Vec<SavedPlayer>,
     /// Every NPC alive at save time. Empty for a save made before NPCs
@@ -218,296 +238,301 @@ pub struct SavedPlayer {
     pub tool: Option<SavedTool>,
 }
 
-/// The v12/v13 `SavedNpc` layout (pre-stats), kept verbatim — bincode
-/// decodes positionally, so the old byte order must be preserved for
-/// migration. Stats default empty; the load path rolls whatever the
-/// kind's registry declares (see `spawn_loaded_npc`).
-#[cfg_attr(test, derive(Serialize))]
-#[derive(Clone, Deserialize)]
-struct SavedNpcV13 {
-    id: u64,
-    kind: String,
-    pose: AvatarPose,
-    movement_mode: MovementMode,
-    needs: HashMap<String, f32>,
-    rng: u64,
-    #[serde(default)]
-    carrying: Option<SavedCarry>,
-    #[serde(default)]
-    tool: Option<SavedTool>,
-}
+#[cfg(any())]
+mod obsolete_migrations {
+    use super::*;
 
-impl From<SavedNpcV13> for SavedNpc {
-    fn from(old: SavedNpcV13) -> Self {
-        SavedNpc {
-            id: old.id,
-            kind: old.kind,
-            pose: old.pose,
-            movement_mode: old.movement_mode,
-            needs: old.needs,
-            rng: old.rng,
-            carrying: old.carrying,
-            tool: old.tool,
-            stats: HashMap::new(),
+    /// The v12/v13 `SavedNpc` layout (pre-stats), kept verbatim — bincode
+    /// decodes positionally, so the old byte order must be preserved for
+    /// migration. Stats default empty; the load path rolls whatever the
+    /// kind's registry declares (see `spawn_loaded_npc`).
+    #[cfg_attr(test, derive(Serialize))]
+    #[derive(Clone, Deserialize)]
+    struct SavedNpcV13 {
+        id: u64,
+        kind: String,
+        pose: AvatarPose,
+        movement_mode: MovementMode,
+        needs: HashMap<String, f32>,
+        rng: u64,
+        #[serde(default)]
+        carrying: Option<SavedCarry>,
+        #[serde(default)]
+        tool: Option<SavedTool>,
+    }
+
+    impl From<SavedNpcV13> for SavedNpc {
+        fn from(old: SavedNpcV13) -> Self {
+            SavedNpc {
+                id: old.id,
+                kind: old.kind,
+                pose: old.pose,
+                movement_mode: old.movement_mode,
+                needs: old.needs,
+                rng: old.rng,
+                carrying: old.carrying,
+                tool: old.tool,
+                stats: HashMap::new(),
+            }
         }
     }
-}
 
-/// The v16 `SaveFile` layout, kept verbatim (field order is the bincode
-/// wire order) so v16 saves can be decoded and migrated instead of
-/// refused. Identical to v17 minus `containers`.
-/// Serialize exists only so tests can author v16 bytes.
-#[cfg_attr(test, derive(Serialize))]
-#[derive(Deserialize)]
-struct SaveFileV16 {
-    #[allow(dead_code)]
-    version: u32,
-    #[serde(default)]
-    block_slots: Vec<String>,
-    edited_chunks: Vec<SavedChunk>,
-    #[serde(default)]
-    players: Vec<SavedPlayer>,
-    #[serde(default)]
-    npcs: Vec<SavedNpc>,
-    #[serde(default)]
-    world_clock: Option<WorldClock>,
-    #[serde(default)]
-    plans: Vec<(IVec3, SavedPlanState)>,
-    #[serde(default)]
-    world_items: Vec<SavedWorldItem>,
-    #[serde(default)]
-    craft_stations: Vec<(IVec3, SavedStationState)>,
-    #[serde(default)]
-    storage_cells: Vec<IVec3>,
-}
+    /// The v16 `SaveFile` layout, kept verbatim (field order is the bincode
+    /// wire order) so v16 saves can be decoded and migrated instead of
+    /// refused. Identical to v17 minus `containers`.
+    /// Serialize exists only so tests can author v16 bytes.
+    #[cfg_attr(test, derive(Serialize))]
+    #[derive(Deserialize)]
+    struct SaveFileV16 {
+        #[allow(dead_code)]
+        version: u32,
+        #[serde(default)]
+        block_slots: Vec<String>,
+        edited_chunks: Vec<SavedChunk>,
+        #[serde(default)]
+        players: Vec<SavedPlayer>,
+        #[serde(default)]
+        npcs: Vec<SavedNpc>,
+        #[serde(default)]
+        world_clock: Option<WorldClock>,
+        #[serde(default)]
+        plans: Vec<(IVec3, SavedPlanState)>,
+        #[serde(default)]
+        world_items: Vec<SavedWorldItem>,
+        #[serde(default)]
+        craft_stations: Vec<(IVec3, SavedStationState)>,
+        #[serde(default)]
+        storage_cells: Vec<IVec3>,
+    }
 
-impl From<SaveFileV16> for SaveFile {
-    fn from(old: SaveFileV16) -> Self {
-        SaveFile {
-            version: SAVE_VERSION,
-            block_slots: old.block_slots,
-            edited_chunks: old.edited_chunks,
-            players: old.players,
-            npcs: old.npcs,
-            world_clock: old.world_clock,
-            plans: old.plans,
-            world_items: old.world_items,
-            craft_stations: old.craft_stations,
-            storage_cells: old.storage_cells,
-            containers: Vec::new(),
+    impl From<SaveFileV16> for SaveFile {
+        fn from(old: SaveFileV16) -> Self {
+            SaveFile {
+                version: SAVE_VERSION,
+                block_slots: old.block_slots,
+                edited_chunks: old.edited_chunks,
+                players: old.players,
+                npcs: old.npcs,
+                world_clock: old.world_clock,
+                plans: old.plans,
+                world_items: old.world_items,
+                craft_stations: old.craft_stations,
+                storage_cells: old.storage_cells,
+                containers: Vec::new(),
+            }
         }
     }
-}
 
-/// The v15 `SaveFile` layout, kept verbatim (field order is the bincode
-/// wire order) so v15 saves can be decoded and migrated instead of
-/// refused. Identical to v16 except `world_items` carry the pre-`count`
-/// [`SavedWorldItemV15`] shape (piles didn't exist).
-/// Serialize exists only so tests can author v15 bytes.
-#[cfg_attr(test, derive(Serialize))]
-#[derive(Deserialize)]
-struct SaveFileV15 {
-    #[allow(dead_code)]
-    version: u32,
-    #[serde(default)]
-    block_slots: Vec<String>,
-    edited_chunks: Vec<SavedChunk>,
-    #[serde(default)]
-    players: Vec<SavedPlayer>,
-    #[serde(default)]
-    npcs: Vec<SavedNpc>,
-    #[serde(default)]
-    world_clock: Option<WorldClock>,
-    #[serde(default)]
-    plans: Vec<(IVec3, SavedPlanState)>,
-    #[serde(default)]
-    world_items: Vec<SavedWorldItemV15>,
-    #[serde(default)]
-    craft_stations: Vec<(IVec3, SavedStationState)>,
-    #[serde(default)]
-    storage_cells: Vec<IVec3>,
-}
+    /// The v15 `SaveFile` layout, kept verbatim (field order is the bincode
+    /// wire order) so v15 saves can be decoded and migrated instead of
+    /// refused. Identical to v16 except `world_items` carry the pre-`count`
+    /// [`SavedWorldItemV15`] shape (piles didn't exist).
+    /// Serialize exists only so tests can author v15 bytes.
+    #[cfg_attr(test, derive(Serialize))]
+    #[derive(Deserialize)]
+    struct SaveFileV15 {
+        #[allow(dead_code)]
+        version: u32,
+        #[serde(default)]
+        block_slots: Vec<String>,
+        edited_chunks: Vec<SavedChunk>,
+        #[serde(default)]
+        players: Vec<SavedPlayer>,
+        #[serde(default)]
+        npcs: Vec<SavedNpc>,
+        #[serde(default)]
+        world_clock: Option<WorldClock>,
+        #[serde(default)]
+        plans: Vec<(IVec3, SavedPlanState)>,
+        #[serde(default)]
+        world_items: Vec<SavedWorldItemV15>,
+        #[serde(default)]
+        craft_stations: Vec<(IVec3, SavedStationState)>,
+        #[serde(default)]
+        storage_cells: Vec<IVec3>,
+    }
 
-impl From<SaveFileV15> for SaveFile {
-    fn from(old: SaveFileV15) -> Self {
-        SaveFile {
-            version: SAVE_VERSION,
-            block_slots: old.block_slots,
-            edited_chunks: old.edited_chunks,
-            players: old.players,
-            npcs: old.npcs,
-            world_clock: old.world_clock,
-            plans: old.plans,
-            world_items: old
-                .world_items
-                .into_iter()
-                .map(SavedWorldItem::from)
-                .collect(),
-            craft_stations: old.craft_stations,
-            storage_cells: old.storage_cells,
-            containers: Vec::new(),
+    impl From<SaveFileV15> for SaveFile {
+        fn from(old: SaveFileV15) -> Self {
+            SaveFile {
+                version: SAVE_VERSION,
+                block_slots: old.block_slots,
+                edited_chunks: old.edited_chunks,
+                players: old.players,
+                npcs: old.npcs,
+                world_clock: old.world_clock,
+                plans: old.plans,
+                world_items: old
+                    .world_items
+                    .into_iter()
+                    .map(SavedWorldItem::from)
+                    .collect(),
+                craft_stations: old.craft_stations,
+                storage_cells: old.storage_cells,
+                containers: Vec::new(),
+            }
         }
     }
-}
 
-/// The v14 `SaveFile` layout, kept verbatim (field order is the bincode
-/// wire order) so v14 saves can be decoded and migrated instead of
-/// refused. Identical to v15 minus `storage_cells`.
-/// Serialize exists only so tests can author v14 bytes.
-#[cfg_attr(test, derive(Serialize))]
-#[derive(Deserialize)]
-struct SaveFileV14 {
-    #[allow(dead_code)]
-    version: u32,
-    #[serde(default)]
-    block_slots: Vec<String>,
-    edited_chunks: Vec<SavedChunk>,
-    #[serde(default)]
-    players: Vec<SavedPlayer>,
-    #[serde(default)]
-    npcs: Vec<SavedNpc>,
-    #[serde(default)]
-    world_clock: Option<WorldClock>,
-    #[serde(default)]
-    plans: Vec<(IVec3, SavedPlanState)>,
-    #[serde(default)]
-    world_items: Vec<SavedWorldItemV15>,
-    #[serde(default)]
-    craft_stations: Vec<(IVec3, SavedStationState)>,
-}
+    /// The v14 `SaveFile` layout, kept verbatim (field order is the bincode
+    /// wire order) so v14 saves can be decoded and migrated instead of
+    /// refused. Identical to v15 minus `storage_cells`.
+    /// Serialize exists only so tests can author v14 bytes.
+    #[cfg_attr(test, derive(Serialize))]
+    #[derive(Deserialize)]
+    struct SaveFileV14 {
+        #[allow(dead_code)]
+        version: u32,
+        #[serde(default)]
+        block_slots: Vec<String>,
+        edited_chunks: Vec<SavedChunk>,
+        #[serde(default)]
+        players: Vec<SavedPlayer>,
+        #[serde(default)]
+        npcs: Vec<SavedNpc>,
+        #[serde(default)]
+        world_clock: Option<WorldClock>,
+        #[serde(default)]
+        plans: Vec<(IVec3, SavedPlanState)>,
+        #[serde(default)]
+        world_items: Vec<SavedWorldItemV15>,
+        #[serde(default)]
+        craft_stations: Vec<(IVec3, SavedStationState)>,
+    }
 
-impl From<SaveFileV14> for SaveFile {
-    fn from(old: SaveFileV14) -> Self {
-        SaveFile {
-            version: SAVE_VERSION,
-            block_slots: old.block_slots,
-            edited_chunks: old.edited_chunks,
-            players: old.players,
-            npcs: old.npcs,
-            world_clock: old.world_clock,
-            plans: old.plans,
-            world_items: old
-                .world_items
-                .into_iter()
-                .map(SavedWorldItem::from)
-                .collect(),
-            craft_stations: old.craft_stations,
-            storage_cells: Vec::new(),
-            containers: Vec::new(),
+    impl From<SaveFileV14> for SaveFile {
+        fn from(old: SaveFileV14) -> Self {
+            SaveFile {
+                version: SAVE_VERSION,
+                block_slots: old.block_slots,
+                edited_chunks: old.edited_chunks,
+                players: old.players,
+                npcs: old.npcs,
+                world_clock: old.world_clock,
+                plans: old.plans,
+                world_items: old
+                    .world_items
+                    .into_iter()
+                    .map(SavedWorldItem::from)
+                    .collect(),
+                craft_stations: old.craft_stations,
+                storage_cells: Vec::new(),
+                containers: Vec::new(),
+            }
         }
     }
-}
 
-/// The v13 `SaveFile` layout, kept verbatim (field order is the bincode
-/// wire order) so v13 saves can be decoded and migrated instead of
-/// refused. Identical to v14 except NPCs lack rolled stats.
-/// Serialize exists only so tests can author v13 bytes.
-#[cfg_attr(test, derive(Serialize))]
-#[derive(Deserialize)]
-struct SaveFileV13 {
-    #[allow(dead_code)]
-    version: u32,
-    #[serde(default)]
-    block_slots: Vec<String>,
-    edited_chunks: Vec<SavedChunk>,
-    #[serde(default)]
-    players: Vec<SavedPlayer>,
-    #[serde(default)]
-    npcs: Vec<SavedNpcV13>,
-    #[serde(default)]
-    world_clock: Option<WorldClock>,
-    #[serde(default)]
-    plans: Vec<(IVec3, SavedPlanState)>,
-    #[serde(default)]
-    world_items: Vec<SavedWorldItemV15>,
-    #[serde(default)]
-    craft_stations: Vec<(IVec3, SavedStationState)>,
-}
+    /// The v13 `SaveFile` layout, kept verbatim (field order is the bincode
+    /// wire order) so v13 saves can be decoded and migrated instead of
+    /// refused. Identical to v14 except NPCs lack rolled stats.
+    /// Serialize exists only so tests can author v13 bytes.
+    #[cfg_attr(test, derive(Serialize))]
+    #[derive(Deserialize)]
+    struct SaveFileV13 {
+        #[allow(dead_code)]
+        version: u32,
+        #[serde(default)]
+        block_slots: Vec<String>,
+        edited_chunks: Vec<SavedChunk>,
+        #[serde(default)]
+        players: Vec<SavedPlayer>,
+        #[serde(default)]
+        npcs: Vec<SavedNpcV13>,
+        #[serde(default)]
+        world_clock: Option<WorldClock>,
+        #[serde(default)]
+        plans: Vec<(IVec3, SavedPlanState)>,
+        #[serde(default)]
+        world_items: Vec<SavedWorldItemV15>,
+        #[serde(default)]
+        craft_stations: Vec<(IVec3, SavedStationState)>,
+    }
 
-impl From<SaveFileV13> for SaveFile {
-    fn from(old: SaveFileV13) -> Self {
-        SaveFile {
-            version: SAVE_VERSION,
-            block_slots: old.block_slots,
-            edited_chunks: old.edited_chunks,
-            players: old.players,
-            npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
-            world_clock: old.world_clock,
-            plans: old.plans,
-            world_items: old
-                .world_items
-                .into_iter()
-                .map(SavedWorldItem::from)
-                .collect(),
-            craft_stations: old.craft_stations,
-            storage_cells: Vec::new(),
-            containers: Vec::new(),
+    impl From<SaveFileV13> for SaveFile {
+        fn from(old: SaveFileV13) -> Self {
+            SaveFile {
+                version: SAVE_VERSION,
+                block_slots: old.block_slots,
+                edited_chunks: old.edited_chunks,
+                players: old.players,
+                npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
+                world_clock: old.world_clock,
+                plans: old.plans,
+                world_items: old
+                    .world_items
+                    .into_iter()
+                    .map(SavedWorldItem::from)
+                    .collect(),
+                craft_stations: old.craft_stations,
+                storage_cells: Vec::new(),
+                containers: Vec::new(),
+            }
         }
     }
-}
 
-/// The v12 `SaveFile` layout, kept verbatim (field order is the bincode
-/// wire order) so v12 saves can be decoded and migrated instead of
-/// refused. Only the fields that differ from v13 carry comments.
-/// Serialize exists only so tests can author v12 bytes.
-#[cfg_attr(test, derive(Serialize))]
-#[derive(Deserialize)]
-struct SaveFileV12 {
-    #[allow(dead_code)]
-    version: u32,
-    #[serde(default)]
-    block_slots: Vec<String>,
-    edited_chunks: Vec<SavedChunk>,
-    /// v13 folds this + carry + tool into a `players` entry under
-    /// [`UNCLAIMED_PLAYER_ID`].
-    last_player_pose: Option<AvatarPose>,
-    #[serde(default)]
-    npcs: Vec<SavedNpcV13>,
-    #[serde(default)]
-    world_clock: Option<WorldClock>,
-    #[serde(default)]
-    plans: Vec<(IVec3, SavedPlanState)>,
-    #[serde(default)]
-    world_items: Vec<SavedWorldItemV15>,
-    #[serde(default)]
-    last_player_carry: Option<SavedCarry>,
-    #[serde(default)]
-    last_player_tool: Option<SavedTool>,
-    #[serde(default)]
-    craft_stations: Vec<(IVec3, SavedStationState)>,
-}
+    /// The v12 `SaveFile` layout, kept verbatim (field order is the bincode
+    /// wire order) so v12 saves can be decoded and migrated instead of
+    /// refused. Only the fields that differ from v13 carry comments.
+    /// Serialize exists only so tests can author v12 bytes.
+    #[cfg_attr(test, derive(Serialize))]
+    #[derive(Deserialize)]
+    struct SaveFileV12 {
+        #[allow(dead_code)]
+        version: u32,
+        #[serde(default)]
+        block_slots: Vec<String>,
+        edited_chunks: Vec<SavedChunk>,
+        /// v13 folds this + carry + tool into a `players` entry under
+        /// [`UNCLAIMED_PLAYER_ID`].
+        last_player_pose: Option<AvatarPose>,
+        #[serde(default)]
+        npcs: Vec<SavedNpcV13>,
+        #[serde(default)]
+        world_clock: Option<WorldClock>,
+        #[serde(default)]
+        plans: Vec<(IVec3, SavedPlanState)>,
+        #[serde(default)]
+        world_items: Vec<SavedWorldItemV15>,
+        #[serde(default)]
+        last_player_carry: Option<SavedCarry>,
+        #[serde(default)]
+        last_player_tool: Option<SavedTool>,
+        #[serde(default)]
+        craft_stations: Vec<(IVec3, SavedStationState)>,
+    }
 
-impl From<SaveFileV12> for SaveFile {
-    fn from(old: SaveFileV12) -> Self {
-        // The legacy single-player slot becomes an unclaimed entry; the
-        // first client id to connect without one of its own inherits
-        // it. A v12 save with no recorded pose (headless world nobody
-        // joined) has nothing worth claiming.
-        let players = match old.last_player_pose {
-            Some(pose) => vec![SavedPlayer {
-                client_id: UNCLAIMED_PLAYER_ID,
-                pose,
-                carry: old.last_player_carry,
-                tool: old.last_player_tool,
-            }],
-            None => Vec::new(),
-        };
-        SaveFile {
-            version: SAVE_VERSION,
-            block_slots: old.block_slots,
-            edited_chunks: old.edited_chunks,
-            players,
-            npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
-            world_clock: old.world_clock,
-            plans: old.plans,
-            world_items: old
-                .world_items
-                .into_iter()
-                .map(SavedWorldItem::from)
-                .collect(),
-            craft_stations: old.craft_stations,
-            storage_cells: Vec::new(),
-            containers: Vec::new(),
+    impl From<SaveFileV12> for SaveFile {
+        fn from(old: SaveFileV12) -> Self {
+            // The legacy single-player slot becomes an unclaimed entry; the
+            // first client id to connect without one of its own inherits
+            // it. A v12 save with no recorded pose (headless world nobody
+            // joined) has nothing worth claiming.
+            let players = match old.last_player_pose {
+                Some(pose) => vec![SavedPlayer {
+                    client_id: UNCLAIMED_PLAYER_ID,
+                    pose,
+                    carry: old.last_player_carry,
+                    tool: old.last_player_tool,
+                }],
+                None => Vec::new(),
+            };
+            SaveFile {
+                version: SAVE_VERSION,
+                block_slots: old.block_slots,
+                edited_chunks: old.edited_chunks,
+                players,
+                npcs: old.npcs.into_iter().map(SavedNpc::from).collect(),
+                world_clock: old.world_clock,
+                plans: old.plans,
+                world_items: old
+                    .world_items
+                    .into_iter()
+                    .map(SavedWorldItem::from)
+                    .collect(),
+                craft_stations: old.craft_stations,
+                storage_cells: Vec::new(),
+                containers: Vec::new(),
+            }
         }
     }
 }
@@ -525,7 +550,8 @@ pub struct SavedWorldItem {
     pub count: u32,
 }
 
-/// The pre-v16 [`SavedWorldItem`] shape (no `count`), kept verbatim so
+#[cfg(any())]
+/// The pre-v16 [`SavedWorldItem`] shape (no `count`), retained only as
 /// v12–v15 saves still decode (bincode is positional — a missing
 /// trailing `count` is a decode error, not a default). Every migration
 /// maps it forward with `count = 1`. Serialize exists only so tests can
@@ -537,6 +563,7 @@ pub struct SavedWorldItemV15 {
     pub translation: bevy::math::Vec3,
 }
 
+#[cfg(any())]
 impl From<SavedWorldItemV15> for SavedWorldItem {
     fn from(old: SavedWorldItemV15) -> Self {
         SavedWorldItem {
@@ -795,19 +822,310 @@ fn read_metadata(dir: &Path) -> Result<SaveMetadata, SaveError> {
 /// intact or a stray tmp — never a truncated/interleaved target.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| SaveError::Io {
+    let mut file = std::fs::File::create(&tmp).map_err(|e| SaveError::Io {
+        path: tmp.clone(),
+        source: e,
+    })?;
+    use std::io::Write as _;
+    file.write_all(bytes).map_err(|e| SaveError::Io {
+        path: tmp.clone(),
+        source: e,
+    })?;
+    file.sync_all().map_err(|e| SaveError::Io {
         path: tmp.clone(),
         source: e,
     })?;
     std::fs::rename(&tmp, path).map_err(|e| SaveError::Io {
         path: path.to_path_buf(),
         source: e,
+    })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| SaveError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path).map_err(|source| SaveError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.write_all(bytes).map_err(|source| SaveError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| SaveError::Io {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
-fn write_metadata(dir: &Path, meta: &SaveMetadata) -> Result<(), SaveError> {
-    let bytes = serde_json::to_vec_pretty(meta)?;
-    write_atomic(&dir.join(METADATA_FILE), &bytes)
+fn sync_dir(path: &Path) -> Result<(), SaveError> {
+    std::fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|source| SaveError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn random_generation_suffix() -> u32 {
+    let mut bytes = [0u8; 4];
+    getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
+    u32::from_le_bytes(bytes)
+}
+
+fn read_current_id(dir: &Path) -> Result<String, SaveError> {
+    let path = dir.join(CURRENT_FILE);
+    let raw = std::fs::read_to_string(&path).map_err(|source| SaveError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let id = raw.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err(SaveError::Corrupt {
+            name: dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            reason: "CURRENT contains an invalid generation id".to_owned(),
+        });
+    }
+    Ok(id.to_owned())
+}
+
+fn generation_ids(dir: &Path) -> Result<Vec<String>, SaveError> {
+    let entries = std::fs::read_dir(dir).map_err(|source| SaveError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    Ok(entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect())
+}
+
+fn current_metadata(dir: &Path) -> Result<SaveMetadata, SaveError> {
+    let id = read_current_id(dir)?;
+    read_metadata(&dir.join(GENERATIONS_DIR).join(id))
+}
+
+fn read_generation(name: &str, dir: &Path) -> Result<SaveFile, SaveError> {
+    let metadata = read_metadata(dir)?;
+    if metadata.version != SAVE_VERSION {
+        return Err(SaveError::VersionMismatch {
+            name: name.to_owned(),
+            found: metadata.version,
+            expected: SAVE_VERSION,
+        });
+    }
+    if metadata.byte_len > MAX_SAVE_BYTES {
+        return Err(SaveError::Corrupt {
+            name: name.to_owned(),
+            reason: format!("declared length {} exceeds limit", metadata.byte_len),
+        });
+    }
+    let blob = dir.join(BLOB_FILE);
+    let bytes = std::fs::read(&blob).map_err(|source| SaveError::Io { path: blob, source })?;
+    if bytes.len() as u64 != metadata.byte_len {
+        return Err(SaveError::Corrupt {
+            name: name.to_owned(),
+            reason: format!(
+                "byte length mismatch: metadata {}, blob {}",
+                metadata.byte_len,
+                bytes.len()
+            ),
+        });
+    }
+    if blake3::hash(&bytes).to_hex().as_str() != metadata.checksum {
+        return Err(SaveError::Corrupt {
+            name: name.to_owned(),
+            reason: "BLAKE3 checksum mismatch".to_owned(),
+        });
+    }
+    let config = bincode::config::standard().with_limit::<1_048_576>();
+    let (save, consumed): (SaveFile, usize) = bincode::serde::decode_from_slice(&bytes, config)?;
+    if consumed != bytes.len() {
+        return Err(SaveError::Corrupt {
+            name: name.to_owned(),
+            reason: format!(
+                "trailing bytes after save payload: {}",
+                bytes.len() - consumed
+            ),
+        });
+    }
+    if save.version != metadata.version {
+        return Err(SaveError::Corrupt {
+            name: name.to_owned(),
+            reason: format!(
+                "embedded version {} differs from metadata {}",
+                save.version, metadata.version
+            ),
+        });
+    }
+    preflight_save(name, &save)?;
+    Ok(save)
+}
+
+fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
+    use std::collections::HashSet;
+    let corrupt = |reason: String| SaveError::Corrupt {
+        name: name.to_owned(),
+        reason,
+    };
+    let expected = crate::voxel::ChunkShape::USIZE;
+    let mut chunk_coords = HashSet::new();
+    for saved in &save.edited_chunks {
+        if !chunk_coords.insert(saved.coord) {
+            return Err(corrupt(format!(
+                "duplicate chunk coordinate {:?}",
+                saved.coord.0
+            )));
+        }
+        if saved.chunk.blocks.len() != expected {
+            return Err(corrupt(format!(
+                "chunk {:?} has {} cells, expected {expected}",
+                saved.coord.0,
+                saved.chunk.blocks.len()
+            )));
+        }
+        let mut sidecars = HashSet::new();
+        for entry in &saved.entities.entries {
+            if !sidecars.insert(entry.cell)
+                || crate::voxel::world_to_chunk(entry.cell).0 != saved.coord
+            {
+                return Err(corrupt(format!(
+                    "chunk {:?} has duplicate or foreign sidecar {:?}",
+                    saved.coord.0, entry.cell
+                )));
+            }
+        }
+    }
+    let mut player_ids = HashSet::new();
+    for player in &save.players {
+        if player.client_id == 0 || !player_ids.insert(player.client_id) {
+            return Err(corrupt(format!(
+                "invalid or duplicate player id {}",
+                player.client_id
+            )));
+        }
+        if !player.pose.translation.is_finite() || !player.pose.yaw.is_finite() {
+            return Err(corrupt(format!(
+                "player {} has non-finite pose",
+                player.client_id
+            )));
+        }
+        if player.carry.as_ref().is_some_and(|carry| carry.count == 0) {
+            return Err(corrupt(format!(
+                "player {} has zero-count carry",
+                player.client_id
+            )));
+        }
+    }
+    let mut npc_ids = HashSet::new();
+    for npc in &save.npcs {
+        if npc.id == 0 || !npc_ids.insert(npc.id) {
+            return Err(corrupt(format!("invalid or duplicate NPC id {}", npc.id)));
+        }
+        if !npc.pose.translation.is_finite()
+            || !npc.pose.yaw.is_finite()
+            || npc.needs.values().any(|value| !value.is_finite())
+            || npc.stats.values().any(|value| !value.is_finite())
+        {
+            return Err(corrupt(format!("NPC {} has non-finite state", npc.id)));
+        }
+    }
+    if save.world_clock.as_ref().is_some_and(|clock| {
+        !clock.time_of_day.is_finite() || !(0.0..1.0).contains(&clock.time_of_day)
+    }) {
+        return Err(corrupt(
+            "world clock is non-finite or out of range".to_owned(),
+        ));
+    }
+    let mut plan_cells = HashSet::new();
+    for (cell, state) in &save.plans {
+        if !plan_cells.insert(*cell) {
+            return Err(corrupt(format!("duplicate plan cell {cell:?}")));
+        }
+        for material in &state.materials {
+            if material.needed == 0 || material.present > material.needed {
+                return Err(corrupt(format!("invalid plan material counts at {cell:?}")));
+            }
+        }
+    }
+    if save
+        .world_items
+        .iter()
+        .any(|item| item.count == 0 || !item.translation.is_finite() || item.item_id.len() > 128)
+    {
+        return Err(corrupt(
+            "invalid world item count, position, or id".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn sort_save(save: &mut SaveFile) {
+    let coord = |cell: &IVec3| (cell.x, cell.y, cell.z);
+    save.edited_chunks
+        .sort_by_key(|chunk| coord(&chunk.coord.0));
+    for chunk in &mut save.edited_chunks {
+        chunk
+            .entities
+            .entries
+            .sort_by_key(|entry| coord(&entry.cell));
+    }
+    save.players.sort_by_key(|player| player.client_id);
+    save.npcs.sort_by_key(|npc| npc.id);
+    save.plans.sort_by_key(|(cell, _)| coord(cell));
+    for (_, plan) in &mut save.plans {
+        plan.materials.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+    }
+    save.world_items.sort_by(|a, b| {
+        a.item_id
+            .cmp(&b.item_id)
+            .then_with(|| a.translation.x.total_cmp(&b.translation.x))
+            .then_with(|| a.translation.y.total_cmp(&b.translation.y))
+            .then_with(|| a.translation.z.total_cmp(&b.translation.z))
+    });
+    save.craft_stations.sort_by_key(|(cell, _)| coord(cell));
+    for (_, station) in &mut save.craft_stations {
+        station.inventory.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+    }
+    save.storage_cells.sort_by_key(coord);
+    save.containers.sort_by_key(|(cell, _)| coord(cell));
+    for (_, container) in &mut save.containers {
+        container
+            .inventory
+            .sort_by(|a, b| a.item_id.cmp(&b.item_id));
+    }
+}
+
+fn retain_two_generations(dir: &Path, current: &str) -> Result<(), SaveError> {
+    let mut ids = generation_ids(dir)?;
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    let mut keep = vec![current.to_owned()];
+    if let Some(previous) = ids.iter().find(|id| id.as_str() != current) {
+        keep.push(previous.clone());
+    }
+    for id in ids {
+        if !keep.contains(&id) {
+            let path = dir.join(id);
+            std::fs::remove_dir_all(&path).map_err(|source| SaveError::Io { path, source })?;
+        }
+    }
+    sync_dir(dir)
 }
 
 /// Write a save to disk, creating the directory if needed. Preserves an
@@ -826,94 +1144,79 @@ pub fn write_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
         path: dir.clone(),
         source: e,
     })?;
-    let bytes = bincode::serde::encode_to_vec(save, bincode::config::standard())?;
-    write_atomic(&dir.join(BLOB_FILE), &bytes)?;
-
+    let mut stable = save.clone();
+    stable.version = SAVE_VERSION;
+    sort_save(&mut stable);
+    let bytes = bincode::serde::encode_to_vec(&stable, bincode::config::standard())?;
+    if bytes.len() as u64 > MAX_SAVE_BYTES {
+        return Err(SaveError::Corrupt {
+            name: name.to_owned(),
+            reason: format!("encoded size {} exceeds {MAX_SAVE_BYTES}", bytes.len()),
+        });
+    }
     let now = now_unix()?;
-    let created_at = read_metadata(&dir).map(|m| m.created_at).unwrap_or(now);
+    let created_at = current_metadata(&dir).map(|m| m.created_at).unwrap_or(now);
+    let generation = format!("{now:016x}-{:08x}", random_generation_suffix());
+    let generations = dir.join(GENERATIONS_DIR);
+    let generation_dir = generations.join(&generation);
+    std::fs::create_dir_all(&generation_dir).map_err(|e| SaveError::Io {
+        path: generation_dir.clone(),
+        source: e,
+    })?;
+    write_synced(&generation_dir.join(BLOB_FILE), &bytes)?;
     let meta = SaveMetadata {
         name: name.to_string(),
         created_at,
         modified_at: now,
         version: SAVE_VERSION,
+        byte_len: bytes.len() as u64,
+        checksum: blake3::hash(&bytes).to_hex().to_string(),
     };
-    write_metadata(&dir, &meta)
+    let metadata = serde_json::to_vec_pretty(&meta)?;
+    write_synced(&generation_dir.join(METADATA_FILE), &metadata)?;
+    sync_dir(&generation_dir)?;
+    sync_dir(&generations)?;
+    write_atomic(&dir.join(CURRENT_FILE), generation.as_bytes())?;
+    retain_two_generations(&generations, &generation)?;
+    Ok(())
 }
 
 pub fn read_save(name: &str) -> Result<SaveFile, SaveError> {
     validate_name(name)?;
     let dir = save_dir_for(name);
+    read_save_at(name, &dir)
+}
+
+fn read_save_at(name: &str, dir: &Path) -> Result<SaveFile, SaveError> {
     if !dir.is_dir() {
         return Err(SaveError::NotFound {
             name: name.to_string(),
-            path: dir,
+            path: dir.to_path_buf(),
         });
     }
-    let meta = read_metadata(&dir)?;
-    if meta.version != SAVE_VERSION
-        && meta.version != 16
-        && meta.version != 15
-        && meta.version != 14
-        && meta.version != 13
-        && meta.version != 12
-    {
-        return Err(SaveError::VersionMismatch {
-            name: name.to_string(),
-            found: meta.version,
-            expected: SAVE_VERSION,
-        });
+    let current = read_current_id(dir)?;
+    let mut candidates = vec![current.clone()];
+    let generations = dir.join(GENERATIONS_DIR);
+    let mut older = generation_ids(&generations)?;
+    older.sort_unstable_by(|a, b| b.cmp(a));
+    candidates.extend(older.into_iter().filter(|id| id != &current));
+    let mut last_error = None;
+    for generation in candidates.into_iter().take(2) {
+        match read_generation(name, &generations.join(&generation)) {
+            Ok(save) => return Ok(save),
+            Err(error) => {
+                bevy::log::warn!(?generation, %error, "save generation rejected; trying previous");
+                last_error = Some(error);
+            }
+        }
     }
-    let blob = dir.join(BLOB_FILE);
-    let bytes = std::fs::read(&blob).map_err(|e| SaveError::Io {
-        path: blob,
-        source: e,
-    })?;
-    if meta.version == 16 {
-        // In-memory migration only; the file upgrades on the next
-        // write, so a failed session never rewrites a good v16 save.
-        let (old, _): (SaveFileV16, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
-        bevy::log::info!("migrated save {name:?} from v16 (gained container stock)");
-        return Ok(old.into());
-    }
-    if meta.version == 15 {
-        // In-memory migration only; the file upgrades on the next
-        // write, so a failed session never rewrites a good v15 save.
-        let (old, _): (SaveFileV15, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
-        bevy::log::info!("migrated save {name:?} from v15 (world items gained pile counts)");
-        return Ok(old.into());
-    }
-    if meta.version == 14 {
-        // In-memory migration only; the file upgrades on the next
-        // write, so a failed session never rewrites a good v14 save.
-        let (old, _): (SaveFileV14, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
-        bevy::log::info!("migrated save {name:?} from v14 (gained storage zones)");
-        return Ok(old.into());
-    }
-    if meta.version == 13 {
-        // In-memory migration only; the file upgrades on the next
-        // write, so a failed session never rewrites a good v13 save.
-        let (old, _): (SaveFileV13, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
-        bevy::log::info!("migrated save {name:?} from v13 (NPCs gained rolled stats)");
-        return Ok(old.into());
-    }
-    if meta.version == 12 {
-        // In-memory migration only; the file upgrades on the next
-        // write, so a failed session never rewrites a good v12 save.
-        let (old, _): (SaveFileV12, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
-        bevy::log::info!("migrated save {name:?} from v12 (single-player slot → players table)");
-        return Ok(old.into());
-    }
-    let (save, _): (SaveFile, usize) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
-    Ok(save)
+    Err(last_error.unwrap_or_else(|| SaveError::Corrupt {
+        name: name.to_owned(),
+        reason: "no readable generations".to_owned(),
+    }))
 }
 
-pub fn list_saves() -> Result<Vec<SaveMetadata>, SaveError> {
+pub fn list_saves() -> Result<Vec<SaveListEntry>, SaveError> {
     let root = save_root();
     if !root.exists() {
         return Ok(Vec::new());
@@ -928,19 +1231,35 @@ pub fn list_saves() -> Result<Vec<SaveMetadata>, SaveError> {
         if !path.is_dir() {
             continue;
         }
-        // Best-effort: a directory without a readable metadata.json is
-        // skipped silently rather than killing the listing. (A broken save
-        // shouldn't block the user from loading their good ones.)
-        if let Ok(meta) = read_metadata(&path) {
-            out.push(meta);
-        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let legacy = read_metadata(&path).ok();
+        let current = current_metadata(&path).ok();
+        let metadata = current.as_ref().or(legacy.as_ref());
+        let version = metadata.map(|meta| meta.version);
+        let status = if current.is_some() {
+            match read_save(&name) {
+                Ok(_) => SaveStatus::Valid,
+                Err(SaveError::VersionMismatch { .. }) => SaveStatus::Incompatible,
+                Err(_) => SaveStatus::Corrupt,
+            }
+        } else if version.is_some_and(|version| version != SAVE_VERSION) {
+            SaveStatus::Incompatible
+        } else {
+            SaveStatus::Corrupt
+        };
+        out.push(SaveListEntry {
+            name,
+            modified_at: metadata.map_or(0, |meta| meta.modified_at),
+            version,
+            status,
+        });
     }
     out.sort_by_key(|m| std::cmp::Reverse(m.modified_at));
     Ok(out)
 }
 
 pub fn save_exists(name: &str) -> bool {
-    save_dir_for(name).join(METADATA_FILE).is_file()
+    save_dir_for(name).is_dir()
 }
 
 /// Permanently remove a save directory and all its contents.
@@ -964,6 +1283,58 @@ mod tests {
     use ndshape::ConstShape;
 
     use crate::blocks::BlockSlot;
+
+    fn empty_save() -> SaveFile {
+        SaveFile {
+            version: SAVE_VERSION,
+            block_slots: Vec::new(),
+            edited_chunks: Vec::new(),
+            players: Vec::new(),
+            npcs: Vec::new(),
+            world_clock: None,
+            plans: Vec::new(),
+            world_items: Vec::new(),
+            craft_stations: Vec::new(),
+            storage_cells: Vec::new(),
+            containers: Vec::new(),
+        }
+    }
+
+    fn write_test_generation(root: &Path, id: &str, save: &SaveFile) {
+        let dir = root.join(GENERATIONS_DIR).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = bincode::serde::encode_to_vec(save, bincode::config::standard()).unwrap();
+        std::fs::write(dir.join(BLOB_FILE), &bytes).unwrap();
+        let metadata = SaveMetadata {
+            name: "fault-test".to_owned(),
+            created_at: 1,
+            modified_at: 1,
+            version: SAVE_VERSION,
+            byte_len: bytes.len() as u64,
+            checksum: blake3::hash(&bytes).to_hex().to_string(),
+        };
+        std::fs::write(
+            dir.join(METADATA_FILE),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn corrupt_current_generation_falls_back_without_mutating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_test_generation(root, "0001", &empty_save());
+        write_test_generation(root, "0002", &empty_save());
+        std::fs::write(root.join(CURRENT_FILE), b"0002").unwrap();
+        let current_blob = root.join(GENERATIONS_DIR).join("0002").join(BLOB_FILE);
+        std::fs::write(&current_blob, b"corrupt").unwrap();
+
+        let before = std::fs::read(&current_blob).unwrap();
+        let loaded = read_save_at("fault-test", root).unwrap();
+        assert_eq!(loaded.version, SAVE_VERSION);
+        assert_eq!(std::fs::read(current_blob).unwrap(), before);
+    }
 
     /// Round-trip a SaveFile through bincode to catch serde regressions
     /// at the shape level. Covers every field the current version
@@ -1144,6 +1515,7 @@ mod tests {
     /// legacy state as the unclaimed `players` entry, byte-compatibly
     /// with what a real v12 session wrote.
     #[test]
+    #[cfg(any())]
     fn v12_savefile_migrates_to_players_table() {
         let old = SaveFileV12 {
             version: 12,
@@ -1181,6 +1553,7 @@ mod tests {
     /// A v12 world nobody ever joined has no pose — and therefore
     /// nothing worth claiming after migration.
     #[test]
+    #[cfg(any())]
     fn poseless_v12_migrates_to_empty_players() {
         let old = SaveFileV12 {
             version: 12,
@@ -1328,4 +1701,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
-

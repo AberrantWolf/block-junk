@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::items::ItemSlot;
 use crate::menu::AppState;
-use crate::protocol::{GameSet, StateSyncChannel};
+use crate::protocol::{GameReady, GameSet, StateSyncChannel};
 
 /// Stock of one placed container block. Just an inventory — containers
 /// have no orders or work timers.
@@ -277,11 +277,11 @@ pub(crate) fn broadcast_container(
     server: &Server,
     cell: IVec3,
     state: Option<ContainerState>,
+    subscriptions: &crate::server::SpatialSubscriptions,
 ) {
     let msg = ContainerUpdate { cell, state };
-    if let Err(err) =
-        broadcast.send::<ContainerUpdate, StateSyncChannel>(&msg, server, &NetworkTarget::All)
-    {
+    let target = subscriptions.target_for_cells([cell]);
+    if let Err(err) = broadcast.send::<ContainerUpdate, StateSyncChannel>(&msg, server, &target) {
         warn!("container update broadcast failed: {err}");
     }
 }
@@ -328,7 +328,7 @@ impl Plugin for ContainersClientPlugin {
 
 /// Server: push the whole container map to a fresh connection.
 fn send_containers_full_sync_on_connect(
-    trigger: On<Add, Connected>,
+    trigger: On<Add, GameReady>,
     containers: Res<Containers>,
     mut senders: Query<&mut MessageSender<ContainersFullSync>>,
 ) {
@@ -384,6 +384,7 @@ pub(crate) fn clear_destroyed_containers(
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut commands: Commands,
+    subscriptions: Res<crate::server::SpatialSubscriptions>,
 ) {
     let Ok(server) = servers.single() else {
         return;
@@ -408,7 +409,7 @@ pub(crate) fn clear_destroyed_containers(
                 },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
-                Replicate::to_clients(NetworkTarget::All),
+                Replicate::to_clients(NetworkTarget::None),
                 Name::new(format!("WorldItem(container_spill:{})", slot.0)),
             ));
         }
@@ -417,7 +418,7 @@ pub(crate) fn clear_destroyed_containers(
             spilled,
             "container destroyed; spilled stock",
         );
-        broadcast_container(&mut broadcast, server, edit.world, None);
+        broadcast_container(&mut broadcast, server, edit.world, None, &subscriptions);
     }
 }
 

@@ -28,8 +28,8 @@ use crate::menu::AppState;
 use crate::npc::{Needs, Npc};
 use crate::npc_registry::NeedRegistry;
 use crate::protocol::{
-    DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools,
-    DebugSpawnWorkbench, GameSet, StateSyncChannel, WorldChannel, WorldClock,
+    AuthenticatedPlayer, DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan,
+    DebugSpawnTools, DebugSpawnWorkbench, GameSet, StateSyncChannel, WorldChannel, WorldClock,
 };
 
 pub struct DebugClientPlugin;
@@ -273,22 +273,17 @@ fn debug_panel_ui(
     }
     if let Some((need, delta)) = need_bump
         && let Ok(mut sender) = need_sender.single_mut()
+        && let Ok(need) = crate::protocol::BoundedString::new(need)
     {
         sender.send::<WorldChannel>(DebugBumpNeed { need, delta });
     }
-    if fill_nearest_plan
-        && let Ok(mut sender) = fill_plan_sender.single_mut()
-    {
+    if fill_nearest_plan && let Ok(mut sender) = fill_plan_sender.single_mut() {
         sender.send::<WorldChannel>(DebugFillNearestPlan);
     }
-    if spawn_tools
-        && let Ok(mut sender) = spawn_tools_sender.single_mut()
-    {
+    if spawn_tools && let Ok(mut sender) = spawn_tools_sender.single_mut() {
         sender.send::<WorldChannel>(DebugSpawnTools);
     }
-    if spawn_workbench
-        && let Ok(mut sender) = spawn_workbench_sender.single_mut()
-    {
+    if spawn_workbench && let Ok(mut sender) = spawn_workbench_sender.single_mut() {
         sender.send::<WorldChannel>(DebugSpawnWorkbench);
     }
 }
@@ -307,13 +302,25 @@ fn debug_panel_ui(
 /// Negative or NaN payloads clamp to 0 (no rewind support — see
 /// the protocol-side comment).
 fn receive_debug_advance_time(
-    mut receivers: Query<&mut MessageReceiver<DebugAdvanceTime>>,
+    mut receivers: Query<(
+        Entity,
+        &AuthenticatedPlayer,
+        &mut MessageReceiver<DebugAdvanceTime>,
+    )>,
     mut clock: ResMut<WorldClock>,
     mut npcs: Query<&mut Needs, With<Npc>>,
     needs_registry: Res<NeedRegistry>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
-    for mut receiver in receivers.iter_mut() {
+    for (connection, auth, mut receiver) in receivers.iter_mut() {
         for msg in receiver.receive() {
+            if !auth.administrator
+                || validation
+                    .authorize(connection, crate::server::RequestClass::Ordinary)
+                    .is_none()
+            {
+                continue;
+            }
             let secs = msg.secs.max(0.0);
             if secs == 0.0 || !secs.is_finite() {
                 continue;
@@ -344,19 +351,31 @@ fn receive_debug_advance_time(
 /// new state. Used during Phase-3/4 development to verify NPC pickup
 /// of fully-materialled plans without hauling each unit by hand.
 fn receive_debug_fill_nearest_plan(
-    mut receivers: Query<(Entity, &mut MessageReceiver<DebugFillNearestPlan>)>,
+    mut receivers: Query<(
+        Entity,
+        &AuthenticatedPlayer,
+        &mut MessageReceiver<DebugFillNearestPlan>,
+    )>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     mut plans: ResMut<crate::plans::Plans>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
-    for (connection, mut receiver) in receivers.iter_mut() {
-        let count = receiver.receive().count();
-        if count == 0 {
+    for (connection, auth, mut receiver) in receivers.iter_mut() {
+        let count = receiver
+            .receive()
+            .filter(|_| {
+                validation
+                    .authorize(connection, crate::server::RequestClass::Ordinary)
+                    .is_some()
+            })
+            .count();
+        if count == 0 || !auth.administrator {
             continue;
         }
         let Some(&avatar) = avatars.0.get(&connection) else {
@@ -397,11 +416,10 @@ fn receive_debug_fill_nearest_plan(
                 kind: Some(state.kind),
                 materials: state.materials,
             };
-            if let Err(err) = broadcast.send::<crate::protocol::PlanEdit, StateSyncChannel>(
-                &reply,
-                server,
-                &NetworkTarget::All,
-            ) {
+            let target = validation.target_for_cells([target_cell]);
+            if let Err(err) = broadcast
+                .send::<crate::protocol::PlanEdit, StateSyncChannel>(&reply, server, &target)
+            {
                 warn!("debug fill PlanEdit broadcast failed: {err}");
             }
         }
@@ -422,19 +440,31 @@ fn receive_debug_fill_nearest_plan(
 /// so the button degrades to "only the kinds we have" rather than
 /// erroring.
 fn receive_debug_spawn_tools(
-    mut receivers: Query<(Entity, &mut MessageReceiver<DebugSpawnTools>)>,
+    mut receivers: Query<(
+        Entity,
+        &AuthenticatedPlayer,
+        &mut MessageReceiver<DebugSpawnTools>,
+    )>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     item_registry: Res<crate::items::ItemRegistry>,
     mut commands: Commands,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS};
 
     const TOOL_IDS: &[&str] = &["vanilla:axe", "vanilla:hammer", "vanilla:pickaxe"];
 
-    for (connection, mut receiver) in receivers.iter_mut() {
-        let count = receiver.receive().count();
-        if count == 0 {
+    for (connection, auth, mut receiver) in receivers.iter_mut() {
+        let count = receiver
+            .receive()
+            .filter(|_| {
+                validation
+                    .authorize(connection, crate::server::RequestClass::Ordinary)
+                    .is_some()
+            })
+            .count();
+        if count == 0 || !auth.administrator {
             continue;
         }
         let Some(&avatar) = avatars.0.get(&connection) else {
@@ -471,7 +501,7 @@ fn receive_debug_spawn_tools(
                 },
                 bevy::prelude::Transform::from_translation(translation),
                 bevy::prelude::GlobalTransform::default(),
-                lightyear::prelude::Replicate::to_clients(NetworkTarget::All),
+                lightyear::prelude::Replicate::to_clients(NetworkTarget::None),
                 bevy::prelude::Name::new(format!("WorldItem(debug_tool:{id_str})")),
             ));
             spawned += 1;
@@ -498,6 +528,7 @@ fn receive_debug_spawn_tools(
 fn receive_debug_spawn_workbench(
     mut receivers: Query<(
         Entity,
+        &AuthenticatedPlayer,
         &mut MessageReceiver<crate::protocol::DebugSpawnWorkbench>,
     )>,
     avatars: Res<crate::server::ClientAvatars>,
@@ -509,6 +540,8 @@ fn receive_debug_spawn_workbench(
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut cell_bus: MessageWriter<crate::protocol::CellEdit>,
+    subscriptions: Res<crate::server::SpatialSubscriptions>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
     use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS};
     use block_junk_mod_api::blocks::{BlockId, Cardinal};
@@ -518,9 +551,16 @@ fn receive_debug_spawn_workbench(
     let Ok(server) = servers.single() else {
         return;
     };
-    for (connection, mut receiver) in receivers.iter_mut() {
-        let count = receiver.receive().count();
-        if count == 0 {
+    for (connection, auth, mut receiver) in receivers.iter_mut() {
+        let count = receiver
+            .receive()
+            .filter(|_| {
+                validation
+                    .authorize(connection, crate::server::RequestClass::Ordinary)
+                    .is_some()
+            })
+            .count();
+        if count == 0 || !auth.administrator {
             continue;
         }
         let Some(&avatar) = avatars.0.get(&connection) else {
@@ -565,6 +605,7 @@ fn receive_debug_spawn_workbench(
             server,
             &mut broadcast,
             &mut cell_bus,
+            &subscriptions,
         );
         info!(
             cell = ?target_cell.to_array(),
@@ -586,12 +627,24 @@ fn receive_debug_spawn_workbench(
 /// it shouldn't fabricate the entry, since the brain's decay loop
 /// would then carry it forever as a no-op key.
 fn receive_debug_bump_need(
-    mut receivers: Query<&mut MessageReceiver<DebugBumpNeed>>,
+    mut receivers: Query<(
+        Entity,
+        &AuthenticatedPlayer,
+        &mut MessageReceiver<DebugBumpNeed>,
+    )>,
     mut npcs: Query<&mut Needs, With<Npc>>,
     needs_registry: Res<NeedRegistry>,
+    mut validation: crate::server::ValidatedRequestContext,
 ) {
-    for mut receiver in receivers.iter_mut() {
+    for (connection, auth, mut receiver) in receivers.iter_mut() {
         for msg in receiver.receive() {
+            if !auth.administrator
+                || validation
+                    .authorize(connection, crate::server::RequestClass::Ordinary)
+                    .is_none()
+            {
+                continue;
+            }
             if !needs_registry.contains(&msg.need) {
                 warn!(
                     need = %msg.need,
@@ -601,7 +654,7 @@ fn receive_debug_bump_need(
             }
             let mut touched = 0usize;
             for mut needs in npcs.iter_mut() {
-                if let Some(v) = needs.0.get_mut(&msg.need) {
+                if let Some(v) = needs.0.get_mut(msg.need.as_ref()) {
                     *v = (*v + msg.delta).clamp(0.0, 1.0);
                     touched += 1;
                 }

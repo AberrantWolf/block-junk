@@ -268,7 +268,12 @@ fn mode_hint_visual(active: bool) -> (Color, Color, Color) {
 /// mode's icon, dim the rest. Mirrors `update_hotbar_highlight`.
 fn refresh_mode_hints(
     mode: Res<PlayerMode>,
-    mut icons: Query<(&ModeHintIcon, &mut ImageNode, &mut BackgroundColor, &mut BorderColor)>,
+    mut icons: Query<(
+        &ModeHintIcon,
+        &mut ImageNode,
+        &mut BackgroundColor,
+        &mut BorderColor,
+    )>,
 ) {
     if !mode.is_changed() {
         return;

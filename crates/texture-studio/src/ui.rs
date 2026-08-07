@@ -133,12 +133,7 @@ fn top_bar(root: &mut egui::Ui, studio: &mut Studio) {
     });
 }
 
-fn texture_list(
-    root: &mut egui::Ui,
-    studio: &mut Studio,
-    cache: &mut PreviewCache,
-    now: f64,
-) {
+fn texture_list(root: &mut egui::Ui, studio: &mut Studio, cache: &mut PreviewCache, now: f64) {
     egui::Panel::left("textures")
         .default_size(210.0)
         .show_inside(root, |ui| {
