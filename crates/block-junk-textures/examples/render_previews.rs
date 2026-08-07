@@ -31,7 +31,7 @@ fn main() {
             .iter()
             .map(|l| l.period as u64)
             .fold(1u64, |acc, p| acc * p / gcd(acc, p));
-        let span = span_override.unwrap_or((lcm as f32).min(12.0).max(2.0));
+        let span = span_override.unwrap_or((lcm as f32).clamp(2.0, 12.0));
         let px = 512u32;
         let rgba = flatten(&baked, px, [0.0, 0.0], span, [0.3, 0.3, 0.3], true);
 

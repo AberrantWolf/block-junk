@@ -828,6 +828,13 @@ struct SaveFeedback {
     failed: bool,
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct PauseMenuLocal<'s> {
+    save_feedback: Local<'s, SaveFeedback>,
+    // Cached for the session: interface-route lookup is a syscall pair.
+    lan_addr: Local<'s, Option<Option<core::net::IpAddr>>>,
+}
+
 fn pause_menu_ui(
     mut contexts: EguiContexts,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
@@ -835,11 +842,12 @@ fn pause_menu_ui(
     mut session: ResMut<ServerSession>,
     debug_no_save: Res<DebugNoSaveOnExit>,
     time: Res<Time>,
-    mut save_feedback: Local<SaveFeedback>,
-    // Computed on first open, cached for the session: the interface-
-    // route lookup is a syscall pair, not worth repeating per frame.
-    mut lan_addr: Local<Option<Option<core::net::IpAddr>>>,
+    local: PauseMenuLocal,
 ) {
+    let PauseMenuLocal {
+        mut save_feedback,
+        mut lan_addr,
+    } = local;
     if !captures.contains(crate::ui_capture::UiCapture::PauseMenu) {
         return;
     }

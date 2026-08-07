@@ -239,14 +239,8 @@ fn bbox_contains(min: IVec3, max: IVec3, p: IVec3) -> bool {
 
 /// Resource wrapper around the Lua-supplied params. Default values fall
 /// back when no mod called `engine.civilization.set_params`.
-#[derive(Resource, Clone, Copy, Debug)]
+#[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct CivilizationParamsRes(pub CivilizationParams);
-
-impl Default for CivilizationParamsRes {
-    fn default() -> Self {
-        Self(CivilizationParams::default())
-    }
-}
 
 pub struct CivilizationPlugin;
 

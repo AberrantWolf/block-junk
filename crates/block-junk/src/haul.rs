@@ -248,10 +248,10 @@ impl HaulStore {
     /// Clear `npc`'s pending_tool slot and release its reservation.
     /// Called from the PickupTool arrival once the tool is equipped.
     pub fn clear_pending_tool(&mut self, npc: NpcId) {
-        if let Some(assignment) = self.assignments.get_mut(&npc) {
-            if let Some(tool) = assignment.pending_tool.take() {
-                self.release_reservation_internal(tool.source, npc);
-            }
+        if let Some(assignment) = self.assignments.get_mut(&npc)
+            && let Some(tool) = assignment.pending_tool.take()
+        {
+            self.release_reservation_internal(tool.source, npc);
         }
     }
 

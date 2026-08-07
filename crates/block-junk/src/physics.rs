@@ -86,6 +86,12 @@ pub const ACTOR_SEPARATION_PUSH_EPS: f32 = 1e-3;
 /// leaving the cornered actor where it was and the pusher with their
 /// half of the displacement consumed against the wall — they don't
 /// magically tunnel.
+type SeparableActorFilter = (
+    With<Actor>,
+    Without<KinematicLock>,
+    Without<crate::npc::Npc>,
+);
+
 pub fn soft_separate_actors(
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
@@ -96,10 +102,7 @@ pub fn soft_separate_actors(
     // clients unless the client pass did the same — so neither does.
     // The client variant in client.rs mirrors this exclusion; keep the
     // two in lockstep.
-    mut actors: Query<
-        (Entity, &mut AvatarPose),
-        (With<Actor>, Without<KinematicLock>, Without<crate::npc::Npc>),
-    >,
+    mut actors: Query<(Entity, &mut AvatarPose), SeparableActorFilter>,
 ) {
     let snapshot: Vec<(Entity, Vec3)> = actors
         .iter()

@@ -191,21 +191,21 @@ fn edge_traversable<W: Walkability>(world: &W, from: IVec3, to: IVec3) -> bool {
 ///
 /// `KinematicLock` opts a body out entirely (use-slot snaps own the
 /// pose), same contract the physics step had.
+type MovingNpcData<'a> = (
+    &'a mut AvatarPose,
+    &'a mut AvatarVelocity,
+    &'a mut AvatarOnGround,
+    &'a mut Brain,
+    &'a mut NavMover,
+);
+type MovingNpcFilter = (With<Npc>, Without<KinematicLock>);
+
 pub(crate) fn npc_mover_step(
     time: Res<Time>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    mut npcs: Query<
-        (
-            &mut AvatarPose,
-            &mut AvatarVelocity,
-            &mut AvatarOnGround,
-            &mut Brain,
-            &mut NavMover,
-        ),
-        (With<Npc>, Without<KinematicLock>),
-    >,
+    mut npcs: Query<MovingNpcData, MovingNpcFilter>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
@@ -453,8 +453,10 @@ mod tests {
             solid: HashSet::new(),
         };
         world.solid.insert(IVec3::new(0, 0, 0));
-        let mut pose = AvatarPose::default();
-        pose.translation = standing_pose_translation(IVec3::new(1, 1, 0));
+        let mut pose = AvatarPose {
+            translation: standing_pose_translation(IVec3::new(1, 1, 0)),
+            ..AvatarPose::default()
+        };
         pose.translation.x = 1.05;
         assert!(pose_has_support(&world, &pose));
         // Centred fully inside x=1 (no straddle) — no support.

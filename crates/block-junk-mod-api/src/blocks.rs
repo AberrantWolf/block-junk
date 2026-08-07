@@ -657,6 +657,50 @@ pub struct EntityAabb {
     pub max: [f32; 3],
 }
 
+impl EntityAabb {
+    /// Default-orientation AABB derived from a footprint. Each cell covers
+    /// `[cx - 0.5, cx + 0.5] × [cy, cy + 1] × [cz - 0.5, cz + 0.5]` in model
+    /// space (origin at anchor's bottom-centre). The cube-cell union is the
+    /// safe fallback when a `BlockDef` doesn't declare a tighter box.
+    pub fn cube_union(footprint: &[[i32; 3]]) -> Self {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for &[cx, cy, cz] in footprint {
+            let lo = [cx as f32 - 0.5, cy as f32, cz as f32 - 0.5];
+            let hi = [cx as f32 + 0.5, cy as f32 + 1.0, cz as f32 + 0.5];
+            for axis in 0..3 {
+                if lo[axis] < min[axis] {
+                    min[axis] = lo[axis];
+                }
+                if hi[axis] > max[axis] {
+                    max[axis] = hi[axis];
+                }
+            }
+        }
+        Self { min, max }
+    }
+
+    /// AABB after rotating by `orientation`. Because rotations are 90°
+    /// multiples the result is still axis-aligned; we just rotate the
+    /// corners and recompute min/max.
+    pub fn rotated(self, orientation: Cardinal) -> Self {
+        let mins = orientation.rotate_point(self.min);
+        let maxs = orientation.rotate_point(self.max);
+        Self {
+            min: [
+                mins[0].min(maxs[0]),
+                mins[1].min(maxs[1]),
+                mins[2].min(maxs[2]),
+            ],
+            max: [
+                mins[0].max(maxs[0]),
+                mins[1].max(maxs[1]),
+                mins[2].max(maxs[2]),
+            ],
+        }
+    }
+}
+
 /// Cardinal placement orientation for a block entity. East is the default
 /// — that's the direction a multi-cell footprint extends in unrotated
 /// model space, per the modeling guide. Rotations are 90° steps around +Y.
@@ -868,49 +912,5 @@ mod tests {
         // Y is preserved.
         assert_eq!(rotated.min[1], 0.0);
         assert_eq!(rotated.max[1], 0.5);
-    }
-}
-
-impl EntityAabb {
-    /// Default-orientation AABB derived from a footprint. Each cell covers
-    /// `[cx - 0.5, cx + 0.5] × [cy, cy + 1] × [cz - 0.5, cz + 0.5]` in model
-    /// space (origin at anchor's bottom-centre). The cube-cell union is the
-    /// safe fallback when a `BlockDef` doesn't declare a tighter box.
-    pub fn cube_union(footprint: &[[i32; 3]]) -> Self {
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for &[cx, cy, cz] in footprint {
-            let lo = [cx as f32 - 0.5, cy as f32, cz as f32 - 0.5];
-            let hi = [cx as f32 + 0.5, cy as f32 + 1.0, cz as f32 + 0.5];
-            for axis in 0..3 {
-                if lo[axis] < min[axis] {
-                    min[axis] = lo[axis];
-                }
-                if hi[axis] > max[axis] {
-                    max[axis] = hi[axis];
-                }
-            }
-        }
-        Self { min, max }
-    }
-
-    /// AABB after rotating by `orientation`. Because rotations are 90°
-    /// multiples the result is still axis-aligned; we just rotate the
-    /// corners and recompute min/max.
-    pub fn rotated(self, orientation: Cardinal) -> Self {
-        let mins = orientation.rotate_point(self.min);
-        let maxs = orientation.rotate_point(self.max);
-        Self {
-            min: [
-                mins[0].min(maxs[0]),
-                mins[1].min(maxs[1]),
-                mins[2].min(maxs[2]),
-            ],
-            max: [
-                mins[0].max(maxs[0]),
-                mins[1].max(maxs[1]),
-                mins[2].max(maxs[2]),
-            ],
-        }
     }
 }

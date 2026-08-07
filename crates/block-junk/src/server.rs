@@ -1252,20 +1252,37 @@ fn install_replication_sender(trigger: On<Add, LinkOf>, mut commands: Commands) 
 /// The avatar starts at the origin so AoI can begin streaming chunks before
 /// the first `PlayerPosition` message lands; without that the new client
 /// sees nothing for ~100 ms.
+#[derive(bevy::ecs::system::SystemParam)]
+struct ClientRegistration<'w, 's> {
+    remote_ids: Query<'w, 's, &'static RemoteId>,
+    avatars: ResMut<'w, ClientAvatars>,
+    sent: ResMut<'w, ClientChunks>,
+    player_states: ResMut<'w, PlayerStates>,
+    registry: Res<'w, BlockRegistry>,
+    item_registry: Res<'w, ItemRegistry>,
+    recipe_registry: Res<'w, crate::recipes::RecipeRegistry>,
+    npc_kind_registry: Res<'w, crate::npc_registry::NpcKindRegistry>,
+    room_pattern_registry: Res<'w, crate::rooms::RoomPatternRegistry>,
+    manifests: Query<'w, 's, &'static mut MessageSender<ModSetManifest>>,
+}
+
 fn register_new_client(
     trigger: On<Add, Connected>,
-    remote_ids: Query<&RemoteId>,
     mut commands: Commands,
-    mut avatars: ResMut<ClientAvatars>,
-    mut sent: ResMut<ClientChunks>,
-    mut player_states: ResMut<PlayerStates>,
-    registry: Res<BlockRegistry>,
-    item_registry: Res<ItemRegistry>,
-    recipe_registry: Res<crate::recipes::RecipeRegistry>,
-    npc_kind_registry: Res<crate::npc_registry::NpcKindRegistry>,
-    room_pattern_registry: Res<crate::rooms::RoomPatternRegistry>,
-    mut manifests: Query<&mut MessageSender<ModSetManifest>>,
+    registration: ClientRegistration,
 ) {
+    let ClientRegistration {
+        remote_ids,
+        mut avatars,
+        mut sent,
+        mut player_states,
+        registry,
+        item_registry,
+        recipe_registry,
+        npc_kind_registry,
+        room_pattern_registry,
+        mut manifests,
+    } = registration;
     let connection = trigger.entity;
     let Ok(remote) = remote_ids.get(connection) else {
         warn!("Connected fired with no RemoteId on entity {connection:?}");
@@ -1589,22 +1606,37 @@ fn poll_chunk_gen(
 ///   - if generated already, snapshot is sent immediately
 ///   - else if a generation task is in flight, skipped (will land later)
 ///   - else a fresh task is queued on `AsyncComputeTaskPool`
+///
 /// Chunks no longer in AoI: a `ChunkUnload` is sent.
 ///
 /// Master chunk records in `ChunkMap` are NOT evicted when no client needs
 /// them — that's deferred to a later stage with the "edited?" tracking, so
 /// we don't lose player edits when the last viewer wanders off.
-fn update_aoi(
-    chunk_map: Res<ChunkMap>,
-    chunks: Query<(&Chunk, &ChunkEntities, Has<ChunkEdited>)>,
-    mut pending: ResMut<PendingChunks>,
-    avatars: Res<ClientAvatars>,
-    poses: Query<&AvatarPose>,
-    mut sent: ResMut<ClientChunks>,
-    mut snapshots: Query<&mut MessageSender<ChunkSnapshot>>,
-    mut unloads: Query<&mut MessageSender<ChunkUnload>>,
-    terrain_slots: Res<TerrainSlots>,
-) {
+#[derive(bevy::ecs::system::SystemParam)]
+struct AoiContext<'w, 's> {
+    chunk_map: Res<'w, ChunkMap>,
+    chunks: Query<'w, 's, (&'static Chunk, &'static ChunkEntities, Has<ChunkEdited>)>,
+    pending: ResMut<'w, PendingChunks>,
+    avatars: Res<'w, ClientAvatars>,
+    poses: Query<'w, 's, &'static AvatarPose>,
+    sent: ResMut<'w, ClientChunks>,
+    snapshots: Query<'w, 's, &'static mut MessageSender<ChunkSnapshot>>,
+    unloads: Query<'w, 's, &'static mut MessageSender<ChunkUnload>>,
+    terrain_slots: Res<'w, TerrainSlots>,
+}
+
+fn update_aoi(context: AoiContext) {
+    let AoiContext {
+        chunk_map,
+        chunks,
+        mut pending,
+        avatars,
+        poses,
+        mut sent,
+        mut snapshots,
+        mut unloads,
+        terrain_slots,
+    } = context;
     for (&client_entity, &avatar_entity) in avatars.0.iter() {
         let Ok(avatar_pose) = poses.get(avatar_entity) else {
             continue;
@@ -1758,8 +1790,7 @@ fn receive_block_edits(
                 edit,
                 &mut commands,
                 &mut chunks,
-                &map,
-                &registry,
+                BlockEditWorld::new(&map, &registry),
                 server,
                 &mut broadcast,
                 &mut bus,
@@ -1778,24 +1809,31 @@ fn receive_block_edits(
 /// going back through the wire — the server can't deliver a BlockEdit
 /// to its own `MessageReceiver`, but it can call this directly with
 /// the same effect.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockEditWorld<'a> {
+    map: &'a ChunkMap,
+    registry: &'a BlockRegistry,
+}
+
+impl<'a> BlockEditWorld<'a> {
+    pub(crate) fn new(map: &'a ChunkMap, registry: &'a BlockRegistry) -> Self {
+        Self { map, registry }
+    }
+}
+
 pub(crate) fn apply_block_edit(
     edit: BlockEdit,
     commands: &mut Commands,
     chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
-    map: &ChunkMap,
-    registry: &BlockRegistry,
+    world: BlockEditWorld<'_>,
     server: &Server,
     broadcast: &mut ServerMultiMessageSender,
     bus: &mut MessageWriter<CellEdit>,
 ) {
     if edit.slot.is_empty() {
-        apply_break(
-            edit, commands, chunks, map, registry, server, broadcast, bus,
-        );
+        apply_break(edit, commands, chunks, world, server, broadcast, bus);
     } else {
-        apply_place(
-            edit, commands, chunks, map, registry, server, broadcast, bus,
-        );
+        apply_place(edit, commands, chunks, world, server, broadcast, bus);
     }
 }
 
@@ -1808,12 +1846,12 @@ fn apply_place(
     edit: BlockEdit,
     commands: &mut Commands,
     chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
-    map: &ChunkMap,
-    registry: &BlockRegistry,
+    world: BlockEditWorld<'_>,
     server: &Server,
     broadcast: &mut ServerMultiMessageSender,
     bus: &mut MessageWriter<CellEdit>,
 ) {
+    let BlockEditWorld { map, registry } = world;
     let def = registry.def(edit.slot);
     let cells = world_footprint(edit.anchor, &def.footprint, edit.orientation);
     if cells.is_empty() {
@@ -1935,12 +1973,12 @@ fn apply_break(
     edit: BlockEdit,
     commands: &mut Commands,
     chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
-    map: &ChunkMap,
-    registry: &BlockRegistry,
+    world: BlockEditWorld<'_>,
     server: &Server,
     broadcast: &mut ServerMultiMessageSender,
     bus: &mut MessageWriter<CellEdit>,
 ) {
+    let BlockEditWorld { map, registry } = world;
     let click_cell = edit.anchor;
     let (click_coord, click_local) = world_to_chunk(click_cell);
     let Some(&click_entity) = map.0.get(&click_coord) else {
@@ -2072,7 +2110,12 @@ fn apply_break(
                 slot: depleted_slot,
                 orientation: Cardinal::default(),
             },
-            commands, chunks, map, registry, server, broadcast, bus,
+            commands,
+            chunks,
+            BlockEditWorld::new(map, registry),
+            server,
+            broadcast,
+            bus,
         );
     }
 }
@@ -2137,8 +2180,7 @@ fn apply_npc_work(
             edit,
             &mut commands,
             &mut chunks,
-            &map,
-            &registry,
+            BlockEditWorld::new(&map, &registry),
             server,
             &mut broadcast,
             &mut bus,
@@ -2156,16 +2198,27 @@ fn apply_npc_work(
 /// the depleted block, which emits the `CellEdit`/`BlockEdit` that
 /// updates the interactable index, arms the regrow timer, and reaches
 /// clients. Single-cell only — bushes have no footprint or sidecar.
+#[derive(bevy::ecs::system::SystemParam)]
+struct NpcConsumptionWorld<'w, 's> {
+    chunks: Query<'w, 's, (&'static mut Chunk, &'static mut ChunkEntities)>,
+    map: Res<'w, ChunkMap>,
+    registry: Res<'w, BlockRegistry>,
+    servers: Query<'w, 's, &'static Server>,
+}
+
 fn apply_npc_consumption(
     mut reader: MessageReader<crate::npc::NpcConsumedInteractable>,
     mut commands: Commands,
-    mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
-    map: Res<ChunkMap>,
-    registry: Res<BlockRegistry>,
-    servers: Query<&Server>,
+    world: NpcConsumptionWorld,
     mut broadcast: ServerMultiMessageSender,
     mut bus: MessageWriter<CellEdit>,
 ) {
+    let NpcConsumptionWorld {
+        mut chunks,
+        map,
+        registry,
+        servers,
+    } = world;
     let Ok(server) = servers.single() else {
         return;
     };
@@ -2208,8 +2261,7 @@ fn apply_npc_consumption(
             },
             &mut commands,
             &mut chunks,
-            &map,
-            &registry,
+            BlockEditWorld::new(&map, &registry),
             server,
             &mut broadcast,
             &mut bus,
@@ -2227,9 +2279,18 @@ fn apply_npc_consumption(
 /// sends a single `NpcDetails` reply over the requesting connection.
 /// Targeted (per-connection sender) — other clients don't see this
 /// traffic.
+type NpcInspectionData<'a> = (
+    &'a NpcId,
+    &'a NpcKind,
+    &'a Needs,
+    &'a NpcStats,
+    &'a Brain,
+    &'a AvatarPose,
+);
+
 fn receive_npc_inspection_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<RequestNpcDetails>)>,
-    npcs: Query<(&NpcId, &NpcKind, &Needs, &NpcStats, &Brain, &AvatarPose), With<Npc>>,
+    npcs: Query<NpcInspectionData, With<Npc>>,
     mut senders: Query<&mut MessageSender<NpcDetails>>,
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
@@ -2549,17 +2610,31 @@ fn drop_target_position(pose: &AvatarPose, world: &crate::npc::WorldWalk) -> Vec
 ///   - no plan at `cell` (was untagged between client click and server receive)
 ///   - plan isn't Build (Remove plans don't accept materials)
 ///   - plan doesn't need this item kind, or is already full.
+#[derive(bevy::ecs::system::SystemParam)]
+struct DepositContext<'w, 's> {
+    avatars: Res<'w, ClientAvatars>,
+    players: Query<'w, 's, (&'static AvatarPose, &'static mut Carrying), With<Avatar>>,
+    plans: ResMut<'w, Plans>,
+    item_registry: Res<'w, ItemRegistry>,
+    rejections: Query<'w, 's, &'static mut MessageSender<ActionRejected>>,
+    toast_senders: Query<'w, 's, &'static mut MessageSender<WorldToast>>,
+    servers: Query<'w, 's, &'static Server>,
+}
+
 fn receive_deposit_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<DepositRequest>)>,
-    avatars: Res<ClientAvatars>,
-    mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
-    mut plans: ResMut<Plans>,
-    item_registry: Res<ItemRegistry>,
-    mut rejections: Query<&mut MessageSender<ActionRejected>>,
-    mut toast_senders: Query<&mut MessageSender<WorldToast>>,
+    context: DepositContext,
     mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
 ) {
+    let DepositContext {
+        avatars,
+        mut players,
+        mut plans,
+        item_registry,
+        mut rejections,
+        mut toast_senders,
+        servers,
+    } = context;
     let Ok(server) = servers.single() else {
         return;
     };

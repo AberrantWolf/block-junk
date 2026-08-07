@@ -6,6 +6,9 @@ finding again lives here.
 
 ## Contents
 
+- **[systemic-remediation-plan.md](systemic-remediation-plan.md)** — prioritized
+  repository-wide correctness, authority, networking, persistence, and lifecycle
+  remediation plan, including validation and rollout gates.
 - **[meshes/](meshes/)** — the 3D asset catalog: what's imported, where
   each mesh is used, what the source KayKit packs offer, the import
   pipeline, and the character rig's animation clips. Start at

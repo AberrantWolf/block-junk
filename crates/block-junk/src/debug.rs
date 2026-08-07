@@ -81,27 +81,15 @@ impl Plugin for DebugServerPlugin {
 /// gated input landed. Defaults to `false`: timed actions are the
 /// gameplay baseline. Toggle on for fast iteration when shaping
 /// terrain by hand.
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct InstantPlayerBuilds(pub bool);
-
-impl Default for InstantPlayerBuilds {
-    fn default() -> Self {
-        Self(false)
-    }
-}
 
 /// Toggles the orange wireframe overlay drawn around each civilization
 /// cluster's inflated bbox. Off by default; flip from the F3 debug
 /// panel. Pure client-side state — the server always replicates the
 /// `ClusterBboxReplica` entities, the client decides whether to render.
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct ShowCivilizationClusters(pub bool);
-
-impl Default for ShowCivilizationClusters {
-    fn default() -> Self {
-        Self(false)
-    }
-}
 
 /// Toggle the debug panel on F3. The captures set IS the open state
 /// — there is no separate `DebugPanelOpen` flag to keep in sync. The
@@ -283,25 +271,25 @@ fn debug_panel_ui(
             sender.send::<WorldChannel>(DebugAdvanceTime { secs });
         }
     }
-    if let Some((need, delta)) = need_bump {
-        if let Ok(mut sender) = need_sender.single_mut() {
-            sender.send::<WorldChannel>(DebugBumpNeed { need, delta });
-        }
+    if let Some((need, delta)) = need_bump
+        && let Ok(mut sender) = need_sender.single_mut()
+    {
+        sender.send::<WorldChannel>(DebugBumpNeed { need, delta });
     }
-    if fill_nearest_plan {
-        if let Ok(mut sender) = fill_plan_sender.single_mut() {
-            sender.send::<WorldChannel>(DebugFillNearestPlan);
-        }
+    if fill_nearest_plan
+        && let Ok(mut sender) = fill_plan_sender.single_mut()
+    {
+        sender.send::<WorldChannel>(DebugFillNearestPlan);
     }
-    if spawn_tools {
-        if let Ok(mut sender) = spawn_tools_sender.single_mut() {
-            sender.send::<WorldChannel>(DebugSpawnTools);
-        }
+    if spawn_tools
+        && let Ok(mut sender) = spawn_tools_sender.single_mut()
+    {
+        sender.send::<WorldChannel>(DebugSpawnTools);
     }
-    if spawn_workbench {
-        if let Ok(mut sender) = spawn_workbench_sender.single_mut() {
-            sender.send::<WorldChannel>(DebugSpawnWorkbench);
-        }
+    if spawn_workbench
+        && let Ok(mut sender) = spawn_workbench_sender.single_mut()
+    {
+        sender.send::<WorldChannel>(DebugSpawnWorkbench);
     }
 }
 
@@ -573,8 +561,7 @@ fn receive_debug_spawn_workbench(
             edit,
             &mut commands,
             &mut chunks,
-            &chunk_map,
-            &block_registry,
+            crate::server::BlockEditWorld::new(&chunk_map, &block_registry),
             server,
             &mut broadcast,
             &mut cell_bus,

@@ -115,10 +115,10 @@ impl InteractionClaims {
     /// double-release on transitions where multiple paths dispatch
     /// the same release (e.g. abandon + arrive racing).
     pub fn release(&mut self, anchor: IVec3, npc: NpcId) {
-        if let Some(holder) = self.by_anchor.get(&anchor) {
-            if holder.0 == npc.0 {
-                self.by_anchor.remove(&anchor);
-            }
+        if let Some(holder) = self.by_anchor.get(&anchor)
+            && holder.0 == npc.0
+        {
+            self.by_anchor.remove(&anchor);
         }
     }
 

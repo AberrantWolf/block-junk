@@ -336,6 +336,7 @@ impl Goal {
 /// [`UseSlot`](block_junk_mod_api::blocks::UseSlot) interaction. Built
 /// once at goal-commit (when the brain knows the anchor + orientation
 /// + slot data) and carried on [`Goal::MoveTo`] so the arrival handler
+///
 /// doesn't need to re-resolve the block def. Action-agnostic: any
 /// goal that lands the NPC at a slot-bearing block populates this the
 /// same way, the arrival applies it uniformly, and the follow-on
@@ -1049,6 +1050,7 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
 ///      errors disable just this one NPC's brain.
 ///   4. Steer the [`MovementIntent`] toward the current waypoint
 ///      (Wander only — Idle and Resting both clear intent).
+///
 /// SystemParam bundle for the craft-station scheduler + arrival
 /// handlers (Phase 6c-A). Folded into one slot to keep the brain tick
 /// under Bevy 0.18's 16-SystemParam ceiling — same reason
@@ -1333,24 +1335,24 @@ fn preempt_current_goal(
     // Interacting-only — but keying off `is_locked` rather than the
     // Goal variant keeps the helper symmetric with the post-completion
     // eject site below.
-    if is_locked {
-        if let Goal::Interacting { target_cell, .. } = &brain.goal {
-            let slot = slot_at_cell(*target_cell, chunks, chunk_map, block_registry);
-            let (anchor, orientation) =
-                resolve_anchor_with_orientation(*target_cell, chunk_entities_q, chunk_map);
-            if !try_eject_to_cells(
-                pose,
-                eject_candidates_for_slot(slot.as_ref(), anchor, orientation),
-                world,
-            ) {
-                warn!(
-                    npc = npc_id.0,
-                    anchor = ?anchor.to_array(),
-                    "preempt eject: no standable approach; NPC may be embedded",
-                );
-            }
-            commands.entity(entity).remove::<KinematicLock>();
+    if is_locked
+        && let Goal::Interacting { target_cell, .. } = &brain.goal
+    {
+        let slot = slot_at_cell(*target_cell, chunks, chunk_map, block_registry);
+        let (anchor, orientation) =
+            resolve_anchor_with_orientation(*target_cell, chunk_entities_q, chunk_map);
+        if !try_eject_to_cells(
+            pose,
+            eject_candidates_for_slot(slot.as_ref(), anchor, orientation),
+            world,
+        ) {
+            warn!(
+                npc = npc_id.0,
+                anchor = ?anchor.to_array(),
+                "preempt eject: no standable approach; NPC may be embedded",
+            );
         }
+        commands.entity(entity).remove::<KinematicLock>();
     }
     npc_path.0.clear();
     brain.goal = Goal::Idle;
@@ -2416,10 +2418,12 @@ fn npc_brain_tick(
                             entity,
                             equipped_tool.item,
                             &station_def,
-                            &haul.item_registry,
-                            &craft.recipes,
-                            &mut craft.stations,
-                            &mut craft.bookings,
+                            crate::craft_stations::CraftStartContext {
+                                item_registry: &haul.item_registry,
+                                recipes: &craft.recipes,
+                                stations: &mut craft.stations,
+                                bookings: &mut craft.bookings,
+                            },
                         )
                         .is_some()
                     } else {
@@ -2452,9 +2456,10 @@ fn npc_brain_tick(
         // claim needs to release it — the brain took the claim at
         // goal commit and a stuck/timeout abandon never reaches
         // the arrival branch that would otherwise own the release.
-        if move_abandoned {
-            if let Goal::MoveTo { on_arrive, .. } = &brain.goal {
-                match on_arrive {
+        if move_abandoned
+            && let Goal::MoveTo { on_arrive, .. } = &brain.goal
+        {
+            match on_arrive {
                     ArrivalAction::Interact {
                         anchor_cell,
                         exclusive,
@@ -2517,8 +2522,7 @@ fn npc_brain_tick(
                         // but `release_npc_booking` handles both.
                         craft.bookings.release_npc_booking(*npc_id, entity);
                     }
-                    _ => {}
-                }
+                _ => {}
             }
         }
         if move_abandoned || rest_done {
@@ -2851,7 +2855,7 @@ fn npc_brain_tick(
                     } else {
                         find_path(foot, stand, &world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
                             .map(|raw| smooth_path(raw, &world))
-                            .filter(|p| p.len() >= 1)
+                            .filter(|p| !p.is_empty())
                     }
                 });
                 match path {
@@ -4158,10 +4162,6 @@ fn build_snapshot(
 #[allow(
     clippy::too_many_arguments,
     reason = "snapshot collector mirrors live brain lookups"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "flat filter pipeline over several registries"
 )]
 fn collect_nearby_plans(
     plans: &Plans,

@@ -705,15 +705,20 @@ struct PreviewState {
     scene_slot: Option<BlockSlot>,
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct SceneSetupAssets<'w> {
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    anim_graphs: ResMut<'w, Assets<AnimationGraph>>,
+    asset_server: Res<'w, AssetServer>,
+    animations: Res<'w, crate::npc_registry::AnimationRegistry>,
+    kinds: Res<'w, crate::npc_registry::NpcKindRegistry>,
+}
+
 fn setup_scene(
     mut commands: Commands,
     mut ambient: ResMut<GlobalAmbientLight>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut anim_graphs: ResMut<Assets<AnimationGraph>>,
-    asset_server: Res<AssetServer>,
-    animations: Res<crate::npc_registry::AnimationRegistry>,
-    kinds: Res<crate::npc_registry::NpcKindRegistry>,
+    mut assets: SceneSetupAssets,
     existing: Option<Res<AvatarAssets>>,
 ) {
     // `OnEnter(InGame)` re-fires on every un-pause, but the scene
@@ -732,8 +737,8 @@ fn setup_scene(
     // Transform so the world position matches the camera-eye height that
     // the owner reports to the server.
     commands.insert_resource(AvatarAssets {
-        mesh: meshes.add(Cuboid::new(0.6, 1.8, 0.6)),
-        avatar_material: materials.add(StandardMaterial {
+        mesh: assets.meshes.add(Cuboid::new(0.6, 1.8, 0.6)),
+        avatar_material: assets.materials.add(StandardMaterial {
             base_color: Color::srgb(0.95, 0.55, 0.25),
             perceptual_roughness: 0.6,
             ..default()
@@ -746,34 +751,39 @@ fn setup_scene(
     // `engine.animations.register` for each rig clip, and mods add
     // their own. Order matches the registry's insertion order so
     // clip_nodes is deterministic across runs.
-    let mut clip_handles: Vec<Handle<AnimationClip>> = Vec::with_capacity(animations.len());
-    let mut clip_ids: Vec<String> = Vec::with_capacity(animations.len());
-    for (id, def) in animations.iter() {
+    let mut clip_handles: Vec<Handle<AnimationClip>> = Vec::with_capacity(assets.animations.len());
+    let mut clip_ids: Vec<String> = Vec::with_capacity(assets.animations.len());
+    for (id, def) in assets.animations.iter() {
         let path = def.asset.clone();
         clip_handles.push(
-            asset_server.load(GltfAssetLabel::Animation(def.clip_index as usize).from_asset(path)),
+            assets
+                .asset_server
+                .load(GltfAssetLabel::Animation(def.clip_index as usize).from_asset(path)),
         );
         clip_ids.push(id.clone());
     }
     let (anim_graph, node_indices) = AnimationGraph::from_clips(clip_handles);
     let clip_nodes: HashMap<String, AnimationNodeIndex> =
-        clip_ids.into_iter().zip(node_indices.into_iter()).collect();
+        clip_ids.into_iter().zip(node_indices).collect();
     // Load every body variant any kind declares, plus the knight
     // fallback. Deduped by path — kinds sharing a variant share the
     // scene handle.
     let mut body_scenes: HashMap<String, Handle<WorldAsset>> = HashMap::new();
-    for path in kinds
+    for path in assets
+        .kinds
         .iter()
         .flat_map(|(_, def)| def.models.iter().map(String::as_str))
         .chain(std::iter::once(KAYKIT_KNIGHT_GLB))
     {
         body_scenes.entry(path.to_owned()).or_insert_with(|| {
-            asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.to_owned()))
+            assets
+                .asset_server
+                .load(GltfAssetLabel::Scene(0).from_asset(path.to_owned()))
         });
     }
     commands.insert_resource(CharacterAssets {
         body_scenes,
-        anim_graph: anim_graphs.add(anim_graph),
+        anim_graph: assets.anim_graphs.add(anim_graph),
         clip_nodes,
     });
 
@@ -1050,43 +1060,39 @@ fn cleanup_session(
 /// One scroll handler covers both jobs because Ctrl gates which one fires:
 ///   - Plain wheel cycles the selected block in the hotbar.
 ///   - Ctrl+wheel rotates the manual placement orientation 90° per click.
+///
 /// We keep them in one system so the wheel never double-fires (rotating
 /// AND cycling) on a frame where the modifier flips mid-scroll.
 fn cycle_selected_or_rotation(
     scroll: Res<AccumulatedMouseScroll>,
-    keys: Res<ButtonInput<KeyCode>>,
-    captures: Res<crate::ui_capture::UiCaptures>,
-    mode: Res<PlayerMode>,
-    mut selected: ResMut<SelectedBlock>,
-    mut rotation: ResMut<PlacementRotation>,
-    palette: Res<PlaceablePalette>,
-    pins: Res<HotbarPins>,
+    mut selection: ScrollSelection,
 ) {
     // SSOT input gate: scroll only acts when no overlay holds the
     // cursor. See [`crate::ui_capture`] for the design rationale.
-    if captures.is_captured() {
+    if selection.captures.is_captured() {
         return;
     }
     // Wheel only cycles blocks in Plan mode (where the selection picks
     // what to tag); Normal has no hotbar visible.
-    if !matches!(*mode, PlayerMode::Plan) {
+    if !matches!(*selection.mode, PlayerMode::Plan) {
         return;
     }
     let dy = scroll.delta.y;
     if dy.abs() < 0.5 {
         return;
     }
-    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let ctrl = selection.keys.pressed(KeyCode::ControlLeft)
+        || selection.keys.pressed(KeyCode::ControlRight);
     if ctrl {
         // Empty palette ⇒ no orientation to rotate; swallow the wheel.
-        if selected.current_block(&palette).is_none() {
+        if selection.selected.current_block(&selection.palette).is_none() {
             return;
         }
         // CCW step on scroll-up matches the right-hand rule for +Y rotation
         // (positive yaw is CCW viewed from above) — rotating "up the wheel"
         // turns the bed's head left, which is the natural feel.
         let step = if dy > 0.0 { 1 } else { -1 };
-        rotation.0 = rotation.0.rotated(step);
+        selection.rotation.0 = selection.rotation.0.rotated(step);
         return;
     }
     // The wheel cycles the PINNED tiles (the visible hotbar), not the
@@ -1094,7 +1100,7 @@ fn cycle_selected_or_rotation(
     // wheel lap would be a chore. Empty slots are skipped. Unpinned
     // selections (made in the B palette) enter the ring at the nearest
     // end on the next click.
-    let occupied: Vec<usize> = pins.0.iter().copied().flatten().collect();
+    let occupied: Vec<usize> = selection.pins.0.iter().copied().flatten().collect();
     let n = occupied.len();
     if n == 0 {
         return;
@@ -1102,14 +1108,28 @@ fn cycle_selected_or_rotation(
     // Hotbar is laid out top→bottom (pin 0 at top). Scroll up moves the
     // highlight to the slot *above* the current one, i.e. toward pin 0.
     // From the deselected state the wheel enters at the nearest end.
-    let pos = selected.0.and_then(|sel| occupied.iter().position(|&p| p == sel));
+    let pos = selection
+        .selected
+        .0
+        .and_then(|sel| occupied.iter().position(|&p| p == sel));
     let next = match (pos, dy > 0.0) {
         (Some(i), true) => (i + n - 1) % n,
         (Some(i), false) => (i + 1) % n,
         (None, true) => n - 1,
         (None, false) => 0,
     };
-    selected.0 = Some(occupied[next]);
+    selection.selected.0 = Some(occupied[next]);
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct ScrollSelection<'w> {
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    captures: Res<'w, crate::ui_capture::UiCaptures>,
+    mode: Res<'w, PlayerMode>,
+    selected: ResMut<'w, SelectedBlock>,
+    rotation: ResMut<'w, PlacementRotation>,
+    palette: Res<'w, PlaceablePalette>,
+    pins: Res<'w, HotbarPins>,
 }
 
 /// Digit keys 1-9 in Plan mode select the block pinned to that slot;
@@ -1439,11 +1459,13 @@ fn update_action_progress_ui(
     }
 }
 
+type HotbarRebuilt = Or<(Added<HotbarSlot>, Added<EmptyHandTile>)>;
+
 fn update_hotbar_highlight(
     selected: Res<SelectedBlock>,
     mut slots: Query<(&HotbarSlot, &mut BorderColor)>,
     mut empty_hand: Query<&mut BorderColor, (With<EmptyHandTile>, Without<HotbarSlot>)>,
-    rebuilt: Query<(), Or<(Added<HotbarSlot>, Added<EmptyHandTile>)>>,
+    rebuilt: Query<(), HotbarRebuilt>,
 ) {
     // Freshly-rebuilt tiles spawn with black borders, so a pin change
     // must re-apply the highlight even when the selection didn't move.
@@ -2756,10 +2778,10 @@ fn update_placement_preview(
     // registration plus `hide_preview_on_mode_change` for the leave-Build
     // transition. SSOT input gating still happens here.
     let hide = |entity: Option<Entity>, q: &mut Query<(&mut Visibility, &mut Transform)>| {
-        if let Some(e) = entity {
-            if let Ok((mut v, _)) = q.get_mut(e) {
-                *v = Visibility::Hidden;
-            }
+        if let Some(e) = entity
+            && let Ok((mut v, _)) = q.get_mut(e)
+        {
+            *v = Visibility::Hidden;
         }
     };
 
@@ -2834,7 +2856,7 @@ fn update_placement_preview(
         }
     }
 
-    if def.mesh.is_some() {
+    if let Some(mesh_path) = &def.mesh {
         // Mesh path. Spawn / replace the WorldAssetRoot if we don't already
         // have one for this slot. Spawning is cheap on the second hit
         // (asset cache); the WorldInstanceReady observer handles the
@@ -2843,7 +2865,6 @@ fn update_placement_preview(
             if let Some(old) = state.scene_root.take() {
                 commands.entity(old).despawn();
             }
-            let mesh_path = def.mesh.as_ref().unwrap();
             let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh_path}#Scene0"));
             let entity = commands
                 .spawn((
@@ -2862,19 +2883,19 @@ fn update_placement_preview(
             state.scene_root = Some(entity);
             state.scene_slot = Some(slot);
         }
-        if let Some(scene_entity) = state.scene_root {
-            if let Ok((mut vis, mut transform)) = roots.get_mut(scene_entity) {
-                transform.translation = anchor.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
-                transform.rotation = Quat::from_rotation_y(orientation.yaw());
-                transform.scale = Vec3::ONE;
-                *vis = if scene_ready.contains(scene_entity) {
-                    Visibility::Visible
-                } else {
-                    // Materials haven't been swapped yet — don't flash
-                    // the original glTF materials at the player.
-                    Visibility::Hidden
-                };
-            }
+        if let Some(scene_entity) = state.scene_root
+            && let Ok((mut vis, mut transform)) = roots.get_mut(scene_entity)
+        {
+            transform.translation = anchor.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+            transform.rotation = Quat::from_rotation_y(orientation.yaw());
+            transform.scale = Vec3::ONE;
+            *vis = if scene_ready.contains(scene_entity) {
+                Visibility::Visible
+            } else {
+                // Materials haven't been swapped yet — don't flash
+                // the original glTF materials at the player.
+                Visibility::Hidden
+            };
         }
         hide(state.cube_root, &mut roots);
     } else {
@@ -2887,13 +2908,13 @@ fn update_placement_preview(
         }
         let extents = (max - min + IVec3::ONE).as_vec3();
         let centre = min.as_vec3() + extents * 0.5;
-        if let Some(cube) = state.cube_root {
-            if let Ok((mut vis, mut transform)) = roots.get_mut(cube) {
-                transform.translation = centre;
-                transform.rotation = Quat::IDENTITY;
-                transform.scale = extents;
-                *vis = Visibility::Visible;
-            }
+        if let Some(cube) = state.cube_root
+            && let Ok((mut vis, mut transform)) = roots.get_mut(cube)
+        {
+            transform.translation = centre;
+            transform.rotation = Quat::IDENTITY;
+            transform.scale = extents;
+            *vis = Visibility::Visible;
         }
         hide(state.scene_root, &mut roots);
     }
@@ -3128,11 +3149,20 @@ fn buffer_input(
 /// predicted player were pushed off NPC bodies here the server would
 /// disagree every contact and the player would rubber-band. Players
 /// ghost through NPCs, by design.
+type ClientActorFilter = (With<Actor>, Without<Npc>);
+type PredictedAvatarData<'a> = (
+    &'a mut AvatarPose,
+    &'a mut AvatarVelocity,
+    &'a mut AvatarOnGround,
+    &'a mut MovementMode,
+    &'a ActionState<MovementIntent>,
+);
+
 fn soft_separate_predicted_actors(
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    mut actors: Query<(Entity, &mut AvatarPose), (With<Actor>, Without<Npc>)>,
+    mut actors: Query<(Entity, &mut AvatarPose), ClientActorFilter>,
     predicted_only: Query<(), With<Predicted>>,
 ) {
     let snapshot: Vec<(Entity, Vec3)> = actors
@@ -3172,16 +3202,7 @@ fn client_player_step(
     chunks: Query<(&'static Chunk, &'static ChunkEntities)>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    mut avatars: Query<
-        (
-            &mut AvatarPose,
-            &mut AvatarVelocity,
-            &mut AvatarOnGround,
-            &mut MovementMode,
-            &ActionState<MovementIntent>,
-        ),
-        With<Predicted>,
-    >,
+    mut avatars: Query<PredictedAvatarData, With<Predicted>>,
 ) {
     let dt = time.delta_secs();
     let world = WorldCollision {
@@ -3491,8 +3512,10 @@ fn apply_broadcast_edit(
 /// later replication tick than the `Avatar` component itself; an observer
 /// firing on `Avatar` alone would happily mesh up the owner's predicted
 /// entity before the marker showed up.
+type UnmeshedRemoteAvatar = (With<Avatar>, Without<Mesh3d>, Without<Predicted>);
+
 fn attach_avatar_visuals(
-    avatars: Query<Entity, (With<Avatar>, Without<Mesh3d>, Without<Predicted>)>,
+    avatars: Query<Entity, UnmeshedRemoteAvatar>,
     assets: Res<AvatarAssets>,
     mut commands: Commands,
 ) {
@@ -3563,8 +3586,10 @@ struct NpcVisuals {
 /// loader skips the AnimationPlayer + AnimationTargetId pass entirely.
 /// `setup_npc_skeleton_anim` replays that pass manually once the scene
 /// instance is ready.
+type UnvisualizedNpc = (With<Npc>, Without<NpcVisuals>);
+
 fn attach_npc_visuals(
-    npcs: Query<(Entity, &NpcId, &crate::npc::NpcKind), (With<Npc>, Without<NpcVisuals>)>,
+    npcs: Query<(Entity, &NpcId, &crate::npc::NpcKind), UnvisualizedNpc>,
     assets: Res<CharacterAssets>,
     kinds: Res<crate::npc_registry::NpcKindRegistry>,
     mut commands: Commands,
@@ -3874,18 +3899,23 @@ fn sync_world_item_transform(mut items: Query<(&WorldItem, &mut Transform), Chan
 /// the `AnimationPlayer`. The follow-up system `start_npc_anim_idle`
 /// watches `Added<AnimationPlayer>` to attach `AnimationTransitions`
 /// and start the idle clip.
+#[derive(bevy::ecs::system::SystemParam)]
+struct NpcRigContext<'w, 's> {
+    npc_scene_roots: Query<'w, 's, (), With<NpcWorldAssetRoot>>,
+    children: Query<'w, 's, &'static Children>,
+    names: Query<'w, 's, &'static Name>,
+    parents: Query<'w, 's, &'static ChildOf>,
+    npc_visuals: Query<'w, 's, &'static mut NpcVisuals>,
+    assets: Res<'w, CharacterAssets>,
+}
+
 fn setup_npc_skeleton_anim(
     trigger: On<WorldInstanceReady>,
-    npc_scene_roots: Query<(), With<NpcWorldAssetRoot>>,
-    children_q: Query<&Children>,
-    names: Query<&Name>,
-    parents: Query<&ChildOf>,
-    mut npc_visuals_q: Query<&mut NpcVisuals>,
-    assets: Res<CharacterAssets>,
+    mut rig: NpcRigContext,
     mut commands: Commands,
 ) {
     let scene_bearer = trigger.event_target();
-    if !npc_scene_roots.contains(scene_bearer) {
+    if !rig.npc_scene_roots.contains(scene_bearer) {
         return;
     }
     // Bevy's glTF loader wraps the scene's top-level nodes in an
@@ -3893,12 +3923,14 @@ fn setup_npc_skeleton_anim(
     // transform (see bevy_gltf loader.rs::world_root_id), so the named
     // "Rig_Medium" node from the glb is a *grandchild* of the WorldAssetRoot
     // bearer, not a direct child. Search by name to be wrapper-agnostic.
-    let Some(rig_root) = find_named_descendant(scene_bearer, "Rig_Medium", &children_q, &names)
+    let Some(rig_root) =
+        find_named_descendant(scene_bearer, "Rig_Medium", &rig.children, &rig.names)
     else {
         warn!("npc scene ready but no 'Rig_Medium' descendant: {scene_bearer:?}");
         return;
     };
-    let rig_name = names
+    let rig_name = rig
+        .names
         .get(rig_root)
         .map(|n| n.as_str())
         .unwrap_or("<unnamed>");
@@ -3911,8 +3943,8 @@ fn setup_npc_skeleton_anim(
         rig_root,
         &mut path,
         rig_root,
-        &children_q,
-        &names,
+        &rig.children,
+        &rig.names,
         &mut commands,
         &mut tagged,
     );
@@ -3924,7 +3956,7 @@ fn setup_npc_skeleton_anim(
     // component is actually in the world.
     commands.entity(rig_root).insert((
         AnimationPlayer::default(),
-        AnimationGraphHandle(assets.anim_graph.clone()),
+        AnimationGraphHandle(rig.assets.anim_graph.clone()),
     ));
 
     // Cache the right-hand attach socket on the NPC root's NpcVisuals so
@@ -3932,10 +3964,10 @@ fn setup_npc_skeleton_anim(
     // The scene bearer's parent is the NPC root (attach_npc_visuals spawns
     // the body as a `.with_child`). `handslot.r` is KayKit's dedicated
     // right-hand attach node, nested under `hand.r` in the rig.
-    let hand_r = find_named_descendant(rig_root, "handslot.r", &children_q, &names);
-    let hand_l = find_named_descendant(rig_root, "handslot.l", &children_q, &names);
-    if let Ok(npc_root) = parents.get(scene_bearer).map(|c| c.0)
-        && let Ok(mut visuals) = npc_visuals_q.get_mut(npc_root)
+    let hand_r = find_named_descendant(rig_root, "handslot.r", &rig.children, &rig.names);
+    let hand_l = find_named_descendant(rig_root, "handslot.l", &rig.children, &rig.names);
+    if let Ok(npc_root) = rig.parents.get(scene_bearer).map(|c| c.0)
+        && let Ok(mut visuals) = rig.npc_visuals.get_mut(npc_root)
     {
         visuals.hand_r = hand_r;
         visuals.hand_l = hand_l;

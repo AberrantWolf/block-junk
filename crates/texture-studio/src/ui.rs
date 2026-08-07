@@ -383,11 +383,11 @@ fn inspector(
                 step_strip(ui, ctx, studio, cache, t, l);
 
                 // ---- selected step params ----------------------------
-                if let Some(s) = studio.sel_step {
-                    if s < studio.doc.textures[t].layers[l].steps.len() {
-                        ui.separator();
-                        step_params(ui, studio, t, l, s, now);
-                    }
+                if let Some(s) = studio.sel_step
+                    && s < studio.doc.textures[t].layers[l].steps.len()
+                {
+                    ui.separator();
+                    step_params(ui, studio, t, l, s, now);
                 }
             });
         });
@@ -487,6 +487,11 @@ fn step_strip(
 
 /// OpSpec-driven parameter editor for one step.
 fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: usize, now: f64) {
+    let location = StepLocation {
+        texture: t,
+        layer: l,
+        step: s,
+    };
     let step = studio.doc.textures[t].layers[l].steps[s].clone();
     let Some(spec) = find_op(&step.op) else {
         ui.colored_label(egui::Color32::RED, format!("unknown op {}", step.op));
@@ -533,9 +538,7 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                             studio,
                             &key,
                             Some(now),
-                            t,
-                            l,
-                            s,
+                            location,
                             ps.name,
                             ParamValue::F32(v),
                         );
@@ -551,9 +554,7 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                             studio,
                             &key,
                             Some(now),
-                            t,
-                            l,
-                            s,
+                            location,
                             ps.name,
                             ParamValue::U32(v),
                         );
@@ -569,9 +570,7 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                             studio,
                             &key,
                             Some(now),
-                            t,
-                            l,
-                            s,
+                            location,
                             ps.name,
                             ParamValue::U32(v),
                         );
@@ -584,9 +583,7 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                             studio,
                             &key,
                             None,
-                            t,
-                            l,
-                            s,
+                            location,
                             ps.name,
                             ParamValue::U32(r % 10_000),
                         );
@@ -606,9 +603,7 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                                         studio,
                                         &key,
                                         None,
-                                        t,
-                                        l,
-                                        s,
+                                        location,
                                         ps.name,
                                         ParamValue::Str((*opt).to_owned()),
                                     );
@@ -644,9 +639,7 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                                         studio,
                                         &key,
                                         None,
-                                        t,
-                                        l,
-                                        s,
+                                        location,
                                         ps.name,
                                         ParamValue::Str(r.clone()),
                                     );
@@ -667,9 +660,7 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                             studio,
                             &key,
                             Some(now),
-                            t,
-                            l,
-                            s,
+                            location,
                             ps.name,
                             ParamValue::Color(v),
                         );
@@ -699,16 +690,14 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
                             studio,
                             &key,
                             Some(now),
-                            t,
-                            l,
-                            s,
+                            location,
                             ps.name,
                             ParamValue::Vec2(v),
                         );
                     }
                 }
                 ParamType::Stops => {
-                    stops_editor(ui, studio, &key, now, t, l, s, ps.name, &step);
+                    stops_editor(ui, studio, &key, now, location, ps.name, &step);
                 }
             }
         });
@@ -718,15 +707,12 @@ fn step_params(ui: &mut egui::Ui, studio: &mut Studio, t: usize, l: usize, s: us
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn stops_editor(
     ui: &mut egui::Ui,
     studio: &mut Studio,
     key: &str,
     now: f64,
-    t: usize,
-    l: usize,
-    s: usize,
+    location: StepLocation,
     name: &str,
     step: &Step,
 ) {
@@ -781,9 +767,7 @@ fn stops_editor(
                 studio,
                 key,
                 Some(now),
-                t,
-                l,
-                s,
+                location,
                 name,
                 ParamValue::Stops(stops),
             );
@@ -926,19 +910,29 @@ fn export_png(
 
 /// `now: Some(t)` = continuous widget (coalescing undo); `None` = one-
 /// shot pick (its own undo entry).
+#[derive(Clone, Copy)]
+struct StepLocation {
+    texture: usize,
+    layer: usize,
+    step: usize,
+}
+
 fn set_param(
     studio: &mut Studio,
     key: &str,
     now: Option<f64>,
-    t: usize,
-    l: usize,
-    s: usize,
+    location: StepLocation,
     name: &str,
     value: ParamValue,
 ) {
     let name = name.to_owned();
+    let StepLocation {
+        texture,
+        layer,
+        step,
+    } = location;
     let apply = move |doc: &mut block_junk_textures::TextureSetDoc| {
-        doc.textures[t].layers[l].steps[s]
+        doc.textures[texture].layers[layer].steps[step]
             .params
             .insert(name, value);
     };

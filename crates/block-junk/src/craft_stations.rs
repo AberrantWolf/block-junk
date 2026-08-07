@@ -474,10 +474,10 @@ pub fn try_schedule_craft_for_npc(
         if dist > MAX_CRAFT_STATION_RADIUS_CELLS {
             continue;
         }
-        if let Some((_, best_dist)) = best {
-            if dist >= best_dist {
-                continue;
-            }
+        if let Some((_, best_dist)) = best
+            && dist >= best_dist
+        {
+            continue;
         }
 
         // Read the block at the station cell to get its tag + tier.
@@ -1081,10 +1081,12 @@ fn receive_work_start(
                 connection,
                 worker_tool,
                 &station_def,
-                &item_registry,
-                &recipes,
-                &mut stations,
-                &mut bookings,
+                CraftStartContext {
+                    item_registry: &item_registry,
+                    recipes: &recipes,
+                    stations: &mut stations,
+                    bookings: &mut bookings,
+                },
             )
             .is_some();
             if started {
@@ -1122,17 +1124,29 @@ fn receive_work_stop(
 /// later placed at the same cell, a player-worked craft kept ticking
 /// against the missing block (output from thin air), and everything
 /// deposited was silently destroyed.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct DestroyedStationContext<'w> {
+    block_registry: Res<'w, crate::blocks::BlockRegistry>,
+    recipes: Res<'w, crate::recipes::RecipeRegistry>,
+    item_registry: Res<'w, crate::items::ItemRegistry>,
+    stations: ResMut<'w, CraftStations>,
+    bookings: ResMut<'w, CraftBookings>,
+}
+
 pub(crate) fn clear_destroyed_stations(
     mut reader: MessageReader<crate::protocol::CellEdit>,
-    block_registry: Res<crate::blocks::BlockRegistry>,
-    recipes: Res<crate::recipes::RecipeRegistry>,
-    item_registry: Res<crate::items::ItemRegistry>,
-    mut stations: ResMut<CraftStations>,
-    mut bookings: ResMut<CraftBookings>,
+    context: DestroyedStationContext,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
     mut commands: Commands,
 ) {
+    let DestroyedStationContext {
+        block_registry,
+        recipes,
+        item_registry,
+        mut stations,
+        mut bookings,
+    } = context;
     use block_junk_mod_api::recipes::RecipeId;
     let Ok(server) = servers.single() else {
         return;
@@ -1411,10 +1425,12 @@ fn tick_station_work(
                     worker,
                     tools.get(worker).ok().and_then(|t| t.item),
                     &station_def,
-                    &item_registry,
-                    &recipes,
-                    &mut stations,
-                    &mut bookings,
+                    CraftStartContext {
+                        item_registry: &item_registry,
+                        recipes: &recipes,
+                        stations: &mut stations,
+                        bookings: &mut bookings,
+                    },
                 )
                 .is_some()
             {
@@ -1493,16 +1509,26 @@ pub(crate) fn lookup_station_def(
 /// `None` path — this helper doesn't probe emptiness because the
 /// player path's `get_or_insert` already created the entry and the
 /// NPC path always has an existing entry to act on.
+pub(crate) struct CraftStartContext<'a> {
+    pub item_registry: &'a crate::items::ItemRegistry,
+    pub recipes: &'a crate::recipes::RecipeRegistry,
+    pub stations: &'a mut CraftStations,
+    pub bookings: &'a mut CraftBookings,
+}
+
 pub(crate) fn try_start_first_satisfiable_order(
     station_cell: IVec3,
     worker_entity: Entity,
     worker_tool: Option<crate::items::ItemSlot>,
     station_def: &StationDefView,
-    item_registry: &crate::items::ItemRegistry,
-    recipes: &crate::recipes::RecipeRegistry,
-    stations: &mut CraftStations,
-    bookings: &mut CraftBookings,
+    context: CraftStartContext<'_>,
 ) -> Option<String> {
+    let CraftStartContext {
+        item_registry,
+        recipes,
+        stations,
+        bookings,
+    } = context;
     use block_junk_mod_api::recipes::RecipeId;
     let state = stations.get_mut(station_cell)?;
     let mut started_recipe_id: Option<String> = None;

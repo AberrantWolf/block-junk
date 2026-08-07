@@ -1,6 +1,6 @@
 ---
 name: networking-design
-description: Design rules for block-junk's networking — what gets replicated and how, channel choices, bandwidth budget, and area-of-interest strategy. Use when adding any feature that crosses the client/server boundary, or when reviewing a change that adds replicated state. The transport mechanics (which lightyear API to call) live in the lightyear-026 skill; this is about *what to send and why*.
+description: Design rules for block-junk's networking — what gets replicated and how, channel choices, bandwidth budget, and area-of-interest strategy. Use when adding any feature that crosses the client/server boundary, or when reviewing a change that adds replicated state. The transport mechanics (which lightyear API to call) live in the lightyear-028 skill; this is about *what to send and why*.
 user-invocable: false
 ---
 
@@ -67,7 +67,7 @@ Four lanes as implemented (`protocol.rs`, registered in `network.rs::ProtocolPlu
 
 | Channel | Mode | Carries | Why this lane |
 |---|---|---|---|
-| `WorldChannel` | `OrderedReliable` | client→server edit/pickup/drop/deposit *requests*, `ActionRejected`, `BlockManifest`, NPC detail responses, dev commands | click-latency UX; must not queue behind bulk transfers |
+| `WorldChannel` | `OrderedReliable` | client→server action/pickup/drop/deposit *requests*, `ActionRejected`, `ModSetManifest`, NPC detail responses, dev commands | click-latency UX; must not queue behind bulk transfers |
 | `ChunkChannel` | `OrderedReliable` | `ChunkSnapshot`, `ChunkUnload`, **and server→client `BlockEdit` broadcasts** | the client skips edits for unloaded chunks trusting the snapshot to carry final state — snapshot, unload, and edit MUST share one ordered stream or a small edit overtakes a fragmented snapshot and is silently lost |
 | `StateSyncChannel` | `OrderedReliable` | `PlanEdit`/`PlanEditBatch`/`PlanFullSync`, station updates/full syncs | isolates 4096-cell plan batches and connect-time full syncs from the click-critical lane; preserves full-sync-before-delta |
 | `PeriodicSyncChannel` | `SequencedUnreliable` | `WorldClockSync` | latest sample wins; a drop is superseded by the next tick |
@@ -84,11 +84,21 @@ Player/NPC transforms ride lightyear's `Replicate` machinery (`SequencedUnreliab
 
 If a chunk has never been edited and is fully reconstructible from the world seed + chunk coords, the server doesn't send the bytes — it sends "chunk K is procedural-default" and the client regenerates. Voxel-Tools recommends this exact pattern (`info.are_voxels_edited()`).
 
-Implement this once we have multi-chunk + procedural worldgen. For now (single hand-built sphere), every chunk is "edited" and gets a snapshot.
+This is implemented by distinguishing procedural-default and edited chunk snapshots. Preserve that distinction when changing snapshot encoding.
 
 ## Area of interest (AoI)
 
-**Not yet — single chunk.** When multi-chunk lands, each player has a chunk-radius AoI (start at 8 chunks). Server only sends snapshots and edits for chunks within that radius.
+Chunk streaming currently tracks a radius of 2 chunks horizontally and 1 vertically (75 chunks at an interior position). That subscription is the source of truth for all spatial network visibility, not just snapshot loading.
+
+The current implementation only applies it to chunk snapshot load/unload. Block-edit broadcasts, replicated NPCs/world items, and several spatial full-sync/delta streams still target every client. Treat this as an implementation gap, not permission to add more global spatial traffic.
+
+Required behavior:
+
+1. A newly subscribed client receives one authoritative snapshot for each entered chunk.
+2. A client leaving a chunk receives unload/removal messages and loses visibility of entities owned by that chunk.
+3. Spatial deltas target the union of clients subscribed to every chunk touched by the change. Multi-cell blocks can cross a chunk boundary.
+4. Replicated spatial entities gain and lose visibility from the same subscription set, using Lightyear's visibility/room support or an equivalent central adapter.
+5. Snapshot generation and transmission have per-client byte budgets so a teleport or initial join cannot monopolize reliable channels.
 
 Per Lysenko's classification, three viable styles:
 
@@ -96,13 +106,13 @@ Per Lysenko's classification, three viable styles:
 2. **Static partitioning** — fixed grid; player subscribes to N nearest cells. *This is what we'll use.*
 3. **Geometric** — prioritize by projected area / distance / visual salience.
 
-For a Minecraft-shaped game, static partitioning at the chunk grid is the natural fit: the partition exists for free (chunks already are the grid).
+For a Minecraft-shaped game, static partitioning at the chunk grid is the natural fit: the partition exists for free (chunks already are the grid). Do not build a second, feature-specific notion of proximity.
 
 ## When to compress
 
 - **Per-message compression** (zstd/lz4): only worth it for messages > ~256 B. `BlockEdit` at ~15 B doesn't need it.
 - **Channel-level compression** (zlib partial-flush, à la Minecraft): consider for the snapshot channel later. Lightyear may already include this — verify before adding.
-- **RLE for chunk snapshots**: trivial win since most blocks are `Empty` in early chunks. Implement *when* `ChunkSnapshot` is the bandwidth bottleneck, not preemptively.
+- **RLE for chunk snapshots**: trivial win since most blocks are `Empty` in early chunks. Snapshot bursts already dominate the reliable-channel budget, so add a bounded RLE or equivalent encoding and verify the decompressed cell count before allocation/use.
 
 ## Time dilation as graceful degradation
 

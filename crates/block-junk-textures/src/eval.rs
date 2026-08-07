@@ -773,11 +773,13 @@ mod tests {
 
     #[test]
     fn blur_preserves_mean() {
-        let mut layer = LayerDef::default();
-        layer.steps = vec![
-            step("white", &[], None),
-            step("blur", &[("radius", ParamValue::F32(3.0))], Some("b")),
-        ];
+        let mut layer = LayerDef {
+            steps: vec![
+                step("white", &[], None),
+                step("blur", &[("radius", ParamValue::F32(3.0))], Some("b")),
+            ],
+            ..LayerDef::default()
+        };
         // Evaluate via the grey path by referencing in a fill mask.
         layer.steps.push(step(
             "fill",

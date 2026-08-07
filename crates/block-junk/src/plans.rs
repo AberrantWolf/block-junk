@@ -269,12 +269,11 @@ fn plan_mode_input(
 
     // During hold: re-project the cursor ray onto the anchor's face
     // plane to track the rectangle's second corner.
-    if let Some(active) = drag.active.as_mut() {
-        if let Some(projected) =
+    if let Some(active) = drag.active.as_mut()
+        && let Some(projected) =
             project_to_face_plane(origin, dir, active.anchor, active.face_normal)
-        {
-            active.second = projected;
-        }
+    {
+        active.second = projected;
     }
 
     // On release of the verb's button: commit the rectangle.

@@ -385,7 +385,7 @@ fn start_netcode_client(
             LocalAddr(CLIENT_ADDR),
             PeerAddr(server_addr),
             Link::new(None),
-            ReplicationReceiver::default(),
+            ReplicationReceiver,
             // lightyear 0.28: prediction is only wired for links that carry
             // a PredictionManager (its on_insert registers the
             // PredictionResource the rollback systems unwrap — without it

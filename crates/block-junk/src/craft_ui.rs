@@ -2,8 +2,8 @@
 //! player queue craft orders, see the station's inventory, deposit
 //! their carry, and manually trigger work cycles.
 //!
-//! Egui-based for MVP because the modal is dense + interactive (lists
-//! + buttons + quantity inputs). Bevy-UI rewrite is tracked as a
+//! Egui-based for MVP because the modal is dense and interactive (lists,
+//! buttons, and quantity inputs). Bevy-UI rewrite is tracked as a
 //! polish item — the in-game HUD reads as a distinct visual layer
 //! today (egui = dev tools, bevy_ui = gameplay), and this modal
 //! straddles that line until we settle on a UI framework for

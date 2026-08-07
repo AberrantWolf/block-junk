@@ -527,7 +527,7 @@ pub fn process_dirty(
                 }
             }
         }
-        candidates.sort_by(|a, b| b.2.cmp(&a.2));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
         let mut claimed_old: HashSet<RoomId> = HashSet::new();
         for (pi, id, _) in candidates {
             if changed_pairs.contains_key(&pi) || claimed_old.contains(&id) {

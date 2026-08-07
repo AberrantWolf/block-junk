@@ -20,17 +20,12 @@ use bevy::prelude::*;
 use crate::menu::AppState;
 use crate::protocol::GameSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Resource)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Resource)]
 pub enum PlayerMode {
+    #[default]
     Normal,
     Plan,
     Storage,
-}
-
-impl Default for PlayerMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl PlayerMode {
