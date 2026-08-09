@@ -22,7 +22,7 @@ grass only. S4's foraging terrain needs a different source. Options:
    could be a new block with a small custom mesh, and fruit could be a
    `leaves_apple` block variant — no new pack required. Cheapest path,
    fits the existing terrain-gen.
-2. **Kenney Nature Kit** (`~/Desktop/Kenney Game Assets All-in-1 3.5.0/
+2. **Kenney Nature Kit** (`~/Desktop/Kenney Game Assets All-in-1 3.6.0/
    3D assets/Nature Kit/Models/GLTF format/`): has real `tree_*`,
    `plant_bush*`, `log_stack*`, `rock_*` `.glb`s (different art style —
    flatter/lower-poly than KayKit; check it reads OK next to KayKit).
