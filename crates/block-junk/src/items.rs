@@ -87,6 +87,12 @@ pub enum ItemBootstrapError {
         "block {block} materials entry for item {item} has count = 0; remove the entry or set count > 0"
     )]
     MaterialCountZero { block: String, item: ItemId },
+    #[error("block {block} has {entries} material entries; maximum is {max}")]
+    MaterialListTooLong {
+        block: String,
+        entries: usize,
+        max: usize,
+    },
 }
 
 /// Finalised item registry. Held as a Bevy `Resource` on each side.
@@ -177,6 +183,13 @@ impl ItemRegistry {
     /// valid; this only catches typos and stale ids.
     pub fn validate_block_drops(&self, blocks: &[BlockDef]) -> Result<(), ItemBootstrapError> {
         for def in blocks {
+            if def.materials.len() > crate::plans::MAX_PLAN_MATERIAL_KINDS {
+                return Err(ItemBootstrapError::MaterialListTooLong {
+                    block: def.id.to_string(),
+                    entries: def.materials.len(),
+                    max: crate::plans::MAX_PLAN_MATERIAL_KINDS,
+                });
+            }
             for drop in def.resolved_drops() {
                 if self.slot_of(&drop.item).is_none() {
                     return Err(ItemBootstrapError::DropItemUnknown {

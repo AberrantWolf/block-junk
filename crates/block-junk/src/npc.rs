@@ -33,7 +33,6 @@ use block_junk_mod_api::npcs::{
     PlanKindHint, PlannerGoal,
 };
 use block_junk_mod_api::shared::BlockPos;
-use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -51,8 +50,7 @@ use crate::plan_claims::PlanClaims;
 use crate::plans::Plans;
 use crate::protocol::{
     Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, CellEdit, EquippedTool, GameSet,
-    KinematicLock, MovementMode, NpcAnimOverride, PlanEdit, PlanKind, StateSyncChannel, WorldClock,
-    WorldItem,
+    KinematicLock, MovementMode, NpcAnimOverride, PlanKind, WorldClock, WorldItem,
 };
 use crate::rooms::RoomMap;
 use crate::scripting::ServerMods;
@@ -452,8 +450,8 @@ pub enum ArrivalAction {
     /// Final leg of a haul cycle: arrive at the plan and deposit the
     /// NPC's full carry stack into the plan's materials. Reads the
     /// NPC's [`Carrying`](crate::protocol::Carrying), calls
-    /// [`Plans::deposit`], broadcasts a [`PlanEdit`] so client
-    /// mirrors update, and clears the carry.
+    /// [`Plans::deposit`], and clears the carry. The store journals the
+    /// client-visible change.
     ///
     /// If on arrival the plan is gone or no longer a Build plan, the
     /// haul releases without depositing (carry stays on the NPC; the
@@ -493,8 +491,7 @@ pub enum ArrivalAction {
     /// scheduler when a station's queued orders have unmet inputs and
     /// the NPC is carrying a matching item. Mirrors `DepositAtPlan`
     /// in shape; the only difference is the deposit target
-    /// (CraftStations vs Plans) and the broadcast (StationUpdate vs
-    /// PlanEdit).
+    /// (CraftStations vs Plans). Each store journals its own delta.
     ///
     /// If by arrival the station is gone (block destroyed) or no
     /// longer wants the carry's item kind, the haul releases without
@@ -986,8 +983,9 @@ fn spawn_initial_npc_on_first_connect(
             crate::npc_mover::NavMover::default(),
             NpcPath::default(),
             NpcAnimOverride::default(),
-            Replicate::to_clients(NetworkTarget::None),
-            InterpolationTarget::to_clients(NetworkTarget::All),
+            crate::spatial::interpolated_spatial_replica(crate::spatial::SpatialScope::Point(
+                translation,
+            )),
             Name::new(format!("npc:{}", id.0)),
         ));
     }
@@ -1101,15 +1099,12 @@ struct HaulCtx<'w, 's> {
     plans: ResMut<'w, Plans>,
     plan_claims: ResMut<'w, PlanClaims>,
     store: ResMut<'w, HaulStore>,
-    broadcast: ServerMultiMessageSender<'w, 's>,
-    servers: Query<'w, 's, &'static Server>,
     world_items: Query<'w, 's, (Entity, &'static WorldItem)>,
     kind_registry: Res<'w, NpcKindRegistry>,
     item_registry: Res<'w, crate::items::ItemRegistry>,
     storage: Res<'w, crate::storage::StorageZones>,
     containers: ResMut<'w, crate::containers::Containers>,
     container_index: Res<'w, crate::containers::ContainerIndex>,
-    subscriptions: Res<'w, crate::server::SpatialSubscriptions>,
 }
 
 /// Read-only world-anchor bundle: room registry plus civilization
@@ -1409,8 +1404,6 @@ fn npc_brain_tick(
     let chunk_map = &world_ctx.chunk_map;
     let block_registry = &world_ctx.block_registry;
     let world_clock = *world_ctx.clock;
-
-    let server = haul.servers.single().ok();
 
     for (
         entity,
@@ -1940,22 +1933,6 @@ fn npc_brain_tick(
                             accepted,
                             "haul deposit complete",
                         );
-                        if let (Some(server), Some(state)) =
-                            (server, haul.plans.get(plan_cell).cloned())
-                        {
-                            let reply = PlanEdit {
-                                cell: plan_cell,
-                                kind: Some(state.kind),
-                                materials: state.materials,
-                            };
-                            let target = haul.subscriptions.target_for_cells([plan_cell]);
-                            if let Err(err) = haul
-                                .broadcast
-                                .send::<PlanEdit, StateSyncChannel>(&reply, server, &target)
-                            {
-                                warn!("haul deposit PlanEdit broadcast failed: {err}");
-                            }
-                        }
                     }
                     // Decide what's next. After a deposit the queue
                     // may still have items (multi-trip haul); a
@@ -2021,6 +1998,13 @@ fn npc_brain_tick(
                         .stations
                         .get(station_cell)
                         .map(|s| {
+                            if !s.can_deposit_with_refund_reserve(
+                                carry_item,
+                                &craft.recipes,
+                                &haul.item_registry,
+                            ) {
+                                return 0;
+                            }
                             crate::haul::compute_station_demand(
                                 s,
                                 &craft.recipes,
@@ -2043,11 +2027,9 @@ fn npc_brain_tick(
                         continue;
                     }
                     let accepted = want.min(carry_count);
-                    let state_after = {
-                        let state = craft.stations.get_or_insert(station_cell);
+                    craft.stations.edit_or_insert(station_cell, |state| {
                         state.deposit(carry_item, accepted);
-                        state.clone()
-                    };
+                    });
                     carrying.count = carry_count - accepted;
                     if carrying.count == 0 {
                         carrying.item = None;
@@ -2058,15 +2040,6 @@ fn npc_brain_tick(
                         accepted,
                         "haul deposit (station) complete",
                     );
-                    if let Some(server) = server {
-                        crate::craft_stations::broadcast_station(
-                            &mut haul.broadcast,
-                            server,
-                            station_cell,
-                            Some(state_after),
-                            Some(&haul.subscriptions),
-                        );
-                    }
                     // Pick next leg from the (possibly still active)
                     // assignment. Same pattern as DepositAtPlan.
                     continue_haul_or_release(
@@ -2126,7 +2099,9 @@ fn npc_brain_tick(
                         },
                         Transform::from_translation(pile_pos),
                         GlobalTransform::default(),
-                        Replicate::to_clients(NetworkTarget::None),
+                        crate::spatial::ordinary_spatial_replica(
+                            crate::spatial::SpatialScope::Point(pile_pos),
+                        ),
                         Name::new(format!("WorldItem(pile:{}x{})", carry_item.0, new_total)),
                     ));
                     carrying.item = None;
@@ -2195,27 +2170,18 @@ fn npc_brain_tick(
                         brain.goal = Goal::Idle;
                         continue;
                     }
-                    let state_after = {
-                        let Some(state) = haul.containers.get_mut(cell) else {
+                    {
+                        let Some(()) = haul.containers.edit_existing(cell, |state| {
+                            state.withdraw_up_to(item_slot, taken);
+                        }) else {
                             // Checked non-empty above; unreachable in
                             // practice, but don't panic on a race.
                             haul.store.release_for_npc(*npc_id);
                             brain.goal = Goal::Idle;
                             continue;
                         };
-                        state.withdraw_up_to(item_slot, taken);
-                        state.clone()
-                    };
-                    haul.containers.remove_if_empty(cell);
-                    if let Some(server) = server {
-                        crate::containers::broadcast_container(
-                            &mut haul.broadcast,
-                            server,
-                            cell,
-                            (!state_after.is_empty()).then_some(state_after),
-                            &haul.subscriptions,
-                        );
                     }
+                    haul.containers.remove_if_empty(cell);
                     info!(
                         npc = npc_id.0,
                         cell = ?cell.to_array(),
@@ -2290,23 +2256,12 @@ fn npc_brain_tick(
                         brain.goal = Goal::Idle;
                         continue;
                     }
-                    let state_after = {
-                        let state = haul.containers.get_or_insert(cell);
+                    haul.containers.edit_or_insert(cell, |state| {
                         state.deposit(carry_item, accepted);
-                        state.clone()
-                    };
+                    });
                     carrying.count = carry_count - accepted;
                     if carrying.count == 0 {
                         carrying.item = None;
-                    }
-                    if let Some(server) = server {
-                        crate::containers::broadcast_container(
-                            &mut haul.broadcast,
-                            server,
-                            cell,
-                            Some(state_after),
-                            &haul.subscriptions,
-                        );
                     }
                     info!(
                         npc = npc_id.0,
@@ -2383,7 +2338,9 @@ fn npc_brain_tick(
                             },
                             Transform::from_translation(pickup_pos),
                             GlobalTransform::default(),
-                            Replicate::to_clients(NetworkTarget::None),
+                            crate::spatial::ordinary_spatial_replica(
+                                crate::spatial::SpatialScope::Point(pickup_pos),
+                            ),
                             Name::new(format!("WorldItem(npc_tool_swap:{})", prev_slot.0)),
                         ));
                     }
@@ -2464,16 +2421,6 @@ fn npc_brain_tick(
                         false
                     };
                     if started {
-                        if let Some(server) = server {
-                            let snapshot = craft.stations.get(station_cell).cloned();
-                            crate::craft_stations::broadcast_station(
-                                &mut haul.broadcast,
-                                server,
-                                station_cell,
-                                snapshot,
-                                Some(&haul.subscriptions),
-                            );
-                        }
                         brain.goal = Goal::CraftingAtStation { station_cell };
                     } else {
                         info!(
@@ -2612,22 +2559,12 @@ fn npc_brain_tick(
                 let mut restore_ok = true;
                 if is_container {
                     restore_ok = false;
-                    if let Some(state) = haul.containers.get_mut(target_cell)
-                        && let Some(food) = state.any_stocked()
-                        && state.withdraw_up_to(food, 1) == 1
-                    {
+                    if let Some(Some(())) = haul.containers.edit_existing(target_cell, |state| {
+                        let food = state.any_stocked()?;
+                        (state.withdraw_up_to(food, 1) == 1).then_some(())
+                    }) {
                         restore_ok = true;
-                        let after = state.clone();
                         haul.containers.remove_if_empty(target_cell);
-                        if let Some(server) = server {
-                            crate::containers::broadcast_container(
-                                &mut haul.broadcast,
-                                server,
-                                target_cell,
-                                (!after.is_empty()).then_some(after),
-                                &haul.subscriptions,
-                            );
-                        }
                     }
                 }
 

@@ -2,16 +2,13 @@
 //! eventually build or remove.
 //!
 //! `Plans` is the canonical map of tagged cells. It lives as a server-
-//! authoritative `Resource` on the server App and as a passive mirror on
-//! each client App, updated via [`PlanEdit`] broadcasts and a one-shot
-//! [`PlanFullSync`] on connect. Mutating from the client side is a wire
-//! request only — the server validates against world state, applies, and
-//! broadcasts. The mirror reflects what the server accepted.
+//! authoritative `Resource` on the server App and as a passive spatial
+//! replica on each client. Client edits are typed requests; accepted state
+//! is journaled and streamed by the generic dataset framework.
 //!
 //! Phase 3 is the data + wire + replication layer. Phase 4 adds drag-
 //! AABB batching, Phase 6 wires NPC pickup against this map.
 
-use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::Cardinal;
 use lightyear::prelude::*;
@@ -24,54 +21,107 @@ use crate::client::{
 use crate::menu::AppState;
 use crate::player_mode::PlayerMode;
 use crate::protocol::{
-    ActionRejected, Avatar, AvatarPose, GameReady, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX,
-    PLAN_REACH, PlanEdit, PlanEditBatch, PlanFullSync, PlanKind, PlanState, RejectReason,
-    StateSyncChannel,
+    ActionRejected, Avatar, AvatarPose, GameSet, MaterialEntry, PLAN_EDIT_BATCH_MAX, PLAN_REACH,
+    PlanEdit, PlanEditBatch, PlanKind, PlanState, RejectReason, StateSyncChannel,
 };
 use crate::server::{RequestClass, ValidatedRequestContext, send_rejection, within_reach};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, world_to_chunk};
 
-#[derive(Resource, Default, Debug)]
-pub struct Plans {
-    map: HashMap<IVec3, PlanState>,
+pub struct PlanDataset;
+
+pub const MAX_PLAN_MATERIAL_KINDS: usize = 64;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PlanWireRecord {
+    cell: IVec3,
+    kind: PlanKind,
+    materials: crate::protocol::BoundedVec<MaterialEntry, MAX_PLAN_MATERIAL_KINDS>,
 }
+
+impl crate::spatial::SpatialDataset for PlanDataset {
+    type Key = IVec3;
+    type Value = PlanState;
+    type Wire = PlanWireRecord;
+    type Persistence = crate::spatial::PersistedDataset;
+    const ID: crate::spatial::DatasetId = crate::spatial::DatasetId(1);
+    const SCHEMA_FINGERPRINT: u64 = 0x706c_616e_0000_0001;
+    const MEMBERSHIP: crate::spatial::MembershipPolicy =
+        crate::spatial::MembershipPolicy::AnchorCell;
+    const REPLICATION: crate::spatial::ReplicationPolicy =
+        crate::spatial::ReplicationPolicy::Immediate;
+    const MAX_RECORD_BYTES: usize = 4096;
+    fn chunks(key: &Self::Key, _: &Self::Value) -> Vec<crate::protocol::ChunkCoord> {
+        vec![crate::voxel::world_to_chunk(*key).0]
+    }
+    fn to_wire(key: &Self::Key, value: &Self::Value) -> Self::Wire {
+        PlanWireRecord {
+            cell: *key,
+            kind: value.kind,
+            materials: crate::protocol::BoundedVec::new(value.materials.clone())
+                .expect("authoritative plans enforce the material bound"),
+        }
+    }
+    fn from_wire(
+        wire: Self::Wire,
+        registry: &crate::spatial::SpatialDecodeRegistry,
+    ) -> Result<(Self::Key, Self::Value), crate::spatial::SpatialError> {
+        if let PlanKind::Build { slot, .. } = wire.kind {
+            registry.require("block", slot.0 as u32)?;
+        }
+        for material in &wire.materials {
+            registry.require("item", material.item.0 as u32)?;
+        }
+        Ok((
+            wire.cell,
+            PlanState {
+                kind: wire.kind,
+                materials: wire.materials.into_inner(),
+            },
+        ))
+    }
+}
+
+pub type Plans = crate::spatial::PartitionedStore<PlanDataset>;
 
 impl Plans {
     /// Full state at `cell`, including materials progress. Use this
     /// when the caller needs the kind, the materials, or
     /// [`PlanState::is_satisfied`].
     pub fn get(&self, cell: IVec3) -> Option<&PlanState> {
-        self.map.get(&cell)
+        self.lookup(&cell)
     }
 
     /// Just the kind (the original pre-Phase-3 contract). Useful for
     /// callers that only branch Remove vs Build and don't care about
     /// materials. Copies so the caller doesn't borrow the map.
     pub fn kind(&self, cell: IVec3) -> Option<PlanKind> {
-        self.map.get(&cell).map(|s| s.kind)
+        self.get(cell).map(|s| s.kind)
     }
 
     pub fn set(&mut self, cell: IVec3, state: PlanState) {
-        self.map.insert(cell, state);
+        self.upsert(cell, state, 0);
     }
 
     pub fn clear(&mut self, cell: IVec3) {
-        self.map.remove(&cell);
+        self.delete(&cell, 0);
     }
 
-    pub fn replace_all(&mut self, entries: impl IntoIterator<Item = (IVec3, PlanState)>) {
-        self.map.clear();
+    pub(crate) fn restore_all(&mut self, entries: impl IntoIterator<Item = (IVec3, PlanState)>) {
+        let keys: Vec<_> = self.entries().map(|(key, _)| *key).collect();
+        for key in keys {
+            self.delete(&key, 0);
+        }
         for (cell, state) in entries {
-            self.map.insert(cell, state);
+            self.upsert(cell, state, 0);
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &PlanState)> {
-        self.map.iter()
+        self.entries()
     }
 
     pub fn snapshot(&self) -> Vec<(IVec3, PlanState)> {
-        self.map.iter().map(|(c, s)| (*c, s.clone())).collect()
+        self.iter().map(|(c, s)| (*c, s.clone())).collect()
     }
 
     /// Deposit `count` units of `item` toward this plan's materials.
@@ -79,15 +129,15 @@ impl Plans {
     /// remaining need). 0 ⇒ plan doesn't need this item, or already
     /// full, or no plan at this cell.
     pub fn deposit(&mut self, cell: IVec3, item: crate::items::ItemSlot, count: u32) -> u32 {
-        let Some(state) = self.map.get_mut(&cell) else {
-            return 0;
-        };
-        let Some(entry) = state.materials.iter_mut().find(|m| m.item == item) else {
-            return 0;
-        };
-        let accepted = count.min(entry.needed.saturating_sub(entry.present));
-        entry.present += accepted;
-        accepted
+        self.edit(&cell, 0, |state| {
+            let Some(entry) = state.materials.iter_mut().find(|m| m.item == item) else {
+                return 0;
+            };
+            let accepted = count.min(entry.needed.saturating_sub(entry.present));
+            entry.present += accepted;
+            accepted
+        })
+        .unwrap_or(0)
     }
 }
 
@@ -96,12 +146,11 @@ pub struct PlansClientPlugin;
 
 impl Plugin for PlansServerPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Plans>();
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<PlanDataset>::server());
         // Observer fires per new client connection — same shape as
         // `register_new_client` sending `BlockManifest`. Late observers
         // are safe because lightyear has already installed the per-
         // connection MessageSender by the time `Connected` lands.
-        app.add_observer(send_plan_full_sync_on_connect);
         app.add_systems(
             Update,
             (receive_plan_edits, receive_plan_edit_batches).in_set(GameSet::Simulation),
@@ -111,21 +160,8 @@ impl Plugin for PlansServerPlugin {
 
 impl Plugin for PlansClientPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Plans>();
-        app.init_resource::<PlanDragState>();
-        // Full-sync runs before per-edit receive so a sync arriving in
-        // the same Bevy tick as an edit doesn't clobber the edit.
-        app.add_systems(
-            Update,
-            (
-                receive_plan_full_sync,
-                receive_plan_edit_broadcasts,
-                receive_plan_edit_batch_broadcasts,
-            )
-                .chain()
-                .in_set(GameSet::Simulation)
-                .run_if(in_state(AppState::InGame)),
-        );
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<PlanDataset>::client());
+        crate::spatial::init_session_resource::<PlanDragState>(app);
         app.add_systems(
             Update,
             plan_mode_input
@@ -638,8 +674,7 @@ fn build_initial_materials(
 }
 
 /// Server: ingest client requests, validate against live world state,
-/// apply to the authoritative `Plans`, broadcast the canonical applied
-/// edit. Reject (silently) edits that don't make sense against the
+/// apply to the authoritative `Plans`. Reject (silently) edits that don't make sense against the
 /// world (tag-remove on empty, tag-build on solid).
 #[allow(
     clippy::too_many_arguments,
@@ -659,13 +694,8 @@ fn receive_plan_edits(
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&AvatarPose, With<Avatar>>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: ValidatedRequestContext,
 ) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         let edits: Vec<PlanEdit> = receiver.receive().collect();
         for edit in edits {
@@ -693,15 +723,12 @@ fn receive_plan_edits(
                 );
                 continue;
             }
-            let (accepted_state, materials_for_broadcast) = match edit.kind {
+            let accepted_state = match edit.kind {
                 Some(PlanKind::Remove) => {
                     if !cell_is_solid(edit.cell, &chunks, &chunk_map) {
                         continue;
                     }
-                    (
-                        Some(PlanState::new(PlanKind::Remove, Vec::new())),
-                        Vec::new(),
-                    )
+                    Some(PlanState::new(PlanKind::Remove, Vec::new()))
                 }
                 Some(kind @ PlanKind::Build { .. }) => {
                     if cell_is_solid(edit.cell, &chunks, &chunk_map) {
@@ -717,25 +744,15 @@ fn receive_plan_edits(
                         continue;
                     }
                     let materials = build_initial_materials(kind, &block_registry, &item_registry);
-                    (Some(PlanState::new(kind, materials.clone())), materials)
+                    Some(PlanState::new(kind, materials))
                 }
                 None => {
                     plans.clear(edit.cell);
-                    (None, Vec::new())
+                    None
                 }
             };
             if let Some(state) = accepted_state {
                 plans.set(edit.cell, state);
-            }
-            let reply = PlanEdit {
-                cell: edit.cell,
-                kind: edit.kind,
-                materials: materials_for_broadcast,
-            };
-            let target = validation.target_for_cells([edit.cell]);
-            if let Err(err) = broadcast.send::<PlanEdit, StateSyncChannel>(&reply, server, &target)
-            {
-                warn!("PlanEdit broadcast failed: {err}");
             }
         }
     }
@@ -743,8 +760,7 @@ fn receive_plan_edits(
 
 /// Server: bulk version of `receive_plan_edits`. Validates each cell
 /// against the same per-kind rules, applies the surviving cells to
-/// `Plans`, and broadcasts a new batch containing only the surviving
-/// cells so clients see exactly what the server accepted.
+/// `Plans`; the spatial journal emits canonical deltas for surviving cells.
 #[allow(clippy::too_many_arguments)]
 fn receive_plan_edit_batches(
     mut commands: Commands,
@@ -760,13 +776,8 @@ fn receive_plan_edit_batches(
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&AvatarPose, With<Avatar>>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: ValidatedRequestContext,
 ) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         let batches: Vec<PlanEditBatch> = receiver.receive().collect();
         for batch in batches {
@@ -802,7 +813,6 @@ fn receive_plan_edit_batches(
                 }
                 _ => Vec::new(),
             };
-            let mut accepted: Vec<IVec3> = Vec::with_capacity(batch.cells.len());
             let mut first_out_of_reach: Option<IVec3> = None;
             for cell in batch.cells {
                 // Same designation reach as single edits. A drag can
@@ -829,25 +839,9 @@ fn receive_plan_edit_batches(
                         plans.clear(cell);
                     }
                 }
-                accepted.push(cell);
             }
             if let Some(cell) = first_out_of_reach {
                 send_rejection(&mut rejections, connection, cell, RejectReason::OutOfReach);
-            }
-            if accepted.is_empty() {
-                continue;
-            }
-            let reply = PlanEditBatch {
-                kind: batch.kind,
-                cells: crate::protocol::BoundedVec::new(accepted)
-                    .expect("accepted cells are a subset of a bounded request"),
-                materials: shared_materials,
-            };
-            let target = validation.target_for_cells(reply.cells.iter().copied());
-            if let Err(err) =
-                broadcast.send::<PlanEditBatch, StateSyncChannel>(&reply, server, &target)
-            {
-                warn!("PlanEditBatch broadcast failed: {err}");
             }
         }
     }
@@ -861,74 +855,6 @@ pub(crate) fn cell_is_solid(cell: IVec3, chunks: &Query<&Chunk>, chunk_map: &Chu
         .and_then(|&entity| chunks.get(entity).ok())
         .map(|chunk| !chunk.get(local).is_empty())
         .unwrap_or(false)
-}
-
-/// Server: on a new client connect, push the current `Plans` snapshot so
-/// the joiner sees existing tags. Subsequent edits arrive as `PlanEdit`
-/// broadcasts. Empty snapshots still send — the receive side relies on
-/// the message to know "the full state is now what I've seen."
-fn send_plan_full_sync_on_connect(
-    trigger: On<Add, GameReady>,
-    plans: Res<Plans>,
-    mut senders: Query<&mut MessageSender<PlanFullSync>>,
-) {
-    let connection = trigger.entity;
-    let Ok(mut sender) = senders.get_mut(connection) else {
-        return;
-    };
-    let sync = PlanFullSync {
-        entries: plans.snapshot(),
-    };
-    sender.send::<StateSyncChannel>(sync);
-}
-
-/// Client: apply a broadcast edit to the local mirror. The server has
-/// already done the validation + materials computation; we trust
-/// both fields directly.
-fn receive_plan_edit_broadcasts(
-    mut receivers: Query<&mut MessageReceiver<PlanEdit>>,
-    mut plans: ResMut<Plans>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for edit in receiver.receive() {
-            match edit.kind {
-                Some(kind) => plans.set(edit.cell, PlanState::new(kind, edit.materials)),
-                None => plans.clear(edit.cell),
-            }
-        }
-    }
-}
-
-/// Client: apply a broadcast batch to the local mirror.
-fn receive_plan_edit_batch_broadcasts(
-    mut receivers: Query<&mut MessageReceiver<PlanEditBatch>>,
-    mut plans: ResMut<Plans>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for batch in receiver.receive() {
-            for cell in batch.cells {
-                match batch.kind {
-                    Some(kind) => {
-                        plans.set(cell, PlanState::new(kind, batch.materials.clone()));
-                    }
-                    None => plans.clear(cell),
-                }
-            }
-        }
-    }
-}
-
-/// Client: replace the local mirror with the join-time snapshot. Drops
-/// any stale entries from a previous session.
-fn receive_plan_full_sync(
-    mut receivers: Query<&mut MessageReceiver<PlanFullSync>>,
-    mut plans: ResMut<Plans>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for sync in receiver.receive() {
-            plans.replace_all(sync.entries);
-        }
-    }
 }
 
 #[cfg(test)]

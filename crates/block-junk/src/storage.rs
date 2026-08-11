@@ -2,11 +2,9 @@
 //!
 //! `StorageZones` is the canonical set of cells the player has marked
 //! as storage. Like `Plans`, it lives as a server-authoritative
-//! `Resource` on the server App and as a passive mirror on each client,
-//! updated via [`StorageEditBatch`] broadcasts and a one-shot
-//! [`StorageFullSync`] on connect. Client mutation is a wire request;
-//! the server validates (reach, batch cap, floor-cell shape) and
-//! broadcasts what it accepted.
+//! `Resource` on the server App and as a passive spatial replica on each
+//! client. Client mutation is a typed request validated for reach, batch
+//! size, and floor-cell shape.
 //!
 //! A zone cell is the *air* cell items occupy — solid floor below,
 //! non-solid at the cell — matching where a pile or container will
@@ -17,7 +15,6 @@
 //! S1 is designation + replication + rendering. S2 (collective piles)
 //! adds the NPC behavior that reads this set.
 
-use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 use lightyear::prelude::*;
 
@@ -27,42 +24,77 @@ use crate::menu::AppState;
 use crate::plans::{cell_is_solid, project_to_face_plane, rect_cells_on_plane};
 use crate::player_mode::PlayerMode;
 use crate::protocol::{
-    ActionRejected, Avatar, AvatarPose, GameReady, GameSet, PLAN_EDIT_BATCH_MAX, PLAN_REACH,
-    RejectReason, StateSyncChannel, StorageEditBatch, StorageFullSync,
+    ActionRejected, Avatar, AvatarPose, GameSet, PLAN_EDIT_BATCH_MAX, PLAN_REACH, RejectReason,
+    StateSyncChannel, StorageEditBatch,
 };
 use crate::server::{RequestClass, ValidatedRequestContext, send_rejection, within_reach};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap};
 
+pub struct StorageDataset;
+
+impl crate::spatial::SpatialDataset for StorageDataset {
+    type Key = IVec3;
+    type Value = IVec3;
+    type Wire = IVec3;
+    type Persistence = crate::spatial::PersistedDataset;
+    const ID: crate::spatial::DatasetId = crate::spatial::DatasetId(2);
+    const SCHEMA_FINGERPRINT: u64 = 0x7374_6f72_0000_0001;
+    const MEMBERSHIP: crate::spatial::MembershipPolicy =
+        crate::spatial::MembershipPolicy::AnchorCell;
+    const REPLICATION: crate::spatial::ReplicationPolicy =
+        crate::spatial::ReplicationPolicy::Immediate;
+    const MAX_RECORD_BYTES: usize = 32;
+    fn chunks(key: &Self::Key, _: &Self::Value) -> Vec<crate::protocol::ChunkCoord> {
+        vec![crate::voxel::world_to_chunk(*key).0]
+    }
+    fn to_wire(_: &Self::Key, value: &Self::Value) -> Self::Wire {
+        *value
+    }
+    fn from_wire(
+        wire: Self::Wire,
+        _: &crate::spatial::SpatialDecodeRegistry,
+    ) -> Result<(Self::Key, Self::Value), crate::spatial::SpatialError> {
+        Ok((wire, wire))
+    }
+}
+
 /// The set of designated storage cells. Sparse and unordered; zone
 /// "shape" is emergent (any painted cell counts, contiguity doesn't
 /// matter to the engine).
-#[derive(Resource, Default, Debug)]
-pub struct StorageZones {
-    cells: HashSet<IVec3>,
-}
+pub type StorageZones = crate::spatial::PartitionedStore<StorageDataset>;
 
 impl StorageZones {
     /// Returns true when the cell was newly inserted (state changed).
     pub fn insert(&mut self, cell: IVec3) -> bool {
-        self.cells.insert(cell)
+        if self.lookup(&cell).is_some() {
+            false
+        } else {
+            self.upsert(cell, cell, 0);
+            true
+        }
     }
 
     /// Returns true when the cell was present (state changed).
     pub fn remove(&mut self, cell: IVec3) -> bool {
-        self.cells.remove(&cell)
+        self.delete(&cell, 0).is_some()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &IVec3> {
-        self.cells.iter()
+        self.entries().map(|(cell, _)| cell)
     }
 
     pub fn snapshot(&self) -> Vec<IVec3> {
-        self.cells.iter().copied().collect()
+        self.iter().copied().collect()
     }
 
-    pub fn replace_all(&mut self, cells: impl IntoIterator<Item = IVec3>) {
-        self.cells.clear();
-        self.cells.extend(cells);
+    pub(crate) fn restore_all(&mut self, cells: impl IntoIterator<Item = IVec3>) {
+        let old: Vec<_> = self.iter().copied().collect();
+        for cell in old {
+            self.delete(&cell, 0);
+        }
+        for cell in cells {
+            self.upsert(cell, cell, 0);
+        }
     }
 }
 
@@ -71,8 +103,7 @@ pub struct StorageClientPlugin;
 
 impl Plugin for StorageServerPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<StorageZones>();
-        app.add_observer(send_storage_full_sync_on_connect);
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<StorageDataset>::server());
         app.add_systems(
             Update,
             receive_storage_edit_batches.in_set(GameSet::Simulation),
@@ -82,17 +113,8 @@ impl Plugin for StorageServerPlugin {
 
 impl Plugin for StorageClientPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<StorageZones>();
-        app.init_resource::<StorageDragState>();
-        // Full-sync before per-batch receive: same-tick ordering rule
-        // as plans (full sync must not clobber a delta applied first).
-        app.add_systems(
-            Update,
-            (receive_storage_full_sync, receive_storage_batch_broadcasts)
-                .chain()
-                .in_set(GameSet::Simulation)
-                .run_if(in_state(AppState::InGame)),
-        );
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<StorageDataset>::client());
+        crate::spatial::init_session_resource::<StorageDragState>(app);
         app.add_systems(
             Update,
             storage_mode_input
@@ -219,12 +241,11 @@ fn storage_mode_input(
     }
 }
 
-/// Server: validate a client's zone-edit batch and broadcast what
-/// stuck. Adds require the floor-cell shape (air at the cell, solid
+/// Server: validate a client's zone-edit batch and apply what stuck.
+/// Adds require the floor-cell shape (air at the cell, solid
 /// below) so zones can't be painted mid-air or inside walls; clears
 /// have no shape requirement (the floor may have been mined since).
-/// Only state-changing cells broadcast — re-painting an existing zone
-/// is a no-op, not traffic.
+/// Re-painting an existing zone is a no-op.
 #[allow(
     clippy::too_many_arguments,
     reason = "wire handler + reach gate + rejection reply"
@@ -240,13 +261,8 @@ fn receive_storage_edit_batches(
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&AvatarPose, With<Avatar>>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: ValidatedRequestContext,
 ) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         let batches: Vec<StorageEditBatch> = receiver.receive().collect();
         for batch in batches {
@@ -262,103 +278,24 @@ fn receive_storage_edit_batches(
             let Ok(pose) = poses.get(avatar) else {
                 continue;
             };
-            let mut accepted: Vec<IVec3> = Vec::with_capacity(batch.cells.len());
             let mut first_out_of_reach: Option<IVec3> = None;
             for cell in batch.cells {
                 if !within_reach(pose, cell.as_vec3() + Vec3::splat(0.5), PLAN_REACH) {
                     first_out_of_reach.get_or_insert(cell);
                     continue;
                 }
-                let changed = if batch.add {
+                if batch.add {
                     let is_floor_cell = !cell_is_solid(cell, &chunks, &chunk_map)
                         && cell_is_solid(cell - IVec3::Y, &chunks, &chunk_map);
-                    is_floor_cell && zones.insert(cell)
+                    if is_floor_cell {
+                        zones.insert(cell);
+                    }
                 } else {
-                    zones.remove(cell)
-                };
-                if changed {
-                    accepted.push(cell);
+                    zones.remove(cell);
                 }
             }
             if let Some(cell) = first_out_of_reach {
                 send_rejection(&mut rejections, connection, cell, RejectReason::OutOfReach);
-            }
-            if accepted.is_empty() {
-                continue;
-            }
-            let reply = StorageEditBatch {
-                add: batch.add,
-                cells: crate::protocol::BoundedVec::new(accepted)
-                    .expect("accepted cells are a subset of a bounded request"),
-            };
-            let target = validation.target_for_cells(reply.cells.iter().copied());
-            if let Err(err) =
-                broadcast.send::<StorageEditBatch, StateSyncChannel>(&reply, server, &target)
-            {
-                warn!("StorageEditBatch broadcast failed: {err}");
-            }
-        }
-    }
-}
-
-/// Server: push the whole zone set to a fresh connection. One message
-/// — the client applies it as a replace, so it must not be split.
-fn send_storage_full_sync_on_connect(
-    trigger: On<Add, GameReady>,
-    zones: Res<StorageZones>,
-    mut senders: Query<&mut MessageSender<StorageFullSync>>,
-) {
-    let connection = trigger.entity;
-    let Ok(mut sender) = senders.get_mut(connection) else {
-        return;
-    };
-    let snapshot = zones.snapshot();
-    if snapshot.is_empty() {
-        sender.send::<StateSyncChannel>(StorageFullSync {
-            reset: true,
-            cells: crate::protocol::BoundedVec::default(),
-        });
-        return;
-    }
-    for (index, part) in snapshot.chunks(PLAN_EDIT_BATCH_MAX).enumerate() {
-        sender.send::<StateSyncChannel>(StorageFullSync {
-            reset: index == 0,
-            cells: crate::protocol::BoundedVec::new(part.to_vec())
-                .expect("storage full-sync chunks use the wire bound"),
-        });
-    }
-}
-
-/// Client: replace the mirror with the connect-time snapshot.
-fn receive_storage_full_sync(
-    mut receivers: Query<&mut MessageReceiver<StorageFullSync>>,
-    mut zones: ResMut<StorageZones>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for sync in receiver.receive() {
-            if sync.reset {
-                zones.replace_all(Vec::new());
-            }
-            for cell in sync.cells {
-                zones.insert(cell);
-            }
-        }
-    }
-}
-
-/// Client: apply broadcast deltas to the mirror.
-fn receive_storage_batch_broadcasts(
-    mut receivers: Query<&mut MessageReceiver<StorageEditBatch>>,
-    mut zones: ResMut<StorageZones>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for batch in receiver.receive() {
-            for cell in batch.cells {
-                if batch.add {
-                    zones.insert(cell);
-                } else {
-                    zones.remove(cell);
-                }
             }
         }
     }
@@ -415,4 +352,23 @@ fn draw_storage_drag_preview(drag: Res<StorageDragState>, mut gizmos: Gizmos) {
         Transform::from_translation(centre).with_scale(scale),
         colour,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repaint_and_reclear_do_not_journal_noops() {
+        let mut zones = StorageZones::default();
+        assert!(zones.insert(IVec3::ZERO));
+        assert_eq!(zones.take_dirty().len(), 1);
+        assert!(!zones.insert(IVec3::ZERO));
+        assert!(zones.take_dirty().is_empty());
+
+        assert!(zones.remove(IVec3::ZERO));
+        assert_eq!(zones.take_dirty().len(), 1);
+        assert!(!zones.remove(IVec3::ZERO));
+        assert!(zones.take_dirty().is_empty());
+    }
 }

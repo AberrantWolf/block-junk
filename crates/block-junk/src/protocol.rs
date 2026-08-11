@@ -16,6 +16,7 @@ pub const MAX_WIRE_ID_BYTES: usize = 128;
 pub const MAX_BLOCK_FOOTPRINT_CELLS: usize = 256;
 pub const MAX_APPLIED_BLOCK_CELLS: usize = 512;
 pub const MAX_REASSEMBLED_MESSAGE_BYTES: usize = 1024 * 1024;
+pub const MAX_SPATIAL_PAGE_BYTES: usize = 32 * 1024;
 
 /// A string whose UTF-8 byte length is rejected during deserialization.
 /// This keeps an attacker-controlled length prefix from allocating an
@@ -309,7 +310,7 @@ pub struct AuthoritativeCellState {
 /// Server fact containing every affected cell. Clients apply this payload
 /// directly and never reconstruct a destructive footprint from stale state.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct AppliedBlockEdit {
+pub struct TerrainEditRecord {
     pub anchor: IVec3,
     pub old_slot: BlockSlot,
     pub orientation: Cardinal,
@@ -353,6 +354,8 @@ pub struct ActionRejected {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectReason {
     OutOfReach,
+    QueueFull,
+    InventoryFull,
 }
 
 impl RejectReason {
@@ -360,19 +363,10 @@ impl RejectReason {
     pub fn text(self) -> &'static str {
         match self {
             RejectReason::OutOfReach => "Too far away",
+            RejectReason::QueueFull => "Station queue is full",
+            RejectReason::InventoryFull => "Station inventory is full",
         }
     }
-}
-
-/// Server → all clients: a worldspace toast requested by a mod via
-/// `engine.ui.toast`. Sparse by design (mods toast on events, not per
-/// tick) so broadcasting a short string stays well inside the bandwidth
-/// budget; text is length-capped at the drain site.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct WorldToast {
-    /// Cell the toast anchors to.
-    pub cell: IVec3,
-    pub text: String,
 }
 
 /// Server-internal local-bus event, NOT a wire message. Emitted once per
@@ -435,6 +429,7 @@ pub struct ServerHello {
     pub protocol_id: u64,
     pub connection_nonce: [u8; 32],
     pub manifest_hash: [u8; 32],
+    pub spatial_registry_fingerprint: [u8; 32],
     pub manifest: ModSetManifest,
 }
 
@@ -462,12 +457,14 @@ pub fn ready_payload(
     protocol_id: u64,
     connection_nonce: &[u8; 32],
     manifest_hash: &[u8; 32],
+    spatial_registry_fingerprint: &[u8; 32],
 ) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(READY_DOMAIN.len() + 8 + 32 + 32);
+    let mut payload = Vec::with_capacity(READY_DOMAIN.len() + 8 + 32 + 32 + 32);
     payload.extend_from_slice(READY_DOMAIN);
     payload.extend_from_slice(&protocol_id.to_le_bytes());
     payload.extend_from_slice(connection_nonce);
     payload.extend_from_slice(manifest_hash);
+    payload.extend_from_slice(spatial_registry_fingerprint);
     payload
 }
 
@@ -485,14 +482,6 @@ pub fn manifest_hash(manifest: &ModSetManifest) -> [u8; 32] {
 /// Unedited chunks travel with `entities` empty — terrain has no
 /// block-entities. Edited chunks ship the sidecar so anchors/ghosts
 /// arrive atomically with the slot grid.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct ChunkSnapshot {
-    pub coord: ChunkCoord,
-    pub data: ChunkData,
-    #[serde(default)]
-    pub entities: Vec<EntityEntry>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ChunkData {
     /// The chunk has never been edited. The client generates it locally
@@ -644,10 +633,45 @@ impl Ease for AvatarPose {
 /// Server → client: this chunk has left your AoI; despawn your local copy.
 /// The server may still hold its data (we don't evict the master record yet),
 /// but you don't need it anymore.
-#[derive(Message, Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct ChunkUnload {
-    pub coord: ChunkCoord,
+/// Ordered server facts for chunk staging and all client-visible spatial
+/// datasets. Deltas received between begin and commit are buffered by the
+/// client and applied atomically with the staged terrain.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+pub enum SpatialMessage {
+    BeginChunk {
+        transaction: u64,
+        coord: ChunkCoord,
+        terrain: ChunkData,
+        entities: BoundedVec<EntityEntry, CHUNK_PADDED_CELLS>,
+    },
+    PartitionPage {
+        transaction: u64,
+        dataset: crate::spatial::DatasetId,
+        schema_fingerprint: u64,
+        /// Dataset-defined sequence of bounded records. The entire page,
+        /// including record framing, is capped rather than only each record.
+        payload: BoundedVec<u8, MAX_SPATIAL_PAGE_BYTES>,
+    },
+    Delta {
+        dataset: crate::spatial::DatasetId,
+        schema_fingerprint: u64,
+        payload: BoundedVec<u8, MAX_SPATIAL_PAGE_BYTES>,
+    },
+    CommitChunk {
+        transaction: u64,
+        coord: ChunkCoord,
+    },
+    LeaveChunk {
+        coord: ChunkCoord,
+    },
+    Toast {
+        cell: IVec3,
+        text: BoundedString<256>,
+    },
 }
+
+/// Single ordered reliable server-to-client lane for [`SpatialMessage`].
+pub struct SpatialChannel;
 
 /// What an `Actor` (player or NPC) is currently carrying. The whole
 /// inventory: a single stack of one item kind, or nothing. See the
@@ -890,11 +914,6 @@ pub struct PlanEdit {
 /// Sparse — only tagged cells. Each entry carries the full PlanState
 /// (kind + materials progress) so a fresh-connecting client renders
 /// the right outline state immediately.
-#[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
-pub struct PlanFullSync {
-    pub entries: Vec<(IVec3, PlanState)>,
-}
-
 /// Wire snapshot of one *matched* room. Detection stays server-side;
 /// clients mirror just enough to surface feedback: the toast on
 /// recognition, the inspect-panel "Room: …" line, debug outlines.
@@ -916,25 +935,6 @@ pub struct RoomSummary {
 /// Server → clients when a room gains or changes a matched pattern
 /// (upsert by `room_id`). Rooms that lose their match arrive as
 /// [`RoomRemove`] instead.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct RoomSync {
-    pub room: RoomSummary,
-}
-
-/// Server → clients when a matched room is destroyed or stops matching.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct RoomRemove {
-    pub room_id: u32,
-}
-
-/// Server → client on connect: every currently matched room. Shares
-/// [`StateSyncChannel`] with the deltas so full-sync-before-delta
-/// ordering holds (same rule as plans / stations).
-#[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
-pub struct RoomsFullSync {
-    pub rooms: Vec<RoomSummary>,
-}
-
 /// Bulk version of [`PlanEdit`]. All cells in `cells` are tagged with
 /// the same `kind` (or cleared if `kind` is `None`). Server validates
 /// each cell against the same rules as `PlanEdit` and drops the ones
@@ -983,8 +983,7 @@ pub const PLAN_EDIT_BATCH_MAX: usize = 4096;
 /// server as a request; server validates (reach + batch cap), applies
 /// to its `StorageZones`, and broadcasts the accepted set back in the
 /// same shape. `add = true` marks the cells as storage, `false`
-/// clears them. Rides [`StateSyncChannel`] with [`StorageFullSync`]
-/// so full-sync-before-delta ordering holds (same rule as plans).
+/// clears them. Accepted state returns through the ordered spatial lane.
 ///
 /// Zone cells are the *air* cells items sit in (solid floor below),
 /// not the floor blocks — the same cell a pile or container occupies.
@@ -998,30 +997,14 @@ pub struct StorageEditBatch {
 /// batch cap with [`PLAN_EDIT_BATCH_MAX`]; bigger zone sets split
 /// across multiple messages (ordering within the channel keeps them
 /// coherent, and add-only application makes splits commutative).
-#[derive(Message, Clone, Debug, Default, Serialize, Deserialize)]
-pub struct StorageFullSync {
-    /// True on the first part so the client clears its previous mirror.
-    pub reset: bool,
-    pub cells: BoundedVec<IVec3, PLAN_EDIT_BATCH_MAX>,
-}
-
 /// Small critical world-command lane. Ordered reliable so edit *requests*,
 /// targeted rejections, request/response UX, and dev commands preserve
 /// the order a player expects without waiting behind bulk state sync.
 pub struct WorldChannel;
 
-/// Chunk stream lane: snapshots, unloads, AND applied [`BlockEdit`]
-/// broadcasts. All three must share one ordered-reliable stream — the
-/// client skips edits for unloaded chunks on the promise that the
-/// chunk's snapshot carries the post-edit state, and a snapshot and a
-/// later unload for the same coord cannot arrive reversed. Splitting
-/// any of them onto another channel reopens the lost-edit race; a move
-/// to unordered reliable needs chunk generations/version guards first.
-pub struct ChunkChannel;
-
-/// Reliable mirror-state lane for plan/craft state. This isolates large
-/// plan batches and connect-time full syncs from the critical world lane
-/// while preserving full-sync-before-delta ordering.
+/// Reliable lane for typed client requests whose latency profile is less
+/// critical than direct world commands. Authoritative spatial facts use
+/// [`SpatialChannel`] instead.
 pub struct StateSyncChannel;
 
 /// Low-priority latest-wins periodic sync lane. Dropping an older sample
@@ -1087,6 +1070,7 @@ impl MapEntities for MovementIntent {
 pub enum GameSet {
     Input,
     Simulation,
+    SpatialSync,
     PostSimulation,
 }
 
@@ -1338,6 +1322,10 @@ mod tests {
             let _ = bincode::serde::decode_from_slice::<BoundedString<128>, _>(
                 &bytes,
                 bincode::config::standard(),
+            );
+            let _ = bincode::serde::decode_from_slice::<SpatialMessage, _>(
+                &bytes,
+                bincode::config::standard().with_limit::<MAX_REASSEMBLED_MESSAGE_BYTES>(),
             );
         }
     }

@@ -13,7 +13,7 @@ use block_junk_mod_api::server::BlockPlacedEvent;
 use block_junk_mod_api::shared::BlockPos;
 use block_junk_mod_api::ui::UiToast;
 use block_junk_scripting::{LoadContext, ModRegistry, warn_if_empty};
-use lightyear::prelude::{NetworkTarget, Server, ServerMultiMessageSender};
+use lightyear::prelude::{Server, ServerMultiMessageSender};
 
 use crate::block_textures::TextureRegistry;
 use crate::blocks::{BlockRegistry, WorldSlots};
@@ -46,7 +46,7 @@ const TOAST_TEXT_MAX: usize = 120;
 
 /// Drain this side's mod-toast queue, normalising text length. Shared
 /// by both drain systems.
-fn drain_toast_queue(queue: &ModToastQueue) -> Vec<crate::protocol::WorldToast> {
+fn drain_toast_queue(queue: &ModToastQueue) -> Vec<(IVec3, String)> {
     let mut drained = queue.0.lock().unwrap();
     drained
         .drain(..)
@@ -60,10 +60,7 @@ fn drain_toast_queue(queue: &ModToastQueue) -> Vec<crate::protocol::WorldToast> 
                 text.truncate(end);
                 text.push('…');
             }
-            crate::protocol::WorldToast {
-                cell: bevy::math::IVec3::new(t.pos.x, t.pos.y, t.pos.z),
-                text,
-            }
+            (bevy::math::IVec3::new(t.pos.x, t.pos.y, t.pos.z), text)
         })
         .collect()
 }
@@ -154,22 +151,26 @@ impl Plugin for ClientScriptingPlugin {
     }
 }
 
-/// Server side: drained `engine.ui.toast` calls become [`WorldToast`]
-/// broadcasts. Sparse traffic — mods toast on events, not per tick.
+/// Server-side mod toasts use the ordered spatial lane and only target
+/// subscribers to the anchor chunk.
 fn broadcast_mod_toasts(
     queue: Res<ModToastQueue>,
     mut broadcast: ServerMultiMessageSender,
     servers: Query<&Server>,
+    subscriptions: Res<crate::server::SpatialSubscriptions>,
 ) {
     let Ok(server) = servers.single() else {
         return;
     };
-    for toast in drain_toast_queue(&queue) {
+    for (cell, text) in drain_toast_queue(&queue) {
+        let Ok(text) = crate::protocol::BoundedString::<256>::new(text) else {
+            continue;
+        };
+        let target = subscriptions.target_for_chunks([crate::voxel::world_to_chunk(cell).0]);
+        let message = crate::protocol::SpatialMessage::Toast { cell, text };
         if let Err(err) = broadcast
-            .send::<crate::protocol::WorldToast, crate::protocol::WorldChannel>(
-                &toast,
-                server,
-                &NetworkTarget::All,
+            .send::<crate::protocol::SpatialMessage, crate::protocol::SpatialChannel>(
+                &message, server, &target,
             )
         {
             warn!("mod toast broadcast failed: {err}");
@@ -183,11 +184,8 @@ fn drain_client_mod_toasts(
     queue: Res<ModToastQueue>,
     mut pending: ResMut<crate::worldspace_toast::PendingToasts>,
 ) {
-    for toast in drain_toast_queue(&queue) {
-        pending.push(crate::worldspace_toast::SpawnToast {
-            cell: toast.cell,
-            text: toast.text,
-        });
+    for (cell, text) in drain_toast_queue(&queue) {
+        pending.push(crate::worldspace_toast::SpawnToast { cell, text });
     }
 }
 

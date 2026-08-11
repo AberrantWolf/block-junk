@@ -17,18 +17,140 @@
 //! map so the by-cell HashMap stays sparse + replication doesn't ship
 //! orphan entries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::items::ItemSlot;
-use crate::menu::AppState;
-use crate::protocol::{
-    ActionRejected, GameReady, GameSet, INTERACT_REACH, RejectReason, StateSyncChannel,
-};
+use crate::protocol::{ActionRejected, GameSet, INTERACT_REACH, RejectReason};
 use crate::server::{send_rejection, within_reach};
+
+pub struct StationDataset;
+
+pub const MAX_STATION_INVENTORY_KINDS: usize = 64;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StationOrderWire {
+    recipe_id: crate::protocol::BoundedString<{ crate::protocol::MAX_WIRE_ID_BYTES }>,
+    total: u32,
+    completed: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActiveWorkWire {
+    recipe_id: crate::protocol::BoundedString<{ crate::protocol::MAX_WIRE_ID_BYTES }>,
+    total_secs: f32,
+    elapsed_secs: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StationWireRecord {
+    cell: IVec3,
+    orders: crate::protocol::BoundedVec<StationOrderWire, MAX_STATION_ORDERS>,
+    inventory: crate::protocol::BoundedVec<(ItemSlot, u32), MAX_STATION_INVENTORY_KINDS>,
+    active_work: Option<ActiveWorkWire>,
+}
+
+impl crate::spatial::SpatialDataset for StationDataset {
+    type Key = IVec3;
+    type Value = StationState;
+    type Wire = StationWireRecord;
+    type Persistence = crate::spatial::PersistedDataset;
+    const ID: crate::spatial::DatasetId = crate::spatial::DatasetId(4);
+    const SCHEMA_FINGERPRINT: u64 = 0x7374_6174_0000_0001;
+    const MEMBERSHIP: crate::spatial::MembershipPolicy =
+        crate::spatial::MembershipPolicy::AnchorCell;
+    const REPLICATION: crate::spatial::ReplicationPolicy =
+        crate::spatial::ReplicationPolicy::Coalesced(std::time::Duration::from_millis(250));
+    const MAX_RECORD_BYTES: usize = 8192;
+    fn chunks(key: &Self::Key, _: &Self::Value) -> Vec<crate::protocol::ChunkCoord> {
+        vec![crate::voxel::world_to_chunk(*key).0]
+    }
+    fn to_wire(key: &Self::Key, value: &Self::Value) -> Self::Wire {
+        let orders = value
+            .orders
+            .iter()
+            .map(|order| StationOrderWire {
+                recipe_id: crate::protocol::BoundedString::new(order.recipe_id.clone())
+                    .expect("authoritative recipe ids enforce the wire bound"),
+                total: order.total,
+                completed: order.completed,
+            })
+            .collect();
+        StationWireRecord {
+            cell: *key,
+            orders: crate::protocol::BoundedVec::new(orders)
+                .expect("authoritative stations enforce the order bound"),
+            inventory: crate::protocol::BoundedVec::new(
+                value
+                    .inventory
+                    .iter()
+                    .map(|(&item, &count)| (item, count))
+                    .collect(),
+            )
+            .expect("authoritative stations enforce the inventory bound"),
+            active_work: value.active_work.as_ref().map(|work| ActiveWorkWire {
+                recipe_id: crate::protocol::BoundedString::new(work.recipe_id.clone())
+                    .expect("authoritative recipe ids enforce the wire bound"),
+                total_secs: work.total_secs,
+                elapsed_secs: work.elapsed_secs,
+            }),
+        }
+    }
+    fn from_wire(
+        wire: Self::Wire,
+        registry: &crate::spatial::SpatialDecodeRegistry,
+    ) -> Result<(Self::Key, Self::Value), crate::spatial::SpatialError> {
+        let mut orders = Vec::new();
+        for order in wire.orders {
+            if order.total == 0 || order.completed > order.total {
+                return Err(crate::spatial::SpatialError::Decode(
+                    "invalid station order counts".into(),
+                ));
+            }
+            orders.push(CraftOrder {
+                recipe_id: order.recipe_id.to_string(),
+                total: order.total,
+                completed: order.completed,
+            });
+        }
+        let mut inventory = HashMap::default();
+        for (item, count) in wire.inventory {
+            registry.require("item", item.0 as u32)?;
+            if count == 0 || inventory.insert(item, count).is_some() {
+                return Err(crate::spatial::SpatialError::Decode(
+                    "invalid station inventory entry".into(),
+                ));
+            }
+        }
+        let active_work = wire.active_work.map(|work| ActiveWork {
+            recipe_id: work.recipe_id.to_string(),
+            total_secs: work.total_secs,
+            elapsed_secs: work.elapsed_secs,
+        });
+        if active_work.as_ref().is_some_and(|work| {
+            !work.total_secs.is_finite()
+                || !work.elapsed_secs.is_finite()
+                || work.total_secs <= 0.0
+                || work.elapsed_secs < 0.0
+                || work.elapsed_secs > work.total_secs
+        }) {
+            return Err(crate::spatial::SpatialError::Decode(
+                "invalid station active work".into(),
+            ));
+        }
+        Ok((
+            wire.cell,
+            StationState {
+                orders,
+                inventory,
+                active_work,
+            },
+        ))
+    }
+}
 
 /// One queued craft at a station. `total` is what the player asked
 /// for; `completed` rises by 1 per Work cycle. When `completed ==
@@ -71,8 +193,8 @@ pub struct ActiveWork {
     pub elapsed_secs: f32,
 }
 
-/// Full server-side state of one station cell. Replicated to clients
-/// via [`StationUpdate`] / [`StationsFullSync`].
+/// Full server-side state of one station cell, replicated through
+/// [`StationDataset`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StationState {
     pub orders: Vec<CraftOrder>,
@@ -97,11 +219,45 @@ impl StationState {
     }
 
     /// Add `count` of `item` to the inventory. 0 is a no-op.
-    pub fn deposit(&mut self, item: ItemSlot, count: u32) {
+    pub fn deposit(&mut self, item: ItemSlot, count: u32) -> bool {
         if count == 0 {
-            return;
+            return true;
         }
-        *self.inventory.entry(item).or_insert(0) += count;
+        if !self.inventory.contains_key(&item)
+            && self.inventory.len() >= MAX_STATION_INVENTORY_KINDS
+        {
+            return false;
+        }
+        let entry = self.inventory.entry(item).or_insert(0);
+        *entry = entry.saturating_add(count);
+        true
+    }
+
+    /// Whether a new deposit preserves enough distinct-kind slots to refund
+    /// every consumed active-work input if that order is cancelled.
+    pub fn can_deposit_with_refund_reserve(
+        &self,
+        item: ItemSlot,
+        recipes: &crate::recipes::RecipeRegistry,
+        items: &crate::items::ItemRegistry,
+    ) -> bool {
+        let adding = usize::from(!self.inventory.contains_key(&item));
+        let mut missing_refunds = HashSet::new();
+        if let Some(active) = &self.active_work
+            && let Some(recipe_slot) = recipes.slot_of(&block_junk_mod_api::recipes::RecipeId::new(
+                active.recipe_id.clone(),
+            ))
+        {
+            for input in &recipes.def(recipe_slot).inputs {
+                if let Some(slot) = items.slot_of(&input.item)
+                    && !self.inventory.contains_key(&slot)
+                    && slot != item
+                {
+                    missing_refunds.insert(slot);
+                }
+            }
+        }
+        self.inventory.len() + adding + missing_refunds.len() <= MAX_STATION_INVENTORY_KINDS
     }
 
     /// Try to remove `count` of `item`. Returns true on success;
@@ -118,6 +274,16 @@ impl StationState {
         if *entry == 0 {
             self.inventory.remove(&item);
         }
+        true
+    }
+
+    /// Queue without exceeding the protocol/save bound. Returns false and
+    /// leaves the state untouched once the station already has 64 orders.
+    pub fn try_queue(&mut self, order: CraftOrder) -> bool {
+        if self.orders.len() >= MAX_STATION_ORDERS {
+            return false;
+        }
+        self.orders.push(order);
         true
     }
 }
@@ -322,59 +488,65 @@ pub fn station_needs_carry(
     })
 }
 
-/// Server-authoritative + client-mirrored craft-order map. Same
-/// shape on both sides; the server mutates + broadcasts, the client
-/// applies broadcasts.
-#[derive(Resource, Default, Debug)]
-pub struct CraftStations {
-    by_cell: HashMap<IVec3, StationState>,
-}
+/// Server-authoritative craft-order map and its client spatial replica.
+pub type CraftStations = crate::spatial::PartitionedStore<StationDataset>;
 
 impl CraftStations {
     pub fn get(&self, cell: IVec3) -> Option<&StationState> {
-        self.by_cell.get(&cell)
-    }
-
-    pub fn get_mut(&mut self, cell: IVec3) -> Option<&mut StationState> {
-        self.by_cell.get_mut(&cell)
+        self.lookup(&cell)
     }
 
     /// Get the state at `cell`, creating an empty one if needed.
     /// Caller is responsible for `remove_if_empty` after a mutation
     /// that could leave it empty.
-    pub fn get_or_insert(&mut self, cell: IVec3) -> &mut StationState {
-        self.by_cell.entry(cell).or_default()
+    pub fn edit_or_insert<R>(
+        &mut self,
+        cell: IVec3,
+        edit: impl FnOnce(&mut StationState) -> R,
+    ) -> R {
+        if self.lookup(&cell).is_none() {
+            self.upsert(cell, StationState::default(), 0);
+        }
+        let result = self
+            .edit(&cell, 0, edit)
+            .expect("station inserted before edit");
+        self.force_flush(&cell);
+        result
     }
 
     /// Drop the entry at `cell` if its state is empty. Keeps the map
     /// sparse — `iter` only yields real stations.
     pub fn remove_if_empty(&mut self, cell: IVec3) {
-        if let Some(state) = self.by_cell.get(&cell)
+        if let Some(state) = self.lookup(&cell)
             && state.is_empty()
         {
-            self.by_cell.remove(&cell);
+            self.delete(&cell, 0);
+            self.force_flush(&cell);
         }
     }
 
     pub fn remove(&mut self, cell: IVec3) -> Option<StationState> {
-        self.by_cell.remove(&cell)
+        let removed = self.delete(&cell, 0);
+        if removed.is_some() {
+            self.force_flush(&cell);
+        }
+        removed
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &StationState)> {
-        self.by_cell.iter()
+        self.entries()
     }
 
-    pub fn replace_all(&mut self, entries: impl IntoIterator<Item = (IVec3, StationState)>) {
-        self.by_cell.clear();
+    pub(crate) fn restore_all(&mut self, entries: impl IntoIterator<Item = (IVec3, StationState)>) {
+        let old: Vec<_> = self.entries().map(|(cell, _)| *cell).collect();
+        for cell in old {
+            self.delete(&cell, 0);
+        }
         for (cell, state) in entries {
             if !state.is_empty() {
-                self.by_cell.insert(cell, state);
+                self.upsert(cell, state, 0);
             }
         }
-    }
-
-    pub fn snapshot(&self) -> Vec<(IVec3, StationState)> {
-        self.by_cell.iter().map(|(c, s)| (*c, s.clone())).collect()
     }
 }
 
@@ -544,22 +716,6 @@ pub fn try_schedule_craft_for_npc(
     Some(cell)
 }
 
-/// Server → client: per-cell broadcast. `state: None` is the "remove
-/// this cell" signal (when the last order completes + inventory
-/// empties).
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct StationUpdate {
-    pub cell: IVec3,
-    pub state: Option<StationState>,
-}
-
-/// Server → client: one-shot dump of every non-empty station, sent
-/// when a client connects. Mirrors `PlanFullSync` exactly.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct StationsFullSync {
-    pub entries: Vec<(IVec3, StationState)>,
-}
-
 /// Client → server: queue a new craft order at `station_cell`.
 /// Server validates recipe is available at the station's tag + tier
 /// before appending. Quantity is clamped at the server.
@@ -624,9 +780,8 @@ pub struct CraftStationsClientPlugin;
 
 impl Plugin for CraftStationsServerPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<CraftStations>();
-        app.init_resource::<CraftBookings>();
-        app.add_observer(send_stations_full_sync_on_connect);
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<StationDataset>::server());
+        crate::spatial::init_session_resource::<CraftBookings>(app);
         app.add_observer(release_workers_on_disconnect);
         app.add_systems(
             Update,
@@ -641,26 +796,15 @@ impl Plugin for CraftStationsServerPlugin {
         );
         // Work timer ticks in FixedUpdate so duration_secs reads as
         // wall-clock seconds independent of frame rate. Output spawn
-        // + state mutation happen on the tick that crosses the
-        // threshold; broadcast follows.
+        // + state mutation happen on the tick that crosses the threshold.
         app.add_systems(FixedUpdate, tick_station_work);
     }
 }
 
 impl Plugin for CraftStationsClientPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<CraftStations>();
-        app.init_resource::<CraftStationUiState>();
-        app.add_systems(
-            Update,
-            (
-                receive_stations_full_sync,
-                receive_station_update_broadcasts,
-            )
-                .chain()
-                .in_set(GameSet::Simulation)
-                .run_if(in_state(AppState::InGame)),
-        );
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<StationDataset>::client());
+        crate::spatial::init_session_resource::<CraftStationUiState>(app);
     }
 }
 
@@ -681,53 +825,6 @@ impl CraftStationUiState {
     /// use this to suppress in-world interactions while UI is active.
     pub fn is_open(&self) -> bool {
         self.open_cell.is_some()
-    }
-}
-
-/// Client observer that requests a full sync from the server on
-/// connect. Wired alongside the existing PlanFullSync flow so
-/// reconnects come up with the full craft-order state.
-fn send_stations_full_sync_on_connect(
-    trigger: On<Add, GameReady>,
-    stations: Res<CraftStations>,
-    mut senders: Query<&mut MessageSender<StationsFullSync>>,
-) {
-    let connection = trigger.entity;
-    let Ok(mut sender) = senders.get_mut(connection) else {
-        return;
-    };
-    let sync = StationsFullSync {
-        entries: stations.snapshot(),
-    };
-    sender.send::<StateSyncChannel>(sync);
-}
-
-fn receive_stations_full_sync(
-    mut receivers: Query<&mut MessageReceiver<StationsFullSync>>,
-    mut stations: ResMut<CraftStations>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for sync in receiver.receive() {
-            stations.replace_all(sync.entries);
-        }
-    }
-}
-
-fn receive_station_update_broadcasts(
-    mut receivers: Query<&mut MessageReceiver<StationUpdate>>,
-    mut stations: ResMut<CraftStations>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for update in receiver.receive() {
-            match update.state {
-                Some(state) if !state.is_empty() => {
-                    stations.by_cell.insert(update.cell, state);
-                }
-                _ => {
-                    stations.by_cell.remove(&update.cell);
-                }
-            }
-        }
     }
 }
 
@@ -757,6 +854,7 @@ pub fn sync_craft_modal_capture(
 /// nobody plausibly wants 1000 of one item from one click. The modal
 /// also clamps client-side; this is the server-of-record cap.
 const MAX_ORDER_QUANTITY: u32 = 99;
+pub const MAX_STATION_ORDERS: usize = 64;
 
 #[allow(
     clippy::too_many_arguments,
@@ -775,14 +873,9 @@ fn receive_queue_orders(
     block_registry: Res<crate::blocks::BlockRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
             if validation
@@ -825,19 +918,26 @@ fn receive_queue_orders(
             if quantity == 0 {
                 continue;
             }
-            let state = stations.get_or_insert(req.station_cell);
-            state.orders.push(CraftOrder {
-                recipe_id: req.recipe_id.clone(),
-                total: quantity,
-                completed: 0,
+            if stations
+                .get(req.station_cell)
+                .is_some_and(|state| state.orders.len() >= MAX_STATION_ORDERS)
+            {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.station_cell,
+                    RejectReason::QueueFull,
+                );
+                continue;
+            }
+            stations.edit_or_insert(req.station_cell, |state| {
+                let queued = state.try_queue(CraftOrder {
+                    recipe_id: req.recipe_id.clone(),
+                    total: quantity,
+                    completed: 0,
+                });
+                debug_assert!(queued, "queue bound was checked before insertion");
             });
-            broadcast_station(
-                &mut broadcast,
-                server,
-                req.station_cell,
-                Some(state.clone()),
-                Some(validation.subscriptions()),
-            );
             info!(
                 cell = ?req.station_cell.to_array(),
                 recipe = %req.recipe_id,
@@ -863,14 +963,9 @@ fn receive_cancel_orders(
     recipes: Res<crate::recipes::RecipeRegistry>,
     item_registry: Res<crate::items::ItemRegistry>,
     mut stations: ResMut<CraftStations>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
             if validation
@@ -898,7 +993,7 @@ fn receive_cancel_orders(
                 );
                 continue;
             }
-            let Some(state) = stations.get_mut(req.station_cell) else {
+            let Some(mut state) = stations.get(req.station_cell).cloned() else {
                 continue;
             };
             let before = state.orders.len();
@@ -934,16 +1029,9 @@ fn receive_cancel_orders(
             if !order_removed && !refunded {
                 continue;
             }
-            let snapshot = state.clone();
-            let now_empty = snapshot.is_empty();
+            stations.upsert(req.station_cell, state, 0);
+            stations.force_flush(&req.station_cell);
             stations.remove_if_empty(req.station_cell);
-            broadcast_station(
-                &mut broadcast,
-                server,
-                req.station_cell,
-                if now_empty { None } else { Some(snapshot) },
-                Some(validation.subscriptions()),
-            );
             info!(
                 cell = ?req.station_cell.to_array(),
                 recipe = %req.recipe_id,
@@ -972,14 +1060,11 @@ fn receive_deposit_to_station(
     chunks: Query<&crate::voxel::Chunk>,
     chunk_map: Res<crate::voxel::ChunkMap>,
     block_registry: Res<crate::blocks::BlockRegistry>,
+    recipes: Res<crate::recipes::RecipeRegistry>,
+    item_registry: Res<crate::items::ItemRegistry>,
     mut stations: ResMut<CraftStations>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
             if validation
@@ -1009,18 +1094,26 @@ fn receive_deposit_to_station(
             {
                 continue;
             }
+            let Some(item) = carry.item else {
+                continue;
+            };
+            if stations.get(req.station_cell).is_some_and(|state| {
+                !state.can_deposit_with_refund_reserve(item, &recipes, &item_registry)
+            }) {
+                send_rejection(
+                    &mut rejections,
+                    connection,
+                    req.station_cell,
+                    RejectReason::InventoryFull,
+                );
+                continue;
+            }
             let Some((item, count)) = carry.drop_all() else {
                 continue;
             };
-            let state = stations.get_or_insert(req.station_cell);
-            state.deposit(item, count);
-            broadcast_station(
-                &mut broadcast,
-                server,
-                req.station_cell,
-                Some(state.clone()),
-                Some(validation.subscriptions()),
-            );
+            stations.edit_or_insert(req.station_cell, |state| {
+                debug_assert!(state.deposit(item, count));
+            });
             info!(
                 cell = ?req.station_cell.to_array(),
                 item = item.0,
@@ -1067,13 +1160,8 @@ fn receive_work_start(
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
     mut bookings: ResMut<CraftBookings>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
             if validation
@@ -1143,7 +1231,9 @@ fn receive_work_start(
             // available, then start it. Shared with the NPC arrival
             // path — single source of truth for "start the first
             // satisfiable order."
-            let _ = stations.get_or_insert(req.station_cell);
+            if stations.get(req.station_cell).is_none() {
+                stations.upsert(req.station_cell, StationState::default(), 0);
+            }
             let started = try_start_first_satisfiable_order(
                 req.station_cell,
                 connection,
@@ -1158,14 +1248,6 @@ fn receive_work_start(
             )
             .is_some();
             if started {
-                let snapshot = stations.get(req.station_cell).cloned();
-                broadcast_station(
-                    &mut broadcast,
-                    server,
-                    req.station_cell,
-                    snapshot,
-                    Some(validation.subscriptions()),
-                );
             } else {
                 // The get_or_insert above may have left an empty
                 // state behind — clean up so the by-cell map stays
@@ -1220,10 +1302,7 @@ pub(crate) struct DestroyedStationContext<'w> {
 pub(crate) fn clear_destroyed_stations(
     mut reader: MessageReader<crate::protocol::CellEdit>,
     context: DestroyedStationContext,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut commands: Commands,
-    subscriptions: Res<crate::server::SpatialSubscriptions>,
 ) {
     let DestroyedStationContext {
         block_registry,
@@ -1233,9 +1312,6 @@ pub(crate) fn clear_destroyed_stations(
         mut bookings,
     } = context;
     use block_junk_mod_api::recipes::RecipeId;
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for edit in reader.read() {
         if edit.prev_slot.is_empty() || block_registry.def(edit.prev_slot).station_tag.is_none() {
             continue;
@@ -1274,7 +1350,9 @@ pub(crate) fn clear_destroyed_stations(
                     },
                     Transform::from_translation(translation),
                     GlobalTransform::default(),
-                    Replicate::to_clients(NetworkTarget::None),
+                    crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                        translation,
+                    )),
                     Name::new(format!("WorldItem(station_spill:{})", slot.0)),
                 ));
             }
@@ -1284,13 +1362,6 @@ pub(crate) fn clear_destroyed_stations(
             spilled,
             dropped_orders = state.orders.len(),
             "station destroyed; cleared state and spilled inventory",
-        );
-        broadcast_station(
-            &mut broadcast,
-            server,
-            edit.world,
-            None,
-            Some(&subscriptions),
         );
     }
 }
@@ -1306,22 +1377,14 @@ fn release_workers_on_disconnect(
     bookings.release_all_workers_for(trigger.entity);
 }
 
-/// Minimum interval between mid-work broadcasts. Trades a couple
-/// updates per craft cycle for a visible progress bar without
-/// per-tick wire traffic. With one active station and a 4-second
-/// recipe this is ~16 broadcasts total — invisible cost. Tighten if
-/// the bar feels choppy; loosen if mass-craft scenes push bandwidth.
-const WORK_PROGRESS_BROADCAST_INTERVAL_SECS: f32 = 0.25;
-
 /// Tick every station's active work toward completion. On completion:
 /// spawn the recipe's output as a `WorldItem` on top of the station,
 /// bump the matching order's `completed`, remove the order if it just
-/// finished, clear `active_work`, broadcast. Inputs were already
+/// finished, and clear `active_work`. Inputs were already
 /// consumed at start, so completion just produces the output.
 ///
-/// Mid-work broadcasts fire at most every
-/// `WORK_PROGRESS_BROADCAST_INTERVAL_SECS` so the modal's progress
-/// label can advance. The completion broadcast happens regardless.
+/// Progress mutations are coalesced by [`StationDataset`]'s replication
+/// policy; completion is explicitly force-flushed.
 #[allow(
     clippy::too_many_arguments,
     reason = "completion path joins many subsystems"
@@ -1332,8 +1395,6 @@ fn tick_station_work(
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
     mut bookings: ResMut<CraftBookings>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut commands: Commands,
     chunks: Query<&'static crate::voxel::Chunk>,
     chunk_map: Res<crate::voxel::ChunkMap>,
@@ -1342,20 +1403,11 @@ fn tick_station_work(
     tools: Query<&crate::protocol::EquippedTool>,
     actor_state: Query<(&crate::protocol::AvatarPose, &crate::protocol::EquippedTool)>,
     client_avatars: Res<crate::server::ClientAvatars>,
-    mut next_broadcast_in: Local<f32>,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
-    let Ok(server) = servers.single() else {
-        return;
-    };
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
-    }
-    *next_broadcast_in -= dt;
-    let do_progress_broadcast = *next_broadcast_in <= 0.0;
-    if do_progress_broadcast {
-        *next_broadcast_in = WORK_PROGRESS_BROADCAST_INTERVAL_SECS;
     }
     // Collect cells with active_work AND an active worker — only
     // those tick. Stations with active_work but no worker are paused
@@ -1406,7 +1458,7 @@ fn tick_station_work(
             bookings.force_clear_worker(cell);
             continue;
         }
-        let Some(state) = stations.get_mut(cell) else {
+        let Some(mut state) = stations.get(cell).cloned() else {
             continue;
         };
         let Some(active) = state.active_work.as_mut() else {
@@ -1414,12 +1466,7 @@ fn tick_station_work(
         };
         active.elapsed_secs += dt;
         if active.elapsed_secs < active.total_secs {
-            // Still working — broadcast at the heartbeat interval so
-            // the modal's progress label advances without per-tick
-            // wire chatter.
-            if do_progress_broadcast {
-                broadcast_station(&mut broadcast, server, cell, Some(state.clone()), None);
-            }
+            stations.upsert(cell, state, 0);
             continue;
         }
         // Completion path. Clone the recipe id out of the active
@@ -1433,7 +1480,8 @@ fn tick_station_work(
                 recipe = %recipe_id_str,
                 "work complete: recipe id missing from registry; skipping output",
             );
-            broadcast_station(&mut broadcast, server, cell, Some(state.clone()), None);
+            stations.upsert(cell, state, 0);
+            stations.force_flush(&cell);
             continue;
         };
         let recipe = recipes.def(recipe_slot);
@@ -1443,7 +1491,8 @@ fn tick_station_work(
                 output = %recipe.output.item,
                 "work complete: output item missing from registry; skipping",
             );
-            broadcast_station(&mut broadcast, server, cell, Some(state.clone()), None);
+            stations.upsert(cell, state, 0);
+            stations.force_flush(&cell);
             continue;
         };
         // Spawn output(s) in the first EMPTY cell around the station —
@@ -1502,7 +1551,9 @@ fn tick_station_work(
                 },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
-                Replicate::to_clients(NetworkTarget::None),
+                crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                    translation,
+                )),
                 Name::new(format!("WorldItem(crafted:{})", recipe.output.item)),
             ));
         }
@@ -1547,6 +1598,8 @@ fn tick_station_work(
         let worker_entity = bookings.worker_at(cell);
         let worker_is_npc = worker_entity.map(|e| npc_q.get(e).is_ok()).unwrap_or(false);
         let mut auto_continued = false;
+        stations.upsert(cell, state, 0);
+        stations.force_flush(&cell);
         if worker_is_npc && let Some(worker) = worker_entity {
             // Look up the station def fresh in case the block was
             // replaced mid-craft (degenerate but defensive).
@@ -1577,16 +1630,7 @@ fn tick_station_work(
             // above; this just frees the slot for the next worker).
             bookings.force_clear_worker(cell);
         }
-        let snapshot = stations.get(cell).cloned();
-        let now_empty = snapshot.as_ref().map(|s| s.is_empty()).unwrap_or(true);
         stations.remove_if_empty(cell);
-        broadcast_station(
-            &mut broadcast,
-            server,
-            cell,
-            if now_empty { None } else { snapshot },
-            None,
-        );
     }
 }
 
@@ -1632,11 +1676,8 @@ pub(crate) fn lookup_station_def(
 /// mismatch). On success: inputs are consumed up front (locked in;
 /// Cancel refunds, completion produces output), `active_work` is set,
 /// `worker_entity` is registered in [`ActiveWorkers`] for the cell
-/// (idempotent — re-registering the same worker is a no-op). Does NOT
-/// broadcast — callers handle the [`StationUpdate`] since
-/// `tick_station_work` already broadcasts at the bottom of its
-/// completion path and double-broadcasting on the same tick would
-/// be wasted bandwidth.
+/// (idempotent — re-registering the same worker is a no-op). The store
+/// journal is force-flushed because work start is a logical state change.
 ///
 /// Caller is responsible for `stations.remove_if_empty(cell)` on the
 /// `None` path — this helper doesn't probe emptiness because the
@@ -1663,7 +1704,7 @@ pub(crate) fn try_start_first_satisfiable_order(
         bookings,
     } = context;
     use block_junk_mod_api::recipes::RecipeId;
-    let state = stations.get_mut(station_cell)?;
+    let mut state = stations.get(station_cell).cloned()?;
     let mut started_recipe_id: Option<String> = None;
     for order_idx in 0..state.orders.len() {
         let order = &state.orders[order_idx];
@@ -1718,26 +1759,9 @@ pub(crate) fn try_start_first_satisfiable_order(
             "station work started",
         );
     }
+    stations.upsert(station_cell, state, 0);
+    stations.force_flush(&station_cell);
     started_recipe_id
-}
-
-/// Helper: send one `StationUpdate` to every client. `state = None`
-/// signals "remove this cell from the mirror" — used when an order
-/// completes and the station has nothing left.
-pub(crate) fn broadcast_station(
-    broadcast: &mut ServerMultiMessageSender,
-    server: &Server,
-    cell: IVec3,
-    state: Option<StationState>,
-    subscriptions: Option<&crate::server::SpatialSubscriptions>,
-) {
-    let msg = StationUpdate { cell, state };
-    let target = subscriptions.map_or(NetworkTarget::All, |subscriptions| {
-        subscriptions.target_for_cells([cell])
-    });
-    if let Err(err) = broadcast.send::<StationUpdate, StateSyncChannel>(&msg, server, &target) {
-        warn!("station update broadcast failed: {err}");
-    }
 }
 
 #[cfg(test)]
@@ -1849,5 +1873,37 @@ mod tests {
         b.release_all_workers_for(a);
         assert!(!b.has_worker(cell_a));
         assert_eq!(b.worker_at(cell_c), Some(c));
+    }
+
+    #[test]
+    fn station_queue_bound_rejects_without_mutation() {
+        let mut state = StationState::default();
+        for index in 0..MAX_STATION_ORDERS {
+            assert!(state.try_queue(CraftOrder {
+                recipe_id: format!("recipe:{index}"),
+                total: 1,
+                completed: 0,
+            }));
+        }
+        let before = state.clone();
+        assert!(!state.try_queue(CraftOrder {
+            recipe_id: "recipe:overflow".to_owned(),
+            total: 1,
+            completed: 0,
+        }));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn station_inventory_kind_bound_rejects_without_mutation() {
+        let mut state = StationState::default();
+        for index in 0..MAX_STATION_INVENTORY_KINDS {
+            assert!(state.deposit(ItemSlot(index as u16), 1));
+        }
+        let before = state.clone();
+        assert!(!state.deposit(ItemSlot(MAX_STATION_INVENTORY_KINDS as u16), 1));
+        assert_eq!(state, before);
+        assert!(state.deposit(ItemSlot(0), 1));
+        assert_eq!(state.inventory[&ItemSlot(0)], 2);
     }
 }

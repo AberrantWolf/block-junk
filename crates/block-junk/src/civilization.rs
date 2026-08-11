@@ -28,7 +28,6 @@ use std::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 use block_junk_mod_api::civilization::CivilizationParams;
 use block_junk_mod_api::rooms::{RoomEvent, RoomId};
-use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::GameSet;
@@ -311,7 +310,12 @@ fn sync_cluster_entities(
                 let entity = commands
                     .spawn((
                         next,
-                        Replicate::to_clients(NetworkTarget::None),
+                        crate::spatial::ordinary_spatial_replica(
+                            crate::spatial::SpatialScope::Bounds {
+                                min: next.min.as_vec3(),
+                                max: (next.max + IVec3::ONE).as_vec3(),
+                            },
+                        ),
                         Name::new(format!("ClusterBbox({})", cluster_id.0)),
                     ))
                     .id();

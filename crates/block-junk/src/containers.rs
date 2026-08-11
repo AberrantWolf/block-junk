@@ -3,11 +3,9 @@
 //! A block whose def carries [`ContainerConfig`] is a storage
 //! container: every placed instance can hold items, tracked here as a
 //! [`ContainerState`] keyed by cell. The shape deliberately mirrors
-//! `CraftStations` (the other per-cell inventory map): the server
-//! mutates + broadcasts [`ContainerUpdate`]s, each client keeps a
-//! passive mirror fed by those plus a connect-time
-//! [`ContainersFullSync`], and empty states drop out of the map so
-//! replication never ships orphan entries.
+//! `CraftStations` (the other per-cell inventory map): the server mutates
+//! through spatial guards, clients keep passive replicas, and empty states
+//! drop out so replication never ships orphan entries.
 //!
 //! Stock is *not* made of `WorldItem` entities — it's counts in a map,
 //! like a station's inventory. The bulk math ([`ItemDef::bulk`] vs
@@ -26,12 +24,65 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use lightyear::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::items::ItemSlot;
-use crate::menu::AppState;
-use crate::protocol::{GameReady, GameSet, StateSyncChannel};
+use crate::protocol::GameSet;
+
+pub struct ContainerDataset;
+
+pub const MAX_CONTAINER_INVENTORY_KINDS: usize = 64;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContainerWireRecord {
+    cell: IVec3,
+    inventory: crate::protocol::BoundedVec<(ItemSlot, u32), MAX_CONTAINER_INVENTORY_KINDS>,
+}
+
+impl crate::spatial::SpatialDataset for ContainerDataset {
+    type Key = IVec3;
+    type Value = ContainerState;
+    type Wire = ContainerWireRecord;
+    type Persistence = crate::spatial::PersistedDataset;
+    const ID: crate::spatial::DatasetId = crate::spatial::DatasetId(3);
+    const SCHEMA_FINGERPRINT: u64 = 0x636f_6e74_0000_0001;
+    const MEMBERSHIP: crate::spatial::MembershipPolicy =
+        crate::spatial::MembershipPolicy::AnchorCell;
+    const REPLICATION: crate::spatial::ReplicationPolicy =
+        crate::spatial::ReplicationPolicy::Immediate;
+    const MAX_RECORD_BYTES: usize = 2048;
+    fn chunks(key: &Self::Key, _: &Self::Value) -> Vec<crate::protocol::ChunkCoord> {
+        vec![crate::voxel::world_to_chunk(*key).0]
+    }
+    fn to_wire(key: &Self::Key, value: &Self::Value) -> Self::Wire {
+        ContainerWireRecord {
+            cell: *key,
+            inventory: crate::protocol::BoundedVec::new(
+                value
+                    .inventory
+                    .iter()
+                    .map(|(&item, &count)| (item, count))
+                    .collect(),
+            )
+            .expect("authoritative containers enforce the inventory bound"),
+        }
+    }
+    fn from_wire(
+        wire: Self::Wire,
+        registry: &crate::spatial::SpatialDecodeRegistry,
+    ) -> Result<(Self::Key, Self::Value), crate::spatial::SpatialError> {
+        let mut inventory = HashMap::default();
+        for (item, count) in wire.inventory {
+            registry.require("item", item.0 as u32)?;
+            if count == 0 || inventory.insert(item, count).is_some() {
+                return Err(crate::spatial::SpatialError::Decode(
+                    "invalid container inventory entry".into(),
+                ));
+            }
+        }
+        Ok((wire.cell, ContainerState { inventory }))
+    }
+}
 
 /// Stock of one placed container block. Just an inventory — containers
 /// have no orders or work timers.
@@ -50,11 +101,18 @@ impl ContainerState {
     }
 
     /// Add `count` of `item`. 0 is a no-op.
-    pub fn deposit(&mut self, item: ItemSlot, count: u32) {
+    pub fn deposit(&mut self, item: ItemSlot, count: u32) -> bool {
         if count == 0 {
-            return;
+            return true;
         }
-        *self.inventory.entry(item).or_insert(0) += count;
+        if !self.inventory.contains_key(&item)
+            && self.inventory.len() >= MAX_CONTAINER_INVENTORY_KINDS
+        {
+            return false;
+        }
+        let entry = self.inventory.entry(item).or_insert(0);
+        *entry = entry.saturating_add(count);
+        true
     }
 
     /// Units of `item` currently stocked.
@@ -94,59 +152,66 @@ impl ContainerState {
     }
 }
 
-/// Server-authoritative + client-mirrored container stock map. Same
-/// shape on both sides; the server mutates + broadcasts, the client
-/// applies broadcasts. Sparse: a placed-but-empty container has no
-/// entry (the block def alone says "this is a container").
-#[derive(Resource, Default, Debug)]
-pub struct Containers {
-    by_cell: HashMap<IVec3, ContainerState>,
-}
+/// Server-authoritative container stock and its client spatial replica.
+/// Sparse: a placed-but-empty container has no entry (the block def alone
+/// says "this is a container").
+pub type Containers = crate::spatial::PartitionedStore<ContainerDataset>;
 
 impl Containers {
     pub fn get(&self, cell: IVec3) -> Option<&ContainerState> {
-        self.by_cell.get(&cell)
+        self.lookup(&cell)
     }
 
-    pub fn get_mut(&mut self, cell: IVec3) -> Option<&mut ContainerState> {
-        self.by_cell.get_mut(&cell)
+    pub fn edit_existing<R>(
+        &mut self,
+        cell: IVec3,
+        edit: impl FnOnce(&mut ContainerState) -> R,
+    ) -> Option<R> {
+        self.edit(&cell, 0, edit)
     }
 
-    /// Get the state at `cell`, creating an empty one if needed.
-    /// Caller is responsible for `remove_if_empty` after a mutation
-    /// that could leave it empty.
-    pub fn get_or_insert(&mut self, cell: IVec3) -> &mut ContainerState {
-        self.by_cell.entry(cell).or_default()
+    pub fn edit_or_insert<R>(
+        &mut self,
+        cell: IVec3,
+        edit: impl FnOnce(&mut ContainerState) -> R,
+    ) -> R {
+        if self.lookup(&cell).is_none() {
+            self.upsert(cell, ContainerState::default(), 0);
+        }
+        self.edit(&cell, 0, edit)
+            .expect("container inserted before edit")
     }
 
     /// Drop the entry at `cell` if its state is empty.
     pub fn remove_if_empty(&mut self, cell: IVec3) {
-        if let Some(state) = self.by_cell.get(&cell)
+        if let Some(state) = self.lookup(&cell)
             && state.is_empty()
         {
-            self.by_cell.remove(&cell);
+            self.delete(&cell, 0);
         }
     }
 
     pub fn remove(&mut self, cell: IVec3) -> Option<ContainerState> {
-        self.by_cell.remove(&cell)
+        self.delete(&cell, 0)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &ContainerState)> {
-        self.by_cell.iter()
+        self.entries()
     }
 
-    pub fn replace_all(&mut self, entries: impl IntoIterator<Item = (IVec3, ContainerState)>) {
-        self.by_cell.clear();
+    pub(crate) fn restore_all(
+        &mut self,
+        entries: impl IntoIterator<Item = (IVec3, ContainerState)>,
+    ) {
+        let old: Vec<_> = self.entries().map(|(cell, _)| *cell).collect();
+        for cell in old {
+            self.delete(&cell, 0);
+        }
         for (cell, state) in entries {
             if !state.is_empty() {
-                self.by_cell.insert(cell, state);
+                self.upsert(cell, state, 0);
             }
         }
-    }
-
-    pub fn snapshot(&self) -> Vec<(IVec3, ContainerState)> {
-        self.by_cell.iter().map(|(c, s)| (*c, s.clone())).collect()
     }
 }
 
@@ -160,6 +225,12 @@ pub fn room_for(
     item_registry: &crate::items::ItemRegistry,
     item: ItemSlot,
 ) -> u32 {
+    if state.is_some_and(|state| {
+        !state.inventory.contains_key(&item)
+            && state.inventory.len() >= MAX_CONTAINER_INVENTORY_KINDS
+    }) {
+        return 0;
+    }
     let used = state.map(|s| s.used_bulk(item_registry)).unwrap_or(0);
     let room_bulk = cfg.capacity_bulk.saturating_sub(used);
     room_bulk / item_registry.def(item).bulk.max(1)
@@ -256,44 +327,14 @@ fn apply_cell_edits_to_index(
     }
 }
 
-/// Server → client: per-cell broadcast. `state: None` is the "remove
-/// this cell" signal (stock fully withdrawn or block destroyed).
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct ContainerUpdate {
-    pub cell: IVec3,
-    pub state: Option<ContainerState>,
-}
-
-/// Server → client: one-shot dump of every non-empty container, sent
-/// when a client connects. Mirrors `StationsFullSync` exactly.
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub struct ContainersFullSync {
-    pub entries: Vec<(IVec3, ContainerState)>,
-}
-
-/// Helper: send one [`ContainerUpdate`] to every client.
-pub(crate) fn broadcast_container(
-    broadcast: &mut ServerMultiMessageSender,
-    server: &Server,
-    cell: IVec3,
-    state: Option<ContainerState>,
-    subscriptions: &crate::server::SpatialSubscriptions,
-) {
-    let msg = ContainerUpdate { cell, state };
-    let target = subscriptions.target_for_cells([cell]);
-    if let Err(err) = broadcast.send::<ContainerUpdate, StateSyncChannel>(&msg, server, &target) {
-        warn!("container update broadcast failed: {err}");
-    }
-}
-
 pub struct ContainersServerPlugin;
 pub struct ContainersClientPlugin;
 
 impl Plugin for ContainersServerPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Containers>();
-        app.init_resource::<ContainerIndex>();
-        app.add_observer(send_containers_full_sync_on_connect);
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<ContainerDataset>::server());
+        crate::spatial::init_session_resource::<Containers>(app);
+        crate::spatial::init_session_resource::<ContainerIndex>(app);
         app.add_observer(scan_chunk_on_add);
         // Same schedule slot as the interactable index's CellEdit
         // consumer — both want the post-apply state of the same bus.
@@ -309,66 +350,7 @@ impl Plugin for ContainersServerPlugin {
 
 impl Plugin for ContainersClientPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Containers>();
-        // Full-sync before per-update receive: same same-tick ordering
-        // rule as stations/plans (full sync must not clobber a delta
-        // applied first).
-        app.add_systems(
-            Update,
-            (
-                receive_containers_full_sync,
-                receive_container_update_broadcasts,
-            )
-                .chain()
-                .in_set(GameSet::Simulation)
-                .run_if(in_state(AppState::InGame)),
-        );
-    }
-}
-
-/// Server: push the whole container map to a fresh connection.
-fn send_containers_full_sync_on_connect(
-    trigger: On<Add, GameReady>,
-    containers: Res<Containers>,
-    mut senders: Query<&mut MessageSender<ContainersFullSync>>,
-) {
-    let connection = trigger.entity;
-    let Ok(mut sender) = senders.get_mut(connection) else {
-        return;
-    };
-    sender.send::<StateSyncChannel>(ContainersFullSync {
-        entries: containers.snapshot(),
-    });
-}
-
-/// Client: replace the mirror with the connect-time snapshot.
-fn receive_containers_full_sync(
-    mut receivers: Query<&mut MessageReceiver<ContainersFullSync>>,
-    mut containers: ResMut<Containers>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for sync in receiver.receive() {
-            containers.replace_all(sync.entries);
-        }
-    }
-}
-
-/// Client: apply broadcast deltas to the mirror.
-fn receive_container_update_broadcasts(
-    mut receivers: Query<&mut MessageReceiver<ContainerUpdate>>,
-    mut containers: ResMut<Containers>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for update in receiver.receive() {
-            match update.state {
-                Some(state) if !state.is_empty() => {
-                    containers.by_cell.insert(update.cell, state);
-                }
-                _ => {
-                    containers.by_cell.remove(&update.cell);
-                }
-            }
-        }
+        app.add_plugins(crate::spatial::SpatialFeaturePlugin::<ContainerDataset>::client());
     }
 }
 
@@ -381,14 +363,8 @@ pub(crate) fn clear_destroyed_containers(
     mut reader: MessageReader<crate::protocol::CellEdit>,
     block_registry: Res<crate::blocks::BlockRegistry>,
     mut containers: ResMut<Containers>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut commands: Commands,
-    subscriptions: Res<crate::server::SpatialSubscriptions>,
 ) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for edit in reader.read() {
         if edit.prev_slot.is_empty() || block_registry.def(edit.prev_slot).container.is_none() {
             continue;
@@ -409,7 +385,9 @@ pub(crate) fn clear_destroyed_containers(
                 },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
-                Replicate::to_clients(NetworkTarget::None),
+                crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                    translation,
+                )),
                 Name::new(format!("WorldItem(container_spill:{})", slot.0)),
             ));
         }
@@ -418,7 +396,6 @@ pub(crate) fn clear_destroyed_containers(
             spilled,
             "container destroyed; spilled stock",
         );
-        broadcast_container(&mut broadcast, server, edit.world, None, &subscriptions);
     }
 }
 
@@ -459,11 +436,24 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_skips_empty_states() {
+    fn distinct_inventory_kind_bound_rejects_without_mutation() {
+        let mut state = ContainerState::default();
+        for index in 0..MAX_CONTAINER_INVENTORY_KINDS {
+            assert!(state.deposit(slot(index as u16), 1));
+        }
+        let before = state.clone();
+        assert!(!state.deposit(slot(MAX_CONTAINER_INVENTORY_KINDS as u16), 1));
+        assert_eq!(state, before);
+        assert!(state.deposit(slot(0), 1));
+        assert_eq!(state.available(slot(0)), 2);
+    }
+
+    #[test]
+    fn restore_all_skips_empty_states() {
         let mut c = Containers::default();
         let mut stocked = ContainerState::default();
         stocked.deposit(slot(1), 1);
-        c.replace_all(vec![
+        c.restore_all(vec![
             (IVec3::ZERO, ContainerState::default()),
             (IVec3::ONE, stocked),
         ]);

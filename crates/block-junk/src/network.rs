@@ -19,18 +19,16 @@ use bevy::prelude::*;
 use lightyear::prelude::server::Start;
 use lightyear::prelude::*;
 
-use crate::craft_stations::{
-    CancelOrder, DepositToStation, QueueOrder, StationUpdate, StationsFullSync, WorkStart, WorkStop,
-};
+use crate::craft_stations::{CancelOrder, DepositToStation, QueueOrder, WorkStart, WorkStop};
 use crate::menu::{AppState, JoinTarget};
 use crate::npc::{Npc, NpcId, NpcPath};
 use crate::protocol::{
-    Actor, AppliedBlockEdit, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockWorkIntent,
-    Carrying, ChunkChannel, ChunkSnapshot, ChunkUnload, ClientReady, DebugAdvanceTime,
-    DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools, DebugSpawnWorkbench, DepositRequest,
-    DropRequest, DropToolRequest, EquippedTool, MovementIntent, MovementMode, NpcAnimOverride,
-    NpcDetails, PeriodicSyncChannel, PickupRequest, PlanEdit, PlanEditBatch, PlanFullSync,
-    RequestNpcDetails, ServerHello, StateSyncChannel, WorldChannel, WorldClockSync, WorldItem,
+    Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockWorkIntent, Carrying,
+    ClientReady, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan, DebugSpawnTools,
+    DebugSpawnWorkbench, DepositRequest, DropRequest, DropToolRequest, EquippedTool,
+    MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PeriodicSyncChannel, PickupRequest,
+    PlanEdit, PlanEditBatch, RequestNpcDetails, ServerHello, SpatialChannel, SpatialMessage,
+    StateSyncChannel, WorldChannel, WorldClockSync, WorldItem,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,15 +205,11 @@ fn persist_access(path: &std::path::Path, access: &PersistedAccess) -> Result<()
 /// than a desync hunt when someone joins with a stale build. The
 /// registry-level mod-set check is a separate, later gate.
 // …0003: NpcDetails gained `stats` (2026-07).
-// …0004: storage zones — StorageEditBatch/StorageFullSync (2026-07, S1).
+// …0004: storage-zone request protocol (2026-07, S1).
 // …0005: WorldItem gained `count` — piles ride the same replication (2026-07, S2).
-// …0006: container stock — ContainerUpdate/ContainersFullSync (2026-07, S3).
-// (S4 finite-food adds no wire messages — the bush transform rides
-//  BlockEdit, the eat draw-down rides ContainerUpdate, and the new
-//  berry/bush registrations are caught by the mod-set gate — so the id
-//  stays 0006. Save format is likewise unchanged: new blocks/items are
-//  appended and remapped by id, so v17 saves load without migration.)
-pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0007;
+// …0006: container stock protocol (2026-07, S3).
+// …0008: unified ordered spatial envelope and trait-driven datasets.
+pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0008;
 
 /// Which address the server socket binds. Inserted by
 /// `run_server_inner`; the dedicated CLI can override the default.
@@ -286,7 +280,7 @@ impl Plugin for ProtocolPlugin {
         })
         .add_direction(NetworkDirection::Bidirectional);
 
-        app.add_channel::<ChunkChannel>(ChannelSettings {
+        app.add_channel::<SpatialChannel>(ChannelSettings {
             mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
             ..default()
         })
@@ -296,7 +290,7 @@ impl Plugin for ProtocolPlugin {
             mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
             ..default()
         })
-        .add_direction(NetworkDirection::Bidirectional);
+        .add_direction(NetworkDirection::ClientToServer);
 
         app.add_channel::<PeriodicSyncChannel>(ChannelSettings {
             mode: ChannelMode::SequencedUnreliable,
@@ -306,39 +300,20 @@ impl Plugin for ProtocolPlugin {
 
         app.register_message::<BlockWorkIntent>()
             .add_direction(NetworkDirection::ClientToServer);
-        app.register_message::<AppliedBlockEdit>()
+        app.register_message::<SpatialMessage>()
             .add_direction(NetworkDirection::ServerToClient);
         // Targeted reply to a refused request (reach gate etc.); feeds
         // the rejection-toast UI on the requesting client only.
         app.register_message::<crate::protocol::ActionRejected>()
             .add_direction(NetworkDirection::ServerToClient);
-        // Mod-requested worldspace toasts (engine.ui.toast), broadcast
-        // to everyone.
-        app.register_message::<crate::protocol::WorldToast>()
-            .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<PlanEdit>()
-            .add_direction(NetworkDirection::Bidirectional);
+            .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<PlanEditBatch>()
-            .add_direction(NetworkDirection::Bidirectional);
-        app.register_message::<PlanFullSync>()
-            .add_direction(NetworkDirection::ServerToClient);
+            .add_direction(NetworkDirection::ClientToServer);
         // Storage-zone designation: batch deltas + connect-time full
         // sync (S1 of the storage arc).
         app.register_message::<crate::protocol::StorageEditBatch>()
-            .add_direction(NetworkDirection::Bidirectional);
-        app.register_message::<crate::protocol::StorageFullSync>()
-            .add_direction(NetworkDirection::ServerToClient);
-        // Room-state mirror: recognition deltas + connect-time full sync.
-        app.register_message::<crate::protocol::RoomSync>()
-            .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<crate::protocol::RoomRemove>()
-            .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<crate::protocol::RoomsFullSync>()
-            .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<ChunkSnapshot>()
-            .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<ChunkUnload>()
-            .add_direction(NetworkDirection::ServerToClient);
+            .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<ServerHello>()
             .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<ClientReady>()
@@ -385,16 +360,6 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<WorkStop>()
             .add_direction(NetworkDirection::ClientToServer);
-        app.register_message::<StationUpdate>()
-            .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<StationsFullSync>()
-            .add_direction(NetworkDirection::ServerToClient);
-        // Container stock mirror (storage arc S3): per-cell deltas +
-        // connect-time full sync, same lane as stations.
-        app.register_message::<crate::containers::ContainerUpdate>()
-            .add_direction(NetworkDirection::ServerToClient);
-        app.register_message::<crate::containers::ContainersFullSync>()
-            .add_direction(NetworkDirection::ServerToClient);
 
         // Player-avatar replication. Server owns the avatar entities; the
         // marker tells receivers "attach a mesh," and `AvatarPose` is the
@@ -402,6 +367,8 @@ impl Plugin for ProtocolPlugin {
         // 40-byte rotation+scale baggage isn't used.
         // See networking-design: state for entities, events for the grid.
         app.component::<Actor>().replicate();
+        app.component::<crate::spatial::SpatialReplica>()
+            .replicate();
         app.component::<Avatar>().replicate();
         app.component::<Npc>().replicate();
         app.component::<NpcId>().replicate();

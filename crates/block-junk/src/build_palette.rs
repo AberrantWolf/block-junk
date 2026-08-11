@@ -347,7 +347,7 @@ pub struct BuildPalettePlugin;
 
 impl Plugin for BuildPalettePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<BuildPaletteState>();
+        crate::spatial::init_session_resource::<BuildPaletteState>(app);
         app.add_systems(
             Update,
             (

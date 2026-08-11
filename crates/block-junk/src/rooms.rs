@@ -168,6 +168,11 @@ impl RoomPatternRegistry {
 #[derive(Message, Clone, Debug)]
 pub struct RoomEventMsg(pub RoomEvent);
 
+/// Internal replication signal emitted for every matched-summary mutation,
+/// including geometry-only changes that deliberately stay silent to mods.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct RoomSummaryMutation(pub RoomId);
+
 struct Room {
     pattern: Option<RoomPatternId>,
     floor_cells: Vec<IVec3>,
@@ -248,14 +253,6 @@ impl RoomMap {
             bbox_max: room.bbox_max,
             floor_area: room.floor_cells.len() as u32,
         })
-    }
-
-    /// Every matched room as a wire summary — the connect-time full sync.
-    pub fn matched_summaries(&self) -> Vec<crate::protocol::RoomSummary> {
-        self.rooms
-            .keys()
-            .filter_map(|&id| self.summary_of(id))
-            .collect()
     }
 
     /// If `cell` is a floor cell of a matched room, return a floor cell
@@ -344,6 +341,10 @@ pub fn mark_dirty_from_edits(
 /// Drains debounced dirty entries and runs detection. Emits `RoomEvent`s
 /// onto the local server bus; the `dispatch_room_events` system in
 /// `scripting.rs` forwards them to mod hooks.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "room detection joins terrain, registries, persistence, and two event audiences"
+)]
 pub fn process_dirty(
     mut dirty: ResMut<DetectionDirty>,
     chunks: Query<&Chunk>,
@@ -352,6 +353,7 @@ pub fn process_dirty(
     pattern_registry: Res<RoomPatternRegistry>,
     mut rooms: ResMut<RoomMap>,
     mut events: MessageWriter<RoomEventMsg>,
+    mut summary_mutations: MessageWriter<RoomSummaryMutation>,
 ) {
     if dirty.cells.is_empty() {
         return;
@@ -609,6 +611,7 @@ pub fn process_dirty(
             }),
         };
 
+        let has_summary = p.pattern.is_some();
         rooms.rooms.insert(
             id,
             Room {
@@ -618,6 +621,10 @@ pub fn process_dirty(
                 bbox_max: p.bbox_max,
             },
         );
+
+        if has_summary {
+            summary_mutations.write(RoomSummaryMutation(id));
+        }
 
         if let Some(ev) = event {
             match &ev {

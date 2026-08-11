@@ -29,7 +29,7 @@ use crate::npc::{Needs, Npc};
 use crate::npc_registry::NeedRegistry;
 use crate::protocol::{
     AuthenticatedPlayer, DAY_LENGTH_SECS, DebugAdvanceTime, DebugBumpNeed, DebugFillNearestPlan,
-    DebugSpawnTools, DebugSpawnWorkbench, GameSet, StateSyncChannel, WorldChannel, WorldClock,
+    DebugSpawnTools, DebugSpawnWorkbench, GameSet, WorldChannel, WorldClock,
 };
 
 pub struct DebugClientPlugin;
@@ -347,8 +347,8 @@ fn receive_debug_advance_time(
 
 /// Apply [`DebugFillNearestPlan`]: pick the requesting player's
 /// nearest unsatisfied Build plan and set every material's `present`
-/// to `needed`. Broadcasts a `PlanEdit` so client mirrors learn the
-/// new state. Used during Phase-3/4 development to verify NPC pickup
+/// to `needed`. The store journals the resulting spatial delta. Used
+/// during development to verify NPC pickup
 /// of fully-materialled plans without hauling each unit by hand.
 fn receive_debug_fill_nearest_plan(
     mut receivers: Query<(
@@ -359,13 +359,8 @@ fn receive_debug_fill_nearest_plan(
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
     mut plans: ResMut<crate::plans::Plans>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, auth, mut receiver) in receivers.iter_mut() {
         let count = receiver
             .receive()
@@ -408,20 +403,6 @@ fn receive_debug_fill_nearest_plan(
             .unwrap_or_default();
         for slot in item_slots {
             plans.deposit(target_cell, slot, u32::MAX);
-        }
-        // Broadcast the updated state.
-        if let Some(state) = plans.get(target_cell).cloned() {
-            let reply = crate::protocol::PlanEdit {
-                cell: target_cell,
-                kind: Some(state.kind),
-                materials: state.materials,
-            };
-            let target = validation.target_for_cells([target_cell]);
-            if let Err(err) = broadcast
-                .send::<crate::protocol::PlanEdit, StateSyncChannel>(&reply, server, &target)
-            {
-                warn!("debug fill PlanEdit broadcast failed: {err}");
-            }
         }
         info!(
             cell = ?target_cell.to_array(),
@@ -501,7 +482,9 @@ fn receive_debug_spawn_tools(
                 },
                 bevy::prelude::Transform::from_translation(translation),
                 bevy::prelude::GlobalTransform::default(),
-                lightyear::prelude::Replicate::to_clients(NetworkTarget::None),
+                crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                    translation,
+                )),
                 bevy::prelude::Name::new(format!("WorldItem(debug_tool:{id_str})")),
             ));
             spawned += 1;

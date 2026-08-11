@@ -35,19 +35,352 @@ use crate::preview::{
     PreviewSceneReady,
 };
 use crate::protocol::{
-    ActionRejected, Actor, AppliedBlockEdit, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity,
-    BlockEdit, BlockWorkIntent, BlockWorkTarget, Carrying, ChunkData, ChunkSnapshot, ChunkUnload,
-    ClientReady, DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameReady, GameSet,
-    INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, PLAN_REACH, PickupRequest,
-    PlanKind, PlanState, ServerHello, WorldChannel, WorldClock, WorldClockSync, WorldItem,
+    ActionRejected, Actor, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit,
+    BlockWorkIntent, BlockWorkTarget, Carrying, ChunkCoord, ChunkData, ClientReady, DepositRequest,
+    DropRequest, DropToolRequest, EquippedTool, GameReady, GameSet, INTERACT_REACH, MovementIntent,
+    MovementMode, NpcAnimOverride, PLAN_REACH, PickupRequest, PlanKind, PlanState, ServerHello,
+    TerrainEditRecord, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
+use crate::spatial::SpatialDataset as _;
 use crate::target_outline::TargetOutlinePlugin;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
 pub struct ClientPlugin;
 
+#[derive(Resource, Default)]
+struct PendingSpatialTransaction {
+    current: Option<(u64, StagedTerrain)>,
+    committed: Vec<StagedTerrain>,
+    terrain_deltas: Vec<TerrainEditRecord>,
+    leaves: Vec<ChunkCoord>,
+    pages: Vec<(u64, crate::spatial::DatasetId, u64, Vec<u8>)>,
+    deltas: Vec<(crate::spatial::DatasetId, u64, Vec<u8>)>,
+    buffered_bytes: usize,
+}
+
+struct StagedTerrain {
+    coord: ChunkCoord,
+    data: ChunkData,
+    entities: Vec<crate::voxel::EntityEntry>,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "closed framework dispatch needs every engine-owned replica store"
+)]
+fn receive_spatial_messages(
+    mut receivers: Query<&mut MessageReceiver<crate::protocol::SpatialMessage>>,
+    mut pending: ResMut<PendingSpatialTransaction>,
+    catalog: Res<crate::spatial::SpatialDatasetRegistry>,
+    blocks: Res<BlockRegistry>,
+    items: Res<ItemRegistry>,
+    mut plans: ResMut<crate::plans::Plans>,
+    mut storage: ResMut<crate::storage::StorageZones>,
+    mut containers: ResMut<crate::containers::Containers>,
+    mut stations: ResMut<crate::craft_stations::CraftStations>,
+    mut rooms: ResMut<crate::room_sync::ClientRooms>,
+    room_patterns: Res<crate::rooms::RoomPatternRegistry>,
+    mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
+    active_chunk_map: Res<ChunkMap>,
+) {
+    let mut references = crate::spatial::SpatialDecodeRegistry::default();
+    for (slot, _) in blocks.iter() {
+        references.register_reference("block", slot.0 as u32);
+    }
+    for (slot, _) in items.iter() {
+        references.register_reference("item", slot.0 as u32);
+    }
+    for mut receiver in receivers.iter_mut() {
+        for message in receiver.receive() {
+            match message {
+                crate::protocol::SpatialMessage::BeginChunk {
+                    transaction,
+                    coord,
+                    terrain,
+                    entities,
+                } => {
+                    pending.pages.clear();
+                    pending.deltas.clear();
+                    pending.buffered_bytes = bincode::serde::encode_to_vec(
+                        (&terrain, &entities),
+                        bincode::config::standard(),
+                    )
+                    .map_or(0, |bytes| bytes.len());
+                    pending.current = Some((
+                        transaction,
+                        StagedTerrain {
+                            coord,
+                            data: terrain,
+                            entities: entities.into_inner(),
+                        },
+                    ));
+                }
+                crate::protocol::SpatialMessage::CommitChunk { transaction, coord } => {
+                    if pending
+                        .current
+                        .as_ref()
+                        .is_some_and(|(id, snapshot)| *id == transaction && snapshot.coord == coord)
+                        && let Some((_, snapshot)) = pending.current.take()
+                    {
+                        let pages = std::mem::take(&mut pending.pages);
+                        for (_, dataset, fingerprint, payload) in pages {
+                            if catalog
+                                .validate_record(dataset, fingerprint, payload.len())
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let source = snapshot.coord;
+                            let result = if dataset == crate::plans::PlanDataset::ID {
+                                plans.apply_replica_record(source, &payload, &references)
+                            } else if dataset == crate::storage::StorageDataset::ID {
+                                storage.apply_replica_record(source, &payload, &references)
+                            } else if dataset == crate::containers::ContainerDataset::ID {
+                                containers.apply_replica_record(source, &payload, &references)
+                            } else if dataset == crate::craft_stations::StationDataset::ID {
+                                stations.apply_replica_record(source, &payload, &references)
+                            } else if dataset == crate::room_sync::RoomSummaryDataset::ID {
+                                rooms.apply_replica_record(source, &payload, &references)
+                            } else {
+                                continue;
+                            };
+                            if let Err(error) = result {
+                                warn!(%error, "rejected spatial partition record");
+                            }
+                        }
+                        for (dataset, fingerprint, payload) in std::mem::take(&mut pending.deltas) {
+                            let active_chunks = active_chunk_map
+                                .0
+                                .keys()
+                                .copied()
+                                .chain(std::iter::once(snapshot.coord))
+                                .collect();
+                            apply_dataset_delta(
+                                dataset,
+                                fingerprint,
+                                &payload,
+                                &catalog,
+                                &references,
+                                &mut plans,
+                                &mut storage,
+                                &mut containers,
+                                &mut stations,
+                                &mut rooms,
+                                &room_patterns,
+                                &mut toasts,
+                                &active_chunks,
+                            );
+                        }
+                        pending.buffered_bytes = 0;
+                        pending.committed.push(snapshot);
+                    }
+                }
+                crate::protocol::SpatialMessage::LeaveChunk { coord } => {
+                    if pending
+                        .current
+                        .as_ref()
+                        .is_some_and(|(_, snapshot)| snapshot.coord == coord)
+                    {
+                        pending.current = None;
+                        pending.pages.clear();
+                        pending.deltas.clear();
+                        pending.buffered_bytes = 0;
+                    }
+                    pending.leaves.push(coord);
+                    plans.unload_replica_chunk(coord);
+                    storage.unload_replica_chunk(coord);
+                    containers.unload_replica_chunk(coord);
+                    stations.unload_replica_chunk(coord);
+                    rooms.unload_replica_chunk(coord);
+                }
+                crate::protocol::SpatialMessage::Toast { cell, text } => {
+                    toasts.push(crate::worldspace_toast::SpawnToast {
+                        cell,
+                        text: text.to_string(),
+                    });
+                }
+                crate::protocol::SpatialMessage::Delta {
+                    dataset,
+                    schema_fingerprint,
+                    payload,
+                } if dataset == crate::spatial::TERRAIN_DATASET_ID
+                    && schema_fingerprint == crate::spatial::TERRAIN_SCHEMA_FINGERPRINT =>
+                {
+                    let bytes = payload.into_inner();
+                    if pending.buffered_bytes.saturating_add(bytes.len())
+                        > crate::spatial::MAX_PENDING_SPATIAL_BYTES
+                    {
+                        continue;
+                    }
+                    if let Ok((edit, consumed)) =
+                        bincode::serde::decode_from_slice::<TerrainEditRecord, _>(
+                            &bytes,
+                            bincode::config::standard(),
+                        )
+                        && consumed == bytes.len()
+                    {
+                        if pending.current.is_some() {
+                            pending.buffered_bytes += bytes.len();
+                        }
+                        pending.terrain_deltas.push(edit);
+                    }
+                }
+                crate::protocol::SpatialMessage::PartitionPage {
+                    transaction,
+                    dataset,
+                    schema_fingerprint,
+                    payload,
+                } => {
+                    if pending
+                        .current
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == transaction)
+                    {
+                        let bytes = payload.into_inner();
+                        if pending.buffered_bytes.saturating_add(bytes.len())
+                            <= crate::spatial::MAX_PENDING_SPATIAL_BYTES
+                        {
+                            pending.buffered_bytes += bytes.len();
+                            pending
+                                .pages
+                                .push((transaction, dataset, schema_fingerprint, bytes));
+                        }
+                    }
+                }
+                crate::protocol::SpatialMessage::Delta {
+                    dataset,
+                    schema_fingerprint,
+                    payload,
+                } => {
+                    let bytes = payload.into_inner();
+                    if pending.current.is_some() {
+                        if pending.buffered_bytes.saturating_add(bytes.len())
+                            <= crate::spatial::MAX_PENDING_SPATIAL_BYTES
+                        {
+                            pending.buffered_bytes += bytes.len();
+                            pending.deltas.push((dataset, schema_fingerprint, bytes));
+                        }
+                    } else {
+                        let active_chunks = active_chunk_map.0.keys().copied().collect();
+                        apply_dataset_delta(
+                            dataset,
+                            schema_fingerprint,
+                            &bytes,
+                            &catalog,
+                            &references,
+                            &mut plans,
+                            &mut storage,
+                            &mut containers,
+                            &mut stations,
+                            &mut rooms,
+                            &room_patterns,
+                            &mut toasts,
+                            &active_chunks,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "closed dispatch over the five engine-owned datasets"
+)]
+fn apply_dataset_delta(
+    dataset: crate::spatial::DatasetId,
+    fingerprint: u64,
+    payload: &[u8],
+    catalog: &crate::spatial::SpatialDatasetRegistry,
+    references: &crate::spatial::SpatialDecodeRegistry,
+    plans: &mut crate::plans::Plans,
+    storage: &mut crate::storage::StorageZones,
+    containers: &mut crate::containers::Containers,
+    stations: &mut crate::craft_stations::CraftStations,
+    rooms: &mut crate::room_sync::ClientRooms,
+    room_patterns: &crate::rooms::RoomPatternRegistry,
+    toasts: &mut crate::worldspace_toast::PendingToasts,
+    active_chunks: &bevy::platform::collections::HashSet<ChunkCoord>,
+) {
+    if catalog
+        .validate_delta(dataset, fingerprint, payload.len())
+        .is_err()
+    {
+        return;
+    }
+    let result = if dataset == crate::plans::PlanDataset::ID {
+        plans.apply_replica_delta(payload, references, active_chunks)
+    } else if dataset == crate::storage::StorageDataset::ID {
+        storage.apply_replica_delta(payload, references, active_chunks)
+    } else if dataset == crate::containers::ContainerDataset::ID {
+        containers.apply_replica_delta(payload, references, active_chunks)
+    } else if dataset == crate::craft_stations::StationDataset::ID {
+        stations.apply_replica_delta(payload, references, active_chunks)
+    } else if dataset == crate::room_sync::RoomSummaryDataset::ID {
+        apply_room_delta_with_notice(
+            payload,
+            references,
+            active_chunks,
+            rooms,
+            room_patterns,
+            toasts,
+        )
+    } else {
+        return;
+    };
+    if let Err(error) = result {
+        warn!(%error, "rejected spatial delta");
+    }
+}
+
+fn apply_room_delta_with_notice(
+    payload: &[u8],
+    references: &crate::spatial::SpatialDecodeRegistry,
+    active_chunks: &bevy::platform::collections::HashSet<ChunkCoord>,
+    rooms: &mut crate::room_sync::ClientRooms,
+    patterns: &crate::rooms::RoomPatternRegistry,
+    toasts: &mut crate::worldspace_toast::PendingToasts,
+) -> Result<(), crate::spatial::SpatialError> {
+    type Delta = crate::spatial::SpatialDelta<u32, crate::room_sync::RoomSummaryWire>;
+    let (delta, consumed): (Delta, usize) = bincode::serde::decode_from_slice(
+        payload,
+        bincode::config::standard().with_limit::<{ crate::spatial::MAX_PARTITION_PAGE_BYTES }>(),
+    )
+    .map_err(|error| crate::spatial::SpatialError::Decode(error.to_string()))?;
+    if consumed != payload.len() {
+        return Err(crate::spatial::SpatialError::TrailingBytes(
+            payload.len() - consumed,
+        ));
+    }
+    let notice = match &delta {
+        Delta::Upsert(room) => {
+            let name = patterns
+                .get(&room.pattern.as_ref().into())
+                .map(|pattern| pattern.display_name.clone())
+                .unwrap_or_else(|| room.pattern.to_string());
+            match rooms.lookup(&room.room_id) {
+                None => Some((room.anchor, name)),
+                Some(previous) if previous.pattern != room.pattern.as_ref() => {
+                    Some((room.anchor, format!("Now: {name}")))
+                }
+                _ => None,
+            }
+        }
+        Delta::Remove(room_id) => rooms
+            .lookup(room_id)
+            .map(|room| (room.anchor, "No longer a room".to_owned())),
+    };
+    rooms.apply_replica_delta(payload, references, active_chunks)?;
+    if let Some((cell, text)) = notice {
+        toasts.push(crate::worldspace_toast::SpawnToast { cell, text });
+    }
+    Ok(())
+}
+
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
+        crate::spatial::init_session_resource::<PendingSpatialTransaction>(app);
         app.add_plugins(FlyCamPlugin)
             .add_plugins(PreviewPlugin)
             .add_plugins(PlayerModePlugin)
@@ -86,16 +419,17 @@ impl Plugin for ClientPlugin {
         app.insert_resource(palette);
         app.insert_resource(pins);
         app.insert_resource(terrain_slots);
+        crate::spatial::init_session_resource::<ChunkMap>(app);
+        crate::spatial::init_session_resource::<SelectedBlock>(app);
+        crate::spatial::init_session_resource::<PlacementRotation>(app);
+        crate::spatial::init_session_resource::<PlayerActionState>(app);
+        crate::spatial::init_session_resource::<BlockWorkIntentState>(app);
+        crate::spatial::init_session_resource::<StationWorkHold>(app);
+        crate::spatial::init_session_resource::<MovementToggleLatch>(app);
+        crate::spatial::init_session_resource::<BlockEntities>(app);
+        crate::spatial::init_session_resource::<PreviewState>(app);
         app.add_plugins(crate::build_palette::BuildPalettePlugin);
-        app.init_resource::<ChunkMap>()
-            .init_resource::<SelectedBlock>()
-            .init_resource::<PlacementRotation>()
-            .init_resource::<PlayerActionState>()
-            .init_resource::<BlockWorkIntentState>()
-            .init_resource::<StationWorkHold>()
-            .init_resource::<MovementToggleLatch>()
-            .init_resource::<BlockEntities>()
-            .init_resource::<PreviewState>()
+        app
             // Client mirror of the server's day/night clock. Starts at
             // 0.25 (sunrise) so the first frame after entering a session
             // — before any WorldClockSync arrives — has the world lit
@@ -178,15 +512,24 @@ impl Plugin for ClientPlugin {
                 Update,
                 (
                     receive_server_hello,
-                    receive_snapshots,
-                    receive_block_edit_broadcasts,
-                    receive_chunk_unloads,
                     receive_world_clock,
                     receive_action_rejections,
-                    receive_world_toasts,
                 )
                     .chain()
                     .in_set(GameSet::Simulation),
+            )
+            .add_systems(
+                Update,
+                (
+                    receive_spatial_messages,
+                    receive_snapshots,
+                    receive_block_edit_broadcasts,
+                    receive_chunk_unloads,
+                    hide_new_spatial_replicas,
+                    update_client_spatial_replica_visibility,
+                )
+                    .chain()
+                    .in_set(GameSet::SpatialSync),
             )
             // Loose items can move after spawn now (settling onto ground
             // when the block under them is mined, rising when a block is
@@ -267,6 +610,7 @@ impl Plugin for ClientPlugin {
             // headlamp once it's there.
             .add_observer(handle_predicted_spawn)
             .add_systems(OnExit(AppState::InGame), cleanup_session)
+            .add_systems(OnExit(AppState::InGame), reset_client_owned_resources)
             .add_systems(
                 OnExit(AppState::InGame),
                 (
@@ -275,6 +619,58 @@ impl Plugin for ClientPlugin {
                     reset_movement_toggle_latch,
                 ),
             );
+    }
+}
+
+fn hide_new_spatial_replicas(
+    replicas: Query<Entity, Added<crate::spatial::SpatialReplica>>,
+    mut commands: Commands,
+) {
+    for entity in &replicas {
+        commands.entity(entity).insert(Visibility::Hidden);
+    }
+}
+
+type ClientSpatialReplicaQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<&'static AvatarPose>,
+        Option<&'static WorldItem>,
+        Option<&'static crate::civilization::ClusterBboxReplica>,
+        &'static mut Visibility,
+    ),
+    With<crate::spatial::SpatialReplica>,
+>;
+
+fn update_client_spatial_replica_visibility(
+    chunks: Res<ChunkMap>,
+    mut replicas: ClientSpatialReplicaQuery,
+) {
+    for (pose, item, bounds, mut visibility) in &mut replicas {
+        let active = if let Some(pose) = pose {
+            chunks
+                .0
+                .contains_key(&crate::voxel::world_to_chunk(pose.translation.floor().as_ivec3()).0)
+        } else if let Some(item) = item {
+            chunks
+                .0
+                .contains_key(&crate::voxel::world_to_chunk(item.translation.floor().as_ivec3()).0)
+        } else if let Some(bounds) = bounds {
+            let min = crate::voxel::world_to_chunk(bounds.min).0.0;
+            let max = crate::voxel::world_to_chunk(bounds.max).0.0;
+            chunks
+                .0
+                .keys()
+                .any(|chunk| chunk.0.cmpge(min).all() && chunk.0.cmple(max).all())
+        } else {
+            false
+        };
+        *visibility = if active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 
@@ -1038,11 +1434,7 @@ type ReplicatedEntitiesQuery<'w, 's> =
 ///      entity ids back to its fresh-launch value. Add yours here when
 ///      a new feature grows one — the invariant is "MainMenu state ==
 ///      pre-first-session state".
-fn cleanup_session(
-    mut commands: Commands,
-    replicated: ReplicatedEntitiesQuery,
-    palette: Res<PlaceablePalette>,
-) {
+fn cleanup_session(mut commands: Commands, replicated: ReplicatedEntitiesQuery) {
     let mut count = 0usize;
     for entity in replicated.iter() {
         commands.entity(entity).despawn();
@@ -1053,31 +1445,14 @@ fn cleanup_session(
     commands.remove_resource::<AvatarAssets>();
     commands.remove_resource::<CharacterAssets>();
     commands.remove_resource::<PreviewMaterials>();
+}
 
-    commands.insert_resource(ChunkMap::default());
-    commands.insert_resource(BlockEntities::default());
-    commands.insert_resource(PreviewState::default());
-    commands.insert_resource(SelectedBlock::default());
+fn reset_client_owned_resources(mut commands: Commands, palette: Res<PlaceablePalette>) {
     commands.insert_resource(HotbarPins::first_n(palette.0.len()));
-    commands.insert_resource(crate::build_palette::BuildPaletteState::default());
-    commands.insert_resource(PlacementRotation::default());
-    commands.insert_resource(PlayerActionState::default());
     commands.insert_resource(WorldClock {
         day: 0,
         time_of_day: 0.25,
     });
-    commands.insert_resource(PlayerMode::default());
-    commands.insert_resource(crate::plans::Plans::default());
-    commands.insert_resource(crate::plans::PlanDragState::default());
-    commands.insert_resource(crate::storage::StorageZones::default());
-    commands.insert_resource(crate::storage::StorageDragState::default());
-    commands.insert_resource(crate::containers::Containers::default());
-    commands.insert_resource(crate::containers::ContainerIndex::default());
-    commands.insert_resource(crate::craft_stations::CraftStations::default());
-    commands.insert_resource(crate::craft_stations::CraftStationUiState::default());
-    commands.insert_resource(crate::room_sync::ClientRooms::default());
-    commands.insert_resource(crate::inspect_panel::InspectTarget::default());
-    commands.insert_resource(crate::worldspace_toast::PendingToasts::default());
 }
 
 /// One scroll handler covers both jobs because Ctrl gates which one fires:
@@ -3096,86 +3471,85 @@ fn swap_preview_scene_materials(
 /// a previous load doesn't survive an unload+reload.
 fn receive_snapshots(
     mut commands: Commands,
-    mut receivers: Query<&mut MessageReceiver<ChunkSnapshot>>,
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     mut map: ResMut<ChunkMap>,
     terrain_slots: Res<TerrainSlots>,
     registry: Res<BlockRegistry>,
+    mut spatial: ResMut<PendingSpatialTransaction>,
 ) {
     let mut staged = bevy::platform::collections::HashMap::new();
     let mut invalid = false;
-    for mut receiver in receivers.iter_mut() {
-        for snapshot in receiver.receive() {
-            if staged.contains_key(&snapshot.coord) {
-                warn!(coord = ?snapshot.coord.0, "duplicate chunk coordinate in snapshot batch");
-                invalid = true;
-                continue;
-            }
-            let chunk = match snapshot.data {
-                ChunkData::Procedural => Chunk::from_terrain(snapshot.coord, &terrain_slots),
-                ChunkData::Raw(blocks) => {
-                    let blocks = blocks.into_inner();
-                    let expected = crate::protocol::CHUNK_PADDED_CELLS;
-                    if blocks.len() != expected {
-                        warn!(coord = ?snapshot.coord.0, got = blocks.len(), expected, "invalid edited chunk length");
-                        invalid = true;
-                        continue;
-                    }
-                    if blocks.iter().any(|&slot| registry.try_def(slot).is_none()) {
-                        warn!(coord = ?snapshot.coord.0, "snapshot contains an unknown block slot");
-                        invalid = true;
-                        continue;
-                    }
-                    Chunk { blocks }
-                }
-                ChunkData::Rle(runs) => {
-                    let mut blocks = Vec::with_capacity(crate::protocol::CHUNK_PADDED_CELLS);
-                    let mut valid = true;
-                    for run in runs {
-                        let Ok(count) = usize::try_from(run.count) else {
-                            valid = false;
-                            break;
-                        };
-                        let Some(next_len) = blocks.len().checked_add(count) else {
-                            valid = false;
-                            break;
-                        };
-                        if count == 0
-                            || next_len > crate::protocol::CHUNK_PADDED_CELLS
-                            || registry.try_def(run.slot).is_none()
-                        {
-                            valid = false;
-                            break;
-                        }
-                        blocks.resize(next_len, run.slot);
-                    }
-                    if !valid || blocks.len() != crate::protocol::CHUNK_PADDED_CELLS {
-                        warn!(coord = ?snapshot.coord.0, "invalid edited chunk RLE");
-                        invalid = true;
-                        continue;
-                    }
-                    Chunk { blocks }
-                }
-            };
-            let mut seen_entries = bevy::platform::collections::HashSet::new();
-            if snapshot.entities.iter().any(|entry| {
-                !seen_entries.insert(entry.cell)
-                    || crate::voxel::world_to_chunk(entry.cell).0 != snapshot.coord
-            }) {
-                warn!(coord = ?snapshot.coord.0, "snapshot has duplicate or foreign sidecar entries");
-                invalid = true;
-                continue;
-            }
-            staged.insert(
-                snapshot.coord,
-                (
-                    chunk,
-                    ChunkEntities {
-                        entries: snapshot.entities,
-                    },
-                ),
-            );
+    let incoming: Vec<_> = spatial.committed.drain(..).collect();
+    for snapshot in incoming {
+        if staged.contains_key(&snapshot.coord) {
+            warn!(coord = ?snapshot.coord.0, "duplicate chunk coordinate in snapshot batch");
+            invalid = true;
+            continue;
         }
+        let chunk = match snapshot.data {
+            ChunkData::Procedural => Chunk::from_terrain(snapshot.coord, &terrain_slots),
+            ChunkData::Raw(blocks) => {
+                let blocks = blocks.into_inner();
+                let expected = crate::protocol::CHUNK_PADDED_CELLS;
+                if blocks.len() != expected {
+                    warn!(coord = ?snapshot.coord.0, got = blocks.len(), expected, "invalid edited chunk length");
+                    invalid = true;
+                    continue;
+                }
+                if blocks.iter().any(|&slot| registry.try_def(slot).is_none()) {
+                    warn!(coord = ?snapshot.coord.0, "snapshot contains an unknown block slot");
+                    invalid = true;
+                    continue;
+                }
+                Chunk { blocks }
+            }
+            ChunkData::Rle(runs) => {
+                let mut blocks = Vec::with_capacity(crate::protocol::CHUNK_PADDED_CELLS);
+                let mut valid = true;
+                for run in runs {
+                    let Ok(count) = usize::try_from(run.count) else {
+                        valid = false;
+                        break;
+                    };
+                    let Some(next_len) = blocks.len().checked_add(count) else {
+                        valid = false;
+                        break;
+                    };
+                    if count == 0
+                        || next_len > crate::protocol::CHUNK_PADDED_CELLS
+                        || registry.try_def(run.slot).is_none()
+                    {
+                        valid = false;
+                        break;
+                    }
+                    blocks.resize(next_len, run.slot);
+                }
+                if !valid || blocks.len() != crate::protocol::CHUNK_PADDED_CELLS {
+                    warn!(coord = ?snapshot.coord.0, "invalid edited chunk RLE");
+                    invalid = true;
+                    continue;
+                }
+                Chunk { blocks }
+            }
+        };
+        let mut seen_entries = bevy::platform::collections::HashSet::new();
+        if snapshot.entities.iter().any(|entry| {
+            !seen_entries.insert(entry.cell)
+                || crate::voxel::world_to_chunk(entry.cell).0 != snapshot.coord
+        }) {
+            warn!(coord = ?snapshot.coord.0, "snapshot has duplicate or foreign sidecar entries");
+            invalid = true;
+            continue;
+        }
+        staged.insert(
+            snapshot.coord,
+            (
+                chunk,
+                ChunkEntities {
+                    entries: snapshot.entities,
+                },
+            ),
+        );
     }
     if invalid {
         warn!("discarding the entire invalid snapshot batch before ECS mutation");
@@ -3484,6 +3858,7 @@ fn receive_server_hello(
     recipe_registry: Res<crate::recipes::RecipeRegistry>,
     npc_kind_registry: Res<NpcKindRegistry>,
     room_pattern_registry: Res<crate::rooms::RoomPatternRegistry>,
+    spatial_registry: Res<crate::spatial::SpatialDatasetRegistry>,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
 ) {
     for (connection, mut receiver, mut sender) in connections.iter_mut() {
@@ -3506,6 +3881,9 @@ fn receive_server_hello(
             if hello.manifest_hash != crate::protocol::manifest_hash(&hello.manifest) {
                 mismatches.push("server manifest hash does not match its payload".to_owned());
             }
+            if hello.spatial_registry_fingerprint != spatial_registry.fingerprint() {
+                mismatches.push("spatial dataset registry differs".to_owned());
+            }
             if mismatches.is_empty() {
                 info!(
                     "mod-set manifest OK ({} block(s), {} item(s), {} recipe(s), {} npc kind(s))",
@@ -3518,6 +3896,7 @@ fn receive_server_hello(
                     hello.protocol_id,
                     &hello.connection_nonce,
                     &hello.manifest_hash,
+                    &hello.spatial_registry_fingerprint,
                 );
                 sender.send::<WorldChannel>(ClientReady {
                     public_key: identity.public_key(),
@@ -3546,14 +3925,23 @@ fn receive_server_hello(
 /// receive a fresh snapshot next time we walk back into range.
 fn receive_chunk_unloads(
     mut commands: Commands,
-    mut receivers: Query<&mut MessageReceiver<ChunkUnload>>,
     mut map: ResMut<ChunkMap>,
+    mut station_ui: ResMut<crate::craft_stations::CraftStationUiState>,
+    mut captures: ResMut<crate::ui_capture::UiCaptures>,
+    mut spatial: ResMut<PendingSpatialTransaction>,
 ) {
-    for mut receiver in receivers.iter_mut() {
-        for unload in receiver.receive() {
-            if let Some(entity) = map.0.remove(&unload.coord) {
-                commands.entity(entity).despawn();
-            }
+    let unloaded = std::mem::take(&mut spatial.leaves);
+    for coord in unloaded {
+        if let Some(entity) = map.0.remove(&coord) {
+            commands.entity(entity).despawn();
+        }
+        if station_ui
+            .open_cell
+            .is_some_and(|cell| crate::voxel::world_to_chunk(cell).0 == coord)
+        {
+            station_ui.open_cell = None;
+            station_ui.pending_quantities.clear();
+            captures.release(crate::ui_capture::UiCapture::CraftModal);
         }
     }
 }
@@ -3566,11 +3954,9 @@ fn receive_chunk_unloads(
 /// For breaks, we read the slot at the anchor *before* clearing so we
 /// know which footprint to expand (the broadcast doesn't include it —
 /// the client is expected to read it from local state). Cells that fall
-/// in unloaded chunks are silently skipped; their sidecar will arrive
-/// via `ChunkSnapshot` whenever the chunk enters AoI. That skip is only
-/// sound because edits and snapshots share `ChunkChannel` (ordered
-/// reliable), so an edit can never overtake the snapshot of the chunk
-/// it lands in — see the `ChunkChannel` doc in protocol.rs.
+/// in unloaded chunks are silently skipped; their sidecar arrives with the
+/// staged terrain whenever the chunk enters AoI. The ordered spatial lane
+/// ensures an edit cannot overtake the transaction it belongs to.
 /// Server told us a request of ours was refused — surface the reason as
 /// a worldspace toast at the cell the player targeted. This is the
 /// client half of the `ActionRejected` contract: the player sees *why*
@@ -3589,38 +3975,19 @@ fn receive_action_rejections(
     }
 }
 
-/// Mod-requested toast arrived from the server (`engine.ui.toast` on
-/// the server side) — hand it to the same worldspace-toast UI the
-/// rejection channel uses.
-fn receive_world_toasts(
-    mut receivers: Query<&mut MessageReceiver<crate::protocol::WorldToast>>,
-    mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
-) {
-    for mut receiver in receivers.iter_mut() {
-        for toast in receiver.receive() {
-            toasts.push(crate::worldspace_toast::SpawnToast {
-                cell: toast.cell,
-                text: toast.text,
-            });
-        }
-    }
-}
-
 fn receive_block_edit_broadcasts(
-    mut receivers: Query<&mut MessageReceiver<AppliedBlockEdit>>,
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
+    mut spatial: ResMut<PendingSpatialTransaction>,
 ) {
-    for mut receiver in receivers.iter_mut() {
-        let edits: Vec<AppliedBlockEdit> = receiver.receive().collect();
-        for edit in edits {
-            apply_broadcast_edit(edit, &mut chunks, &map);
-        }
+    let edits = std::mem::take(&mut spatial.terrain_deltas);
+    for edit in edits {
+        apply_broadcast_edit(edit, &mut chunks, &map);
     }
 }
 
 fn apply_broadcast_edit(
-    edit: AppliedBlockEdit,
+    edit: TerrainEditRecord,
     chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
     map: &ChunkMap,
 ) {

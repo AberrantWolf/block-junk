@@ -38,7 +38,7 @@ pub struct InspectPanelPlugin;
 
 impl Plugin for InspectPanelPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<InspectTarget>();
+        crate::spatial::init_session_resource::<InspectTarget>(app);
         app.add_systems(OnEnter(AppState::InGame), spawn_inspect_panel);
         app.add_systems(
             Update,

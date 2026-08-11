@@ -1063,6 +1063,18 @@ fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
                 return Err(corrupt(format!("invalid plan material counts at {cell:?}")));
             }
         }
+        if state.materials.len() > crate::plans::MAX_PLAN_MATERIAL_KINDS {
+            return Err(corrupt(format!("plan at {cell:?} exceeds 64 materials")));
+        }
+        if state
+            .materials
+            .iter()
+            .any(|material| material.item_id.len() > crate::protocol::MAX_WIRE_ID_BYTES)
+        {
+            return Err(corrupt(format!(
+                "plan at {cell:?} has an oversized item id"
+            )));
+        }
     }
     if save
         .world_items
@@ -1072,6 +1084,54 @@ fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
         return Err(corrupt(
             "invalid world item count, position, or id".to_owned(),
         ));
+    }
+    let mut station_cells = HashSet::new();
+    for (cell, station) in &save.craft_stations {
+        if !station_cells.insert(*cell)
+            || station.orders.len() > crate::craft_stations::MAX_STATION_ORDERS
+            || station.inventory.len() > crate::craft_stations::MAX_STATION_INVENTORY_KINDS
+            || station.orders.iter().any(|order| {
+                order.recipe_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
+                    || order.total == 0
+                    || order.completed > order.total
+            })
+            || station.inventory.iter().any(|item| {
+                item.item_id.len() > crate::protocol::MAX_WIRE_ID_BYTES || item.count == 0
+            })
+            || station.active_work.as_ref().is_some_and(|work| {
+                work.recipe_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
+                    || !work.total_secs.is_finite()
+                    || !work.elapsed_secs.is_finite()
+                    || work.total_secs <= 0.0
+                    || work.elapsed_secs < 0.0
+                    || work.elapsed_secs > work.total_secs
+            })
+        {
+            return Err(corrupt(format!(
+                "invalid bounded station state at {cell:?}"
+            )));
+        }
+    }
+    let mut storage_cells = HashSet::new();
+    if save
+        .storage_cells
+        .iter()
+        .any(|cell| !storage_cells.insert(*cell))
+    {
+        return Err(corrupt("duplicate storage cell".to_owned()));
+    }
+    let mut container_cells = HashSet::new();
+    for (cell, container) in &save.containers {
+        if !container_cells.insert(*cell)
+            || container.inventory.len() > crate::containers::MAX_CONTAINER_INVENTORY_KINDS
+            || container.inventory.iter().any(|item| {
+                item.item_id.len() > crate::protocol::MAX_WIRE_ID_BYTES || item.count == 0
+            })
+        {
+            return Err(corrupt(format!(
+                "invalid bounded container state at {cell:?}"
+            )));
+        }
     }
     Ok(())
 }

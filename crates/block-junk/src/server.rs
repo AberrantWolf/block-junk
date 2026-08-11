@@ -24,17 +24,19 @@ use crate::physics::{
 };
 use crate::plans::Plans;
 use crate::protocol::{
-    ActionRejected, Actor, AppliedBlockEdit, AuthenticatedPlayer, AuthoritativeCellState, Avatar,
-    AvatarOnGround, AvatarPose, AvatarVelocity, BlockEdit, BlockWorkIntent, BlockWorkTarget,
-    CHUNK_PADDED, Carrying, CellEdit, ChunkChannel, ChunkCoord, ChunkData, ChunkSnapshot,
-    ChunkUnload, ClientReady, DepositRequest, DropRequest, DropToolRequest, EquippedTool,
-    GameReady, GameSet, INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails,
-    PeriodicSyncChannel, PickupRequest, PlanEdit, PlanKind, REACH_SLACK, RejectReason,
-    RequestNpcDetails, ServerHello, StateSyncChannel, WorldChannel, WorldClock, WorldClockSync,
-    WorldItem, WorldToast,
+    ActionRejected, Actor, AuthenticatedPlayer, AuthoritativeCellState, Avatar, AvatarOnGround,
+    AvatarPose, AvatarVelocity, BlockEdit, BlockWorkIntent, BlockWorkTarget, CHUNK_PADDED,
+    Carrying, CellEdit, ChunkCoord, ChunkData, ClientReady, DepositRequest, DropRequest,
+    DropToolRequest, EquippedTool, GameReady, GameSet, INTERACT_REACH, MovementIntent,
+    MovementMode, NpcAnimOverride, NpcDetails, PeriodicSyncChannel, PickupRequest, PlanKind,
+    REACH_SLACK, RejectReason, RequestNpcDetails, ServerHello, TerrainEditRecord, WorldChannel,
+    WorldClock, WorldClockSync, WorldItem,
 };
 use crate::recipes::RecipeRegistry;
-use crate::rooms::{DetectionDirty, RoomEventMsg, RoomMap, mark_dirty_from_edits, process_dirty};
+use crate::rooms::{
+    DetectionDirty, RoomEventMsg, RoomMap, RoomSummaryMutation, mark_dirty_from_edits,
+    process_dirty,
+};
 use crate::save::{
     SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk,
     SavedContainerState, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState,
@@ -107,6 +109,7 @@ impl Plugin for ServerPlugin {
         // know about block-entity footprints.
         app.add_message::<CellEdit>();
         app.add_message::<RoomEventMsg>();
+        app.add_message::<RoomSummaryMutation>();
         // Two chained groups in Simulation. Splitting into two `add_systems`
         // calls works around a Bevy 0.19 trait-resolution wall on chained
         // tuples beyond ~5 systems. The room group reads chunks updated by
@@ -126,8 +129,7 @@ impl Plugin for ServerPlugin {
         //
         // `auto_clear_stale_plans` listens to the `CellEdit` bus that
         // `apply_block_edit` writes per cell change and clears any
-        // matching plan tag, then broadcasts a `PlanEdit{None}` so
-        // client mirrors drop the now-stale outline.
+        // matching plan tag; the spatial store journals the removal.
         app.add_systems(
             Update,
             (
@@ -190,7 +192,12 @@ impl Plugin for ServerPlugin {
         );
         app.add_systems(
             Update,
-            (poll_chunk_gen, update_aoi, update_spatial_visibility)
+            (
+                poll_chunk_gen,
+                update_aoi,
+                refresh_spatial_scopes,
+                update_spatial_visibility,
+            )
                 .chain()
                 .in_set(GameSet::Simulation),
         );
@@ -252,13 +259,21 @@ struct SnapshotBudgets(HashMap<Entity, SnapshotBudget>);
 struct SnapshotBudget {
     updated_at: Instant,
     bytes: f32,
+    pending: Option<PendingChunkTransmission>,
+}
+
+struct PendingChunkTransmission {
+    coord: ChunkCoord,
+    messages: Vec<(crate::protocol::SpatialMessage, usize)>,
+    next: usize,
 }
 
 impl Default for SnapshotBudget {
     fn default() -> Self {
         Self {
             updated_at: Instant::now(),
-            bytes: 128.0 * 1024.0,
+            bytes: crate::spatial::SPATIAL_BURST_BYTES as f32,
+            pending: None,
         }
     }
 }
@@ -294,14 +309,6 @@ pub(crate) struct ValidatedRequestContext<'w, 's> {
 }
 
 impl ValidatedRequestContext<'_, '_> {
-    pub(crate) fn target_for_cells(&self, cells: impl IntoIterator<Item = IVec3>) -> NetworkTarget {
-        self.subscriptions.target_for_cells(cells)
-    }
-
-    pub(crate) fn subscriptions(&self) -> &SpatialSubscriptions {
-        &self.subscriptions
-    }
-
     pub(crate) fn authorize(
         &mut self,
         connection: Entity,
@@ -497,7 +504,7 @@ fn load_from_save(
     );
     // Storage zones are plain coords — no slot remap, straight restore.
     if !save.storage_cells.is_empty() {
-        storage_zones.replace_all(save.storage_cells.iter().copied());
+        storage_zones.restore_all(save.storage_cells.iter().copied());
     }
     // Restore the plan map before chunk spawn so `auto_clear_stale_plans`
     // running on the load's CellEdits doesn't see a partial state.
@@ -537,7 +544,7 @@ fn load_from_save(
                 )
             })
             .collect();
-        plans.replace_all(restored);
+        plans.restore_all(restored);
     }
     // Restore craft-station state. Each station's inventory items
     // resolve through the item registry; missing ids (mod removed)
@@ -588,7 +595,7 @@ fn load_from_save(
                 )
             })
             .collect();
-        stations.replace_all(restored);
+        stations.restore_all(restored);
     }
     // Restore container stock (v17). Same id→slot resolution as
     // station inventories; unknown ids drop just that entry.
@@ -601,7 +608,9 @@ fn load_from_save(
                 for entry in saved.inventory {
                     let id = block_junk_mod_api::items::ItemId::new(entry.item_id.clone());
                     match item_registry.slot_of(&id) {
-                        Some(slot) => state.deposit(slot, entry.count),
+                        Some(slot) => {
+                            debug_assert!(state.deposit(slot, entry.count));
+                        }
                         None => warn!(
                             cell = ?cell.to_array(),
                             item = %entry.item_id,
@@ -612,7 +621,7 @@ fn load_from_save(
                 (cell, state)
             })
             .collect();
-        containers.replace_all(restored);
+        containers.restore_all(restored);
     }
     // Restore the world clock if the save carries one. Saves predating
     // v4 don't (Option::None); fall back to the resource's default
@@ -723,7 +732,9 @@ fn load_from_save(
             },
             Transform::from_translation(translation),
             GlobalTransform::default(),
-            Replicate::to_clients(NetworkTarget::None),
+            crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                translation,
+            )),
             Name::new(format!("WorldItem(loaded:{})", id)),
         ));
         loaded_items += 1;
@@ -1067,8 +1078,9 @@ fn spawn_loaded_npc(
         crate::npc_mover::NavMover::default(),
         NpcPath::default(),
         NpcAnimOverride::default(),
-        Replicate::to_clients(NetworkTarget::None),
-        InterpolationTarget::to_clients(NetworkTarget::All),
+        crate::spatial::interpolated_spatial_replica(crate::spatial::SpatialScope::Point(
+            npc.pose.translation,
+        )),
         Name::new(format!("npc:{}", npc.id)),
     ));
 }
@@ -1270,7 +1282,9 @@ pub fn shrink_or_despawn_stack(
             },
             Transform::from_translation(translation),
             GlobalTransform::default(),
-            Replicate::to_clients(NetworkTarget::None),
+            crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                translation,
+            )),
             Name::new(format!("WorldItem(remainder:{})", item.0)),
         ));
     }
@@ -1535,17 +1549,21 @@ pub struct SpatialSubscriptions {
 struct SpatialVisibilityState(HashSet<(Entity, Entity)>);
 
 impl SpatialSubscriptions {
-    pub(crate) fn target_for_cells(&self, cells: impl IntoIterator<Item = IVec3>) -> NetworkTarget {
+    pub(crate) fn target_for_chunks(
+        &self,
+        chunks: impl IntoIterator<Item = ChunkCoord>,
+    ) -> NetworkTarget {
         let mut peers: HashSet<PeerId> = HashSet::default();
-        for cell in cells {
-            let coord = world_to_chunk(cell).0;
-            if let Some(subscribers) = self.chunk_to_clients.get(&coord) {
+        for chunk in chunks {
+            if let Some(subscribers) = self.chunk_to_clients.get(&chunk) {
                 peers.extend(subscribers.iter().copied());
             }
         }
         NetworkTarget::Only(peers.into_iter().collect())
     }
-
+    pub(crate) fn target_for_cells(&self, cells: impl IntoIterator<Item = IVec3>) -> NetworkTarget {
+        self.target_for_chunks(cells.into_iter().map(|cell| world_to_chunk(cell).0))
+    }
     fn remove_client(&mut self, connection: Entity) {
         let peer = self.client_to_peer.remove(&connection);
         if let Some(chunks) = self.client_to_chunks.remove(&connection) {
@@ -1595,6 +1613,7 @@ const READY_CHALLENGE_TTL: Duration = Duration::from_secs(10);
 struct PendingReadyChallenge {
     nonce: [u8; 32],
     manifest_hash: [u8; 32],
+    spatial_registry_fingerprint: [u8; 32],
     issued_at: Instant,
 }
 
@@ -1605,6 +1624,7 @@ struct HelloContext<'w, 's> {
     recipes: Res<'w, crate::recipes::RecipeRegistry>,
     npc_kinds: Res<'w, crate::npc_registry::NpcKindRegistry>,
     rooms: Res<'w, crate::rooms::RoomPatternRegistry>,
+    spatial_registry: Res<'w, crate::spatial::SpatialDatasetRegistry>,
     senders: Query<'w, 's, &'static mut MessageSender<ServerHello>>,
 }
 
@@ -1618,10 +1638,12 @@ fn send_server_hello(trigger: On<Add, Connected>, mut commands: Commands, contex
         recipes,
         npc_kinds,
         rooms,
+        spatial_registry,
         mut senders,
     } = context;
     let manifest = crate::modset::local_manifest(&blocks, &items, &recipes, &npc_kinds, &rooms);
     let hash = crate::protocol::manifest_hash(&manifest);
+    let spatial_registry_fingerprint = spatial_registry.fingerprint();
     let mut nonce = [0u8; 32];
     if let Err(error) = getrandom::fill(&mut nonce) {
         error!("cannot create client-ready challenge: {error}");
@@ -1637,11 +1659,13 @@ fn send_server_hello(trigger: On<Add, Connected>, mut commands: Commands, contex
         protocol_id: crate::network::NETCODE_PROTOCOL_ID,
         connection_nonce: nonce,
         manifest_hash: hash,
+        spatial_registry_fingerprint,
         manifest,
     });
     commands.entity(connection).insert(PendingReadyChallenge {
         nonce,
         manifest_hash: hash,
+        spatial_registry_fingerprint,
         issued_at: Instant::now(),
     });
 }
@@ -1683,6 +1707,7 @@ fn verify_client_ready(
                     crate::network::NETCODE_PROTOCOL_ID,
                     &challenge.nonce,
                     &challenge.manifest_hash,
+                    &challenge.spatial_registry_fingerprint,
                 );
                 key.verify(&payload, &signature).is_ok()
             })();
@@ -1800,9 +1825,10 @@ fn register_new_client(
             spawn_carry,
             spawn_tool,
             ActionState::<MovementIntent>::default(),
-            Replicate::to_clients(NetworkTarget::None),
-            PredictionTarget::to_clients(NetworkTarget::Single(remote.0)),
-            InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(remote.0)),
+            crate::spatial::predicted_owner_avatar(
+                crate::spatial::SpatialScope::Point(spawn_pose.translation),
+                remote.0,
+            ),
             ControlledBy {
                 owner: connection,
                 // Persistent: lightyear's SessionBased default despawns
@@ -1968,7 +1994,9 @@ fn forget_disconnected_client(
                             },
                             Transform::from_translation(translation),
                             GlobalTransform::default(),
-                            Replicate::to_clients(NetworkTarget::None),
+                            crate::spatial::ordinary_spatial_replica(
+                                crate::spatial::SpatialScope::Point(translation),
+                            ),
                             Name::new(format!("WorldItem(disconnect:{})", slot.0)),
                         ));
                     }
@@ -1985,7 +2013,14 @@ fn forget_disconnected_client(
         commands.entity(avatar).despawn();
     }
     sent.remove_client(trigger.entity);
-    snapshot_budgets.0.remove(&trigger.entity);
+    if let Some(pending_coord) = snapshot_budgets
+        .0
+        .remove(&trigger.entity)
+        .and_then(|budget| budget.pending.map(|pending| pending.coord))
+        && let Ok(remote) = remote_ids.get(trigger.entity)
+    {
+        remove_spatial_subscriber(&mut sent, trigger.entity, remote.0, pending_coord);
+    }
     work_leases.0.remove(&trigger.entity);
 }
 
@@ -2057,7 +2092,7 @@ fn poll_chunk_gen(
 ///   - else if a generation task is in flight, skipped (will land later)
 ///   - else a fresh task is queued on `AsyncComputeTaskPool`
 ///
-/// Chunks no longer in AoI: a `ChunkUnload` is sent.
+/// Chunks no longer in AoI receive an ordered `LeaveChunk` fact.
 ///
 /// Master chunk records in `ChunkMap` are NOT evicted when no client needs
 /// them — that's deferred to a later stage with the "edited?" tracking, so
@@ -2071,10 +2106,10 @@ struct AoiContext<'w, 's> {
     poses: Query<'w, 's, &'static AvatarPose>,
     sent: ResMut<'w, SpatialSubscriptions>,
     remote_ids: Query<'w, 's, &'static RemoteId>,
-    snapshots: Query<'w, 's, &'static mut MessageSender<ChunkSnapshot>>,
-    unloads: Query<'w, 's, &'static mut MessageSender<ChunkUnload>>,
+    spatial: Query<'w, 's, &'static mut MessageSender<crate::protocol::SpatialMessage>>,
     terrain_slots: Res<'w, TerrainSlots>,
     budgets: ResMut<'w, SnapshotBudgets>,
+    snapshots: Res<'w, crate::spatial::SpatialSnapshotCache>,
 }
 
 fn update_aoi(context: AoiContext) {
@@ -2085,11 +2120,11 @@ fn update_aoi(context: AoiContext) {
         avatars,
         poses,
         mut sent,
-        mut snapshots,
-        mut unloads,
+        mut spatial,
         terrain_slots,
         remote_ids,
         mut budgets,
+        snapshots,
     } = context;
     for (&client_entity, &avatar_entity) in avatars.0.iter() {
         let Ok(avatar_pose) = poses.get(avatar_entity) else {
@@ -2114,7 +2149,45 @@ fn update_aoi(context: AoiContext) {
         let now = Instant::now();
         let elapsed = now.duration_since(budget.updated_at).as_secs_f32();
         budget.updated_at = now;
-        budget.bytes = (budget.bytes + elapsed * 32.0 * 1024.0).min(128.0 * 1024.0);
+        budget.bytes = (budget.bytes + elapsed * crate::spatial::SPATIAL_BYTES_PER_SECOND as f32)
+            .min(crate::spatial::SPATIAL_BURST_BYTES as f32);
+
+        // Leaving an already-committed chunk is independent of a staged entry.
+        // Process it first so a large incoming snapshot can never delay unload.
+        for coord in &removed {
+            if let Ok(mut sender) = spatial.get_mut(client_entity) {
+                sender.send::<crate::protocol::SpatialChannel>(
+                    crate::protocol::SpatialMessage::LeaveChunk { coord: *coord },
+                );
+            }
+            remove_spatial_subscriber(&mut sent, client_entity, remote.0, *coord);
+        }
+
+        if budget
+            .pending
+            .as_ref()
+            .is_some_and(|outgoing| !desired.contains(&outgoing.coord))
+        {
+            let coord = budget.pending.take().expect("pending was checked").coord;
+            if let Ok(mut sender) = spatial.get_mut(client_entity) {
+                sender.send::<crate::protocol::SpatialChannel>(
+                    crate::protocol::SpatialMessage::LeaveChunk { coord },
+                );
+            }
+            remove_spatial_subscriber(&mut sent, client_entity, remote.0, coord);
+        }
+        if budget.pending.is_some() {
+            transmit_pending_chunk(budget, client_entity, remote.0, &mut spatial, &mut sent);
+            if budget.pending.is_some() {
+                continue;
+            }
+        }
+        candidates.retain(|coord| {
+            !sent
+                .client_to_chunks
+                .get(&client_entity)
+                .is_some_and(|current| current.contains(coord))
+        });
 
         for coord in &candidates {
             // Resolve the chunk's wire payload. Three states:
@@ -2148,46 +2221,132 @@ fn update_aoi(context: AoiContext) {
             let Some((data, entities)) = payload else {
                 continue; // still generating; try again next tick
             };
-            let snapshot = ChunkSnapshot {
+            let transaction = spatial_transaction_id(client_entity, *coord);
+            let mut messages = vec![crate::protocol::SpatialMessage::BeginChunk {
+                transaction,
                 coord: *coord,
-                data,
-                entities,
-            };
-            let encoded_bytes =
-                bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
-                    .map_or(usize::MAX, |bytes| bytes.len());
-            if encoded_bytes as f32 > budget.bytes {
+                terrain: data,
+                entities: crate::protocol::BoundedVec::new(entities)
+                    .expect("a chunk sidecar cannot exceed the padded cell count"),
+            }];
+            append_partition_pages(&snapshots, *coord, transaction, &mut messages);
+            messages.push(crate::protocol::SpatialMessage::CommitChunk {
+                transaction,
+                coord: *coord,
+            });
+            let Some(messages) = messages
+                .into_iter()
+                .map(|message| {
+                    let size = bincode::serde::encode_to_vec(&message, bincode::config::standard())
+                        .ok()?
+                        .len();
+                    // The token bucket can never hold more than one burst. A
+                    // message above that ceiling would otherwise remain at the
+                    // head of the transaction forever.
+                    (size <= crate::spatial::SPATIAL_BURST_BYTES).then_some((message, size))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                warn!(coord = ?coord.0, "spatial transaction contains an oversized message");
                 continue;
-            }
-            if let Ok(mut sender) = snapshots.get_mut(client_entity) {
-                sender.send::<ChunkChannel>(snapshot);
-                budget.bytes -= encoded_bytes as f32;
-                sent.client_to_chunks
-                    .entry(client_entity)
-                    .or_default()
-                    .insert(*coord);
-                sent.chunk_to_clients
-                    .entry(*coord)
-                    .or_default()
-                    .insert(remote.0);
-            }
-        }
-
-        for coord in &removed {
-            if let Ok(mut sender) = unloads.get_mut(client_entity) {
-                sender.send::<ChunkChannel>(ChunkUnload { coord: *coord });
-            }
-            if let Some(current) = sent.client_to_chunks.get_mut(&client_entity) {
-                current.remove(coord);
-            }
-            if let Some(clients) = sent.chunk_to_clients.get_mut(coord) {
-                clients.remove(&remote.0);
-                if clients.is_empty() {
-                    sent.chunk_to_clients.remove(coord);
-                }
+            };
+            budget.pending = Some(PendingChunkTransmission {
+                coord: *coord,
+                messages,
+                next: 0,
+            });
+            transmit_pending_chunk(budget, client_entity, remote.0, &mut spatial, &mut sent);
+            if budget.pending.is_some() {
+                break;
             }
         }
     }
+}
+
+fn transmit_pending_chunk(
+    budget: &mut SnapshotBudget,
+    connection: Entity,
+    peer: PeerId,
+    senders: &mut Query<&mut MessageSender<crate::protocol::SpatialMessage>>,
+    subscriptions: &mut SpatialSubscriptions,
+) {
+    let Some(outgoing) = budget.pending.as_mut() else {
+        return;
+    };
+    let Ok(mut sender) = senders.get_mut(connection) else {
+        return;
+    };
+    while let Some((message, size)) = outgoing.messages.get(outgoing.next) {
+        if *size as f32 > budget.bytes {
+            break;
+        }
+        let began = matches!(message, crate::protocol::SpatialMessage::BeginChunk { .. });
+        let committed = matches!(message, crate::protocol::SpatialMessage::CommitChunk { .. });
+        sender.send::<crate::protocol::SpatialChannel>(message.clone());
+        budget.bytes -= *size as f32;
+        outgoing.next += 1;
+        if began {
+            subscriptions
+                .chunk_to_clients
+                .entry(outgoing.coord)
+                .or_default()
+                .insert(peer);
+        }
+        if committed {
+            subscriptions
+                .client_to_chunks
+                .entry(connection)
+                .or_default()
+                .insert(outgoing.coord);
+        }
+    }
+    if outgoing.next == outgoing.messages.len() {
+        budget.pending = None;
+    }
+}
+
+fn remove_spatial_subscriber(
+    subscriptions: &mut SpatialSubscriptions,
+    connection: Entity,
+    peer: PeerId,
+    coord: ChunkCoord,
+) {
+    if let Some(current) = subscriptions.client_to_chunks.get_mut(&connection) {
+        current.remove(&coord);
+    }
+    if let Some(clients) = subscriptions.chunk_to_clients.get_mut(&coord) {
+        clients.remove(&peer);
+        if clients.is_empty() {
+            subscriptions.chunk_to_clients.remove(&coord);
+        }
+    }
+}
+
+fn spatial_transaction_id(connection: Entity, coord: ChunkCoord) -> u64 {
+    let bits = connection.to_bits();
+    let c = coord.0;
+    bits.rotate_left(17)
+        ^ (c.x as u32 as u64)
+        ^ ((c.y as u32 as u64) << 21)
+        ^ ((c.z as u32 as u64) << 42)
+}
+
+fn append_partition_pages(
+    snapshots: &crate::spatial::SpatialSnapshotCache,
+    coord: ChunkCoord,
+    transaction: u64,
+    messages: &mut Vec<crate::protocol::SpatialMessage>,
+) {
+    messages.extend(snapshots.pages(coord).filter_map(|page| {
+        crate::protocol::BoundedVec::new(page.payload)
+            .ok()
+            .map(|payload| crate::protocol::SpatialMessage::PartitionPage {
+                transaction,
+                dataset: page.dataset,
+                schema_fingerprint: page.schema_fingerprint,
+                payload,
+            })
+    }));
 }
 
 fn encode_chunk_data(blocks: &[BlockSlot]) -> ChunkData {
@@ -2219,48 +2378,84 @@ fn encode_chunk_data(blocks: &[BlockSlot]) -> ChunkData {
 fn update_spatial_visibility(
     mut commands: Commands,
     subscriptions: Res<SpatialSubscriptions>,
-    actors: Query<(Entity, &AvatarPose), With<Actor>>,
-    items: Query<(Entity, &WorldItem)>,
-    clusters: Query<(Entity, &crate::civilization::ClusterBboxReplica)>,
+    replicas: Query<(Entity, &crate::spatial::SpatialScope), With<crate::spatial::SpatialReplica>>,
     mut state: ResMut<SpatialVisibilityState>,
 ) {
-    use lightyear::prelude::VisibilityExt as _;
-
     let mut desired = HashSet::default();
     for (&connection, chunks) in &subscriptions.client_to_chunks {
-        for (entity, pose) in &actors {
-            if chunks.contains(&world_to_chunk_coord(pose.translation)) {
-                desired.insert((entity, connection));
-            }
-        }
-        for (entity, item) in &items {
-            if chunks.contains(&world_to_chunk_coord(item.translation)) {
-                desired.insert((entity, connection));
-            }
-        }
-        for (entity, bounds) in &clusters {
-            let min = world_to_chunk(bounds.min).0.0;
-            let max = world_to_chunk(bounds.max).0.0;
-            if chunks.iter().any(|coord| {
-                let value = coord.0;
-                value.x >= min.x
-                    && value.y >= min.y
-                    && value.z >= min.z
-                    && value.x <= max.x
-                    && value.y <= max.y
-                    && value.z <= max.z
-            }) {
+        for (entity, scope) in &replicas {
+            if scope.intersects(chunks) {
                 desired.insert((entity, connection));
             }
         }
     }
     for &(entity, connection) in desired.difference(&state.0) {
-        commands.gain_visibility(entity, connection);
+        crate::spatial::gain_replica_visibility(&mut commands, entity, connection);
     }
     for &(entity, connection) in state.0.difference(&desired) {
-        commands.lose_visibility(entity, connection);
+        crate::spatial::lose_replica_visibility(&mut commands, entity, connection);
     }
     state.0 = desired;
+}
+
+type ActorScopeQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static AvatarPose,
+        &'static mut crate::spatial::SpatialScope,
+    ),
+    (
+        Changed<AvatarPose>,
+        With<Actor>,
+        Without<WorldItem>,
+        Without<crate::civilization::ClusterBboxReplica>,
+    ),
+>;
+type ItemScopeQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static WorldItem,
+        &'static mut crate::spatial::SpatialScope,
+    ),
+    (
+        Changed<WorldItem>,
+        Without<Actor>,
+        Without<crate::civilization::ClusterBboxReplica>,
+    ),
+>;
+type ClusterScopeQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static crate::civilization::ClusterBboxReplica,
+        &'static mut crate::spatial::SpatialScope,
+    ),
+    (
+        Changed<crate::civilization::ClusterBboxReplica>,
+        Without<Actor>,
+        Without<WorldItem>,
+    ),
+>;
+
+fn refresh_spatial_scopes(
+    mut actors: ActorScopeQuery,
+    mut items: ItemScopeQuery,
+    mut clusters: ClusterScopeQuery,
+) {
+    for (pose, mut scope) in &mut actors {
+        *scope = crate::spatial::SpatialScope::Point(pose.translation);
+    }
+    for (item, mut scope) in &mut items {
+        *scope = crate::spatial::SpatialScope::Point(item.translation);
+    }
+    for (bounds, mut scope) in &mut clusters {
+        *scope = crate::spatial::SpatialScope::Bounds {
+            min: bounds.min.as_vec3(),
+            max: (bounds.max + IVec3::ONE).as_vec3(),
+        };
+    }
 }
 
 fn world_to_chunk_coord(pos: Vec3) -> ChunkCoord {
@@ -2696,11 +2891,8 @@ fn apply_place(
         cells.iter().map(|&world| (world, edit.slot)).collect();
     crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
 
-    // ChunkChannel, not WorldChannel: the client drops edits for chunks it
-    // hasn't loaded, trusting the eventual ChunkSnapshot to carry the final
-    // state. That only holds if snapshot and edit share one ordered stream —
-    // on separate channels a small edit can overtake a fragmented snapshot
-    // cut *after* it and be lost until the chunk re-enters AoI.
+    // The ordered spatial lane keeps terrain edits consistent with staged
+    // chunk entry and leave transactions.
     let states = cells
         .iter()
         .map(|&world| AuthoritativeCellState {
@@ -2717,7 +2909,7 @@ fn apply_place(
             }),
         })
         .collect();
-    let applied = AppliedBlockEdit {
+    let applied = TerrainEditRecord {
         anchor: edit.anchor,
         old_slot: BlockSlot::EMPTY,
         orientation: edit.orientation,
@@ -2725,8 +2917,8 @@ fn apply_place(
             .expect("validated block footprints fit the applied-edit wire bound"),
     };
     let target = subscriptions.target_for_cells(cells.iter().copied());
-    if let Err(err) = broadcast.send::<AppliedBlockEdit, ChunkChannel>(&applied, server, &target) {
-        warn!("AppliedBlockEdit broadcast failed: {err}");
+    if let Err(err) = send_spatial_terrain_delta(broadcast, server, &target, &applied) {
+        warn!("terrain spatial delta failed: {err}");
     }
 }
 
@@ -2850,8 +3042,8 @@ fn apply_break(
 
     // Broadcast the canonical applied break with the resolved anchor +
     // orientation, so other clients can compute the footprint themselves.
-    // ChunkChannel for snapshot/edit ordering — see apply_place.
-    let applied = AppliedBlockEdit {
+    // Ordered spatial lane for staging/edit ordering — see apply_place.
+    let applied = TerrainEditRecord {
         anchor,
         old_slot: slot,
         orientation,
@@ -2868,8 +3060,8 @@ fn apply_break(
         .expect("validated block footprints fit the applied-edit wire bound"),
     };
     let target = subscriptions.target_for_cells(cells.iter().copied());
-    if let Err(err) = broadcast.send::<AppliedBlockEdit, ChunkChannel>(&applied, server, &target) {
-        warn!("AppliedBlockEdit broadcast failed: {err}");
+    if let Err(err) = send_spatial_terrain_delta(broadcast, server, &target, &applied) {
+        warn!("terrain spatial delta failed: {err}");
     }
 
     // S4 forage harvest-transform: a resource block with `depleted_block`
@@ -2899,6 +3091,29 @@ fn apply_break(
             subscriptions,
         );
     }
+}
+
+fn send_spatial_terrain_delta(
+    broadcast: &mut ServerMultiMessageSender,
+    server: &Server,
+    target: &NetworkTarget,
+    edit: &TerrainEditRecord,
+) -> Result<(), String> {
+    let bytes = bincode::serde::encode_to_vec(edit, bincode::config::standard())
+        .expect("bounded terrain edit serializes");
+    let payload =
+        crate::protocol::BoundedVec::new(bytes).expect("bounded terrain edit fits a spatial page");
+    broadcast
+        .send::<crate::protocol::SpatialMessage, crate::protocol::SpatialChannel>(
+            &crate::protocol::SpatialMessage::Delta {
+                dataset: crate::spatial::TERRAIN_DATASET_ID,
+                schema_fingerprint: crate::spatial::TERRAIN_SCHEMA_FINGERPRINT,
+                payload,
+            },
+            server,
+            target,
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// Resolve a default-orientation footprint into world cells. Same shape
@@ -3232,7 +3447,9 @@ fn receive_pickup_requests(
                         },
                         Transform::from_translation(req.target),
                         GlobalTransform::default(),
-                        Replicate::to_clients(NetworkTarget::None),
+                        crate::spatial::ordinary_spatial_replica(
+                            crate::spatial::SpatialScope::Point(req.target),
+                        ),
                         Name::new(format!("WorldItem(tool_swap:{})", prev_slot.0)),
                     ));
                 }
@@ -3324,7 +3541,9 @@ fn receive_drop_requests(
                 },
                 Transform::from_translation(translation),
                 GlobalTransform::default(),
-                Replicate::to_clients(NetworkTarget::None),
+                crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                    translation,
+                )),
                 Name::new(format!("WorldItem(dropped:{})", item.0)),
             ));
         }
@@ -3388,7 +3607,7 @@ fn receive_drop_tool_requests(
             },
             Transform::from_translation(target),
             GlobalTransform::default(),
-            Replicate::to_clients(NetworkTarget::None),
+            crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(target)),
             Name::new(format!("WorldItem(tool_dropped:{})", slot.0)),
         ));
     }
@@ -3434,8 +3653,7 @@ fn drop_target_position(pose: &AvatarPose, world: &crate::npc::WorldWalk) -> Vec
 /// plan's `materials_present`. Per request: locate the player, read
 /// their `Carrying`, compute how many units the targeted plan still
 /// needs of that item, decrement the carry by that amount, increment
-/// the plan, then broadcast the updated `PlanEdit` so every client's
-/// `Plans` mirror sees the new materials. Silent no-op on:
+/// the plan; the spatial store journals the new materials. Silent no-op on:
 ///   - empty carry
 ///   - no plan at `cell` (was untagged between client click and server receive)
 ///   - plan isn't Build (Remove plans don't accept materials)
@@ -3447,14 +3665,12 @@ struct DepositContext<'w, 's> {
     plans: ResMut<'w, Plans>,
     item_registry: Res<'w, ItemRegistry>,
     rejections: Query<'w, 's, &'static mut MessageSender<ActionRejected>>,
-    toast_senders: Query<'w, 's, &'static mut MessageSender<WorldToast>>,
-    servers: Query<'w, 's, &'static Server>,
+    toast_senders: Query<'w, 's, &'static mut MessageSender<crate::protocol::SpatialMessage>>,
 }
 
 fn receive_deposit_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<DepositRequest>), With<GameReady>>,
     context: DepositContext,
-    mut broadcast: ServerMultiMessageSender,
     mut validation: ValidatedRequestContext,
 ) {
     let DepositContext {
@@ -3464,11 +3680,7 @@ fn receive_deposit_requests(
         item_registry,
         mut rejections,
         mut toast_senders,
-        servers,
     } = context;
-    let Ok(server) = servers.single() else {
-        return;
-    };
     for (connection, mut receiver) in receivers.iter_mut() {
         let requests: Vec<DepositRequest> = receiver.receive().collect();
         for req in requests {
@@ -3507,38 +3719,27 @@ fn receive_deposit_requests(
             if carry.count == 0 {
                 carry.item = None;
             }
-            // Broadcast the updated plan state so client mirrors learn
-            // the new materials.present + outline re-renders.
-            let updated_state = plans.get(req.cell).cloned();
-            if let Some(state) = updated_state {
+            if let Some(state) = plans.get(req.cell) {
                 // Targeted deposit receipt — the depositor sees
                 // "Wood Log 2/4" at the plan cell (there's no audio
                 // yet, and the ghost re-tint alone is easy to miss).
-                // Other clients learn the same from the PlanEdit
-                // broadcast below.
                 if let Some(entry) = state.materials.iter().find(|m| m.item == carry_item)
                     && let Ok(mut sender) = toast_senders.get_mut(connection)
                 {
-                    sender.send::<WorldChannel>(WorldToast {
-                        cell: req.cell,
-                        text: format!(
-                            "{} {}/{}",
-                            item_registry.def(entry.item).display_name,
-                            entry.present,
-                            entry.needed
-                        ),
-                    });
-                }
-                let reply = PlanEdit {
-                    cell: req.cell,
-                    kind: Some(state.kind),
-                    materials: state.materials,
-                };
-                let target = validation.target_for_cells([req.cell]);
-                if let Err(err) =
-                    broadcast.send::<PlanEdit, StateSyncChannel>(&reply, server, &target)
-                {
-                    warn!("deposit PlanEdit broadcast failed: {err}");
+                    let text = format!(
+                        "{} {}/{}",
+                        item_registry.def(entry.item).display_name,
+                        entry.present,
+                        entry.needed
+                    );
+                    if let Ok(text) = crate::protocol::BoundedString::<256>::new(text) {
+                        sender.send::<crate::protocol::SpatialChannel>(
+                            crate::protocol::SpatialMessage::Toast {
+                                cell: req.cell,
+                                text,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -3598,16 +3799,7 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
 ///
 /// Broadcasts a `PlanEdit { kind: None }` per cleared tag so client
 /// mirrors drop their outline at the same moment the cell changes.
-fn auto_clear_stale_plans(
-    mut reader: MessageReader<CellEdit>,
-    mut plans: ResMut<Plans>,
-    mut broadcast: ServerMultiMessageSender,
-    servers: Query<&Server>,
-    subscriptions: Res<SpatialSubscriptions>,
-) {
-    let Ok(server) = servers.single() else {
-        return;
-    };
+fn auto_clear_stale_plans(mut reader: MessageReader<CellEdit>, mut plans: ResMut<Plans>) {
     for edit in reader.read() {
         let stale = match plans.get(edit.world).map(|s| s.kind) {
             Some(PlanKind::Remove) => edit.slot.is_empty(),
@@ -3618,15 +3810,6 @@ fn auto_clear_stale_plans(
             continue;
         }
         plans.clear(edit.world);
-        let msg = PlanEdit {
-            cell: edit.world,
-            kind: None,
-            materials: Vec::new(),
-        };
-        let target = subscriptions.target_for_cells([edit.world]);
-        if let Err(err) = broadcast.send::<PlanEdit, StateSyncChannel>(&msg, server, &target) {
-            warn!("auto-clear PlanEdit broadcast failed: {err}");
-        }
     }
 }
 
@@ -3678,9 +3861,8 @@ pub(crate) fn settled_translation(
 /// block used to be. Drops don't support each other, so a whole pile
 /// settles onto the same floor cell.
 ///
-/// Server-authoritative spawn with `Replicate::to_clients(All)` — every
-/// client gets the new entity in their next replication tick, and the
-/// client-side observer attaches the visible glTF scene.
+/// Server-authoritative spatial spawn. AOI visibility decides which clients
+/// receive the entity, and the client-side observer attaches its visible scene.
 fn spawn_drops_on_destroy(
     mut reader: MessageReader<CellEdit>,
     mut commands: Commands,
@@ -3733,7 +3915,9 @@ fn spawn_drops_on_destroy(
                     },
                     Transform::from_translation(translation),
                     GlobalTransform::default(),
-                    Replicate::to_clients(NetworkTarget::None),
+                    crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
+                        translation,
+                    )),
                     Name::new(format!("WorldItem({})", item_id)),
                 ));
             }

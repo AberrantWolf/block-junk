@@ -291,7 +291,12 @@ impl Plugin for MenuPlugin {
         app.init_resource::<SaveListing>();
         app.init_resource::<SaveStatus>();
         app.init_resource::<MenuPage>();
-        app.add_systems(OnEnter(AppState::MainMenu), refresh_save_listing);
+        app.init_resource::<DeleteConfirmation>();
+        crate::spatial::init_session_resource::<PauseMenuState>(app);
+        app.add_systems(
+            OnEnter(AppState::MainMenu),
+            (refresh_save_listing, reset_delete_confirmation),
+        );
 
         // bevy_egui attaches its primary context to the FIRST camera that
         // appears. Without this, the menu state has no camera (the 3D one
@@ -465,7 +470,7 @@ fn main_menu_ui(
     // World name awaiting delete confirmation. Delete is irreversible
     // and sits one row away from Load — a single misclick must not
     // destroy a world, so the first click only arms the confirm row.
-    mut confirm_delete: Local<Option<String>>,
+    mut confirm_delete: ResMut<DeleteConfirmation>,
     // Placeholder values for the not-yet-wired Settings page.
     mut dummy: Local<DummySettings>,
 ) {
@@ -498,7 +503,7 @@ fn main_menu_ui(
                     &mut new_name,
                     &mut listing,
                     &mut status,
-                    &mut confirm_delete,
+                    &mut confirm_delete.0,
                     &mut host_access,
                 ),
                 MenuPage::Multiplayer => multiplayer_page(
@@ -909,11 +914,18 @@ struct SaveFeedback {
     failed: bool,
 }
 
-#[derive(bevy::ecs::system::SystemParam)]
-struct PauseMenuLocal<'s> {
-    save_feedback: Local<'s, SaveFeedback>,
+#[derive(Resource, Default)]
+struct PauseMenuState {
+    save_feedback: SaveFeedback,
     // Cached for the session: interface-route lookup is a syscall pair.
-    lan_addr: Local<'s, Option<Option<core::net::IpAddr>>>,
+    lan_addr: Option<Option<core::net::IpAddr>>,
+}
+
+#[derive(Resource, Default)]
+struct DeleteConfirmation(Option<String>);
+
+fn reset_delete_confirmation(mut confirmation: ResMut<DeleteConfirmation>) {
+    confirmation.0 = None;
 }
 
 #[allow(
@@ -928,12 +940,12 @@ fn pause_menu_ui(
     debug_no_save: Res<DebugNoSaveOnExit>,
     time: Res<Time>,
     join_code: Res<HostedJoinCode>,
-    local: PauseMenuLocal,
+    mut local: ResMut<PauseMenuState>,
 ) {
-    let PauseMenuLocal {
-        mut save_feedback,
-        mut lan_addr,
-    } = local;
+    let PauseMenuState {
+        save_feedback,
+        lan_addr,
+    } = &mut *local;
     if !captures.contains(crate::ui_capture::UiCapture::PauseMenu) {
         return;
     }

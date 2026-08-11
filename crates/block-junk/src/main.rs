@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod architecture;
 mod block_textures;
 mod blocks;
 mod build_palette;
@@ -37,6 +39,7 @@ mod rooms;
 mod save;
 mod scripting;
 mod server;
+mod spatial;
 mod storage;
 mod target_outline;
 mod ui_capture;
@@ -358,7 +361,12 @@ fn run_client(preset: Option<LaunchMode>, invite_secret: Option<[u8; 32]>) {
     // gameplay-y runs while the main menu is open.
     app.configure_sets(
         Update,
-        (GameSet::Input, GameSet::Simulation, GameSet::PostSimulation)
+        (
+            GameSet::Input,
+            GameSet::Simulation,
+            GameSet::SpatialSync,
+            GameSet::PostSimulation,
+        )
             .chain()
             .run_if(in_state(AppState::InGame)),
     );
@@ -394,6 +402,12 @@ fn kick_to_ingame(mut next: ResMut<NextState<AppState>>) {
 fn configure_shared_schedule(app: &mut App) {
     app.configure_sets(
         Update,
-        (GameSet::Input, GameSet::Simulation, GameSet::PostSimulation).chain(),
+        (
+            GameSet::Input,
+            GameSet::Simulation,
+            GameSet::SpatialSync,
+            GameSet::PostSimulation,
+        )
+            .chain(),
     );
 }

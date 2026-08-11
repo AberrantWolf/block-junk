@@ -57,7 +57,7 @@ struct WorldspaceProgressBar {
 #[derive(Component, Debug)]
 struct WorldspaceProgressBarFill;
 
-/// Server-broadcast → client mirror lookup. Keyed by station cell so
+/// Client spatial-replica lookup. Keyed by station cell so
 /// we can answer "does this station already have a bar?" without
 /// scanning the UI tree. Cleared when the bar entity despawns.
 #[derive(Resource, Default, Debug)]
@@ -69,7 +69,7 @@ pub struct CraftProgressHudPlugin;
 
 impl Plugin for CraftProgressHudPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<WorldspaceProgressBars>();
+        crate::spatial::init_session_resource::<WorldspaceProgressBars>(app);
         // PostSimulation runs after the camera's frame-interpolated
         // transform is finalized, so `world_to_viewport` projects
         // against the same camera pose the renderer will use this
@@ -80,15 +80,7 @@ impl Plugin for CraftProgressHudPlugin {
                 .in_set(GameSet::PostSimulation)
                 .run_if(in_state(AppState::InGame)),
         );
-        // Bar entities carry DespawnOnExit; the by-cell index must reset
-        // with them (private type, so the reset lives here rather than
-        // in client.rs::cleanup_session).
-        app.add_systems(OnExit(AppState::InGame), reset_progress_bars);
     }
-}
-
-fn reset_progress_bars(mut bars: ResMut<WorldspaceProgressBars>) {
-    bars.by_cell.clear();
 }
 
 /// Per-frame system: ensure each station with `active_work` has a

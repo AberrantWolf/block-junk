@@ -12,7 +12,7 @@ use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 /// Tracks the ECS entity rendering each placed block-entity (a block
 /// whose `BlockDef.mesh` is set, e.g. furniture, doors). Indexed by world
 /// cell with a parallel per-chunk set so we can despawn an entire chunk's
-/// block entities cheaply on `ChunkUnload`.
+/// block entities cheaply on ordered chunk leave.
 #[derive(Resource, Default)]
 pub struct BlockEntities {
     by_cell: HashMap<IVec3, Entity>,

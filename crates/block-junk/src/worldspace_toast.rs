@@ -67,7 +67,7 @@ pub struct WorldspaceToastPlugin;
 
 impl Plugin for WorldspaceToastPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<PendingToasts>();
+        crate::spatial::init_session_resource::<PendingToasts>(app);
         // PostSimulation: after the frame-interpolated camera transform
         // finalises so `world_to_viewport` projects against the same
         // pose the renderer uses (matches craft_progress_hud). Drain
