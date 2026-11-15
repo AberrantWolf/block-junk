@@ -23,6 +23,7 @@ use crate::shared::BlockPos;
 /// One queued `engine.ui.toast` request. The engine drains the queue
 /// every tick; ordering within a tick follows call order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UiToast {
     /// World cell the toast floats above.
     pub pos: BlockPos,
@@ -32,6 +33,7 @@ pub struct UiToast {
 /// What the player is hovering, handed to `engine.ui.on_inspect`
 /// callbacks whenever the inspect panel re-renders.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InspectTarget {
     /// One of `"block"`, `"item"`, `"npc"`, `"plan"`.
     pub kind: String,

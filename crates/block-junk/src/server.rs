@@ -24,29 +24,21 @@ use crate::physics::{
 };
 use crate::plans::Plans;
 use crate::protocol::{
-    ActionRejected, Actor, AuthenticatedPlayer, AuthoritativeCellState, Avatar, AvatarOnGround,
-    AvatarPose, AvatarVelocity, BlockEdit, BlockWorkIntent, BlockWorkTarget, CHUNK_PADDED,
-    Carrying, CellEdit, ChunkCoord, ChunkData, ClientReady, DepositRequest, DropRequest,
-    DropToolRequest, EquippedTool, GameReady, GameSet, INTERACT_REACH, MovementIntent,
-    MovementMode, NpcAnimOverride, NpcDetails, PeriodicSyncChannel, PickupRequest, PlanKind,
-    REACH_SLACK, RejectReason, RequestNpcDetails, ServerHello, TerrainEditRecord, WorldChannel,
-    WorldClock, WorldClockSync, WorldItem,
+    ActionRejected, Actor, AuthenticatedPlayer, Avatar, AvatarOnGround, AvatarPose, AvatarVelocity,
+    BlockEdit, BlockWorkIntent, BlockWorkTarget, Carrying, CellEdit, ChunkCoord, ChunkData,
+    ClientReady, DepositRequest, DropRequest, DropToolRequest, EquippedTool, GameReady, GameSet,
+    INTERACT_REACH, MovementIntent, MovementMode, NpcAnimOverride, NpcDetails, PeriodicSyncChannel,
+    PickupRequest, PlanKind, REACH_SLACK, RejectReason, RequestNpcDetails, ServerHello,
+    TerrainEditRecord, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::recipes::RecipeRegistry;
-use crate::rooms::{
-    DetectionDirty, RoomEventMsg, RoomMap, RoomSummaryMutation, mark_dirty_from_edits,
-    process_dirty,
-};
 use crate::save::{
     SAVE_VERSION, SaveError, SaveFile, SavedActiveWork, SavedCarry, SavedChunk,
     SavedContainerState, SavedCraftOrder, SavedMaterialEntry, SavedNpc, SavedPlanState,
     SavedPlayer, SavedStationItem, SavedStationState, SavedTool, SavedWorldItem, read_save,
     remap_block_slots, write_save,
 };
-use crate::voxel::{
-    Chunk, ChunkEntities, ChunkMap, EntryKind, chunk_local_to_world, chunk_world_transform,
-    world_to_chunk,
-};
+use crate::voxel::{Chunk, ChunkEntities, ChunkMap, chunk_world_transform, world_to_chunk};
 
 /// Marker on chunks whose state has diverged from the deterministic terrain
 /// function. Server uses it to decide whether to ship the bytes or just
@@ -64,7 +56,7 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::npc::NpcServerPlugin);
         app.add_plugins(crate::plans::PlansServerPlugin);
         app.add_plugins(crate::storage::StorageServerPlugin);
-        app.add_plugins(crate::room_sync::RoomSyncServerPlugin);
+        app.add_plugins(crate::placement_network::PlacementServerPlugin);
         app.add_plugins(crate::plan_claims::PlanClaimsPlugin);
         app.add_plugins(crate::haul::HaulPlugin);
         app.add_plugins(crate::craft_stations::CraftStationsServerPlugin);
@@ -72,24 +64,70 @@ impl Plugin for ServerPlugin {
         app.add_plugins(crate::regrow::RegrowServerPlugin);
         // ServerScriptingPlugin inserts BlockRegistry; resolve well-known
         // terrain slots from it once so chunk gen doesn't hash strings.
-        let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
+        let terrain_slots = TerrainSlots::from_registry(
+            app.world().resource::<BlockRegistry>(),
+            &app.world().resource::<crate::scripting::SelectedWorld>().0,
+        );
         app.insert_resource(terrain_slots);
         // lightyear 0.28: the replication send rate is app-wide, not
         // per-sender. Overrides the Default (send every tick) the
         // lightyear plugins insert.
         app.insert_resource(ReplicationMetadata::new(REPLICATION_INTERVAL));
         app.init_resource::<ChunkMap>();
+        app.init_resource::<crate::placements::Placements>();
+        app.init_resource::<crate::facility_interactions::FacilityInteractions>();
+        crate::spatial::init_session_resource::<crate::item_placement::ItemPlacementQueue>(app);
+        app.add_systems(PostUpdate, crate::item_placement::deliver);
         app.init_resource::<ClientAvatars>();
         app.init_resource::<SpatialSubscriptions>();
         app.init_resource::<SpatialVisibilityState>();
         app.init_resource::<PendingChunks>();
+        app.init_resource::<ActiveSimulationChunks>();
+        app.init_resource::<crate::spatial_geometry::StructuralSummaries>();
+        app.init_resource::<crate::space_identity::SpaceIdentities>();
+        app.init_resource::<crate::spatial_events::SpatialJournal>();
+        app.init_resource::<crate::capabilities::Capabilities>()
+            .init_resource::<crate::capabilities::CapabilityWork>()
+            .init_resource::<crate::capabilities::CapabilityDependencies>();
+        app.init_resource::<crate::facility_access::FacilityAccess>()
+            .init_resource::<crate::facility_access::AccessWork>()
+            .init_resource::<crate::facility_access::FacilityDependencies>();
+        app.init_resource::<crate::settlements::Settlements>()
+            .init_resource::<crate::settlements::SettlementWork>()
+            .init_resource::<crate::settlements::SettlementDependencies>();
+        app.init_resource::<crate::live_spaces::SpatialDependencies>()
+            .init_resource::<crate::live_spaces::RoofEnvelope>()
+            .init_resource::<crate::live_spaces::SpatialComputation>()
+            .init_resource::<crate::live_spaces::PublishedSpaces>();
+        app.add_systems(
+            PostUpdate,
+            (
+                crate::live_spaces::track_roof_envelope,
+                crate::spatial_geometry::refresh_structural_summaries,
+                crate::spatial_geometry::materialize_facilities,
+                crate::live_spaces::compute_spaces,
+                crate::settlements::refresh,
+                crate::facility_access::refresh,
+                crate::capabilities::refresh,
+                crate::live_spaces::request_dependency_chunks,
+            )
+                .chain(),
+        );
         app.init_resource::<PlayerStates>();
         app.init_resource::<BlockWorkLeases>();
         app.init_resource::<RequestBudgets>();
         app.init_resource::<SnapshotBudgets>();
+        app.init_resource::<crate::space_network::SpaceSenders>();
+        app.init_resource::<crate::capability_network::CapabilitySenders>();
+        app.add_systems(
+            PostUpdate,
+            (
+                crate::space_network::publish,
+                crate::capability_network::publish,
+            )
+                .after(crate::capabilities::refresh),
+        );
         app.init_resource::<SaveWriteGuard>();
-        app.init_resource::<RoomMap>();
-        app.init_resource::<DetectionDirty>();
         // World clock. Start at 0.25 (sunrise) so a fresh session begins
         // with the world lit and gives players a few minutes before the
         // first sleep-driven NPC behaviour kicks in. Save persistence is
@@ -108,19 +146,11 @@ impl Plugin for ServerPlugin {
         // per footprint cell so existing per-cell consumers don't need to
         // know about block-entity footprints.
         app.add_message::<CellEdit>();
-        app.add_message::<RoomEventMsg>();
-        app.add_message::<RoomSummaryMutation>();
-        // Two chained groups in Simulation. Splitting into two `add_systems`
-        // calls works around a Bevy 0.19 trait-resolution wall on chained
-        // tuples beyond ~5 systems. The room group reads chunks updated by
-        // `receive_block_edits`, so its order is "after edits"; the AoI
-        // group is independent.
         app.add_systems(
             Update,
-            (receive_block_edits, mark_dirty_from_edits, process_dirty)
-                .chain()
-                .in_set(GameSet::Simulation),
+            flush_mod_terrain_effects.in_set(GameSet::PostSimulation),
         );
+        app.add_systems(Update, receive_block_edits.in_set(GameSet::Simulation));
         // NPC work-completion adapter: translates the brain's local-bus
         // `NpcWorkCompleted` events into the same `apply_block_edit`
         // path that handles client `BlockEdit` messages — so the world
@@ -149,19 +179,7 @@ impl Plugin for ServerPlugin {
         // spawn_drops_on_destroy is immaterial, only "after edits."
         app.add_systems(
             Update,
-            apply_npc_consumption
-                .after(receive_block_edits)
-                .in_set(GameSet::Simulation),
-        );
-        // Station + container teardown ride the same CellEdit bus.
-        // Separate add_systems call: the chained tuple above sits at
-        // the Bevy 0.19 trait-resolution limit already.
-        app.add_systems(
-            Update,
-            (
-                crate::craft_stations::clear_destroyed_stations,
-                crate::containers::clear_destroyed_containers,
-            )
+            apply_facility_completion
                 .after(receive_block_edits)
                 .in_set(GameSet::Simulation),
         );
@@ -187,12 +205,14 @@ impl Plugin for ServerPlugin {
                 receive_drop_requests,
                 receive_drop_tool_requests,
                 receive_deposit_requests,
+                crate::portal_service::receive,
             )
                 .in_set(GameSet::Simulation),
         );
         app.add_systems(
             Update,
             (
+                request_npc_chunks,
                 poll_chunk_gen,
                 update_aoi,
                 refresh_spatial_scopes,
@@ -233,8 +253,8 @@ impl Plugin for ServerPlugin {
         // system that touches ChunkMap so loaded chunks beat AoI's
         // procedural fallback. `save_then_shutdown` polls the shutdown flag
         // every tick — when it fires, writes the world and exits the App.
-        app.add_systems(Startup, load_from_save);
-        app.add_systems(Update, (save_then_shutdown, save_on_request));
+        app.add_systems(Startup, load_from_save.in_set(WorldLoad));
+        app.add_systems(Last, (save_then_shutdown, save_on_request));
         app.add_systems(Update, (verify_client_ready, expire_ready_challenges));
         app.add_observer(send_server_hello);
         app.add_observer(install_replication_sender);
@@ -251,10 +271,26 @@ pub(crate) enum RequestClass {
 }
 
 #[derive(Resource, Default)]
-struct RequestBudgets(HashMap<Entity, PeerRequestBudget>);
+pub(crate) struct RequestBudgets(HashMap<Entity, PeerRequestBudget>);
 
 #[derive(Resource, Default)]
-struct SnapshotBudgets(HashMap<Entity, SnapshotBudget>);
+pub(crate) struct SnapshotBudgets(HashMap<Entity, SnapshotBudget>);
+impl SnapshotBudgets {
+    pub(crate) fn spend(&mut self, connection: Entity, bytes: usize) -> bool {
+        let budget = self.0.entry(connection).or_default();
+        let now = Instant::now();
+        budget.bytes = (budget.bytes
+            + now.duration_since(budget.updated_at).as_secs_f32()
+                * crate::spatial::SPATIAL_BYTES_PER_SECOND as f32)
+            .min(crate::spatial::SPATIAL_BURST_BYTES as f32);
+        budget.updated_at = now;
+        if bytes as f32 > budget.bytes {
+            return false;
+        }
+        budget.bytes -= bytes as f32;
+        true
+    }
+}
 
 struct SnapshotBudget {
     updated_at: Instant,
@@ -388,12 +424,12 @@ fn client_id_u64(remote: &RemoteId) -> Option<u64> {
 
 /// Set by `load_from_save` when a load was attempted and failed (corrupt
 /// blob, version mismatch, missing block ids). The session then runs on
-/// an empty world — and every save path refuses to write to the
+/// runtime startup — and every save path refuses to write to the
 /// configured name, so the original file is never clobbered by the
 /// accidental fresh world. A *missing* save (hosting a new world) does
 /// NOT set this; there's nothing to protect.
 #[derive(Resource, Default)]
-pub struct SaveWriteGuard {
+pub(crate) struct SaveWriteGuard {
     pub reason: Option<String>,
 }
 
@@ -403,13 +439,25 @@ pub struct SaveWriteGuard {
 /// bytes rather than the procedural shortcut. Procedural chunks aren't
 /// persisted (`Chunk::from_terrain` regenerates them on demand).
 ///
-/// A load failure does NOT abort startup — we log and continue with an
-/// empty world. Better than an unbootable session if a save is corrupt.
-/// But the failure arms [`SaveWriteGuard`], so nothing this session
-/// writes back over the file that failed to load — the empty world is
-/// throwaway, the original save is not.
+/// A load failure arms [`SaveWriteGuard`]. Runtime activation then aborts
+/// startup before hooks or population bootstrap; the original save is untouched.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WorldLoad;
+
 #[derive(bevy::ecs::system::SystemParam)]
 struct SaveRegistries<'w> {
+    craft_bookings: ResMut<'w, crate::craft_stations::CraftBookings>,
+    interactions: ResMut<'w, crate::facility_interactions::FacilityInteractions>,
+    spaces: ResMut<'w, crate::space_identity::SpaceIdentities>,
+    spatial_events: ResMut<'w, crate::spatial_events::SpatialJournal>,
+    published_spaces: ResMut<'w, crate::live_spaces::PublishedSpaces>,
+    craft_order_ids: ResMut<'w, crate::craft_stations::CraftOrderIds>,
+    pending_items: ResMut<'w, crate::item_placement::ItemPlacementQueue>,
+    placements: ResMut<'w, crate::placements::Placements>,
+    mods: ResMut<'w, crate::scripting::ServerMods>,
+    preset: Res<'w, crate::scripting::SelectedWorld>,
+    contracts: Res<'w, crate::content_contracts::ContentContracts>,
+    population: ResMut<'w, crate::npc::PopulationInitialized>,
     blocks: Res<'w, BlockRegistry>,
     items: Res<'w, ItemRegistry>,
     kinds: Res<'w, crate::npc_registry::NpcKindRegistry>,
@@ -425,16 +473,16 @@ fn load_from_save(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut player_states: ResMut<PlayerStates>,
-    mut dirty: ResMut<DetectionDirty>,
     mut clock: ResMut<WorldClock>,
     mut plans: ResMut<Plans>,
+    mut construction: ResMut<crate::construction::ConstructionLedger>,
     mut stations: ResMut<CraftStations>,
     mut containers: ResMut<crate::containers::Containers>,
     mut storage_zones: ResMut<crate::storage::StorageZones>,
     mut guard: ResMut<SaveWriteGuard>,
     mut npc_ids: ResMut<crate::npc::NpcIdAllocator>,
     config: Option<Res<ServerSaveConfig>>,
-    registries: SaveRegistries,
+    mut registries: SaveRegistries,
 ) {
     let Some(config) = config else {
         return;
@@ -447,7 +495,7 @@ fn load_from_save(
     };
     let fail = |e: &SaveError, guard: &mut SaveWriteGuard| {
         error!(
-            "load save {name:?} failed: {e}; continuing with an EMPTY world. \
+            "load save {name:?} failed: {e}; aborting runtime startup. \
              Saving to {name:?} is disabled for this session so the \
              original file stays intact."
         );
@@ -463,6 +511,34 @@ fn load_from_save(
         }
         Err(e) => {
             fail(&e, &mut guard);
+            return;
+        }
+    };
+    let Some(_saved_world) = save.world.as_ref() else {
+        fail(
+            &SaveError::Corrupt {
+                name: name.into(),
+                reason: "missing world preset".into(),
+            },
+            &mut guard,
+        );
+        return;
+    };
+    save = match crate::save_upgrade::migrate(
+        &save,
+        &registries.contracts,
+        &registries.blocks,
+        &registries.preset.0,
+    ) {
+        Ok(staged) => staged,
+        Err(reason) => {
+            fail(
+                &SaveError::Corrupt {
+                    name: name.into(),
+                    reason,
+                },
+                &mut guard,
+            );
             return;
         }
     };
@@ -492,7 +568,45 @@ fn load_from_save(
         fail(&e, &mut guard);
         return;
     }
-    let block_registry = &registries.blocks;
+    if let Err(reason) = crate::action_jobs::validate_owners(&save, &registries.mods.0)
+        .and_then(|()| {
+            registries
+                .mods
+                .0
+                .restore_events(&save.world.as_ref().expect("validated world").events)
+        })
+        .and_then(|()| registries.mods.0.restore_state(&save.mod_state))
+    {
+        fail(
+            &SaveError::Corrupt {
+                name: name.into(),
+                reason,
+            },
+            &mut guard,
+        );
+        return;
+    }
+    let mut placements = save
+        .world
+        .as_ref()
+        .expect("validated world")
+        .placements
+        .clone();
+    placements
+        .rebuild(&registries.blocks)
+        .expect("preflighted placements");
+    *registries.placements = placements;
+    *registries.craft_order_ids = save.world.as_ref().unwrap().craft_order_ids.clone();
+    *npc_ids = save.world.as_ref().unwrap().npc_ids.clone();
+    registries.craft_bookings.jobs = save.world.as_ref().unwrap().craft_jobs.clone();
+    registries.craft_bookings.jobs.suspend_for_load();
+    *registries.interactions = save.world.as_ref().unwrap().interactions.clone();
+    *registries.spaces = save.world.as_ref().unwrap().spaces.clone();
+    *registries.spatial_events = save.world.as_ref().unwrap().spatial_events.clone();
+    registries.published_spaces.revision = registries.spatial_events.revision;
+    registries.interactions.suspend_for_load();
+    *registries.pending_items = save.world.as_ref().unwrap().pending_items.clone();
+    registries.population.0 = save.world.as_ref().unwrap().population_initialized;
     let item_registry = &registries.items;
     let kind_registry = &registries.kinds;
     info!(
@@ -540,12 +654,41 @@ fn load_from_save(
                     .collect();
                 (
                     cell,
-                    crate::protocol::PlanState::new(saved.kind, materials),
+                    crate::protocol::PlanState {
+                        kind: saved.kind, materials, project_id: saved.project_id,
+                        revision: saved.revision, footprint: saved.footprint, progress_secs: saved.progress_secs,
+                    },
                 )
             })
             .collect();
         plans.restore_all(restored);
     }
+    construction.jobs = save.construction.jobs.clone();
+    construction.jobs.suspend_for_load();
+    construction.next_project_id = save.construction.next_project_id;
+    construction.pending_refunds = save
+        .construction
+        .pending_refunds
+        .iter()
+        .map(|refund| crate::construction::PendingRefund {
+            project_id: refund.project_id,
+            origin: refund.origin,
+            items: refund
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        item_registry
+                            .slot_of(&block_junk_mod_api::items::ItemId::new(
+                                item.item_id.clone(),
+                            ))
+                            .expect("preflighted refund item"),
+                        item.count,
+                    )
+                })
+                .collect(),
+        })
+        .collect();
     // Restore craft-station state. Each station's inventory items
     // resolve through the item registry; missing ids (mod removed)
     // log + drop just that inventory entry rather than blocking the
@@ -561,6 +704,8 @@ fn load_from_save(
                     .orders
                     .into_iter()
                     .map(|o| CraftOrder {
+                        id: o.id,
+                        revision: o.revision,
                         recipe_id: o.recipe_id,
                         total: o.total,
                         completed: o.completed,
@@ -581,6 +726,19 @@ fn load_from_save(
                     }
                 }
                 let active_work = saved.active_work.map(|aw| ActiveWork {
+                    order_id: aw.order_id,
+                    committed_inputs: aw
+                        .committed_inputs
+                        .into_iter()
+                        .map(|entry| {
+                            (
+                                item_registry
+                                    .slot_of(&block_junk_mod_api::items::ItemId::new(entry.item_id))
+                                    .expect("validated saved commitment"),
+                                entry.count,
+                            )
+                        })
+                        .collect(),
                     recipe_id: aw.recipe_id,
                     total_secs: aw.total_secs,
                     elapsed_secs: aw.elapsed_secs,
@@ -634,14 +792,6 @@ fn load_from_save(
             "restored world clock from save",
         );
     }
-    // Mark every room-bounding cell in loaded chunks dirty for room
-    // detection. RoomMap is runtime-only state (not persisted — RoomIds
-    // aren't stable across restarts per the design memo), so without
-    // priming the dirty queue here, registered rooms from before the
-    // save would only re-detect after the player edited a block. Use
-    // the moment-of-load timestamp so the existing DEBOUNCE window
-    // applies and the first `process_dirty` tick after Startup runs
-    // the detection.
     // Saved padding is maintained at runtime, so chunks from a healthy
     // save are already mutually consistent — this refresh is a no-op
     // there. It exists to heal saves written before padding write-
@@ -662,32 +812,13 @@ fn load_from_save(
     }
     drop(originals);
 
-    let now = Instant::now();
-    let mut dirty_marked = 0usize;
     for SavedChunk {
         coord,
         chunk,
-        entities,
+        entities: _,
     } in save.edited_chunks
     {
-        // Interior cells run [1, CHUNK_PADDED - 1) in chunk-local space.
-        // `chunk_local_to_world` converts to the unpadded world cell.
-        for x in 1..(CHUNK_PADDED as i32 - 1) {
-            for y in 1..(CHUNK_PADDED as i32 - 1) {
-                for z in 1..(CHUNK_PADDED as i32 - 1) {
-                    let local = IVec3::new(x, y, z);
-                    let slot = chunk.get(local);
-                    if slot.is_empty() {
-                        continue;
-                    }
-                    if !block_registry.def(slot).flags.room_boundary {
-                        continue;
-                    }
-                    dirty.push(chunk_local_to_world(coord, local), now);
-                    dirty_marked += 1;
-                }
-            }
-        }
+        let entities = registries.placements.sidecar_for(coord, &registries.blocks);
         let entity = commands
             .spawn((
                 chunk,
@@ -700,14 +831,22 @@ fn load_from_save(
             .id();
         chunk_map.0.insert(coord, entity);
     }
-    if dirty_marked > 0 {
-        info!("primed {dirty_marked} room-bounding cells for re-detection after load");
-    }
     for npc in save.npcs {
         // Keep the runtime allocator ahead of every persisted id so a
         // post-load spawn can't collide (claim tables key on NpcId).
-        npc_ids.reserve_through(npc.id);
-        spawn_loaded_npc(&mut commands, npc, kind_registry, item_registry);
+
+        let exit = save
+            .world
+            .as_ref()
+            .unwrap()
+            .interactions
+            .loaded_occupancy(npc.id);
+        let entity = spawn_loaded_npc(&mut commands, npc, kind_registry, item_registry);
+        if let Some(exit) = exit {
+            commands
+                .entity(entity)
+                .insert((exit, crate::protocol::KinematicLock));
+        }
     }
     // Loose items in the world. Resolve item ids → slots through the
     // current registry. An item id missing from the registry (mod
@@ -767,7 +906,7 @@ fn load_from_save(
     clippy::too_many_arguments,
     reason = "save preflight spans every registry-backed persisted subsystem"
 )]
-fn validate_runtime_save_references(
+pub(crate) fn validate_runtime_save_references(
     name: &str,
     save: &SaveFile,
     blocks: &BlockRegistry,
@@ -798,6 +937,48 @@ fn validate_runtime_save_references(
             .ok_or_else(|| corrupt(format!("invalid recipe slot {} for {id:?}", slot.0)))
     };
 
+    if let Some(world) = &save.world {
+        world.pending_items.validate(items).map_err(&corrupt)?;
+        world
+            .spatial_events
+            .validate(&world.events, &world.spaces)
+            .map_err(&corrupt)?;
+        world
+            .placements
+            .validate_saved(save, blocks, &world.preset)
+            .map_err(corrupt)?;
+    }
+    for state in &save.mod_state {
+        match &state.scope {
+            block_junk_scripting::state::StateScope::World => {}
+            block_junk_scripting::state::StateScope::Space(id)
+                if save.world.as_ref().is_some_and(|world| {
+                    world
+                        .spaces
+                        .records
+                        .get(&crate::space_identity::SpaceId(*id))
+                        .is_some_and(|record| !record.resolved_state_owners.contains(&state.mod_id))
+                }) => {}
+            block_junk_scripting::state::StateScope::Placement(id)
+                if save
+                    .world
+                    .as_ref()
+                    .is_some_and(|world| world.placements.contains(*id)) => {}
+            block_junk_scripting::state::StateScope::Npc(id)
+                if save.npcs.iter().any(|npc| npc.id == *id)
+                    || save
+                        .world
+                        .as_ref()
+                        .is_some_and(|world| world.npc_ids.retired.contains(id)) => {}
+            _ => {
+                return Err(corrupt(format!(
+                    "mod {} state references missing scope {:?}",
+                    state.mod_id, state.scope
+                )));
+            }
+        }
+    }
+
     for player in &save.players {
         if let Some(carry) = &player.carry {
             item_slot(&carry.item_id)?;
@@ -813,6 +994,17 @@ fn validate_runtime_save_references(
         }
     }
     for npc in &save.npcs {
+        if let Some(id) = npc.home_facility
+            && !save
+                .world
+                .as_ref()
+                .is_some_and(|world| world.placements.contains(id))
+        {
+            return Err(corrupt(format!(
+                "NPC {} has an unknown home facility {id}",
+                npc.id
+            )));
+        }
         if kinds.get(&npc.kind).is_none() {
             return Err(corrupt(format!(
                 "NPC {} has unknown kind {:?}",
@@ -834,11 +1026,20 @@ fn validate_runtime_save_references(
             item_slot(&tool.item_id)?;
         }
     }
-    for (_, plan) in &save.plans {
-        if let PlanKind::Build { slot, .. } = plan.kind
-            && blocks.try_def(slot).is_none()
-        {
-            return Err(corrupt(format!("plan has invalid block slot {}", slot.0)));
+    for (cell, plan) in &save.plans {
+        if let PlanKind::Build { slot, orientation } = plan.kind {
+            let def = blocks
+                .try_def(slot)
+                .ok_or_else(|| corrupt(format!("plan has invalid block slot {}", slot.0)))?;
+            let mut expected = world_footprint(*cell, &def.footprint, orientation);
+            let mut saved = plan.footprint.clone();
+            expected.sort_by_key(|c| (c.x, c.y, c.z));
+            saved.sort_by_key(|c| (c.x, c.y, c.z));
+            if saved != expected {
+                return Err(corrupt(format!(
+                    "saved project footprint at {cell:?} differs from current content"
+                )));
+            }
         }
         for material in &plan.materials {
             item_slot(&material.item_id)?;
@@ -855,6 +1056,19 @@ fn validate_runtime_save_references(
             .find(|chunk| chunk.coord == coord)
             .map(|chunk| chunk.chunk.get(local))
     };
+    for refund in &save.construction.pending_refunds {
+        for item in &refund.items {
+            item_slot(&item.item_id)?;
+        }
+    }
+    let mut craft_ids = std::collections::HashSet::new();
+    let next_craft_id = save
+        .world
+        .as_ref()
+        .map_or(1, |world| world.craft_order_ids.next);
+    if next_craft_id == 0 {
+        return Err(corrupt("invalid craft identity allocator".into()));
+    }
     for (cell, station) in &save.craft_stations {
         let slot = saved_slot_at(*cell)
             .ok_or_else(|| corrupt(format!("station state at {cell:?} has no saved chunk")))?;
@@ -871,13 +1085,28 @@ fn validate_runtime_save_references(
         })?;
         for order in &station.orders {
             let def = recipe(&order.recipe_id)?;
-            if &def.station != station_tag || order.total == 0 || order.completed > order.total {
+            if order.id == 0
+                || order.id >= next_craft_id
+                || !craft_ids.insert(order.id)
+                || order.revision != u64::from(order.completed) + 1
+                || &def.station != station_tag
+                || order.total == 0
+                || order.total > crate::craft_stations::MAX_ORDER_QUANTITY
+                || order.completed >= order.total
+            {
                 return Err(corrupt(format!("invalid craft order at {cell:?}")));
             }
         }
         if let Some(work) = &station.active_work {
+            for entry in &work.committed_inputs {
+                item_slot(&entry.item_id)?;
+            }
             let def = recipe(&work.recipe_id)?;
-            if &def.station != station_tag
+            if !station
+                .orders
+                .iter()
+                .any(|order| order.id == work.order_id && order.recipe_id == work.recipe_id)
+                || &def.station != station_tag
                 || !work.total_secs.is_finite()
                 || work.total_secs <= 0.0
                 || !work.elapsed_secs.is_finite()
@@ -887,12 +1116,8 @@ fn validate_runtime_save_references(
                 return Err(corrupt(format!("invalid active craft work at {cell:?}")));
             }
         }
-        let mut total = 0_u32;
         for entry in &station.inventory {
             item_slot(&entry.item_id)?;
-            total = total
-                .checked_add(entry.count)
-                .ok_or_else(|| corrupt(format!("station inventory overflows at {cell:?}")))?;
         }
     }
     for (cell, container) in &save.containers {
@@ -985,7 +1210,7 @@ fn spawn_loaded_npc(
     npc: SavedNpc,
     kind_registry: &crate::npc_registry::NpcKindRegistry,
     item_registry: &ItemRegistry,
-) {
+) -> Entity {
     let mut needs = npc.needs;
     if let Some(def) = kind_registry.get(&npc.kind) {
         for (need_id, default_value) in &def.default_needs {
@@ -1030,6 +1255,15 @@ fn spawn_loaded_npc(
             }
         })
         .unwrap_or_default();
+    let mut policy_results = npc.policy_results;
+    if let Some((candidate_id, revision)) = npc.active_policy_job {
+        policy_results.push(block_junk_mod_api::npcs::PolicyJobResult {
+            candidate_id,
+            revision,
+            state: block_junk_mod_api::npcs::PolicyJobState::Interrupted,
+            reason: Some("session reloaded; transient reservation must be revalidated".into()),
+        });
+    }
     // Tool slot: same lookup-or-drop-with-warning pattern. NPCs don't
     // get a starter-loadout fallback (only players do via
     // STARTER_TOOL_ID); a missing saved id just lands them with no
@@ -1054,35 +1288,42 @@ fn spawn_loaded_npc(
         .unwrap_or_default();
     // Nested tuple: same 15-element Bundle workaround as the spawn-
     // cluster path. Identity/brain group + per-frame state + lightyear.
-    commands.spawn((
-        (
-            Actor,
-            Npc,
-            NpcId(npc.id),
-            NpcKind(npc.kind),
-            Needs(needs),
-            NpcStats(stats),
-            Brain {
-                goal: Goal::Idle,
-                rng,
-                home_cluster: None,
-                preempt_cooldown_secs: 0.0,
-            },
-            carry,
-            tool,
-        ),
-        npc.pose,
-        AvatarVelocity::default(),
-        AvatarOnGround::default(),
-        npc.movement_mode,
-        crate::npc_mover::NavMover::default(),
-        NpcPath::default(),
-        NpcAnimOverride::default(),
-        crate::spatial::interpolated_spatial_replica(crate::spatial::SpatialScope::Point(
-            npc.pose.translation,
-        )),
-        Name::new(format!("npc:{}", npc.id)),
-    ));
+    commands
+        .spawn((
+            (
+                Actor,
+                Npc,
+                NpcId(npc.id),
+                NpcKind(npc.kind),
+                Needs(needs),
+                NpcStats(stats),
+                Brain {
+                    goal: Goal::Idle,
+                    rng,
+                    home_facility: npc
+                        .home_facility
+                        .map(block_junk_mod_api::architecture::PlacementId),
+                    preempt_cooldown_secs: 0.0,
+                    policy_results,
+                    active_policy_job: None,
+                    awaiting_construction: None,
+                },
+                carry,
+                tool,
+            ),
+            npc.pose,
+            AvatarVelocity::default(),
+            AvatarOnGround::default(),
+            npc.movement_mode,
+            crate::npc_mover::NavMover::default(),
+            NpcPath::default(),
+            NpcAnimOverride::default(),
+            crate::spatial::interpolated_spatial_replica(crate::spatial::SpatialScope::Point(
+                npc.pose.translation,
+            )),
+            Name::new(format!("npc:{}", npc.id)),
+        ))
+        .id()
 }
 
 /// Polled each tick. When the client flips the save-request atomic, write
@@ -1143,7 +1384,7 @@ fn save_on_request(
 /// shape. Item slots are resolved back to their stable ids for the
 /// same reason `convert_saved_plans` does — slot ordering can shift
 /// between sessions if the mod set changes.
-fn convert_saved_stations(
+pub(crate) fn convert_saved_stations(
     stations: &CraftStations,
     item_registry: &ItemRegistry,
 ) -> Vec<(IVec3, SavedStationState)> {
@@ -1154,6 +1395,8 @@ fn convert_saved_stations(
                 .orders
                 .iter()
                 .map(|o| SavedCraftOrder {
+                    id: o.id,
+                    revision: o.revision,
                     recipe_id: o.recipe_id.clone(),
                     total: o.total,
                     completed: o.completed,
@@ -1168,6 +1411,15 @@ fn convert_saved_stations(
                 })
                 .collect();
             let active_work = state.active_work.as_ref().map(|aw| SavedActiveWork {
+                order_id: aw.order_id,
+                committed_inputs: aw
+                    .committed_inputs
+                    .iter()
+                    .map(|&(slot, count)| SavedStationItem {
+                        item_id: item_registry.id_of(slot).to_string(),
+                        count,
+                    })
+                    .collect(),
                 recipe_id: aw.recipe_id.clone(),
                 total_secs: aw.total_secs,
                 elapsed_secs: aw.elapsed_secs,
@@ -1233,6 +1485,10 @@ fn convert_saved_plans(
             (
                 cell,
                 SavedPlanState {
+                    project_id: state.project_id,
+                    revision: state.revision,
+                    footprint: state.footprint,
+                    progress_secs: state.progress_secs,
                     kind: state.kind,
                     materials,
                 },
@@ -1352,6 +1608,7 @@ fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec
     npcs.iter()
         .map(
             |(id, kind, pose, mode, needs, brain, carry, tool, stats)| SavedNpc {
+                home_facility: brain.home_facility.map(|id| id.0),
                 id: id.0,
                 kind: kind.0.clone(),
                 pose: *pose,
@@ -1361,6 +1618,8 @@ fn collect_saved_npcs(npcs: &SavedNpcQuery, item_registry: &ItemRegistry) -> Vec
                 carrying: saved_carry_of(carry, item_registry),
                 tool: saved_tool_of(tool, item_registry),
                 stats: stats.0.clone(),
+                policy_results: brain.policy_results.clone(),
+                active_policy_job: brain.active_policy_job.clone(),
             },
         )
         .collect()
@@ -1441,6 +1700,19 @@ type SavedNpcQuery<'w, 's> = Query<
 /// persisted.
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct SaveCtx<'w, 's> {
+    craft_bookings: Res<'w, crate::craft_stations::CraftBookings>,
+    interactions: Res<'w, crate::facility_interactions::FacilityInteractions>,
+    spaces: Res<'w, crate::space_identity::SpaceIdentities>,
+    spatial_events: Res<'w, crate::spatial_events::SpatialJournal>,
+    npc_ids: Res<'w, crate::npc::NpcIdAllocator>,
+    craft_order_ids: Res<'w, crate::craft_stations::CraftOrderIds>,
+    pending_items: Res<'w, crate::item_placement::ItemPlacementQueue>,
+    placements: Res<'w, crate::placements::Placements>,
+    mods: Res<'w, crate::scripting::ServerMods>,
+    preset: Res<'w, crate::scripting::SelectedWorld>,
+    contracts: Res<'w, crate::content_contracts::ContentContracts>,
+    population: Res<'w, crate::npc::PopulationInitialized>,
+    construction: Res<'w, crate::construction::ConstructionLedger>,
     clock: Res<'w, WorldClock>,
     plans: Res<'w, Plans>,
     stations: Res<'w, CraftStations>,
@@ -1486,6 +1758,42 @@ fn assemble_save_file(ctx: &SaveCtx) -> SaveFile {
         })
         .collect();
     SaveFile {
+        mod_state: ctx.mods.0.saved_state(),
+        world: Some(crate::save::SavedWorld {
+            spaces: ctx.spaces.clone(),
+            spatial_events: ctx.spatial_events.clone(),
+            events: ctx.mods.0.saved_events(),
+            craft_jobs: ctx.craft_bookings.jobs.clone(),
+            interactions: ctx.interactions.clone(),
+            npc_ids: ctx.npc_ids.clone(),
+            craft_order_ids: ctx.craft_order_ids.clone(),
+            pending_items: ctx.pending_items.clone(),
+            placements: ctx.placements.clone(),
+            contracts: ctx.contracts.clone(),
+            preset: ctx.preset.0.clone(),
+            population_initialized: ctx.population.0,
+        }),
+        construction: crate::save::SavedConstruction {
+            jobs: ctx.construction.jobs.clone(),
+            next_project_id: ctx.construction.next_project_id,
+            pending_refunds: ctx
+                .construction
+                .pending_refunds
+                .iter()
+                .map(|refund| crate::save::SavedRefund {
+                    project_id: refund.project_id,
+                    origin: refund.origin,
+                    items: refund
+                        .items
+                        .iter()
+                        .map(|&(item, count)| SavedStationItem {
+                            item_id: ctx.item_registry.id_of(item).to_string(),
+                            count,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        },
         version: SAVE_VERSION,
         block_slots: ctx.block_registry.slot_table(),
         edited_chunks: edited,
@@ -1549,6 +1857,16 @@ pub struct SpatialSubscriptions {
 struct SpatialVisibilityState(HashSet<(Entity, Entity)>);
 
 impl SpatialSubscriptions {
+    pub(crate) fn chunks_for(&self, connection: Entity) -> impl Iterator<Item = ChunkCoord> + '_ {
+        self.client_to_chunks
+            .get(&connection)
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+    pub(crate) fn requested_chunks(&self) -> impl Iterator<Item = ChunkCoord> + '_ {
+        self.chunk_to_clients.keys().copied()
+    }
     pub(crate) fn target_for_chunks(
         &self,
         chunks: impl IntoIterator<Item = ChunkCoord>,
@@ -1587,6 +1905,61 @@ impl SpatialSubscriptions {
 #[derive(Resource, Default)]
 pub struct PendingChunks(pub HashMap<ChunkCoord, Task<Chunk>>);
 
+/// Simulation demand is independent of connected viewers. This contains only
+/// active actor neighborhoods, never a census of generated terrain.
+#[derive(Resource, Default)]
+pub(crate) struct ActiveSimulationChunks(pub HashSet<ChunkCoord>);
+
+fn request_npc_chunks(
+    actors: Query<&AvatarPose, With<crate::npc::Npc>>,
+    mut demand: ResMut<ActiveSimulationChunks>,
+    map: Res<ChunkMap>,
+    mut pending: ResMut<PendingChunks>,
+    slots: Res<TerrainSlots>,
+) {
+    let mut requested = std::collections::BTreeMap::<[i32; 3], i32>::new();
+    for pose in &actors {
+        if !pose.translation.is_finite() {
+            continue;
+        }
+        let center = world_to_chunk_coord(pose.translation);
+        for x in -1..=1 {
+            for y in -1..=1 {
+                for z in -1..=1 {
+                    let distance = x * x + y * y + z * z;
+                    let coord = (center.0 + IVec3::new(x, y, z)).to_array();
+                    requested
+                        .entry(coord)
+                        .and_modify(|old| *old = (*old).min(distance))
+                        .or_insert(distance);
+                }
+            }
+        }
+    }
+    demand.0 = requested
+        .keys()
+        .map(|coord| ChunkCoord(IVec3::from_array(*coord)))
+        .collect();
+    let mut requested: Vec<_> = requested.into_iter().collect();
+    requested.sort_by_key(|(coord, distance)| (*distance, *coord));
+    let mut remaining = 4usize;
+    for (coord, _) in requested {
+        if remaining == 0 || pending.0.len() >= 32 {
+            break;
+        }
+        let coord = ChunkCoord(IVec3::from_array(coord));
+        if map.0.contains_key(&coord) || pending.0.contains_key(&coord) {
+            continue;
+        }
+        let slots = *slots;
+        pending.0.insert(
+            coord,
+            AsyncComputeTaskPool::get().spawn(async move { Chunk::from_terrain(coord, &slots) }),
+        );
+        remaining -= 1;
+    }
+}
+
 const AOI_RADIUS_XZ: i32 = 2;
 const AOI_RADIUS_Y: i32 = 1;
 
@@ -1619,11 +1992,13 @@ struct PendingReadyChallenge {
 
 #[derive(bevy::ecs::system::SystemParam)]
 struct HelloContext<'w, 's> {
+    preset: Res<'w, crate::scripting::SelectedWorld>,
+    content: Res<'w, crate::scripting::ContentFingerprint>,
     blocks: Res<'w, BlockRegistry>,
     items: Res<'w, ItemRegistry>,
     recipes: Res<'w, crate::recipes::RecipeRegistry>,
     npc_kinds: Res<'w, crate::npc_registry::NpcKindRegistry>,
-    rooms: Res<'w, crate::rooms::RoomPatternRegistry>,
+    rules: Res<'w, crate::world_rules::WorldRules>,
     spatial_registry: Res<'w, crate::spatial::SpatialDatasetRegistry>,
     senders: Query<'w, 's, &'static mut MessageSender<ServerHello>>,
 }
@@ -1633,15 +2008,18 @@ struct HelloContext<'w, 's> {
 fn send_server_hello(trigger: On<Add, Connected>, mut commands: Commands, context: HelloContext) {
     let connection = trigger.entity;
     let HelloContext {
+        preset,
+        content,
         blocks,
         items,
         recipes,
         npc_kinds,
-        rooms,
+        rules,
         spatial_registry,
         mut senders,
     } = context;
-    let manifest = crate::modset::local_manifest(&blocks, &items, &recipes, &npc_kinds, &rooms);
+    let manifest =
+        crate::modset::local_manifest(&blocks, &items, &recipes, &npc_kinds, &rules, &content);
     let hash = crate::protocol::manifest_hash(&manifest);
     let spatial_registry_fingerprint = spatial_registry.fingerprint();
     let mut nonce = [0u8; 32];
@@ -1656,6 +2034,7 @@ fn send_server_hello(trigger: On<Add, Connected>, mut commands: Commands, contex
         return;
     };
     sender.send::<WorldChannel>(ServerHello {
+        world_preset: preset.0.clone(),
         protocol_id: crate::network::NETCODE_PROTOCOL_ID,
         connection_nonce: nonce,
         manifest_hash: hash,
@@ -1760,6 +2139,7 @@ fn expire_ready_challenges(
 /// sees nothing for ~100 ms.
 #[derive(bevy::ecs::system::SystemParam)]
 struct ClientRegistration<'w, 's> {
+    preset: Res<'w, crate::scripting::SelectedWorld>,
     remote_ids: Query<'w, 's, &'static RemoteId>,
     avatars: ResMut<'w, ClientAvatars>,
     sent: ResMut<'w, SpatialSubscriptions>,
@@ -1772,6 +2152,7 @@ fn register_new_client(
     registration: ClientRegistration,
 ) {
     let ClientRegistration {
+        preset,
         remote_ids,
         mut avatars,
         mut sent,
@@ -1806,7 +2187,7 @@ fn register_new_client(
             // tool crafting, not a granted starter axe.
             (
                 AvatarPose {
-                    translation: Vec3::new(0.0, 32.0, 60.0),
+                    translation: Vec3::from_array(preset.0.player_spawn),
                     yaw: 0.0,
                 },
                 Carrying::default(),
@@ -1949,6 +2330,7 @@ fn forget_disconnected_client(
     mut avatars: ResMut<ClientAvatars>,
     mut sent: ResMut<SpatialSubscriptions>,
     mut work_leases: ResMut<BlockWorkLeases>,
+    mut plan_claims: ResMut<crate::plan_claims::PlanClaims>,
     mut snapshot_budgets: ResMut<SnapshotBudgets>,
     mut player_states: ResMut<PlayerStates>,
     remote_ids: Query<&RemoteId>,
@@ -2021,13 +2403,15 @@ fn forget_disconnected_client(
     {
         remove_spatial_subscriber(&mut sent, trigger.entity, remote.0, pending_coord);
     }
-    work_leases.0.remove(&trigger.entity);
+    work_leases.release(trigger.entity, &mut plan_claims);
 }
 
 /// Drains completed chunk-generation tasks off the AsyncComputeTaskPool,
 /// installing the resulting chunks into the world. Runs before `update_aoi`
 /// so newly-completed chunks are available to send this same tick.
 fn poll_chunk_gen(
+    blocks: Res<BlockRegistry>,
+    placements: Res<crate::placements::Placements>,
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut pending: ResMut<PendingChunks>,
@@ -2077,7 +2461,7 @@ fn poll_chunk_gen(
             .spawn((
                 chunk,
                 coord,
-                ChunkEntities::default(),
+                placements.sidecar_for(coord, &blocks),
                 Name::new(format!("chunk{:?}", coord.0.to_array())),
                 chunk_world_transform(coord),
             ))
@@ -2194,7 +2578,7 @@ fn update_aoi(context: AoiContext) {
             //   - server has the chunk, edited: send the bytes + sidecar
             //   - server has the chunk, never edited: send Procedural (tiny)
             //   - server doesn't have the chunk yet: queue async gen and skip
-            let payload: Option<(ChunkData, Vec<crate::voxel::EntityEntry>)> =
+            let payload: Option<(ChunkData, Vec<crate::voxel::EntityEntry>, u64)> =
                 if let Some(&entity) = chunk_map.0.get(coord) {
                     chunks.get(entity).ok().map(|(chunk, entities, edited)| {
                         let data = if edited {
@@ -2205,7 +2589,7 @@ fn update_aoi(context: AoiContext) {
                         // Procedural chunks have no entities by construction, but
                         // ship the sidecar regardless — empty in that case, so
                         // the wire cost is one varint.
-                        (data, entities.entries.clone())
+                        (data, entities.entries.clone(), chunk.revision)
                     })
                 } else {
                     if !pending.0.contains_key(coord) {
@@ -2218,11 +2602,12 @@ fn update_aoi(context: AoiContext) {
                     None
                 };
 
-            let Some((data, entities)) = payload else {
+            let Some((data, entities, revision)) = payload else {
                 continue; // still generating; try again next tick
             };
             let transaction = spatial_transaction_id(client_entity, *coord);
             let mut messages = vec![crate::protocol::SpatialMessage::BeginChunk {
+                revision,
                 transaction,
                 coord: *coord,
                 terrain: data,
@@ -2516,7 +2901,7 @@ fn receive_block_edits(
     map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
-    plans: Res<Plans>,
+    mut project: ProjectExecution,
     avatars: Res<ClientAvatars>,
     actors: Query<(&AvatarPose, &EquippedTool), With<Avatar>>,
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
@@ -2530,24 +2915,47 @@ fn receive_block_edits(
     };
     for (connection, mut receiver) in receivers.iter_mut() {
         for intent in receiver.receive() {
-            if validation
-                .authorize(connection, RequestClass::Ordinary)
-                .is_none()
-            {
+            let Some(auth) = validation.authorize(connection, RequestClass::Ordinary) else {
                 continue;
-            }
-            let previous = leases.0.get(&connection);
-            if previous.is_some_and(|lease| intent.sequence <= lease.sequence) {
+            };
+            let previous = leases.0.get(&connection).cloned();
+            if previous
+                .as_ref()
+                .is_some_and(|lease| intent.sequence <= lease.sequence)
+            {
                 continue;
             }
             match intent.target {
                 Some(target) => {
+                    let project_token = match target {
+                        BlockWorkTarget::Plan { cell } => {
+                            project.plans.get(cell).map(|p| p.token())
+                        }
+                        BlockWorkTarget::Break { .. } => None,
+                    };
                     let progress = previous
-                        .filter(|lease| lease.target == target)
+                        .as_ref()
+                        .filter(|lease| {
+                            lease.target == target && lease.project_token == project_token
+                        })
                         .map_or(0.0, |lease| lease.progress_secs);
+                    let reservation = previous
+                        .as_ref()
+                        .filter(|lease| {
+                            lease.target == target && lease.project_token == project_token
+                        })
+                        .and_then(|lease| lease.reservation.clone());
+                    if reservation.is_none() {
+                        leases.release(connection, &mut project.claims);
+                    }
                     leases.0.insert(
                         connection,
                         BlockWorkLease {
+                            owner: block_junk_mod_api::authority::ReservationOwner::Player {
+                                id: auth.player_id,
+                            },
+                            reservation,
+                            project_token,
                             sequence: intent.sequence,
                             target,
                             refreshed_at: Instant::now(),
@@ -2556,7 +2964,7 @@ fn receive_block_edits(
                     );
                 }
                 None => {
-                    leases.0.remove(&connection);
+                    leases.release(connection, &mut project.claims);
                 }
             }
         }
@@ -2564,7 +2972,15 @@ fn receive_block_edits(
 
     let mut completed = Vec::new();
     let mut invalid = Vec::new();
-    for (&connection, lease) in &mut leases.0 {
+    let mut worked_projects = std::collections::HashSet::new();
+    let mut connections: Vec<_> = leases
+        .0
+        .iter()
+        .map(|(connection, lease)| (*connection, lease.owner.clone()))
+        .collect();
+    connections.sort_by(|a, b| a.1.cmp(&b.1));
+    for (connection, _) in connections {
+        let lease = leases.0.get_mut(&connection).expect("collected work lease");
         if lease.refreshed_at.elapsed() > Duration::from_millis(500) {
             invalid.push(connection);
             continue;
@@ -2579,11 +2995,17 @@ fn receive_block_edits(
         };
         let (cell, edit, work_slot, verb) = match lease.target {
             BlockWorkTarget::Plan { cell } => {
-                let Some(state) = plans.get(cell) else {
+                let Some(state) = project.plans.get(cell) else {
                     invalid.push(connection);
                     continue;
                 };
-                if !state.is_satisfied() {
+                if !state.is_satisfied()
+                    || Some(state.token()) != lease.project_token
+                    || lease
+                        .reservation
+                        .as_ref()
+                        .is_some_and(|reservation| !project.claims.matches(cell, reservation))
+                {
                     invalid.push(connection);
                     continue;
                 }
@@ -2663,37 +3085,85 @@ fn receive_block_edits(
                 work.duration_secs
             })
             * multiplier;
-        lease.progress_secs += time.delta_secs();
+        if let BlockWorkTarget::Plan { cell } = lease.target {
+            if lease.reservation.is_none() {
+                let Some(reservation) = project.claims.claim_owned(cell, lease.owner.clone())
+                else {
+                    invalid.push(connection);
+                    continue;
+                };
+                lease.reservation = Some(reservation);
+            }
+            if !worked_projects.insert(cell) {
+                continue;
+            }
+            lease.progress_secs = project
+                .plans
+                .edit(&cell, 0, |p| {
+                    p.progress_secs = (p.progress_secs + time.delta_secs()).min(duration);
+                    p.progress_secs
+                })
+                .unwrap_or(0.0);
+        } else {
+            lease.progress_secs += time.delta_secs();
+        }
         if lease.progress_secs >= duration {
-            completed.push((connection, edit));
+            completed.push((connection, edit, lease.project_token));
         }
     }
     for connection in invalid {
-        leases.0.remove(&connection);
+        leases.release(connection, &mut project.claims);
     }
-    for (connection, edit) in completed {
-        leases.0.remove(&connection);
-        apply_block_edit(
-            edit,
-            &mut commands,
-            &mut chunks,
-            BlockEditWorld::new(&map, &registry),
-            server,
-            &mut broadcast,
-            &mut bus,
-            &validation.subscriptions,
-        );
+    for (connection, edit, token) in completed {
+        leases.release(connection, &mut project.claims);
+        let mut commit = || {
+            apply_block_edit(
+                edit,
+                &mut commands,
+                &mut chunks,
+                BlockEditWorld::new(
+                    &map,
+                    &registry,
+                    &mut project.placements,
+                    &mut project.facilities,
+                ),
+                server,
+                &mut broadcast,
+                &mut bus,
+                &validation.subscriptions,
+            )
+        };
+        if let Some(token) = token {
+            crate::construction::complete(&mut project.plans, edit.anchor, token, commit);
+        } else {
+            commit();
+        }
     }
 }
 
 #[derive(Resource, Default)]
 struct BlockWorkLeases(HashMap<Entity, BlockWorkLease>);
 
+#[derive(Clone)]
 struct BlockWorkLease {
+    owner: block_junk_mod_api::authority::ReservationOwner,
+    reservation: Option<crate::reservations::Lease>,
+    project_token: Option<(u64, u64)>,
     sequence: u64,
     target: BlockWorkTarget,
     refreshed_at: Instant,
     progress_secs: f32,
+}
+
+impl BlockWorkLeases {
+    fn release(&mut self, connection: Entity, claims: &mut crate::plan_claims::PlanClaims) {
+        if let Some(lease) = self.0.remove(&connection)
+            && let BlockWorkTarget::Plan { cell } = lease.target
+            && let Some(reservation) = lease.reservation
+        {
+            claims.release_owned(cell, &reservation);
+        }
+    }
 }
 
 fn server_slot_at(
@@ -2718,15 +3188,32 @@ fn server_slot_at(
 /// going back through the wire — the server can't deliver a BlockEdit
 /// to its own `MessageReceiver`, but it can call this directly with
 /// the same effect.
-#[derive(Clone, Copy)]
-pub(crate) struct BlockEditWorld<'a> {
+pub(crate) struct BlockEditWorld<'a, 'w> {
+    cause: Option<block_junk_scripting::events::EventCause>,
+    facilities: &'a mut crate::facility_inventory::FacilityService<'w>,
     map: &'a ChunkMap,
     registry: &'a BlockRegistry,
+    placements: &'a mut crate::placements::Placements,
 }
 
-impl<'a> BlockEditWorld<'a> {
-    pub(crate) fn new(map: &'a ChunkMap, registry: &'a BlockRegistry) -> Self {
-        Self { map, registry }
+impl<'a, 'w> BlockEditWorld<'a, 'w> {
+    fn caused_by(mut self, cause: Option<block_junk_scripting::events::EventCause>) -> Self {
+        self.cause = cause;
+        self
+    }
+    pub(crate) fn new(
+        map: &'a ChunkMap,
+        registry: &'a BlockRegistry,
+        placements: &'a mut crate::placements::Placements,
+        facilities: &'a mut crate::facility_inventory::FacilityService<'w>,
+    ) -> Self {
+        Self {
+            cause: None,
+            map,
+            registry,
+            placements,
+            facilities,
+        }
     }
 }
 
@@ -2738,358 +3225,147 @@ pub(crate) fn apply_block_edit(
     edit: BlockEdit,
     commands: &mut Commands,
     chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
-    world: BlockEditWorld<'_>,
+    world: BlockEditWorld<'_, '_>,
     server: &Server,
     broadcast: &mut ServerMultiMessageSender,
     bus: &mut MessageWriter<CellEdit>,
     subscriptions: &SpatialSubscriptions,
-) {
-    if edit.slot.is_empty() {
-        apply_break(
-            edit,
-            commands,
-            chunks,
-            world,
-            server,
-            broadcast,
-            bus,
-            subscriptions,
-        );
-    } else {
-        apply_place(
-            edit,
-            commands,
-            chunks,
-            world,
-            server,
-            broadcast,
-            bus,
-            subscriptions,
-        );
-    }
-}
-
-/// Place path. Resolves the rotated footprint, validates every cell is
-/// empty (and its chunk is loaded), writes the slot to each cell, adds an
-/// `Anchor` entry at the anchor cell + `Ghost` entries at every other
-/// footprint cell. Cross-chunk footprints are handled naturally — each
-/// affected chunk gets the cells that fall inside it.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "shared authoritative edit transaction"
-)]
-fn apply_place(
-    edit: BlockEdit,
-    commands: &mut Commands,
-    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
-    world: BlockEditWorld<'_>,
-    server: &Server,
-    broadcast: &mut ServerMultiMessageSender,
-    bus: &mut MessageWriter<CellEdit>,
-    subscriptions: &SpatialSubscriptions,
-) {
-    let BlockEditWorld { map, registry } = world;
-    let def = registry.def(edit.slot);
-    let cells = world_footprint(edit.anchor, &def.footprint, edit.orientation);
-    if cells.is_empty() {
-        return;
-    }
-
-    // Group cells by their owning chunk + verify each chunk is loaded.
-    let mut cells_by_chunk: HashMap<ChunkCoord, Vec<(IVec3, IVec3)>> = HashMap::default();
-    for cell in &cells {
-        let (coord, local) = world_to_chunk(*cell);
-        cells_by_chunk
-            .entry(coord)
-            .or_default()
-            .push((*cell, local));
-    }
-    for coord in cells_by_chunk.keys() {
-        if !map.0.contains_key(coord) {
-            // A footprint cell falls in a chunk the server hasn't
-            // generated yet. Reject the placement; the client retries
-            // when AoI brings the chunk online. Loud log so this surfaces
-            // if it happens often in practice (suggests the placement UX
-            // is letting players aim past their AoI).
-            warn!(
-                anchor = ?edit.anchor,
-                slot = %def.id,
-                missing_chunk = ?coord,
-                "rejecting cross-chunk place: chunk not loaded server-side",
-            );
-            return;
-        }
-    }
-
-    // Validation pass: every footprint cell must currently be empty.
-    // Split borrow trick — we can't both `.iter` and `.get_mut` the same
-    // query, so do validation against the *immutable* view via a per-
-    // chunk lookup that reborrows the query each time.
-    for (coord, cells_in_chunk) in &cells_by_chunk {
-        let chunk_entity = map.0[coord];
-        let Ok((chunk, _)) = chunks.get(chunk_entity) else {
-            return;
-        };
-        for &(_world, local) in cells_in_chunk {
-            if !chunk.get(local).is_empty() {
-                info!(
-                    anchor = ?edit.anchor,
-                    slot = %def.id,
-                    blocked = ?_world,
-                    "rejecting place: footprint cell already occupied",
-                );
-                return;
-            }
-        }
-    }
-
-    // Sidecar entries describe block-entity geometry — anchors track the
-    // entity's orientation, ghosts point footprint cells back at their
-    // anchor. Plain cube blocks need none of that: the slot grid alone
-    // tells the full story. So only mesh blocks get sidecar entries.
-    let needs_sidecar = def.mesh.is_some();
-
-    // Apply pass. One chunk at a time so the borrow scope is clean.
-    for (coord, cells_in_chunk) in &cells_by_chunk {
-        let chunk_entity = map.0[coord];
-        let Ok((mut chunk, mut entities)) = chunks.get_mut(chunk_entity) else {
-            continue;
-        };
-        for &(world, local) in cells_in_chunk {
-            // is_empty was checked above; set should always succeed.
-            // Padding cells aren't part of `world_to_chunk`'s output for
-            // interior coords, so set() returns true on the real edits.
-            chunk.set(local, edit.slot);
-            if needs_sidecar {
-                let kind = if world == edit.anchor {
-                    EntryKind::Anchor {
-                        orientation: edit.orientation,
-                    }
-                } else {
-                    EntryKind::Ghost {
-                        anchor: edit.anchor,
-                    }
-                };
-                entities.insert(world, kind);
-            }
-            bus.write(CellEdit {
-                world,
-                slot: edit.slot,
-                // Place validation rejects any non-empty footprint cell,
-                // so the prior occupant is always EMPTY.
-                prev_slot: BlockSlot::EMPTY,
-                is_anchor: world == edit.anchor,
-            });
-        }
-        commands.entity(chunk_entity).insert(ChunkEdited);
-    }
-    // Echo border cells into loaded neighbours' padding rings (own pass
-    // — the per-chunk loop above holds a mutable borrow per chunk, and a
-    // cell's mirrors live in *other* chunks, possibly ones in this very
-    // footprint).
-    let mirror_cells: Vec<(IVec3, BlockSlot)> =
-        cells.iter().map(|&world| (world, edit.slot)).collect();
-    crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
-
-    // The ordered spatial lane keeps terrain edits consistent with staged
-    // chunk entry and leave transactions.
-    let states = cells
-        .iter()
-        .map(|&world| AuthoritativeCellState {
-            world,
-            slot: edit.slot,
-            entity: needs_sidecar.then_some(if world == edit.anchor {
-                EntryKind::Anchor {
-                    orientation: edit.orientation,
-                }
-            } else {
-                EntryKind::Ghost {
-                    anchor: edit.anchor,
-                }
-            }),
-        })
-        .collect();
-    let applied = TerrainEditRecord {
-        anchor: edit.anchor,
-        old_slot: BlockSlot::EMPTY,
-        orientation: edit.orientation,
-        cells: crate::protocol::BoundedVec::new(states)
-            .expect("validated block footprints fit the applied-edit wire bound"),
+) -> bool {
+    let mut transaction = crate::terrain_transaction::TerrainTransaction::default();
+    let read = |cell| {
+        let (coord, local) = world_to_chunk(cell);
+        let entity = *world.map.0.get(&coord)?;
+        let (chunk, sidecar) = chunks.get(entity).ok()?;
+        Some((chunk.get(local), sidecar.get(cell), chunk.revision))
     };
-    let target = subscriptions.target_for_cells(cells.iter().copied());
-    if let Err(err) = send_spatial_terrain_delta(broadcast, server, &target, &applied) {
-        warn!("terrain spatial delta failed: {err}");
+    if transaction.stage(edit, world.registry, &read).is_err() {
+        return false;
     }
-}
-
-/// Break path. Resolves the clicked cell to its entity's anchor (single-
-/// cell blocks resolve to themselves with default orientation; multi-
-/// cell entities walk the chunk sidecar). Clears every footprint cell
-/// in the affected chunks + drops the entries.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "shared authoritative edit transaction"
-)]
-fn apply_break(
-    edit: BlockEdit,
-    commands: &mut Commands,
-    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
-    world: BlockEditWorld<'_>,
-    server: &Server,
-    broadcast: &mut ServerMultiMessageSender,
-    bus: &mut MessageWriter<CellEdit>,
-    subscriptions: &SpatialSubscriptions,
-) {
-    let BlockEditWorld { map, registry } = world;
-    let click_cell = edit.anchor;
-    let (click_coord, click_local) = world_to_chunk(click_cell);
-    let Some(&click_entity) = map.0.get(&click_coord) else {
-        return;
-    };
-
-    // Resolve clicked cell → anchor cell + slot + orientation.
-    let (anchor, slot, orientation) = {
-        let Ok((chunk, entities)) = chunks.get(click_entity) else {
-            return;
-        };
-        let click_slot = chunk.get(click_local);
-        if click_slot.is_empty() {
-            return;
-        }
-        match entities.get(click_cell) {
-            Some(EntryKind::Anchor { orientation }) => (click_cell, click_slot, orientation),
-            Some(EntryKind::Ghost { anchor }) => {
-                // Anchor lives in the same or another chunk. Look it up.
-                let (anchor_coord, anchor_local) = world_to_chunk(anchor);
-                let Some(&anchor_entity) = map.0.get(&anchor_coord) else {
-                    warn!(
-                        clicked = ?click_cell,
-                        anchor = ?anchor,
-                        "ghost cell points at unloaded anchor chunk; ignoring break",
-                    );
-                    return;
-                };
-                let Ok((anchor_chunk, anchor_entities)) = chunks.get(anchor_entity) else {
-                    return;
-                };
-                let anchor_slot = anchor_chunk.get(anchor_local);
-                let orientation = match anchor_entities.get(anchor) {
-                    Some(EntryKind::Anchor { orientation }) => orientation,
-                    _ => {
-                        // Sidecar inconsistency — anchor entry missing or
-                        // a ghost. Loud log; bail without mutating.
-                        error!(
-                            clicked = ?click_cell,
-                            anchor = ?anchor,
-                            "ghost->anchor resolution failed; sidecar inconsistent",
-                        );
-                        return;
-                    }
-                };
-                (anchor, anchor_slot, orientation)
-            }
-            None => {
-                // No sidecar entry: a plain single-cell block. Resolve
-                // trivially.
-                (click_cell, click_slot, Cardinal::default())
-            }
-        }
-    };
-
-    // Compute footprint cells from the resolved entity.
-    let def = registry.def(slot);
-    let cells = world_footprint(anchor, &def.footprint, orientation);
-    let mut cells_by_chunk: HashMap<ChunkCoord, Vec<(IVec3, IVec3)>> = HashMap::default();
-    for cell in &cells {
-        let (coord, local) = world_to_chunk(*cell);
-        cells_by_chunk
-            .entry(coord)
-            .or_default()
-            .push((*cell, local));
-    }
-
-    // Apply: clear each cell + drop the entry.
-    for (coord, cells_in_chunk) in &cells_by_chunk {
-        let Some(&chunk_entity) = map.0.get(coord) else {
-            continue;
-        };
-        let Ok((mut chunk, mut entities)) = chunks.get_mut(chunk_entity) else {
-            continue;
-        };
-        for &(world, local) in cells_in_chunk {
-            chunk.set(local, BlockSlot::EMPTY);
-            entities.remove(world);
-            bus.write(CellEdit {
-                world,
-                slot: BlockSlot::EMPTY,
-                // The full footprint shares the same source block — its
-                // slot was captured at resolution above. Subscribers
-                // (drops, sidecar cleanup) read this to learn *what*
-                // was destroyed without re-querying the now-empty cell.
-                prev_slot: slot,
-                is_anchor: world == anchor,
-            });
-        }
-        commands.entity(chunk_entity).insert(ChunkEdited);
-    }
-    // Echo the cleared cells into loaded neighbours' padding rings
-    // (separate pass for the same borrow reason as the place path).
-    let mirror_cells: Vec<(IVec3, BlockSlot)> = cells
-        .iter()
-        .map(|&world| (world, BlockSlot::EMPTY))
-        .collect();
-    crate::voxel::apply_padding_mirrors(&mirror_cells, map, chunks);
-
-    // Broadcast the canonical applied break with the resolved anchor +
-    // orientation, so other clients can compute the footprint themselves.
-    // Ordered spatial lane for staging/edit ordering — see apply_place.
-    let applied = TerrainEditRecord {
-        anchor,
-        old_slot: slot,
-        orientation,
-        cells: crate::protocol::BoundedVec::new(
-            cells
-                .iter()
-                .map(|&world| AuthoritativeCellState {
-                    world,
-                    slot: BlockSlot::EMPTY,
-                    entity: None,
-                })
-                .collect(),
-        )
-        .expect("validated block footprints fit the applied-edit wire bound"),
-    };
-    let target = subscriptions.target_for_cells(cells.iter().copied());
-    if let Err(err) = send_spatial_terrain_delta(broadcast, server, &target, &applied) {
-        warn!("terrain spatial delta failed: {err}");
-    }
-
-    // S4 forage harvest-transform: a resource block with `depleted_block`
-    // (a ripe berry bush) doesn't leave bare air when harvested — it
-    // leaves its depleted form behind (bare bush), which the regrow
-    // system then grows back. The clear above already emitted the
-    // destroy `CellEdit` that spawned the drops (berries) off `slot`;
-    // now stamp the depleted block into the just-emptied anchor cell.
-    // Single-cell only: we place the depleted block's own footprint at
-    // the anchor, so a multi-cell resource block would only restore its
-    // anchor cell — fine for bushes, revisit if a big harvestable lands.
-    if let Some(depleted_id) = registry.def(slot).depleted_block.clone()
-        && let Some(depleted_slot) = registry.slot_of(&depleted_id)
+    let mut placements = world.placements.clone();
+    if placements
+        .apply_effects(&transaction.effects, world.registry)
+        .is_err()
     {
-        apply_place(
-            BlockEdit {
-                anchor,
-                slot: depleted_slot,
-                orientation: Cardinal::default(),
-            },
-            commands,
-            chunks,
-            BlockEditWorld::new(map, registry),
-            server,
-            broadcast,
-            bus,
-            subscriptions,
-        );
+        return false;
+    }
+    let Ok(change) = world
+        .facilities
+        .spatial_events
+        .prepare(transaction.changes().map(|(cell, _, _)| cell), world.cause)
+    else {
+        return false;
+    };
+    world.facilities.spatial_events.commit_change(change);
+    world
+        .facilities
+        .retire(&transaction.effects, world.registry);
+    *world.placements = placements;
+    commit_terrain_transaction(
+        transaction,
+        commands,
+        chunks,
+        world.map,
+        server,
+        broadcast,
+        bus,
+        subscriptions,
+        world.cause,
+    );
+    true
+}
+
+/// All fallible geometry work has finished; exclusive chunk access prevents
+/// changes between validation and commit. Effects publish only after all writes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one committed terrain transaction spans geometry and ordered spatial publication"
+)]
+pub(crate) fn commit_terrain_transaction(
+    transaction: crate::terrain_transaction::TerrainTransaction,
+    commands: &mut Commands,
+    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: &ChunkMap,
+    server: &Server,
+    broadcast: &mut ServerMultiMessageSender,
+    bus: &mut MessageWriter<CellEdit>,
+    subscriptions: &SpatialSubscriptions,
+    cause: Option<block_junk_scripting::events::EventCause>,
+) {
+    let effects = commit_terrain_geometry(transaction, commands, chunks, map, bus, cause, true);
+    for applied in effects {
+        let target = subscriptions.target_for_cells(applied.cells.iter().map(|c| c.world));
+        if let Err(error) = send_spatial_terrain_delta(broadcast, server, &target, &applied) {
+            warn!(%error,"terrain spatial delta failed");
+        }
+    }
+}
+
+pub(crate) fn commit_terrain_geometry(
+    transaction: crate::terrain_transaction::TerrainTransaction,
+    commands: &mut Commands,
+    chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
+    map: &ChunkMap,
+    bus: &mut MessageWriter<CellEdit>,
+    cause: Option<block_junk_scripting::events::EventCause>,
+    yield_drops: bool,
+) -> Vec<TerrainEditRecord> {
+    let mut mirrors = Vec::new();
+    for (cell, slot, entry) in transaction.changes() {
+        let (coord, local) = world_to_chunk(cell);
+        let entity = map.0[&coord];
+        let (mut chunk, mut sidecar) = chunks
+            .get_mut(entity)
+            .expect("exclusive validated terrain chunk");
+        chunk.apply_committed_cell(local, slot);
+        if let Some(entry) = entry {
+            sidecar.insert(cell, entry);
+        } else {
+            sidecar.remove(cell);
+        }
+        commands.entity(entity).insert(ChunkEdited);
+        mirrors.push((cell, slot));
+    }
+    crate::voxel::apply_padding_mirrors(&mirrors, map, chunks);
+    for (coord, revision) in &transaction.revisions {
+        let entity = map.0[&ChunkCoord(IVec3::from_array(*coord))];
+        chunks
+            .get_mut(entity)
+            .expect("validated revision chunk")
+            .0
+            .revision = *revision;
+    }
+    for (effect_index, applied) in transaction.effects.iter().enumerate() {
+        for cell in applied.cells.iter() {
+            bus.write(CellEdit {
+                yield_drops: yield_drops && transaction.yields_drops(effect_index),
+                cause,
+                world: cell.world,
+                slot: cell.slot,
+                prev_slot: applied.old_slot,
+                is_anchor: cell.world == applied.anchor,
+            });
+        }
+    }
+    transaction.effects
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct PendingTerrainEffects(pub Vec<TerrainEditRecord>);
+
+fn flush_mod_terrain_effects(
+    mut queue: ResMut<PendingTerrainEffects>,
+    servers: Query<&Server>,
+    mut broadcast: ServerMultiMessageSender,
+    subscriptions: Res<SpatialSubscriptions>,
+) {
+    let Ok(server) = servers.single() else {
+        return;
+    };
+    for applied in queue.0.drain(..) {
+        let target = subscriptions.target_for_cells(applied.cells.iter().map(|c| c.world));
+        if let Err(error) = send_spatial_terrain_delta(&mut broadcast, server, &target, &applied) {
+            warn!(%error,"terrain spatial delta failed");
+        }
     }
 }
 
@@ -3126,6 +3402,19 @@ fn world_footprint(anchor: IVec3, def_footprint: &[[i32; 3]], orientation: Cardi
         .collect()
 }
 
+type ConstructionWorkers<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static crate::npc::NpcId,
+        &'static AvatarPose,
+        &'static EquippedTool,
+        Option<&'static mut Brain>,
+        Option<&'static mut Needs>,
+    ),
+    With<crate::npc::Npc>,
+>;
+
 /// NPC work consumer. Translates the brain's `NpcWorkCompleted` events
 /// into `BlockEdit`s and feeds them through the same `apply_block_edit`
 /// path that handles client requests — so the world mutation, the
@@ -3140,7 +3429,9 @@ fn apply_npc_work(
     mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
     map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
-    plans: Res<Plans>,
+    mut project: ProjectExecution,
+    mut workers: ConstructionWorkers,
+    items: Res<ItemRegistry>,
     servers: Query<&Server>,
     mut broadcast: ServerMultiMessageSender,
     mut bus: MessageWriter<CellEdit>,
@@ -3150,128 +3441,378 @@ fn apply_npc_work(
         return;
     };
     for completion in reader.read() {
-        // Authoritative half of "cancel cancels": the brain re-checks
-        // before emitting, but a plan edit can land between that check
-        // and this apply. Never mutate the world for a plan that no
-        // longer exists as completed.
-        if plans.kind(completion.cell) != Some(completion.plan_kind) {
-            info!(
-                cell = ?completion.cell.to_array(),
-                "npc work completion against missing/changed plan; skipping edit",
+        let result: Result<(), &str> = (|| {
+            // Authoritative half of "cancel cancels": the brain re-checks
+            // before emitting, but a plan edit can land between that check
+            // and this apply. Never mutate the world for a plan that no
+            // longer exists as completed.
+            let holder = project.claims.holder(completion.cell);
+            if holder != Some(completion.worker)
+                || project
+                    .plans
+                    .get(completion.cell)
+                    .is_none_or(|p| p.token() != completion.project_token)
+            {
+                info!(
+                    cell = ?completion.cell.to_array(),
+                    "npc work completion against missing/changed plan; skipping edit",
+                );
+                return Err("project or worker authority changed");
+            }
+            project.claims.release(completion.cell, completion.worker);
+            let Some((_, pose, tool, _, _)) =
+                workers.iter().find(|(id, ..)| **id == completion.worker)
+            else {
+                return Err("construction actor missing");
+            };
+            if !within_reach(
+                pose,
+                completion.cell.as_vec3() + Vec3::splat(0.5),
+                INTERACT_REACH,
+            ) {
+                return Err("construction actor out of reach");
+            }
+            let (slot, verb) = match completion.plan_kind {
+                PlanKind::Build { slot, .. } => (slot, block_junk_mod_api::blocks::WorkVerb::Build),
+                PlanKind::Remove => {
+                    let Some(slot) = server_slot_at(completion.cell, &chunks, &map) else {
+                        return Err("construction terrain unavailable");
+                    };
+                    (slot, block_junk_mod_api::blocks::WorkVerb::Destroy)
+                }
+            };
+            let Some(def) = registry.try_def(slot) else {
+                return Err("construction definition missing");
+            };
+            if let Some(work) = &def.work_action {
+                let has_tool = work
+                    .tool_for(verb)
+                    .is_none_or(|tag| items.tool_has_tag(tool.item, tag));
+                if work.duration_multiplier(verb, has_tool).is_none() {
+                    return Err("construction tool requirement no longer met");
+                }
+            }
+            let edit = match completion.plan_kind {
+                PlanKind::Remove => BlockEdit {
+                    anchor: completion.cell,
+                    slot: BlockSlot::EMPTY,
+                    orientation: Cardinal::default(),
+                },
+                PlanKind::Build { slot, orientation } => BlockEdit {
+                    anchor: completion.cell,
+                    slot,
+                    orientation,
+                },
+            };
+            let cause = project
+                .ledger
+                .jobs
+                .records
+                .values()
+                .find(|job| {
+                    !job.state.terminal()
+                        && job.target
+                            == (block_junk_mod_api::authority::JobTarget::Construction {
+                                project_id: completion.project_token.0,
+                                project_revision: completion.project_token.1,
+                            })
+                })
+                .and_then(|job| job.cause);
+            let completed = crate::construction::complete(
+                &mut project.plans,
+                completion.cell,
+                completion.project_token,
+                || {
+                    apply_block_edit(
+                        edit,
+                        &mut commands,
+                        &mut chunks,
+                        BlockEditWorld::new(
+                            &map,
+                            &registry,
+                            &mut project.placements,
+                            &mut project.facilities,
+                        )
+                        .caused_by(cause),
+                        server,
+                        &mut broadcast,
+                        &mut bus,
+                        &subscriptions,
+                    )
+                },
             );
-            continue;
+            if completed {
+                Ok(())
+            } else {
+                Err("authoritative completion rejected")
+            }
+        })();
+        if project.ledger.jobs.records.values().any(|job| {
+            !job.state.terminal()
+                && job.actor
+                    == block_junk_mod_api::authority::ReservationOwner::Npc {
+                        id: completion.worker.0,
+                    }
+                && job.target
+                    == block_junk_mod_api::authority::JobTarget::Construction {
+                        project_id: completion.project_token.0,
+                        project_revision: completion.project_token.1,
+                    }
+        }) {
+            project.ledger.finish_project(
+                completion.project_token,
+                result.is_ok(),
+                result.err().unwrap_or(""),
+            );
         }
-        let edit = match completion.plan_kind {
-            PlanKind::Remove => BlockEdit {
-                anchor: completion.cell,
-                slot: BlockSlot::EMPTY,
-                orientation: Cardinal::default(),
-            },
-            PlanKind::Build { slot, orientation } => BlockEdit {
-                anchor: completion.cell,
-                slot,
-                orientation,
-            },
-        };
-        apply_block_edit(
-            edit,
-            &mut commands,
-            &mut chunks,
-            BlockEditWorld::new(&map, &registry),
-            server,
-            &mut broadcast,
-            &mut bus,
-            &subscriptions,
-        );
+        if let Some((_, _, _, brain, needs)) = workers
+            .iter_mut()
+            .find(|(id, ..)| **id == completion.worker)
+        {
+            if result.is_ok()
+                && let Some(mut needs) = needs
+                && let Some(restore) = &completion.need_restore
+                && let Some(value) = needs.0.get_mut(&restore.need)
+            {
+                *value = (*value - restore.restores).max(0.0);
+            }
+            let Some(mut brain) = brain else {
+                continue;
+            };
+            if brain.awaiting_construction == Some(completion.project_token) {
+                brain.awaiting_construction = None;
+            }
+            if brain
+                .active_policy_job
+                .as_ref()
+                .is_some_and(|(id, revision)| {
+                    id == &format!("construction:{}", completion.project_token.0)
+                        && *revision == completion.project_token.1
+                })
+            {
+                crate::npc::finish_policy_job(
+                    &mut brain,
+                    if result.is_ok() {
+                        block_junk_mod_api::npcs::PolicyJobState::Completed
+                    } else {
+                        block_junk_mod_api::npcs::PolicyJobState::Failed
+                    },
+                    result.err(),
+                );
+            }
+        }
     }
 }
 
 /// NPC bush-eat consumer (S4 forage). Translates each
-/// [`NpcConsumedInteractable`] into an in-place swap of the block for
+/// A committed facility action can request an in-place swap of the block for
 /// its `depleted_block` — *without* spawning drops (the villager ate
 /// the berries; harvesting the same bush drops them instead).
 ///
-/// The swap is done as a silent clear (no `CellEdit`, so
-/// `spawn_drops_on_destroy` never fires) followed by an `apply_place` of
-/// the depleted block, which emits the `CellEdit`/`BlockEdit` that
-/// updates the interactable index, arms the regrow timer, and reaches
-/// clients. Single-cell only — bushes have no footprint or sidecar.
+/// Geometry, escrow and the actor's need change commit together. Failed or stale
+/// completions leave the original resource intact and grant no free need recovery.
 #[derive(bevy::ecs::system::SystemParam)]
 struct NpcConsumptionWorld<'w, 's> {
+    homes: Query<'w, 's, (&'static NpcId, &'static mut crate::npc::Brain)>,
+    facilities: crate::facility_inventory::FacilityService<'w>,
     chunks: Query<'w, 's, (&'static mut Chunk, &'static mut ChunkEntities)>,
     map: Res<'w, ChunkMap>,
     registry: Res<'w, BlockRegistry>,
-    servers: Query<'w, 's, &'static Server>,
-    subscriptions: Res<'w, SpatialSubscriptions>,
+    placements: ResMut<'w, crate::placements::Placements>,
+    actors: Query<'w, 's, (&'static NpcId, &'static mut Needs, &'static AvatarPose)>,
+    construction: crate::construction::ConstructionService<'w>,
+    effects: ResMut<'w, PendingTerrainEffects>,
 }
 
-fn apply_npc_consumption(
-    mut reader: MessageReader<crate::npc::NpcConsumedInteractable>,
+#[cfg(test)]
+pub(crate) fn install_interaction_fixture(app: &mut App) {
+    app.init_resource::<crate::facility_access::FacilityAccess>()
+        .add_message::<crate::facility_interactions::InteractionCompleted>()
+        .add_systems(
+            PreUpdate,
+            (
+                crate::facility_interactions::reconcile_exits,
+                crate::facility_interactions::activate,
+            )
+                .chain(),
+        )
+        .add_systems(
+            Update,
+            (
+                crate::facility_interactions::advance,
+                apply_facility_completion,
+            )
+                .chain(),
+        )
+        .add_systems(PostUpdate, crate::facility_interactions::reconcile_exits);
+}
+
+fn apply_facility_completion(
+    mut reader: MessageReader<crate::facility_interactions::InteractionCompleted>,
+    mut interactions: ResMut<crate::facility_interactions::FacilityInteractions>,
+    mut claims: ResMut<crate::interactables::InteractionClaims>,
+    mut world: NpcConsumptionWorld,
     mut commands: Commands,
-    world: NpcConsumptionWorld,
-    mut broadcast: ServerMultiMessageSender,
     mut bus: MessageWriter<CellEdit>,
 ) {
-    let NpcConsumptionWorld {
-        mut chunks,
-        map,
-        registry,
-        servers,
-        subscriptions,
-    } = world;
-    let Ok(server) = servers.single() else {
-        return;
+    use block_junk_mod_api::{
+        architecture::{FacilityAction, FacilityConsumption},
+        authority::{JobState, JobTarget, ReservationOwner},
     };
-    for msg in reader.read() {
-        let (coord, local) = world_to_chunk(msg.cell);
-        let Some(&entity) = map.0.get(&coord) else {
-            continue;
-        };
-        // Resolve the depleted target from whatever block is currently
-        // there — it may have been mined/regrown between eat and now.
-        let depleted_slot = {
-            let Ok((chunk, _)) = chunks.get(entity) else {
-                continue;
-            };
-            let slot = chunk.get(local);
-            if slot.is_empty() {
-                continue;
-            }
-            let Some(depleted_id) = registry.def(slot).depleted_block.clone() else {
-                continue;
-            };
-            match registry.slot_of(&depleted_id) {
-                Some(s) => s,
-                None => continue,
-            }
-        };
-        // Silently empty the cell (no CellEdit ⇒ no drops), then place
-        // the depleted block through the shared path.
+    for message in reader.read() {
+        if !interactions
+            .jobs
+            .records
+            .get(&message.job_id)
+            .is_some_and(|job| {
+                job.actor
+                    == (ReservationOwner::Npc {
+                        id: message.actor.0,
+                    })
+                    && job.state == JobState::Working
+                    && interactions
+                        .progress
+                        .get(&job.id)
+                        .is_some_and(|p| p.remaining_secs == 0.)
+            })
         {
-            let Ok((mut chunk, _)) = chunks.get_mut(entity) else {
-                continue;
-            };
-            chunk.set(local, BlockSlot::EMPTY);
+            continue;
         }
-        apply_place(
-            BlockEdit {
-                anchor: msg.cell,
-                slot: depleted_slot,
-                orientation: Cardinal::default(),
-            },
-            &mut commands,
-            &mut chunks,
-            BlockEditWorld::new(&map, &registry),
-            server,
-            &mut broadcast,
-            &mut bus,
-            &subscriptions,
-        );
-        info!(
-            cell = ?msg.cell.to_array(),
-            depleted = %registry.id_of(depleted_slot),
-            "npc ate a self-consuming interactable; depleted it",
-        );
+        let outcome = (|| -> Result<(), String> {
+            let job = interactions
+                .jobs
+                .records
+                .get(&message.job_id)
+                .ok_or("interaction job missing")?
+                .clone();
+            if job.actor
+                != (ReservationOwner::Npc {
+                    id: message.actor.0,
+                })
+                || job.state != JobState::Working
+                || !interactions
+                    .progress
+                    .get(&job.id)
+                    .is_some_and(|p| p.remaining_secs == 0.)
+            {
+                return Err("interaction not ready to complete".into());
+            }
+            let (use_slot, action) = interactions.validate_target(
+                job.id,
+                &world.placements,
+                &world.registry,
+                &claims,
+            )?;
+            let FacilityAction::Timed {
+                need_restore,
+                consumption,
+                ..
+            } = action.clone()
+            else {
+                return Err("wrong timed action".into());
+            };
+            let JobTarget::Interaction { slot, .. } = &job.target else {
+                return Err("wrong job target".into());
+            };
+            let placement = &world.placements.records[&slot.placement];
+            let anchor = IVec3::from_array(placement.anchor);
+            let (_, mut needs, pose) = world
+                .actors
+                .iter_mut()
+                .find(|(id, _, _)| **id == message.actor)
+                .ok_or("interaction actor missing")?;
+            let approach = IVec3::from_array(interactions.progress[&job.id].approach);
+            if !crate::facility_interactions::valid_actor_pose(use_slot, anchor, approach, pose) {
+                return Err("interaction actor left its authored use position".into());
+            }
+            if need_restore
+                .as_ref()
+                .is_some_and(|restore| !needs.0.contains_key(&restore.need))
+            {
+                return Err("actor does not have the requested need".into());
+            }
+            let mut facilities = crate::facility_inventory::FacilityTransaction::default();
+            let mut terrain = crate::terrain_transaction::TerrainTransaction::default();
+            if let Some(consumption) = consumption {
+                match consumption {
+                    FacilityConsumption::Stock { count, tag } => {
+                        facilities.consume_stock(anchor, count, tag.as_ref(), &world.facilities)?
+                    }
+                    FacilityConsumption::Deplete => {
+                        let base = |cell| {
+                            let (coord, local) = world_to_chunk(cell);
+                            let entity = world.map.0.get(&coord)?;
+                            let (chunk, sidecar) = world.chunks.get(*entity).ok()?;
+                            Some((chunk.get(local), sidecar.get(cell), chunk.revision))
+                        };
+                        terrain.stage(
+                            BlockEdit {
+                                anchor,
+                                slot: BlockSlot::EMPTY,
+                                orientation: Cardinal::default(),
+                            },
+                            &world.registry,
+                            &base,
+                        )?;
+                    }
+                }
+            }
+            if world.effects.0.len() + terrain.effects.len() > 4096 {
+                return Err("terrain publication queue full".into());
+            }
+            let mut placements = world.placements.clone();
+            placements.apply_effects(&terrain.effects, &world.registry)?;
+            let mut construction = world.construction.stage();
+            construction.resolve_terrain(terrain.changes().map(|(cell, _, _)| cell));
+            let spatial_change = world
+                .facilities
+                .spatial_events
+                .prepare(terrain.changes().map(|(cell, _, _)| cell), job.cause)?;
+            facilities.retire(&terrain.effects, &world.registry, &world.facilities);
+            world
+                .facilities
+                .spatial_events
+                .commit_change(spatial_change);
+            world.construction.commit(construction);
+            world.facilities.commit(facilities);
+            *world.placements = placements;
+            let effects = commit_terrain_geometry(
+                terrain,
+                &mut commands,
+                &mut world.chunks,
+                &world.map,
+                &mut bus,
+                job.cause,
+                false,
+            );
+            world.effects.0.extend(effects);
+            if need_restore
+                .as_ref()
+                .is_some_and(|restore| restore.need == "sleep")
+                && world
+                    .placements
+                    .records
+                    .get(&slot.placement)
+                    .is_some_and(|record| record.active)
+                && let Some((_, mut brain)) =
+                    world.homes.iter_mut().find(|(id, _)| **id == message.actor)
+            {
+                brain.home_facility = Some(slot.placement);
+            }
+            if let Some(restore) = need_restore {
+                let deficit = needs.0.get_mut(&restore.need).expect("validated need");
+                *deficit = (*deficit - restore.restores).max(0.);
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                interactions.finish(message.job_id, JobState::Completed, None, &mut claims);
+            }
+            Err(reason) => {
+                interactions.finish(message.job_id, JobState::Failed, Some(reason), &mut claims);
+            }
+        }
     }
 }
 
@@ -3428,9 +3969,19 @@ fn receive_pickup_requests(
                 // the displaced tool landing at the player's feet
                 // (potentially inside the body collider or behind
                 // them).
-                let displaced = tool.item.replace(item_slot);
+                let Some((remaining, displaced)) =
+                    crate::item_placement::exchange_tool(&mut tool, item_slot, item_count)
+                else {
+                    continue;
+                };
                 claimed.insert(entity);
-                commands.entity(entity).despawn();
+                shrink_or_despawn_stack(
+                    &mut commands,
+                    entity,
+                    item_slot,
+                    item_translation,
+                    remaining,
+                );
                 info!(
                     new_tool = item_slot.0,
                     displaced = ?displaced.map(|s| s.0),
@@ -3475,13 +4026,8 @@ fn receive_pickup_requests(
     }
 }
 
-/// Apply a client's drop request. Clears the player's `Carrying` and
-/// spawns N `WorldItem` entities (one per unit in the dropped stack).
-/// Items land one tile ahead of the player when that cell is standable
-/// (so the player can see what they just dropped), else at the player's
-/// feet (sliding off a cliff edge or facing a wall both degrade to
-/// "right here"). A tight per-unit fan jitter keeps a stack from
-/// z-fighting at the same point.
+/// Transfer the carried stack to durable item delivery. A blocked destination
+/// retains the obligation, and a large stack costs one queued delivery.
 #[allow(
     clippy::too_many_arguments,
     reason = "wire handler joins validated gameplay state"
@@ -3490,14 +4036,17 @@ fn receive_drop_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<DropRequest>), With<GameReady>>,
     avatars: Res<ClientAvatars>,
     mut players: Query<(&AvatarPose, &mut Carrying), With<Avatar>>,
+    sidecars: Query<&'static crate::voxel::ChunkEntities>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
-    mut commands: Commands,
+    mut pending_items: ResMut<crate::item_placement::ItemPlacementQueue>,
+    item_registry: Res<ItemRegistry>,
     mut validation: ValidatedRequestContext,
 ) {
     let world = crate::npc::WorldWalk {
         chunks: &chunks,
+        sidecars: &sidecars,
         chunk_map: &chunk_map,
         registry: &block_registry,
     };
@@ -3523,30 +4072,11 @@ fn receive_drop_requests(
             continue;
         };
         let centre = drop_target_position(pose, &world);
-        // Tight ring (0.08 m) so a 5-stack reads as "here," not "spread
-        // across half a tile." Each unit settles like a destroy-drop —
-        // the fallback branch of `drop_target_position` is the flying
-        // player's foot position, which can be any height above ground,
-        // and an unsettled spawn there floats forever (no CellEdit ever
-        // re-settles a cell nothing was built in).
-        for unit in 0..count {
-            let angle = (unit as f32) * std::f32::consts::TAU / count.max(1) as f32;
-            let offset = Vec3::new(angle.cos() * 0.08, 0.0, angle.sin() * 0.08);
-            let translation = settled_translation(&world, centre + offset);
-            commands.spawn((
-                WorldItem {
-                    item,
-                    translation,
-                    count: 1,
-                },
-                Transform::from_translation(translation),
-                GlobalTransform::default(),
-                crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
-                    translation,
-                )),
-                Name::new(format!("WorldItem(dropped:{})", item.0)),
-            ));
-        }
+        pending_items.enqueue(
+            centre.floor().as_ivec3(),
+            item_registry.def(item).id.clone(),
+            count,
+        );
     }
 }
 
@@ -3564,14 +4094,17 @@ fn receive_drop_tool_requests(
     mut receivers: Query<(Entity, &mut MessageReceiver<DropToolRequest>), With<GameReady>>,
     avatars: Res<ClientAvatars>,
     mut players: Query<(&AvatarPose, &mut EquippedTool), With<Avatar>>,
+    sidecars: Query<&'static crate::voxel::ChunkEntities>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
-    mut commands: Commands,
+    mut pending_items: ResMut<crate::item_placement::ItemPlacementQueue>,
+    item_registry: Res<ItemRegistry>,
     mut validation: ValidatedRequestContext,
 ) {
     let world = crate::npc::WorldWalk {
         chunks: &chunks,
+        sidecars: &sidecars,
         chunk_map: &chunk_map,
         registry: &block_registry,
     };
@@ -3599,17 +4132,11 @@ fn receive_drop_tool_requests(
         // Settled for the same reason as receive_drop_requests: the
         // foot-position fallback can be mid-air.
         let target = settled_translation(&world, drop_target_position(pose, &world));
-        commands.spawn((
-            WorldItem {
-                item: slot,
-                translation: target,
-                count: 1,
-            },
-            Transform::from_translation(target),
-            GlobalTransform::default(),
-            crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(target)),
-            Name::new(format!("WorldItem(tool_dropped:{})", slot.0)),
-        ));
+        pending_items.enqueue(
+            target.floor().as_ivec3(),
+            item_registry.def(slot).id.clone(),
+            1,
+        );
     }
 }
 
@@ -3711,13 +4238,18 @@ fn receive_deposit_requests(
                 _ => continue,
             };
             // Plan must exist + accept this item kind.
-            let accepted = plans.deposit(req.cell, carry_item, carry_count);
+            let Some(token) = plans.get(req.cell).map(|project| project.token()) else {
+                continue;
+            };
+            let accepted = crate::construction::transfer_carried_materials(
+                &mut plans,
+                req.cell,
+                token,
+                &mut carry,
+                carry_count,
+            );
             if accepted == 0 {
                 continue;
-            }
-            carry.count = carry_count - accepted;
-            if carry.count == 0 {
-                carry.item = None;
             }
             if let Some(state) = plans.get(req.cell) {
                 // Targeted deposit receipt — the depositor sees
@@ -3799,17 +4331,24 @@ fn summarize_goal(goal: &Goal) -> (String, Option<IVec3>) {
 ///
 /// Broadcasts a `PlanEdit { kind: None }` per cleared tag so client
 /// mirrors drop their outline at the same moment the cell changes.
-fn auto_clear_stale_plans(mut reader: MessageReader<CellEdit>, mut plans: ResMut<Plans>) {
+fn auto_clear_stale_plans(
+    mut reader: MessageReader<CellEdit>,
+    mut construction: crate::construction::ConstructionService,
+) {
     for edit in reader.read() {
-        let stale = match plans.get(edit.world).map(|s| s.kind) {
-            Some(PlanKind::Remove) => edit.slot.is_empty(),
-            Some(PlanKind::Build { .. }) => !edit.slot.is_empty(),
-            None => false,
-        };
-        if !stale {
-            continue;
+        let affected = construction
+            .iter()
+            .find(|(anchor, state)| {
+                (**anchor == edit.world || state.footprint.contains(&edit.world))
+                    && match state.kind {
+                        PlanKind::Remove => edit.slot.is_empty(),
+                        PlanKind::Build { .. } => !edit.slot.is_empty(),
+                    }
+            })
+            .map(|(anchor, _)| *anchor);
+        if let Some(anchor) = affected {
+            construction.cancel(anchor);
         }
-        plans.clear(edit.world);
     }
 }
 
@@ -3839,88 +4378,23 @@ pub(crate) fn settled_translation(
     )
 }
 
-/// Spawn drop items when a block is destroyed. Reads the same CellEdit
-/// bus as `auto_clear_stale_plans`; for each destroyed *block* (the
-/// destroy-edit with `is_anchor` set — exactly one per block, however
-/// many footprint cells it covered), looks up the destroyed block's
-/// `BlockDef.drops`, and for each entry spawns `count` `WorldItem`
-/// entities at the anchor cell's centre with a small per-unit XZ jitter
-/// so a multi-item pile doesn't z-fight.
-///
-/// `drops` is a per-block contract, like `materials`: a 2-cell bed with
-/// `{wood, count=3}` yields 3 wood, exactly, whatever its footprint.
-/// (An earlier version spawned the list once per footprint *cell*,
-/// which minted resources against build cost and made non-divisible
-/// totals unrepresentable — destruction is atomic per block, so cell
-/// granularity corresponded to nothing.)
-///
-/// Each drop is then settled down to solid ground via
-/// [`settled_translation`] — a block destroyed in mid-air (the floating
-/// block above the player's reach, or the last block of a column) leaves
-/// its drops resting on whatever is below instead of hanging where the
-/// block used to be. Drops don't support each other, so a whole pile
-/// settles onto the same floor cell.
-///
-/// Server-authoritative spatial spawn. AOI visibility decides which clients
-/// receive the entity, and the client-side observer attaches its visible scene.
+/// Record one durable stack per drop entry and destroyed placement. Delivery is
+/// bounded and retries blocked/unloaded destinations instead of burying material.
 fn spawn_drops_on_destroy(
     mut reader: MessageReader<CellEdit>,
-    mut commands: Commands,
-    chunks: Query<&'static Chunk>,
-    chunk_map: Res<ChunkMap>,
+    mut pending: ResMut<crate::item_placement::ItemPlacementQueue>,
     blocks: Res<BlockRegistry>,
-    items: Res<ItemRegistry>,
 ) {
-    use crate::items::drop_jitter as jitter;
-    use block_junk_mod_api::items::ItemId;
-
-    let world = crate::npc::WorldWalk {
-        chunks: &chunks,
-        chunk_map: &chunk_map,
-        registry: &blocks,
-    };
-
     for edit in reader.read() {
-        if !edit.slot.is_empty() || edit.prev_slot.is_empty() || !edit.is_anchor {
+        if !edit.yield_drops
+            || !edit.slot.is_empty()
+            || edit.prev_slot.is_empty()
+            || !edit.is_anchor
+        {
             continue;
         }
-        let def = blocks.def(edit.prev_slot);
-        if def.resolved_drops().is_empty() {
-            continue;
-        }
-        // Cell centre. The +0.5 XZ centres the item in the cell (jitter
-        // then spreads a pile within it); Y here is unimportant because
-        // `settled_translation` re-quantizes it to the resting cell's
-        // base — we only need it to floor() back to `edit.world`.
-        let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
-        for drop in def.resolved_drops() {
-            let item_id: &ItemId = &drop.item;
-            // boot validation guarantees this resolves; failing here
-            // would be an engine bug.
-            let Some(slot) = items.slot_of(item_id) else {
-                error!(
-                    block = %def.id,
-                    item = %item_id,
-                    "drops references item missing from registry after boot; skipping",
-                );
-                continue;
-            };
-            for unit in 0..drop.count {
-                let translation = settled_translation(&world, centre + jitter(edit.world, unit));
-                commands.spawn((
-                    WorldItem {
-                        item: slot,
-                        translation,
-                        count: 1,
-                    },
-                    Transform::from_translation(translation),
-                    GlobalTransform::default(),
-                    crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
-                        translation,
-                    )),
-                    Name::new(format!("WorldItem({})", item_id)),
-                ));
-            }
+        for drop in blocks.def(edit.prev_slot).resolved_drops() {
+            pending.enqueue(edit.world, drop.item.clone(), drop.count);
         }
     }
 }
@@ -4068,6 +4542,7 @@ fn push_actors_out_of_new_blocks(
 /// mined block all fall straight to the same exposed floor in one pass.
 fn settle_items_on_cell_edit(
     mut reader: MessageReader<CellEdit>,
+    sidecars: Query<&'static crate::voxel::ChunkEntities>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
@@ -4086,6 +4561,7 @@ fn settle_items_on_cell_edit(
 
     let world = crate::npc::WorldWalk {
         chunks: &chunks,
+        sidecars: &sidecars,
         chunk_map: &chunk_map,
         registry: &registry,
     };
@@ -4115,6 +4591,7 @@ fn settle_items_on_cell_edit(
 /// and simply marks itself done.
 fn settle_loaded_items_after_load(
     mut ran: Local<bool>,
+    sidecars: Query<&'static crate::voxel::ChunkEntities>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
@@ -4130,6 +4607,7 @@ fn settle_loaded_items_after_load(
 
     let world = crate::npc::WorldWalk {
         chunks: &chunks,
+        sidecars: &sidecars,
         chunk_map: &chunk_map,
         registry: &registry,
     };
@@ -4265,5 +4743,342 @@ fn rescue_embedded_actors_after_load(
                 }
             }
         }
+    }
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct ProjectExecution<'w> {
+    ledger: ResMut<'w, crate::construction::ConstructionLedger>,
+    facilities: crate::facility_inventory::FacilityService<'w>,
+    plans: ResMut<'w, Plans>,
+    claims: ResMut<'w, crate::plan_claims::PlanClaims>,
+    placements: ResMut<'w, crate::placements::Placements>,
+}
+
+#[cfg(test)]
+#[path = "construction_udp.rs"]
+mod construction_udp;
+
+#[cfg(test)]
+#[path = "foundation_udp.rs"]
+mod foundation_udp;
+
+#[cfg(test)]
+mod simulation_demand_tests {
+    use super::*;
+    #[test]
+    fn npc_neighborhoods_generate_without_players_and_ignore_unrequested_caves() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        crate::scripting::install_independent_fixture(&mut app, block_junk_mod_api::Side::Server);
+        let slots = *app.world().resource::<TerrainSlots>();
+        app.init_resource::<ChunkMap>()
+            .init_resource::<crate::placements::Placements>()
+            .init_resource::<PendingChunks>()
+            .init_resource::<ActiveSimulationChunks>()
+            .add_systems(Update, (request_npc_chunks, poll_chunk_gen).chain());
+        let npc = app
+            .world_mut()
+            .spawn((
+                Npc,
+                AvatarPose {
+                    translation: Vec3::new(96., 12., 96.),
+                    yaw: 0.,
+                },
+            ))
+            .id();
+        let unrelated = ChunkCoord(IVec3::splat(100));
+        let entity = app
+            .world_mut()
+            .spawn((
+                unrelated,
+                Chunk::from_terrain(unrelated, &slots),
+                ChunkEntities::default(),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<ChunkMap>()
+            .0
+            .insert(unrelated, entity);
+        app.update();
+        let demand = &app.world().resource::<ActiveSimulationChunks>().0;
+        assert_eq!(demand.len(), 27);
+        assert!(!demand.contains(&unrelated));
+        assert!(app.world().resource::<PendingChunks>().0.len() <= 4);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.update();
+            let map = &app.world().resource::<ChunkMap>().0;
+            if app
+                .world()
+                .resource::<ActiveSimulationChunks>()
+                .0
+                .iter()
+                .all(|coord| map.contains_key(coord))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "NPC geometry failed to converge");
+            std::thread::yield_now();
+        }
+        assert_eq!(app.world().resource::<ChunkMap>().0.len(), 28);
+        app.world_mut().despawn(npc);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ActiveSimulationChunks>()
+                .0
+                .is_empty()
+        );
+        assert!(app.world().resource::<PendingChunks>().0.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod consumption_transaction_tests {
+    use super::*;
+    fn complete_intent(
+        world: &mut World,
+        cell: IVec3,
+        actor: u64,
+    ) -> crate::facility_interactions::InteractionCompleted {
+        let mut jobs = world
+            .remove_resource::<crate::facility_interactions::FacilityInteractions>()
+            .unwrap();
+        let mut claims = world
+            .remove_resource::<crate::interactables::InteractionClaims>()
+            .unwrap();
+        let placement = world
+            .resource::<crate::placements::Placements>()
+            .at(cell)
+            .unwrap();
+        let owner = block_junk_mod_api::authority::ReservationOwner::Npc { id: actor };
+        let job = jobs
+            .prepare(
+                crate::facility_interactions::InteractionRequest {
+                    placement,
+                    slot_key: "fruit",
+                    action: "eat",
+                    actor: owner.clone(),
+                    controller: owner,
+                    cause: None,
+                    approach: cell + IVec3::Z,
+                },
+                world.resource::<BlockRegistry>(),
+                &mut claims,
+            )
+            .unwrap();
+        jobs.working(job.id);
+        jobs.progress.get_mut(&job.id).unwrap().remaining_secs = 0.;
+        world.insert_resource(jobs);
+        world.insert_resource(claims);
+        crate::facility_interactions::InteractionCompleted {
+            job_id: job.id,
+            actor: NpcId(actor),
+        }
+    }
+    #[test]
+    fn competing_uses_of_last_stock_restore_only_the_actor_that_consumes_it() {
+        let definitions=serde_json::from_value(serde_json::json!([{"id":"test:basket","display_name":"Basket","flags":{},"color":[1,1,1],"container":{"capacity_bulk":16,"accepts":[]},"facility_slots":[{"key":"fruit","yaw":0,"approaches":[[0,0,1]],"exclusive":false,"interactions":["eat"]}],"facility_actions":{"eat":{"kind":"timed","duration_secs":1,"need_restore":{"need":"hunger","restores":0.5},"consumption":{"kind":"stock","count":1,"tag":"test:food"}}}}])).unwrap();
+        let registry = BlockRegistry::build(definitions).unwrap().0;
+        let basket = registry.require("test:basket");
+        let items=crate::items::ItemRegistry::build(serde_json::from_value(serde_json::json!([{"id":"test:fruit","display_name":"Fruit","mesh":"mods://test/fruit.gltf","tags":["test:food"]}])).unwrap()).unwrap();
+        let fruit = items.slot_of(&"test:fruit".into()).unwrap();
+        let mut app = App::new();
+        crate::facility_inventory::install_fixture(&mut app);
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(registry)
+            .insert_resource(items)
+            .init_resource::<ChunkMap>()
+            .init_resource::<Plans>()
+            .init_resource::<crate::construction::ConstructionLedger>()
+            .init_resource::<crate::placements::Placements>()
+            .init_resource::<crate::plan_claims::PlanClaims>()
+            .init_resource::<crate::haul::HaulStore>()
+            .init_resource::<PendingTerrainEffects>()
+            .add_message::<CellEdit>()
+            .add_message::<crate::facility_interactions::InteractionCompleted>()
+            .add_systems(Update, apply_facility_completion);
+        let cell = IVec3::new(4, 2, 4);
+        let mut chunk = Chunk {
+            revision: 0,
+            blocks: vec![BlockSlot::EMPTY; (crate::protocol::CHUNK_PADDED as usize).pow(3)],
+        };
+        chunk.set(world_to_chunk(cell).1, basket);
+        let mut placements = crate::placements::Placements::default();
+        placements
+            .index_existing(
+                cell,
+                basket,
+                Cardinal::East,
+                app.world().resource::<BlockRegistry>(),
+                |at| Some(chunk.get(world_to_chunk(at).1)),
+            )
+            .unwrap();
+        app.insert_resource(placements);
+        let entity = app
+            .world_mut()
+            .spawn((chunk, ChunkEntities::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<ChunkMap>()
+            .0
+            .insert(ChunkCoord(IVec3::ZERO), entity);
+        let actors: Vec<_> = (1..=2)
+            .map(|id| {
+                app.world_mut()
+                    .spawn((
+                        NpcId(id),
+                        Needs(std::collections::HashMap::from_iter([(
+                            "hunger".into(),
+                            1.,
+                        )])),
+                        AvatarPose {
+                            translation: crate::physics::standing_pose_translation(cell + IVec3::Z),
+                            yaw: 0.,
+                        },
+                    ))
+                    .id()
+            })
+            .collect();
+        app.world_mut()
+            .resource_mut::<crate::containers::Containers>()
+            .edit_or_insert(cell, |state| {
+                state.inventory.insert(fruit, 1);
+            });
+        let first = complete_intent(app.world_mut(), cell, 1);
+        let second = complete_intent(app.world_mut(), cell, 2);
+        app.world_mut().write_message(first.clone());
+        app.world_mut().write_message(second);
+        app.world_mut().write_message(first);
+        app.update();
+        assert_eq!(
+            app.world().get::<Needs>(actors[0]).unwrap().0["hunger"],
+            0.5
+        );
+        assert_eq!(app.world().get::<Needs>(actors[1]).unwrap().0["hunger"], 1.);
+        assert_eq!(
+            app.world()
+                .resource::<crate::containers::Containers>()
+                .get(cell)
+                .map_or(0, |state| state.available(fruit)),
+            0
+        );
+        let jobs = &app
+            .world()
+            .resource::<crate::facility_interactions::FacilityInteractions>()
+            .jobs;
+        assert_eq!(
+            jobs.records[&1].state,
+            block_junk_mod_api::authority::JobState::Completed
+        );
+        assert_eq!(
+            jobs.records[&2].state,
+            block_junk_mod_api::authority::JobState::Failed
+        );
+        assert!(app.world().resource::<PendingTerrainEffects>().0.is_empty());
+    }
+
+    #[test]
+    fn consuming_a_resource_commits_need_and_geometry_once_or_neither() {
+        let definitions = serde_json::from_value(serde_json::json!([
+            {"id":"test:crop","display_name":"Crop","flags":{},"color":[1,1,1],"depleted_block":"test:stalk","facility_slots":[{"key":"fruit","yaw":0,"approaches":[[0,0,1]],"exclusive":false,"interactions":["eat"]}],"facility_actions":{"eat":{"kind":"timed","duration_secs":1,"need_restore":{"need":"hunger","restores":0.5},"consumption":{"kind":"deplete"}}}},
+            {"id":"test:stalk","display_name":"Stalk","flags":{},"color":[1,1,1],"footprint":[[0,0,0],[1,0,0]]}
+        ])).unwrap();
+        let registry = BlockRegistry::build(definitions).unwrap().0;
+        let crop = registry.require("test:crop");
+        let stalk = registry.require("test:stalk");
+        let mut app = App::new();
+        crate::facility_inventory::install_fixture(&mut app);
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(registry)
+            .init_resource::<ChunkMap>()
+            .init_resource::<Plans>()
+            .init_resource::<crate::construction::ConstructionLedger>()
+            .init_resource::<crate::placements::Placements>()
+            .init_resource::<crate::plan_claims::PlanClaims>()
+            .init_resource::<crate::haul::HaulStore>()
+            .init_resource::<PendingTerrainEffects>()
+            .add_message::<CellEdit>()
+            .init_resource::<crate::interactables::InteractionClaims>()
+            .add_message::<crate::facility_interactions::InteractionCompleted>()
+            .add_systems(Update, apply_facility_completion);
+        let cell = IVec3::new(4, 2, 4);
+        let obstruction = cell + IVec3::from_array(Cardinal::default().rotate_offset([1, 0, 0]));
+        let mut chunk = Chunk {
+            revision: 0,
+            blocks: vec![BlockSlot::EMPTY; (crate::protocol::CHUNK_PADDED as usize).pow(3)],
+        };
+        chunk.set(world_to_chunk(cell).1, crop);
+        chunk.set(world_to_chunk(obstruction).1, crop);
+        let entity = app
+            .world_mut()
+            .spawn((chunk, ChunkEntities::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<ChunkMap>()
+            .0
+            .insert(ChunkCoord(IVec3::ZERO), entity);
+        let actor = app
+            .world_mut()
+            .spawn((
+                NpcId(9),
+                Needs(std::collections::HashMap::from_iter([(
+                    "hunger".into(),
+                    1.,
+                )])),
+                AvatarPose {
+                    translation: crate::physics::standing_pose_translation(cell + IVec3::Z),
+                    yaw: 0.,
+                },
+            ))
+            .id();
+        let mut placements = crate::placements::Placements::default();
+        placements
+            .index_existing(
+                cell,
+                crop,
+                Cardinal::default(),
+                app.world().resource::<BlockRegistry>(),
+                |at| {
+                    Some(
+                        app.world()
+                            .get::<Chunk>(entity)
+                            .unwrap()
+                            .get(world_to_chunk(at).1),
+                    )
+                },
+            )
+            .unwrap();
+        app.insert_resource(placements);
+        let first = complete_intent(app.world_mut(), cell, 9);
+        app.world_mut().write_message(first);
+        app.update();
+        assert_eq!(app.world().get::<Needs>(actor).unwrap().0["hunger"], 1.);
+        assert_eq!(
+            app.world()
+                .get::<Chunk>(entity)
+                .unwrap()
+                .get(world_to_chunk(cell).1),
+            crop
+        );
+        assert!(app.world().resource::<PendingTerrainEffects>().0.is_empty());
+        app.world_mut()
+            .get_mut::<Chunk>(entity)
+            .unwrap()
+            .set(world_to_chunk(obstruction).1, BlockSlot::EMPTY);
+        // Two competing completions against one revision cannot eat twice.
+        let second = complete_intent(app.world_mut(), cell, 9);
+        app.world_mut().write_message(second.clone());
+        app.world_mut().write_message(second);
+        app.update();
+        assert_eq!(app.world().get::<Needs>(actor).unwrap().0["hunger"], 0.5);
+        let chunk = app.world().get::<Chunk>(entity).unwrap();
+        assert_eq!(chunk.get(world_to_chunk(cell).1), stalk);
+        assert_eq!(chunk.get(world_to_chunk(obstruction).1), stalk);
+        assert_eq!(app.world().resource::<PendingTerrainEffects>().0.len(), 2);
+        let messages = app.world().resource::<Messages<CellEdit>>();
+        let mut cursor = messages.get_cursor();
+        assert!(cursor.read(messages).all(|edit| !edit.yield_drops));
     }
 }

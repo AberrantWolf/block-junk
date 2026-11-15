@@ -6,6 +6,17 @@
 //! mod is **disabled for the rest of the session** and a loud `error!` is
 //! logged. The engine never silently continues with corrupt mod state.
 
+mod callbacks;
+pub mod commands;
+mod composition;
+mod definitions;
+pub mod events;
+mod list_patch;
+pub mod resources;
+mod sandbox;
+pub mod state;
+pub use sandbox::ScriptLimits;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,12 +34,14 @@ use block_junk_mod_api::{
     shared::BlockPos,
     ui::{InspectTarget, UiToast},
 };
-use mlua::{Function, Lua, LuaSerdeExt, SerializeOptions, Table, Value};
+use mlua::{Lua, LuaSerdeExt, SerializeOptions, Table, Value};
 use thiserror::Error;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Error)]
 pub enum LoadError {
+    #[error("content composition: {0}")]
+    Composition(String),
     #[error("reading {path}: {source}")]
     Io {
         path: PathBuf,
@@ -59,9 +72,6 @@ pub enum LoadError {
 }
 
 /// Slot in the per-mod `engine` table where a registered hook callback lives.
-const BLOCK_PLACED_SLOT: &str = "_block_placed_handler";
-const ROOM_EVENT_SLOT: &str = "_room_event_handler";
-const INSPECT_SLOT: &str = "_inspect_handler";
 /// Sub-table on `engine` holding per-kind NPC planner callbacks. Unlike
 /// the single-slot hooks above, planners are keyed by NPC kind id so one
 /// mod can plan for multiple kinds it has registered.
@@ -76,6 +86,22 @@ const NPC_PLANNERS_TABLE: &str = "_npc_planners";
 /// builds two parallel registries that agree slot-for-slot.
 #[derive(Clone, Default)]
 pub struct LoadContext {
+    pub commands: commands::CommandOutbox,
+    frozen_definitions: Arc<Mutex<std::collections::BTreeMap<String, serde_json::Value>>>,
+    pub mod_state: state::StateStore,
+    state_schemas: Arc<Mutex<std::collections::BTreeMap<String, state::StateSchema>>>,
+    pub field_provenance:
+        Arc<Mutex<std::collections::BTreeMap<String, Vec<definitions::FieldSource>>>>,
+    pub pending_movement: Arc<Mutex<Vec<block_junk_mod_api::architecture::MovementProfile>>>,
+    pub pending_settlements:
+        Arc<Mutex<Vec<block_junk_mod_api::architecture::SettlementDefinition>>>,
+    pub pending_capabilities:
+        Arc<Mutex<Vec<block_junk_mod_api::capabilities::CapabilityDefinition>>>,
+    pub pending_worlds: Arc<Mutex<Vec<block_junk_mod_api::worlds::WorldPreset>>>,
+    pub pending_world_upgrades: Arc<Mutex<Vec<block_junk_mod_api::upgrades::WorldUpgrade>>>,
+    callback_owners: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+    pub provenance: Arc<Mutex<std::collections::BTreeMap<String, Vec<definitions::Source>>>>,
+    phase: Arc<std::sync::atomic::AtomicU8>,
     pub pending_blocks: Arc<Mutex<Vec<BlockDef>>>,
     pub pending_items: Arc<Mutex<Vec<ItemDef>>>,
     pub pending_rooms: Arc<Mutex<Vec<RoomPattern>>>,
@@ -83,13 +109,9 @@ pub struct LoadContext {
     pub pending_needs: Arc<Mutex<Vec<NeedDef>>>,
     pub pending_animations: Arc<Mutex<Vec<AnimationDef>>>,
     pub pending_recipes: Arc<Mutex<Vec<RecipeDef>>>,
-    /// At most one set of work-action defaults across all mods. Loud
-    /// failure on second call so two mods can't silently overwrite each
-    /// other's balance — matches the "never silently degrade" rule.
+    /// Composed work-action defaults; replacement requires explicit ownership.
     pub pending_work_defaults: Arc<Mutex<Option<WorkDefaults>>>,
-    /// At most one set of civilization-cluster params. Same single-writer
-    /// rule as work-defaults — two mods can't silently disagree on how
-    /// rooms group into clusters.
+    /// Composed civilization-cluster parameters.
     pub pending_civilization_params: Arc<Mutex<Option<CivilizationParams>>>,
     /// At most one material-drop multiplier across all mods (same
     /// single-writer rule). Scales `materials` counts when a block
@@ -106,6 +128,117 @@ pub struct LoadContext {
 impl LoadContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Publish engine-resolved values after validation (for example implicit drops).
+    pub fn publish_definition<T: serde::Serialize>(&self, category: &str, id: &str, value: &T) {
+        self.frozen_definitions.lock().unwrap().insert(
+            format!("{category}/{id}"),
+            serde_json::to_value(value).expect("validated definition serializes"),
+        );
+    }
+
+    pub fn record_derivation(&self, field: String, inputs: Vec<String>, operation: &str) {
+        self.field_provenance
+            .lock()
+            .unwrap()
+            .entry(field)
+            .or_default()
+            .push(definitions::FieldSource {
+                source: definitions::Source {
+                    mod_id: "engine".into(),
+                    stage: operation.into(),
+                },
+                defaulted: false,
+                derived_from: inputs,
+            });
+    }
+
+    pub fn explain_validation(&self, error: &str) -> String {
+        let sources = self.provenance.lock().unwrap();
+        let mut details = Vec::new();
+        for (definition, history) in sources.iter() {
+            let Some((_, id)) = definition.split_once('/') else {
+                continue;
+            };
+            if !error.contains(id) {
+                continue;
+            }
+            if let Some(source) = history.last() {
+                details.push(format!(
+                    "{definition}: {} / {}",
+                    source.mod_id, source.stage
+                ));
+            }
+            for (path, fields) in self
+                .field_provenance
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path.starts_with(&format!("{definition}/")))
+            {
+                if let Some(field) = path.rsplit('/').next()
+                    && error.contains(field)
+                    && let Some(source) = fields.last()
+                {
+                    details.push(format!(
+                        "{path}: {} / {}{}",
+                        source.source.mod_id,
+                        source.source.stage,
+                        if source.defaulted { " (default)" } else { "" }
+                    ));
+                    for input in &source.derived_from {
+                        let owner = sources
+                            .iter()
+                            .filter(|(key, _)| input.starts_with(key.as_str()))
+                            .max_by_key(|(key, _)| key.len())
+                            .and_then(|(_, history)| history.last());
+                        details.push(match owner {
+                            Some(owner) => {
+                                format!("derived from {input}: {} / {}", owner.mod_id, owner.stage)
+                            }
+                            None => format!("derived from {input}: engine default"),
+                        });
+                    }
+                }
+            }
+            if details.len() >= 8 {
+                break;
+            }
+        }
+        if details.is_empty() {
+            error.into()
+        } else {
+            format!("{error}\n{}", details.join("\n"))
+        }
+    }
+
+    /// Canonical post-composition content, including policy data formerly absent
+    /// from the network agreement. Draining startup buffers does not alter this hash.
+    pub fn definition_snapshot(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        self.frozen_definitions.lock().unwrap().clone()
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        let definitions = self.frozen_definitions.lock().unwrap();
+        let setting = |key: &str, default: serde_json::Value| {
+            definitions.get(key).cloned().unwrap_or(default)
+        };
+        let mut value = serde_json::json!({
+            "api": API_VERSION,
+            "state_schemas": &*self.state_schemas.lock().unwrap(),
+            "definitions": &*definitions,
+            "work_defaults": setting("npcs/work_defaults",serde_json::to_value(WorkDefaults::default()).unwrap()),
+            "civilization": setting("civilization/params",serde_json::to_value(CivilizationParams::default()).unwrap()),
+            "drop_multiplier": setting("blocks/material_drop_multiplier",serde_json::json!(1.0)),
+        });
+        value.sort_all_objects();
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in serde_json::to_vec(&value).expect("content serializes") {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
     }
 
     /// Drain the accumulated block defs. Called by the engine after
@@ -129,7 +262,7 @@ impl LoadContext {
         std::mem::take(&mut *self.pending_npc_kinds.lock().unwrap())
     }
 
-    /// Drain the accumulated need defs.
+    /// Drain pending needs; runtime queries use the frozen definition snapshot.
     pub fn take_needs(&self) -> Vec<NeedDef> {
         std::mem::take(&mut *self.pending_needs.lock().unwrap())
     }
@@ -174,6 +307,7 @@ impl LoadContext {
 }
 
 pub struct LoadedMod {
+    pub directory: PathBuf,
     pub name: String,
     pub manifest: ModManifest,
     pub lua: Lua,
@@ -181,6 +315,15 @@ pub struct LoadedMod {
 }
 
 pub struct ModRegistry {
+    events: events::EventQueue,
+    failures: std::collections::VecDeque<events::BehaviorFailure>,
+    pub commands: commands::CommandOutbox,
+    pub mod_state: state::StateStore,
+    state_schemas: Arc<Mutex<std::collections::BTreeMap<String, state::StateSchema>>>,
+    pub source_fingerprint: u64,
+    callback_owners: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+    phase: Arc<std::sync::atomic::AtomicU8>,
+    runtime_started: bool,
     pub side: Side,
     pub mods: Vec<LoadedMod>,
 }
@@ -192,106 +335,180 @@ impl ModRegistry {
     /// `side` (or `shared`) are still listed as loaded — they just have no
     /// hooks registered, which is valid.
     pub fn load_dir(side: Side, mods_dir: &Path, ctx: &LoadContext) -> Result<Self, LoadError> {
+        Self::load_dir_with_limits(side, mods_dir, ctx, ScriptLimits::default())
+    }
+
+    pub fn load_dir_with_limits(
+        side: Side,
+        mods_dir: &Path,
+        ctx: &LoadContext,
+        limits: ScriptLimits,
+    ) -> Result<Self, LoadError> {
+        let mut registry = Self::load_composed(side, mods_dir, ctx, limits)?;
+        registry.activate_runtime()?;
+        Ok(registry)
+    }
+
+    /// Engine entry point: compose definitions, then validate engine references,
+    /// then call activate_runtime. No events script runs before that validation.
+    pub fn load_composed(
+        side: Side,
+        mods_dir: &Path,
+        ctx: &LoadContext,
+        limits: ScriptLimits,
+    ) -> Result<Self, LoadError> {
+        if limits.memory_bytes == 0 || limits.instructions_per_call == 0 {
+            return Err(LoadError::Composition(
+                "script budgets must be positive".into(),
+            ));
+        }
         let mut mods = Vec::new();
         if !mods_dir.exists() {
             info!("no mods directory at {}", mods_dir.display());
-            return Ok(Self { side, mods });
+            return Ok(Self {
+                events: Default::default(),
+                failures: Default::default(),
+                commands: ctx.commands.clone(),
+                mod_state: ctx.mod_state.clone(),
+                state_schemas: ctx.state_schemas.clone(),
+                source_fingerprint: 0,
+                side,
+                mods,
+                callback_owners: ctx.callback_owners.clone(),
+                phase: ctx.phase.clone(),
+                runtime_started: false,
+            });
         }
 
-        let entries = fs::read_dir(mods_dir).map_err(|e| LoadError::Io {
-            path: mods_dir.to_owned(),
-            source: e,
-        })?;
-
-        // Mod load order has to be stable so block-slot assignment is
-        // deterministic across runs. Rule: `vanilla` first if present,
-        // then everything else by directory name. Once we have an explicit
-        // `load_after` field in the manifest, this becomes a topological
-        // sort with the same vanilla-first behaviour falling out naturally.
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| LoadError::Io {
-                path: mods_dir.to_owned(),
-                source: e,
-            })?;
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
+        let discovered = composition::discover(mods_dir)?;
+        let source_fingerprint = composition::fingerprint_sources(&discovered)?;
+        ctx.phase.store(0, std::sync::atomic::Ordering::Relaxed);
+        for (dir, manifest) in &discovered {
+            mods.push(load_mod(side, dir, manifest.clone(), ctx, limits)?);
+        }
+        ctx.phase.store(1, std::sync::atomic::Ordering::Relaxed);
+        for ((dir, _), m) in discovered.iter().zip(&mods) {
+            if dir.join("patches.lua").exists() {
+                run_script(&m.lua, &m.name, side, dir, "patches.lua")?;
             }
-            if !dir.join("manifest.toml").exists() {
-                continue;
-            }
-            dirs.push(dir);
         }
-        dirs.sort_by(|a, b| {
-            let a_van = a.file_name().and_then(|n| n.to_str()) == Some("vanilla");
-            let b_van = b.file_name().and_then(|n| n.to_str()) == Some("vanilla");
-            b_van.cmp(&a_van).then_with(|| a.cmp(b))
-        });
-        for dir in dirs {
-            mods.push(load_mod(side, &dir, ctx)?);
-        }
-
+        ctx.phase.store(3, std::sync::atomic::Ordering::Relaxed);
         info!("[{}] loaded {} mod(s)", side.as_str(), mods.len());
-        Ok(Self { side, mods })
+        Ok(Self {
+            events: Default::default(),
+            failures: Default::default(),
+            commands: ctx.commands.clone(),
+            mod_state: ctx.mod_state.clone(),
+            state_schemas: ctx.state_schemas.clone(),
+            source_fingerprint,
+            side,
+            mods,
+            callback_owners: ctx.callback_owners.clone(),
+            phase: ctx.phase.clone(),
+            runtime_started: false,
+        })
     }
 
-    /// Server-only: dispatch the after-place event to every active mod.
-    /// Mods that error out are disabled for the rest of the session.
-    pub fn dispatch_block_placed(&mut self, event: BlockPlacedEvent) {
-        debug_assert_eq!(self.side, Side::Server);
-        for m in &mut self.mods {
-            if m.disabled {
-                continue;
+    pub fn activate_runtime(&mut self) -> Result<(), LoadError> {
+        if self.runtime_started {
+            return Ok(());
+        }
+        self.runtime_started = true;
+        self.phase.store(2, std::sync::atomic::Ordering::Relaxed);
+        let result = (|| {
+            for m in &self.mods {
+                if self.side == Side::Server && m.directory.join(EVENTS_SCRIPT).exists() {
+                    run_script(&m.lua, &m.name, self.side, &m.directory, EVENTS_SCRIPT)?;
+                }
             }
-            if let Err(e) = call_block_placed(&m.lua, &event) {
-                error!(mod_name = %m.name, error = %e, "disabling mod after callback error");
+            self.validate_restored_subscriptions()
+                .map_err(LoadError::Composition)?;
+            Ok(())
+        })();
+        self.phase.store(3, std::sync::atomic::Ordering::Relaxed);
+        if result.is_err() {
+            for m in &mut self.mods {
                 m.disabled = true;
             }
         }
+        result
     }
 
-    /// Client-side: collect inspect-panel contributions for the hovered
-    /// target. Each active mod's `engine.ui.on_inspect` callback may
-    /// return one string (a line/block of text appended to the panel)
-    /// or nil. A callback that errors disables its mod for the session,
-    /// same policy as the server-side hooks.
-    pub fn call_inspect(&mut self, target: &InspectTarget) -> Vec<String> {
+    fn dispatch_subscription<T: serde::Serialize>(
+        &mut self,
+        event: &str,
+        value: &T,
+    ) -> Vec<String> {
+        let prefix = format!("subscription/{event}/");
+        let subscriptions: Vec<_> = self
+            .callback_owners
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, owner)| (key.clone(), owner.clone()))
+            .collect();
         let mut lines = Vec::new();
-        for m in &mut self.mods {
+        for (key, owner) in subscriptions {
+            let Some(m) = self.mods.iter_mut().find(|m| m.manifest.id == owner) else {
+                continue;
+            };
             if m.disabled {
                 continue;
             }
-            match call_inspect_hook(&m.lua, target) {
-                Ok(Some(text)) => lines.push(text),
-                Ok(None) => {}
-                Err(e) => {
-                    error!(mod_name = %m.name, error = %e, "disabling mod after callback error");
+            let result = m
+                .lua
+                .to_value_with(value, lua_event_options())
+                .and_then(|value| callbacks::call(&m.lua, &key, value));
+            match result {
+                Ok(Value::String(text)) if event == "inspect" => match text.to_str() {
+                    Ok(text) => lines.push(text.to_owned()),
+                    Err(_) => m.disabled = true,
+                },
+                Ok(Value::Nil) => {}
+                Ok(_) if event != "inspect" => {}
+                Ok(_) => {
+                    error!(mod_name=%owner, "inspect callback returned neither string nor nil");
                     m.disabled = true;
                 }
+                Err(error) => {
+                    error!(mod_name=%owner, %error, "disabling failed subscription owner");
+                    m.disabled = true;
+                }
+            }
+            if m.disabled {
+                self.failures.push_back(events::BehaviorFailure {
+                    owner,
+                    behavior: key,
+                    cause: None,
+                    reason: "inspection subscription failed; callback commands were discarded"
+                        .into(),
+                });
             }
         }
         lines
     }
 
-    /// Server-only: dispatch a room-detector event to every active mod.
-    pub fn dispatch_room_event(&mut self, event: &RoomEvent) {
+    pub fn dispatch_block_placed(
+        &mut self,
+        event: BlockPlacedEvent,
+    ) -> Result<events::EventCause, String> {
         debug_assert_eq!(self.side, Side::Server);
-        for m in &mut self.mods {
-            if m.disabled {
-                continue;
-            }
-            if let Err(e) = call_room_event(&m.lua, event) {
-                error!(mod_name = %m.name, error = %e, "disabling mod after callback error");
-                m.disabled = true;
-            }
-        }
+        self.enqueue_event("block_placed", &event, None)
+    }
+
+    pub fn call_inspect(&mut self, target: &InspectTarget) -> Vec<String> {
+        self.dispatch_subscription("inspect", target)
+    }
+
+    pub fn dispatch_room_event(&mut self, event: &RoomEvent) -> Result<events::EventCause, String> {
+        debug_assert_eq!(self.side, Side::Server);
+        self.enqueue_event("room_event", event, None)
     }
 
     /// Server-only: ask whichever active mod registered a planner for
-    /// `kind` what the NPC should do next. Walks the mods in load order
-    /// — the first one with a matching planner wins; duplicate
-    /// registrations from a later mod aren't visible from here.
+    /// `kind` what the NPC should do next. The last explicitly authorized
+    /// replacement owns the callback; composition rejects conflicting writers.
     ///
     /// Returns:
     /// - `Ok(Some(goal))` — planner returned a goal.
@@ -303,29 +520,48 @@ impl ModRegistry {
     ///   disabling the whole mod. A buggy planner that crashes for
     ///   every NPC will silence its NPCs one-by-one and log loudly
     ///   each time, but other mods + other kinds keep working.
+    pub fn planner_owner(&self, kind: &str) -> Option<String> {
+        self.callback_owners
+            .lock()
+            .unwrap()
+            .get(&format!("planner/{kind}"))
+            .cloned()
+    }
+
     pub fn call_planner(
         &self,
         kind: &NpcKindId,
         snapshot: &NpcSnapshot,
     ) -> Result<Option<PlannerGoal>, PlannerError> {
         debug_assert_eq!(self.side, Side::Server);
-        for m in &self.mods {
-            if m.disabled {
-                continue;
-            }
-            match call_npc_planner(&m.lua, kind, snapshot) {
-                Ok(Some(goal)) => return Ok(Some(goal)),
-                Ok(None) => continue,
-                Err(source) => {
-                    return Err(PlannerError {
-                        mod_name: m.name.clone(),
-                        kind: kind.clone(),
-                        source,
-                    });
-                }
-            }
+        let owner = self
+            .callback_owners
+            .lock()
+            .unwrap()
+            .get(&format!("planner/{}", kind.as_str()))
+            .cloned();
+        let Some(owner) = owner else {
+            return Ok(None);
+        };
+        let Some(m) = self.mods.iter().find(|m| m.manifest.id == owner) else {
+            return Err(PlannerError {
+                mod_name: owner,
+                kind: kind.clone(),
+                source: mlua::Error::external("planner owner is unavailable"),
+            });
+        };
+        if m.disabled {
+            return Err(PlannerError {
+                mod_name: owner,
+                kind: kind.clone(),
+                source: mlua::Error::external("planner owner is disabled"),
+            });
         }
-        Ok(None)
+        call_npc_planner(&m.lua, kind, snapshot).map_err(|source| PlannerError {
+            mod_name: owner,
+            kind: kind.clone(),
+            source,
+        })
     }
 }
 
@@ -356,17 +592,13 @@ pub fn warn_if_empty(registry: &ModRegistry) {
 const DATA_SCRIPT: &str = "data.lua";
 const EVENTS_SCRIPT: &str = "events.lua";
 
-fn load_mod(side: Side, dir: &Path, ctx: &LoadContext) -> Result<LoadedMod, LoadError> {
-    let manifest_path = dir.join("manifest.toml");
-    let manifest_str = fs::read_to_string(&manifest_path).map_err(|e| LoadError::Io {
-        path: manifest_path.clone(),
-        source: e,
-    })?;
-    let manifest: ModManifest = toml::from_str(&manifest_str).map_err(|e| LoadError::Manifest {
-        path: manifest_path,
-        source: e,
-    })?;
-
+fn load_mod(
+    side: Side,
+    dir: &Path,
+    manifest: ModManifest,
+    ctx: &LoadContext,
+    limits: ScriptLimits,
+) -> Result<LoadedMod, LoadError> {
     let target =
         ApiVersion::parse(&manifest.api_version).map_err(|reason| LoadError::ApiVersion {
             name: manifest.name.clone(),
@@ -386,31 +618,41 @@ fn load_mod(side: Side, dir: &Path, ctx: &LoadContext) -> Result<LoadedMod, Load
     // as a valid script for the no-scripts check on either side — an
     // events-only mod (no declarative content) is legitimate.
     let has_events = dir.join(EVENTS_SCRIPT).exists();
-    if !has_data && !has_events {
+    if !has_data && !has_events && !dir.join("patches.lua").exists() {
         return Err(LoadError::NoScripts {
             name: manifest.name.clone(),
         });
     }
 
-    let lua = Lua::new();
+    let lua = sandbox::create(dir, &manifest, limits).map_err(|source| LoadError::Lua {
+        name: manifest.name.clone(),
+        side: side.as_str(),
+        source,
+    })?;
     install_engine_table(&lua, side, ctx).map_err(|source| LoadError::Lua {
         name: manifest.name.clone(),
         side: side.as_str(),
         source,
     })?;
 
-    // data.lua runs first so events.lua can reference helpers/constants
-    // it defines. Server-only events.lua follows; on the client we stop
-    // after data.lua because no client-side hooks exist yet.
+    definitions::install(&lua, ctx, &manifest)
+        .and_then(|_| callbacks::install(&lua, ctx, &manifest))
+        .and_then(|_| state::install(&lua, ctx, &manifest.id))
+        .and_then(|_| commands::install(&lua, side, ctx, &manifest.id))
+        .map_err(|source| LoadError::Lua {
+            name: manifest.name.clone(),
+            side: side.as_str(),
+            source,
+        })?;
+
+    // Registry orchestration runs every data script before any patch or runtime hook.
     if has_data {
         run_script(&lua, &manifest.name, side, dir, DATA_SCRIPT)?;
-    }
-    if has_events && side == Side::Server {
-        run_script(&lua, &manifest.name, side, dir, EVENTS_SCRIPT)?;
     }
 
     info!(name = %manifest.name, version = %manifest.version, side = side.as_str(), "loaded mod");
     Ok(LoadedMod {
+        directory: dir.to_owned(),
         name: manifest.name.clone(),
         manifest,
         lua,
@@ -433,7 +675,9 @@ fn run_script(
     let chunk_name = format!("{mod_name}/{relative}");
     lua.load(&src)
         .set_name(chunk_name)
-        .exec()
+        .set_mode(mlua::ChunkMode::Text)
+        .into_function()
+        .and_then(|function| sandbox::call::<()>(lua, function, ()))
         .map_err(|source| LoadError::Lua {
             name: mod_name.to_owned(),
             side: side.as_str(),
@@ -446,49 +690,22 @@ fn run_script(
 fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), mlua::Error> {
     let engine = lua.create_table()?;
     engine.set("side", side.as_str())?;
+    engine.set("worlds", lua.create_table()?)?;
+    engine.set("world_upgrades", lua.create_table()?)?;
+    engine.set("movement", lua.create_table()?)?;
+    engine.set("settlements", lua.create_table()?)?;
+    engine.set("capabilities", lua.create_table()?)?;
 
     // engine.blocks.register(def) — both sides; the same shared.lua runs in
     // both Lua states, so each side accumulates an identical block list and
     // ends up with matching slots.
     let blocks_table = lua.create_table()?;
-    let pending = ctx.pending_blocks.clone();
-    let register_block = lua.create_function(move |lua, def_value: Value| {
-        let def: BlockDef = lua.from_value(def_value)?;
-        let mut buf = pending.lock().unwrap();
-        if buf.iter().any(|d| d.id == def.id) {
-            return Err(mlua::Error::external(format!(
-                "duplicate block id {}",
-                def.id
-            )));
-        }
-        buf.push(def);
-        Ok(())
-    })?;
-    blocks_table.set("register", register_block)?;
 
     // engine.blocks.set_material_drop_multiplier(x) — both sides, so the
     // resolved drop lists agree across the wire. Scales `materials` when a
     // block leaves `drops` unspecified (see BlockDef::resolve_drops).
     // Single-writer, like set_work_defaults: a second caller fails loudly
     // instead of the winner depending on mod load order.
-    let pending_mult = ctx.pending_material_drop_multiplier.clone();
-    let set_material_drop_multiplier = lua.create_function(move |_, mult: f32| {
-        if !mult.is_finite() || mult < 0.0 {
-            return Err(mlua::Error::external(format!(
-                "material drop multiplier must be finite and >= 0, got {mult}"
-            )));
-        }
-        let mut slot = pending_mult.lock().unwrap();
-        if let Some(existing) = *slot {
-            return Err(mlua::Error::external(format!(
-                "material drop multiplier already set to {existing}; \
-                 only one mod may call set_material_drop_multiplier"
-            )));
-        }
-        *slot = Some(mult);
-        Ok(())
-    })?;
-    blocks_table.set("set_material_drop_multiplier", set_material_drop_multiplier)?;
     engine.set("blocks", blocks_table)?;
 
     // engine.items.register(def) — both sides accumulate identical item
@@ -496,40 +713,12 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     // physical things actors can carry; see the `items` module in the
     // mod-API crate for the def shape.
     let items_table = lua.create_table()?;
-    let pending_items = ctx.pending_items.clone();
-    let register_item = lua.create_function(move |lua, value: Value| {
-        let def: ItemDef = lua.from_value(value)?;
-        let mut buf = pending_items.lock().unwrap();
-        if buf.iter().any(|i| i.id == def.id) {
-            return Err(mlua::Error::external(format!(
-                "duplicate item id {}",
-                def.id
-            )));
-        }
-        buf.push(def);
-        Ok(())
-    })?;
-    items_table.set("register", register_item)?;
     engine.set("items", items_table)?;
 
     // engine.rooms.register(pattern) — both sides accumulate the same set
     // since shared.lua runs in both Lua states. The engine builds parallel
     // RoomPatternRegistries that agree.
     let rooms_table = lua.create_table()?;
-    let pending_rooms = ctx.pending_rooms.clone();
-    let register_room = lua.create_function(move |lua, value: Value| {
-        let pattern: RoomPattern = lua.from_value(value)?;
-        let mut buf = pending_rooms.lock().unwrap();
-        if buf.iter().any(|p| p.id == pattern.id) {
-            return Err(mlua::Error::external(format!(
-                "duplicate room pattern id {}",
-                pattern.id
-            )));
-        }
-        buf.push(pattern);
-        Ok(())
-    })?;
-    rooms_table.set("register", register_room)?;
     engine.set("rooms", rooms_table)?;
 
     // engine.needs.register(def) — both sides accumulate; only the server
@@ -537,20 +726,6 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     // tick), but registering on both sides keeps slot ordering identical
     // so a future client-side debug HUD reads the same indices.
     let needs_table = lua.create_table()?;
-    let pending_needs = ctx.pending_needs.clone();
-    let register_need = lua.create_function(move |lua, value: Value| {
-        let def: NeedDef = lua.from_value(value)?;
-        let mut buf = pending_needs.lock().unwrap();
-        if buf.iter().any(|n| n.id == def.id) {
-            return Err(mlua::Error::external(format!(
-                "duplicate need id {}",
-                def.id
-            )));
-        }
-        buf.push(def);
-        Ok(())
-    })?;
-    needs_table.set("register", register_need)?;
     // engine.needs.get(id) — read back a previously-registered need
     // (including urge_threshold + preempt_threshold) so the planner can
     // gate decisions on data-driven cutoffs instead of file-local
@@ -575,20 +750,6 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     // AnimationGraph keyed by id, while the server only validates
     // that references from NpcKindDef + UseSlot resolve.
     let animations_table = lua.create_table()?;
-    let pending_animations = ctx.pending_animations.clone();
-    let register_animation = lua.create_function(move |lua, value: Value| {
-        let def: AnimationDef = lua.from_value(value)?;
-        let mut buf = pending_animations.lock().unwrap();
-        if buf.iter().any(|a| a.id == def.id) {
-            return Err(mlua::Error::external(format!(
-                "duplicate animation id {}",
-                def.id
-            )));
-        }
-        buf.push(def);
-        Ok(())
-    })?;
-    animations_table.set("register", register_animation)?;
     engine.set("animations", animations_table)?;
 
     // engine.recipes.register(def) — both sides accumulate. Recipes
@@ -597,58 +758,13 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     // Slot ordering matches across sides so a future wire-friendly
     // RecipeSlot type drops in cleanly.
     let recipes_table = lua.create_table()?;
-    let pending_recipes = ctx.pending_recipes.clone();
-    let register_recipe = lua.create_function(move |lua, value: Value| {
-        let def: RecipeDef = lua.from_value(value)?;
-        let mut buf = pending_recipes.lock().unwrap();
-        if buf.iter().any(|r| r.id == def.id) {
-            return Err(mlua::Error::external(format!(
-                "duplicate recipe id {}",
-                def.id
-            )));
-        }
-        buf.push(def);
-        Ok(())
-    })?;
-    recipes_table.set("register", register_recipe)?;
     engine.set("recipes", recipes_table)?;
 
     // engine.npcs.register(def) — both sides accumulate. set_planner is
     // server-only because planners run against authoritative state.
     let npcs_table = lua.create_table()?;
-    let pending_npcs = ctx.pending_npc_kinds.clone();
-    let register_npc = lua.create_function(move |lua, value: Value| {
-        let def: NpcKindDef = lua.from_value(value)?;
-        let mut buf = pending_npcs.lock().unwrap();
-        if buf.iter().any(|n| n.id == def.id) {
-            return Err(mlua::Error::external(format!(
-                "duplicate npc kind id {}",
-                def.id
-            )));
-        }
-        buf.push(def);
-        Ok(())
-    })?;
-    npcs_table.set("register", register_npc)?;
 
-    // engine.npcs.set_work_defaults(def) — both sides accumulate; only
-    // one mod may set this per session. The validator (engine-side, in
-    // npc_registry.rs) cross-checks the need against the registered
-    // NeedRegistry at boot. A nil call clears the slot; mods can use
-    // this in shared.lua to express "I want the engine fallback."
-    let pending_work_defaults = ctx.pending_work_defaults.clone();
-    let set_work_defaults = lua.create_function(move |lua, value: Value| {
-        let def: WorkDefaults = lua.from_value(value)?;
-        let mut slot = pending_work_defaults.lock().unwrap();
-        if slot.is_some() {
-            return Err(mlua::Error::external(
-                "engine.npcs.set_work_defaults called twice; only one mod may set work defaults",
-            ));
-        }
-        *slot = Some(def);
-        Ok(())
-    })?;
-    npcs_table.set("set_work_defaults", set_work_defaults)?;
+    // Composed work defaults are validated against needs by the engine.
 
     if side == Side::Server {
         // Pre-create the planners table so set_planner's writes never
@@ -656,36 +772,12 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
         // it empty; dispatch checks before invoking.
         let planners = lua.create_table()?;
         engine.set(NPC_PLANNERS_TABLE, planners)?;
-
-        let set_planner = lua.create_function(|lua, (kind, callback): (String, Function)| {
-            let engine: Table = lua.globals().get("engine")?;
-            let planners: Table = engine.get(NPC_PLANNERS_TABLE)?;
-            planners.set(kind, callback)?;
-            Ok(())
-        })?;
-        npcs_table.set("set_planner", set_planner)?;
     }
 
     engine.set("npcs", npcs_table)?;
 
-    // engine.civilization.set_params({ max_room_distance_cells = N,
-    //                                  buffer_cells = M }) — same
-    // single-writer rule as set_work_defaults; vanilla owns the slot,
-    // a second caller errors loudly so two mods can't silently disagree.
+    // Civilization settings use the same explicit composition ownership.
     let civ_table = lua.create_table()?;
-    let pending_civ_params = ctx.pending_civilization_params.clone();
-    let set_civ_params = lua.create_function(move |lua, value: Value| {
-        let def: CivilizationParams = lua.from_value(value)?;
-        let mut slot = pending_civ_params.lock().unwrap();
-        if slot.is_some() {
-            return Err(mlua::Error::external(
-                "engine.civilization.set_params called twice; only one mod may set civilization params",
-            ));
-        }
-        *slot = Some(def);
-        Ok(())
-    })?;
-    civ_table.set("set_params", set_civ_params)?;
     engine.set("civilization", civ_table)?;
 
     // engine.ui — the content-level UI seed (see mod-api's `ui` module
@@ -698,35 +790,24 @@ fn install_engine_table(lua: &Lua, side: Side, ctx: &LoadContext) -> Result<(), 
     //     mods can do it from data.lua without an `engine.side` check.
     let ui_table = lua.create_table()?;
     let toast_queue = ctx.ui_toasts.clone();
+    lua.set_app_data(toast_queue.clone());
+    let phase = ctx.phase.clone();
     let push_toast = lua.create_function(move |lua, (pos, text): (Value, String)| {
+        if phase.load(std::sync::atomic::Ordering::Relaxed) == 4 {
+            return Err(mlua::Error::external(
+                "world effects are forbidden during state migration",
+            ));
+        }
         let pos: BlockPos = lua.from_value(pos)?;
-        toast_queue.lock().unwrap().push(UiToast { pos, text });
+        let mut queue = toast_queue.lock().unwrap();
+        if queue.len() >= 256 || text.len() > 4096 {
+            return Err(mlua::Error::external("mod toast command budget exceeded"));
+        }
+        queue.push(UiToast { pos, text });
         Ok(())
     })?;
     ui_table.set("toast", push_toast)?;
-    let register_inspect = lua.create_function(|lua, callback: Function| {
-        let engine: Table = lua.globals().get("engine")?;
-        engine.set(INSPECT_SLOT, callback)?;
-        Ok(())
-    })?;
-    ui_table.set("on_inspect", register_inspect)?;
     engine.set("ui", ui_table)?;
-
-    if side == Side::Server {
-        let register = lua.create_function(|lua, callback: Function| {
-            let engine: Table = lua.globals().get("engine")?;
-            engine.set(BLOCK_PLACED_SLOT, callback)?;
-            Ok(())
-        })?;
-        engine.set("on_block_placed", register)?;
-
-        let register_room = lua.create_function(|lua, callback: Function| {
-            let engine: Table = lua.globals().get("engine")?;
-            engine.set(ROOM_EVENT_SLOT, callback)?;
-            Ok(())
-        })?;
-        engine.set("on_room_event", register_room)?;
-    }
 
     lua.globals().set("engine", engine)?;
     Ok(())
@@ -743,53 +824,20 @@ fn lua_event_options() -> SerializeOptions {
         .serialize_unit_to_null(false)
 }
 
-fn call_block_placed(lua: &Lua, event: &BlockPlacedEvent) -> Result<(), mlua::Error> {
-    let engine: Table = lua.globals().get("engine")?;
-    let handler: Value = engine.get(BLOCK_PLACED_SLOT)?;
-    let Value::Function(handler) = handler else {
-        return Ok(());
-    };
-    let event_value = lua.to_value_with(event, lua_event_options())?;
-    handler.call::<()>(event_value)
-}
-
-/// Invoke one mod's inspect hook. `Ok(None)` covers both "no handler
-/// registered" and "handler returned nil"; any non-string non-nil
-/// return is an error (the mod author's bug should be loud).
-fn call_inspect_hook(lua: &Lua, target: &InspectTarget) -> Result<Option<String>, mlua::Error> {
-    let engine: Table = lua.globals().get("engine")?;
-    let handler: Value = engine.get(INSPECT_SLOT)?;
-    let Value::Function(handler) = handler else {
-        return Ok(None);
-    };
-    let target_value = lua.to_value_with(target, lua_event_options())?;
-    let returned: Value = handler.call(target_value)?;
-    match returned {
-        Value::Nil => Ok(None),
-        Value::String(s) => Ok(Some(s.to_str()?.to_owned())),
-        other => Err(mlua::Error::external(format!(
-            "engine.ui.on_inspect callback must return a string or nil, got {}",
-            other.type_name()
-        ))),
-    }
-}
-
-fn call_room_event(lua: &Lua, event: &RoomEvent) -> Result<(), mlua::Error> {
-    let engine: Table = lua.globals().get("engine")?;
-    let handler: Value = engine.get(ROOM_EVENT_SLOT)?;
-    let Value::Function(handler) = handler else {
-        return Ok(());
-    };
-    let event_value = lua.to_value_with(event, lua_event_options())?;
-    handler.call::<()>(event_value)
-}
-
 /// Look up a planner for `kind` in this Lua state. Returns:
 /// - `Ok(Some(goal))` — planner present and returned a parseable goal.
 /// - `Ok(None)` — no planner registered for this kind in this state.
 /// - `Err(_)` — planner was present but errored (call failed, returned
 ///   non-table, or returned something that doesn't parse as a
 ///   [`PlannerGoal`]).
+struct DecodedGoal(PlannerGoal);
+impl mlua::FromLua for DecodedGoal {
+    fn from_lua(value: Value, lua: &Lua) -> mlua::Result<Self> {
+        definitions::validate_input(&value)?;
+        lua.from_value(value).map(Self)
+    }
+}
+
 fn call_npc_planner(
     lua: &Lua,
     kind: &NpcKindId,
@@ -804,10 +852,35 @@ fn call_npc_planner(
     let Value::Function(handler) = handler else {
         return Ok(None);
     };
+    commands::cause(lua, None);
+    commands::behavior(lua, &format!("planner/{}", kind.as_str()));
     let snapshot_value = lua.to_value_with(snapshot, lua_event_options())?;
-    let returned: Value = handler.call(snapshot_value)?;
-    let goal: PlannerGoal = lua.from_value(returned)?;
-    Ok(Some(goal))
+    let goal: DecodedGoal = sandbox::call(lua, handler, snapshot_value)?;
+    Ok(Some(goal.0))
+}
+
+/// Evaluate a standalone data resource with the production callback budgets.
+/// Returned tables are plain, acyclic data: parsing cannot trigger unbounded
+/// metamethod execution after the host coroutine has finished.
+pub fn evaluate_data(source: &str, name: &str) -> mlua::Result<(Lua, Value)> {
+    let lua = Lua::new_with(
+        mlua::StdLib::TABLE | mlua::StdLib::STRING | mlua::StdLib::MATH | mlua::StdLib::UTF8,
+        mlua::LuaOptions::default(),
+    )?;
+    let limits = ScriptLimits::default();
+    lua.set_memory_limit(limits.memory_bytes)?;
+    lua.set_app_data(limits);
+    for name in ["dofile", "loadfile", "load", "collectgarbage"] {
+        lua.globals().set(name, Value::Nil)?;
+    }
+    let function = lua
+        .load(source)
+        .set_name(name)
+        .set_mode(mlua::ChunkMode::Text)
+        .into_function()?;
+    let value: Value = sandbox::call(&lua, function, ())?;
+    definitions::validate_input(&value)?;
+    Ok((lua, value))
 }
 
 #[cfg(test)]
@@ -820,6 +893,9 @@ mod tests {
         let ctx = LoadContext::new();
         let lua = Lua::new();
         install_engine_table(&lua, Side::Server, &ctx).expect("install engine table");
+        let manifest =
+            toml::from_str("id='test'\nname='test'\nversion='1.0.0'\napi_version='0.6.0'").unwrap();
+        definitions::install(&lua, &ctx, &manifest).unwrap();
         (lua, ctx)
     }
 

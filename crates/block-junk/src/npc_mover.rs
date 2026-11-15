@@ -202,6 +202,7 @@ type MovingNpcFilter = (With<Npc>, Without<KinematicLock>);
 
 pub(crate) fn npc_mover_step(
     time: Res<Time>,
+    sidecars: Query<&'static crate::voxel::ChunkEntities>,
     chunks: Query<&'static Chunk>,
     chunk_map: Res<ChunkMap>,
     registry: Res<BlockRegistry>,
@@ -213,6 +214,7 @@ pub(crate) fn npc_mover_step(
     }
     let world = WorldWalk {
         chunks: &chunks,
+        sidecars: &sidecars,
         chunk_map: &chunk_map,
         registry: &registry,
     };

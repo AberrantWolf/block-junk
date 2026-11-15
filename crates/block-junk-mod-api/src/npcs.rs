@@ -7,7 +7,7 @@
 //! new `PlannerGoal` variant requires engine support — mods cannot teach
 //! the engine new primitive actions through the registry alone.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +95,7 @@ impl core::fmt::Display for NpcKindId {
 /// delta. `duration_secs` defaults to 4.0 (an NPC visibly stands at
 /// the target for a few seconds).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkDefaults {
     #[serde(default)]
     pub need_restore: Option<NeedRestore>,
@@ -141,6 +142,7 @@ fn default_work_duration_secs() -> f32 {
 ///   tick. `None` ⇒ the need never preempts (e.g. `work`: wanting
 ///   *more* work isn't an emergency).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NeedDef {
     pub id: NeedId,
     pub display_name: String,
@@ -171,6 +173,7 @@ pub struct NeedDef {
 /// a threshold keeps the rule legible in play ("they're starving,
 /// they tire fast") where a gradient would read as mush.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecayBoost {
     /// The triggering need's id (cross-validated at boot like
     /// `need_restore.need`).
@@ -191,6 +194,7 @@ pub struct DecayBoost {
 /// systems) decide what a stat means. Vanilla's first: `laziness`,
 /// scaling the post-work breather.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NpcStatDef {
     pub id: String,
     pub min: f32,
@@ -202,9 +206,17 @@ pub struct NpcStatDef {
 /// each side, agreeing on slot ordering for any future wire-friendly
 /// `NpcKindSlot` type (today the wire still carries the full string).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NpcKindDef {
     pub id: NpcKindId,
     pub display_name: String,
+    /// Physical routing and interaction contract. Omitted definitions use the
+    /// selected world's profile for compatibility, while shipped content is explicit.
+    #[serde(default)]
+    pub movement_profile: Option<String>,
+    /// Work the planner may choose for this kind. Empty means no colony jobs.
+    #[serde(default)]
+    pub job_classes: BTreeSet<JobClass>,
     /// Per-NPC rolled stats this kind declares. See [`NpcStatDef`].
     /// Registration order is the roll order (determinism across
     /// spawns), validated at boot (min ≤ max, unique non-empty ids).
@@ -247,11 +259,20 @@ pub struct NpcKindDef {
     pub models: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobClass {
+    Construction,
+    Hauling,
+    Crafting,
+}
+
 /// Per-kind default animation set. All three slots are mandatory —
 /// every NPC kind needs *some* clip to play in the three core states
 /// (stationary, moving, working a plan). When more states show up
 /// (jumping, falling, dying) they get their own slots here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NpcKindAnimations {
     pub idle: String,
     pub walk: String,
@@ -265,8 +286,9 @@ pub struct NpcKindAnimations {
 ///
 /// Built on the engine side at planner-call time, serialised once into
 /// the target Lua state, and discarded. Planners read it as a Lua table
-/// (e.g. `snapshot.needs.hunger`, `snapshot.nearby_rooms[1]`).
+/// (e.g. `snapshot.needs.hunger`, `snapshot.nearby_spaces[1]`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NpcSnapshot {
     /// Stable per-NPC handle — same value across every call for the
     /// same NPC, distinct between NPCs. Planners use this to key any
@@ -284,13 +306,11 @@ pub struct NpcSnapshot {
     /// declare the stat — planners should `or`-default their reads.
     #[serde(default)]
     pub stats: HashMap<String, f32>,
-    /// Up to K nearest detected rooms with a matched pattern, sorted by
-    /// distance from `foot` (closest first). Empty when no matched
-    /// rooms exist (early game, or the world detector hasn't run yet).
-    /// Planners filter by `pattern` to pick a target — e.g. "head for
-    /// the nearest `vanilla:small_house`."
+    /// Bounded nearest architectural spaces activated by settlement facilities.
+    /// Empty caves are omitted. Candidates carry the source spatial revision;
+    /// execution validates the selected waypoint or facility against live geometry.
     #[serde(default)]
-    pub nearby_rooms: Vec<NearbyRoom>,
+    pub nearby_spaces: Vec<NearbySpace>,
     /// Up to K nearest reachable interactable blocks, sorted by
     /// distance (closest first). One entry per
     /// [`Interactable`](crate::blocks::Interactable)-bearing cell in
@@ -329,18 +349,49 @@ pub struct NpcSnapshot {
     /// raw `time_of_day` and re-derive the threshold.
     #[serde(default)]
     pub is_night: bool,
-    /// Engine-assigned haul work this NPC is already committed to.
-    /// Populated by the haul scheduler before the planner runs;
-    /// planners see these for *visibility* only — they cannot
-    /// claim, alter, or hand back an assignment. When this field is
-    /// non-empty the engine bypasses the planner entirely for the
-    /// tick and drives the NPC through the haul cycle directly, so
-    /// any [`PlannerGoal`] a planner *does* return for an assigned
-    /// NPC is silently ignored. Future planner versions can use this
-    /// to score "should I do my own thing on top of hauling?" decisions
-    /// (today the answer is "you can't").
+    /// Engine-owned work this NPC already accepted. Planners cannot alter an
+    /// active reservation; its eventual outcome arrives in `job_results`.
     #[serde(default)]
     pub pending_assignments: Vec<PendingAssignment>,
+    /// Read-only, bounded work choices. Enumeration never reserves anything;
+    /// returning `take_job` asks the engine to validate and reserve one intent.
+    #[serde(default)]
+    pub job_candidates: Vec<JobCandidate>,
+    /// Terminal and rejection results from earlier selected intents.
+    #[serde(default)]
+    pub job_results: Vec<PolicyJobResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobCandidate {
+    pub id: String,
+    pub revision: u64,
+    pub class: JobClass,
+    pub target: BlockPos,
+    pub estimated_cost: u32,
+    pub requirements: Vec<String>,
+    pub capability: Option<String>,
+    pub available: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyJobState {
+    Accepted,
+    Completed,
+    Interrupted,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyJobResult {
+    pub candidate_id: String,
+    pub revision: u64,
+    pub state: PolicyJobState,
+    pub reason: Option<String>,
 }
 
 /// One entry in [`NpcSnapshot::pending_assignments`]. Coarse view of
@@ -348,6 +399,7 @@ pub struct NpcSnapshot {
 /// understand "you're hauling to that build over there" without
 /// leaking item-slot internals or reservation-table internals.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PendingAssignment {
     /// The Build plan cell this haul is delivering to.
     pub plan_cell: BlockPos,
@@ -363,6 +415,7 @@ pub struct PendingAssignment {
 /// decide whether to take the plan; the engine looks up the full
 /// PlanKind from its server-side `Plans` resource at goal commit time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NearbyPlan {
     /// World cell of the plan. For Remove plans the cell is currently
     /// solid (the block to break); for Build plans the cell is empty
@@ -409,6 +462,7 @@ pub enum PlanKindHint {
 /// the NPC just completes the goal with no effect (and no need
 /// change).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NearbyInteraction {
     /// World cell of the interactable block. May be any cell of a
     /// multi-cell block; the engine resolves the anchor at goal
@@ -431,31 +485,29 @@ pub struct NearbyInteraction {
     /// just wants any-anyone-eat-here.
     pub exclusive: bool,
     /// Manhattan distance from the NPC's foot, same metric used by
-    /// `nearby_rooms.distance`. Cheap, ranks correctly for "nearer is
+    /// `nearby_spaces.distance`. Cheap, ranks correctly for "nearer is
     /// better." Planners that need euclidean derive it from `foot` +
     /// `cell` themselves.
     pub distance: u32,
+    /// Additive capability IDs this facility currently contributes to for the
+    /// actor's movement profile.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
-/// One entry in [`NpcSnapshot::nearby_rooms`]. Carries enough info to
+/// One entry in [`NpcSnapshot::nearby_spaces`]. Carries enough info to
 /// decide whether the room is interesting and where to walk to. The
 /// engine recomputes this fresh per planner call (the snapshot is
 /// transient), so planners shouldn't cache anchors across calls — the
 /// player may have demolished the floor in the meantime.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NearbyRoom {
-    /// Engine-side stable id for the region. Plain u32, mirroring the
-    /// engine's `RoomId` so the planner can compare equality across
-    /// calls (same `id` ⇒ same room).
-    pub id: u32,
-    /// Deepest matching pattern id. A planner that wants "any enclosed
-    /// space" today has to check the full set (`enclosed_space`,
-    /// `walled_yard`, `small_house`); an `is_a` checker on the engine
-    /// surface comes later.
-    pub pattern: String,
-    /// Floor cell to use as the "go to this room" target — chosen by
-    /// the engine as whichever floor cell is closest to the room's
-    /// geometric centroid, so it's guaranteed walkable.
+#[serde(deny_unknown_fields)]
+pub struct NearbySpace {
+    /// Durable architectural identity, independent of display names or functions.
+    pub id: u64,
+    /// Coherent spatial revision from which this candidate was read.
+    pub revision: u64,
+    /// Nearest exact floor surface. Path validity is checked by execution.
     pub anchor: BlockPos,
     /// Manhattan distance (cells) from the NPC's foot to the anchor.
     /// Cheap to compute server-side and ranks correctly for "nearer is
@@ -482,6 +534,8 @@ pub enum PlannerGoal {
     /// attractions). Distinct from `Rest` — `Idle` says "ask me again
     /// soon"; `Rest` says "I have decided to wait this long."
     Idle,
+    /// Validate and reserve an enumerated work candidate.
+    TakeJob { candidate_id: String, revision: u64 },
     /// Pick a random reachable target within `radius_cells` of the
     /// NPC's current foot cell and walk there. The engine's pathfinder
     /// owns target selection and route planning; planners only get to

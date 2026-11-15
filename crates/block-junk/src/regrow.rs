@@ -25,7 +25,6 @@ use crate::blocks::BlockRegistry;
 use crate::protocol::{BlockEdit, CHUNK_PADDED, CellEdit, ChunkCoord, GameSet};
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, chunk_local_to_world, world_to_chunk};
 use block_junk_mod_api::blocks::Cardinal;
-use lightyear::prelude::{Server, ServerMultiMessageSender};
 
 /// Cell → wall-clock second (`Time::elapsed_secs`) at which the block
 /// there transforms into its `regrow.into`. Server-only; never
@@ -71,12 +70,12 @@ impl Plugin for RegrowServerPlugin {
 /// save-loaded chunks — exactly the re-prime path.
 fn scan_chunk_on_add(
     trigger: On<Add, Chunk>,
-    chunks: Query<(&Chunk, &ChunkCoord)>,
+    chunks: Query<(&Chunk, &ChunkCoord, Option<&ChunkEntities>)>,
     registry: Res<BlockRegistry>,
     time: Res<Time>,
     mut schedule: ResMut<RegrowSchedule>,
 ) {
-    let Ok((chunk, coord)) = chunks.get(trigger.entity) else {
+    let Ok((chunk, coord, sidecar)) = chunks.get(trigger.entity) else {
         return;
     };
     let now = time.elapsed_secs();
@@ -93,6 +92,14 @@ fn scan_chunk_on_add(
                     continue;
                 };
                 let world = chunk_local_to_world(*coord, local);
+                if sidecar.is_some_and(|sidecar| {
+                    matches!(
+                        sidecar.get(world),
+                        Some(crate::voxel::EntryKind::Ghost { .. })
+                    )
+                }) {
+                    continue;
+                }
                 schedule.arm(world, now + regrow.after_secs);
             }
         }
@@ -110,7 +117,7 @@ fn arm_from_cell_edits(
 ) {
     let now = time.elapsed_secs();
     for edit in reader.read() {
-        let regrow = (!edit.slot.is_empty())
+        let regrow = (edit.is_anchor && !edit.slot.is_empty())
             .then(|| registry.def(edit.slot).regrow.as_ref())
             .flatten();
         match regrow {
@@ -127,86 +134,194 @@ fn arm_from_cell_edits(
 /// dropped from the schedule by `arm_from_cell_edits`, but re-read
 /// defensively), then rewrite it to `regrow.into` through the shared
 /// block-edit path.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "block-edit application spans many subsystems"
-)]
+#[derive(bevy::ecs::system::SystemParam)]
+struct RegrowWorld<'w, 's> {
+    facilities: crate::facility_inventory::FacilityService<'w>,
+    chunks: Query<'w, 's, (&'static mut Chunk, &'static mut ChunkEntities)>,
+    map: Res<'w, ChunkMap>,
+    registry: Res<'w, BlockRegistry>,
+    placements: ResMut<'w, crate::placements::Placements>,
+    construction: crate::construction::ConstructionService<'w>,
+    effects: ResMut<'w, crate::server::PendingTerrainEffects>,
+}
 fn fire_due_regrows(
     time: Res<Time>,
     mut schedule: ResMut<RegrowSchedule>,
     mut commands: Commands,
-    mut chunks: Query<(&mut Chunk, &mut ChunkEntities)>,
-    map: Res<ChunkMap>,
-    registry: Res<BlockRegistry>,
-    servers: Query<&Server>,
-    mut broadcast: ServerMultiMessageSender,
+    mut world: RegrowWorld,
     mut bus: MessageWriter<CellEdit>,
-    subscriptions: Res<crate::server::SpatialSubscriptions>,
 ) {
     let now = time.elapsed_secs();
-    // Collect due cells first — we can't mutate the schedule while
-    // borrowing it, and the edit path may itself write CellEdits.
-    let due: Vec<IVec3> = schedule
+    let mut due: Vec<_> = schedule
         .due
         .iter()
         .filter(|(_, at)| **at <= now)
-        .map(|(cell, _)| *cell)
+        .map(|(cell, at)| (*cell, *at))
         .collect();
-    if due.is_empty() {
-        return;
-    }
-    let Ok(server) = servers.single() else {
-        return;
-    };
-    for cell in due {
-        schedule.due.remove(&cell);
-        // Re-read the live block; resolve its regrow target now (the def
-        // may name a different `into` than when armed, and the block may
-        // have changed out from under us on a chunk we didn't observe).
-        let Some(into_slot) = current_regrow_target(cell, &chunks, &map, &registry) else {
+    due.sort_by(|(a, at), (b, bt)| at.total_cmp(bt).then(a.to_array().cmp(&b.to_array())));
+    for (cell, _) in due.into_iter().take(16) {
+        // Unknown geometry and temporary obstructions retain the obligation.
+        schedule.due.insert(cell, now + 1.);
+        let base = |cell| {
+            let (coord, local) = world_to_chunk(cell);
+            let (chunk, entities) = world.chunks.get(*world.map.0.get(&coord)?).ok()?;
+            Some((chunk.get(local), entities.get(cell), chunk.revision))
+        };
+        let Some((slot, entry, _)) = base(cell) else {
             continue;
         };
-        crate::server::apply_block_edit(
-            BlockEdit {
-                anchor: cell,
-                slot: into_slot,
-                orientation: Cardinal::default(),
-            },
+        let orientation = match entry {
+            Some(crate::voxel::EntryKind::Anchor { orientation, .. }) => orientation,
+            Some(crate::voxel::EntryKind::Ghost { .. }) => {
+                schedule.due.remove(&cell);
+                continue;
+            }
+            None => Cardinal::default(),
+        };
+        let Some(regrow) = world.registry.def(slot).regrow.as_ref() else {
+            schedule.due.remove(&cell);
+            continue;
+        };
+        let Some(into_slot) = world.registry.slot_of(&regrow.into) else {
+            continue;
+        };
+        let mut terrain = crate::terrain_transaction::TerrainTransaction::default();
+        if terrain
+            .replace(
+                BlockEdit {
+                    anchor: cell,
+                    slot: into_slot,
+                    orientation,
+                },
+                &world.registry,
+                &base,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        if world.effects.0.len() + terrain.effects.len() > 4096 {
+            continue;
+        }
+        let mut placements = world.placements.clone();
+        if placements
+            .apply_effects(&terrain.effects, &world.registry)
+            .is_err()
+        {
+            continue;
+        }
+        let mut construction = world.construction.stage();
+        construction.resolve_terrain(terrain.changes().map(|(cell, _, _)| cell));
+        world.construction.commit(construction);
+        world.facilities.retire(&terrain.effects, &world.registry);
+        *world.placements = placements;
+        let effects = crate::server::commit_terrain_geometry(
+            terrain,
             &mut commands,
-            &mut chunks,
-            crate::server::BlockEditWorld::new(&map, &registry),
-            server,
-            &mut broadcast,
+            &mut world.chunks,
+            &world.map,
             &mut bus,
-            &subscriptions,
+            None,
+            false,
         );
-        info!(cell = ?cell.to_array(), block = %registry.id_of(into_slot), "block regrew");
+        world.effects.0.extend(effects);
+        schedule.due.remove(&cell);
     }
-}
-
-/// The resolved `regrow.into` slot of whatever block currently sits at
-/// `cell`, or `None` if the cell is unloaded, empty, or holds a block
-/// that no longer regrows.
-fn current_regrow_target(
-    cell: IVec3,
-    chunks: &Query<(&mut Chunk, &mut ChunkEntities)>,
-    map: &ChunkMap,
-    registry: &BlockRegistry,
-) -> Option<crate::blocks::BlockSlot> {
-    let (coord, local) = world_to_chunk(cell);
-    let &entity = map.0.get(&coord)?;
-    let (chunk, _) = chunks.get(entity).ok()?;
-    let slot = chunk.get(local);
-    if slot.is_empty() {
-        return None;
-    }
-    let regrow = registry.def(slot).regrow.as_ref()?;
-    registry.slot_of(&regrow.into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_regrowth_retries_without_removing_the_existing_resource() {
+        let defs = serde_json::from_value(serde_json::json!([
+            {"id":"test:bare","display_name":"Bare","flags":{},"color":[1,1,1],"regrow":{"into":"test:ripe","after_secs":0.01}},
+            {"id":"test:ripe","display_name":"Ripe","flags":{},"color":[1,1,1],"footprint":[[0,0,0],[1,0,0]]}
+        ])).unwrap();
+        let registry = BlockRegistry::build(defs).unwrap().0;
+        let bare = registry.require("test:bare");
+        let ripe = registry.require("test:ripe");
+        let mut app = App::new();
+        crate::facility_inventory::install_fixture(&mut app);
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(registry)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(100),
+            ))
+            .init_resource::<ChunkMap>()
+            .init_resource::<crate::plans::Plans>()
+            .init_resource::<crate::construction::ConstructionLedger>()
+            .init_resource::<crate::placements::Placements>()
+            .init_resource::<crate::plan_claims::PlanClaims>()
+            .init_resource::<crate::haul::HaulStore>()
+            .init_resource::<crate::server::PendingTerrainEffects>()
+            .add_message::<CellEdit>()
+            .add_plugins(RegrowServerPlugin);
+        let cell = IVec3::new(4, 2, 4);
+        let blocked = cell + IVec3::from_array(Cardinal::default().rotate_offset([1, 0, 0]));
+        let mut chunk = Chunk {
+            revision: 0,
+            blocks: vec![crate::blocks::BlockSlot::EMPTY; (CHUNK_PADDED as usize).pow(3)],
+        };
+        chunk.set(world_to_chunk(cell).1, bare);
+        // A ripe single cell is deliberately an unrelated obstruction; this
+        // fixture does not ask the service to remove or validate that object.
+        chunk.set(world_to_chunk(blocked).1, ripe);
+        let entity = app
+            .world_mut()
+            .spawn((ChunkCoord(IVec3::ZERO), chunk, ChunkEntities::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<ChunkMap>()
+            .0
+            .insert(ChunkCoord(IVec3::ZERO), entity);
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .get::<Chunk>(entity)
+                .unwrap()
+                .get(world_to_chunk(cell).1),
+            bare
+        );
+        assert!(
+            app.world()
+                .resource::<RegrowSchedule>()
+                .due
+                .contains_key(&cell)
+        );
+        assert!(
+            app.world()
+                .resource::<crate::server::PendingTerrainEffects>()
+                .0
+                .is_empty()
+        );
+        app.world_mut()
+            .get_mut::<Chunk>(entity)
+            .unwrap()
+            .set(world_to_chunk(blocked).1, crate::blocks::BlockSlot::EMPTY);
+        for _ in 0..20 {
+            app.update();
+        }
+        let chunk = app.world().get::<Chunk>(entity).unwrap();
+        assert_eq!(chunk.get(world_to_chunk(cell).1), ripe);
+        assert_eq!(chunk.get(world_to_chunk(blocked).1), ripe);
+        assert!(
+            !app.world()
+                .resource::<RegrowSchedule>()
+                .due
+                .contains_key(&cell)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<crate::server::PendingTerrainEffects>()
+                .0
+                .len(),
+            2
+        );
+    }
 
     /// `arm` sets a fresh timer but never resets a running one — a
     /// reloaded chunk re-scanning an already-scheduled bare bush must

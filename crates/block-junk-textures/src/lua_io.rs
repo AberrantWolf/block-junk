@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use mlua::{Lua, Table, Value};
+use mlua::{Table, Value};
 
 use crate::doc::{
     DEFAULT_PIXELS_PER_BLOCK, FinishDef, LayerDef, ParamValue, RampStop, Step, TextureDef,
@@ -33,12 +33,8 @@ pub fn parse_file(path: &Path) -> Result<TextureSetDoc, TexError> {
 /// Parse + validate a `textures.lua` source string. `source_name` is used
 /// in error messages (usually the file path).
 pub fn parse_str(src: &str, source_name: &str) -> Result<TextureSetDoc, TexError> {
-    let lua = Lua::new();
-    let value: Value = lua
-        .load(src)
-        .set_name(source_name)
-        .eval()
-        .map_err(|source| TexError::Lua {
+    let (_lua, value) =
+        block_junk_scripting::evaluate_data(src, source_name).map_err(|source| TexError::Lua {
             source_name: source_name.to_owned(),
             source,
         })?;
@@ -535,5 +531,20 @@ return {
         let doc = parse_str("return {}", "empty").unwrap();
         assert_eq!(doc.pixels_per_block, 16);
         assert!(doc.textures.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_regressions {
+    #[test]
+    fn texture_resources_cannot_escape_data_budget() {
+        for source in [
+            "while true do pcall(function() while true do end end) end",
+            "return setmetatable({}, {__index=function() while true do end end})",
+            "return {textures={},unexpected=0/0}",
+            "return {io=io.open('unavailable')}",
+        ] {
+            assert!(super::parse_str(source, "malformed texture fixture").is_err());
+        }
     }
 }

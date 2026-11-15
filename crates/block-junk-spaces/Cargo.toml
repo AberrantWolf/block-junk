@@ -1,0 +1,7 @@
+[package]
+name = "block-junk-spaces"
+version.workspace = true
+edition.workspace = true
+description = "Experimental, engine-independent reference model for structural spaces"
+
+[dependencies]

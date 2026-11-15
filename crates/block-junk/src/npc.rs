@@ -27,10 +27,10 @@
 //! when no mods load.
 
 use bevy::prelude::*;
-use block_junk_mod_api::blocks::{Cardinal, Interactable, NeedRestore, UseSlot};
+use block_junk_mod_api::blocks::{Cardinal, NeedRestore, UseSlot};
 use block_junk_mod_api::npcs::{
-    NearbyInteraction, NearbyPlan, NearbyRoom, NpcKindId, NpcSnapshot, PendingAssignment,
-    PlanKindHint, PlannerGoal,
+    JobCandidate, JobClass, NearbyInteraction, NearbyPlan, NearbySpace, NpcKindId, NpcSnapshot,
+    PendingAssignment, PlanKindHint, PlannerGoal, PolicyJobResult, PolicyJobState,
 };
 use block_junk_mod_api::shared::BlockPos;
 use serde::{Deserialize, Serialize};
@@ -40,10 +40,11 @@ use crate::blocks::{BlockRegistry, BlockSlot};
 use crate::haul::{HaulStore, HaulTarget};
 use crate::interactables::{InteractableIndex, InteractionClaims};
 use crate::items::ItemSlot;
+use crate::live_spaces::PublishedSpaces;
 use crate::npc_registry::{NeedRegistry, NpcKindRegistry, WorkDefaultsRes};
 use crate::pathfinding::{
-    NAV_BODY_HALF_EXTENT, NAV_PASSABLE_COST_MULT, Walkability, corridor_clear, find_path,
-    nearest_standable_below, smooth_path, standable,
+    NAV_BODY_HALF_EXTENT, Walkability, corridor_clear, find_path, nearest_standable_below,
+    smooth_path, standable,
 };
 use crate::physics::{EYE_OFFSET_FROM_CENTRE, PLAYER_HALF_EXTENTS, standing_pose_translation};
 use crate::plan_claims::PlanClaims;
@@ -52,7 +53,6 @@ use crate::protocol::{
     Actor, AvatarOnGround, AvatarPose, AvatarVelocity, Carrying, CellEdit, EquippedTool, GameSet,
     KinematicLock, MovementMode, NpcAnimOverride, PlanKind, WorldClock, WorldItem,
 };
-use crate::rooms::RoomMap;
 use crate::scripting::ServerMods;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind, world_to_chunk};
 
@@ -257,25 +257,10 @@ pub enum Goal {
         /// Clip id for the client override (vanilla: the lie idle).
         animation: Option<String>,
     },
-    /// Standing at an interactable cell, counting down to completion.
-    /// One state covers every variant the engine used to have a
-    /// separate Goal for (Consuming, Sleeping, and the future
-    /// Enchanting / Smelting / etc.) — the block def's
-    /// [`Interactable`](block_junk_mod_api::blocks::Interactable)
-    /// supplies the action-specific tuning (need to decrement,
-    /// duration, exclusivity).
-    ///
-    /// Entered only via a successful arrival on a `MoveTo` with
-    /// `ArrivalAction::Interact`. `need_restore` is captured at goal
-    /// creation so a planner that mid-action decides "actually you
-    /// should be eating *that* food" can't retroactively change what
-    /// the NPC is doing now — the captured snapshot wins. `target_cell`
-    /// is the interactable block itself (not the stand cell); the
-    /// brain uses it to rotate the body toward whatever the NPC is
-    /// interacting with for non-snap interactions. `anchor_cell` is
-    /// the claim key for `exclusive` interactables — released on any
-    /// path out of [`Goal::Interacting`] including stuck-abandon or
-    /// planner override; ignored when the block is non-exclusive.
+    /// Activity mirror for an authoritative named-slot job. The facility service
+    /// owns the timer, reservation, original placement revision and completion.
+    /// Captured need/animation values support inspection; they never authorize a
+    /// benefit. The brain travels to the slot and cleans up on a terminal result.
     Interacting {
         remaining_secs: f32,
         need_restore: Option<NeedRestore>,
@@ -305,6 +290,7 @@ pub enum Goal {
     /// being placed (Build) or removed (Remove) at *that* moment
     /// determined the payoff; the mid-action picture doesn't matter.
     Working {
+        project_token: (u64, u64),
         remaining_secs: f32,
         target_cell: IVec3,
         plan_kind: PlanKind,
@@ -417,6 +403,7 @@ pub enum ArrivalAction {
     /// engine-wide [`WorkDefaults`](block_junk_mod_api::npcs::WorkDefaults))
     /// at goal commit; arrival doesn't re-read the block def.
     Work {
+        project_token: (u64, u64),
         duration_secs: f32,
         target_cell: IVec3,
         plan_kind: PlanKind,
@@ -543,7 +530,7 @@ pub struct Brain {
     /// cluster contains the cell it just slept in. Claims aren't saved
     /// across world reloads — `ClusterId` isn't stable across restarts;
     /// the NPC re-claims on next sleep.
-    pub home_cluster: Option<crate::civilization::ClusterId>,
+    pub home_facility: Option<block_junk_mod_api::architecture::PlacementId>,
     /// Seconds until the next survival preempt may fire. Set after
     /// every preempt so an *unsatisfiable* critical need (exhausted at
     /// noon when sleep is night-gated; starving with no food in range)
@@ -551,6 +538,41 @@ pub struct Brain {
     /// NPC works in [`PREEMPT_RETRY_COOLDOWN_SECS`] chunks until the
     /// need becomes satisfiable. Runtime-only; not persisted.
     pub preempt_cooldown_secs: f32,
+    /// Bounded feedback delivered to the planner on its next decision.
+    pub policy_results: Vec<block_junk_mod_api::npcs::PolicyJobResult>,
+    /// Candidate selected by policy while its engine-owned execution is active.
+    pub active_policy_job: Option<(String, u64)>,
+    /// A queued transaction owns the actor until the Update service replies.
+    pub awaiting_construction: Option<(u64, u64)>,
+}
+
+pub(crate) fn finish_policy_job(brain: &mut Brain, state: PolicyJobState, reason: Option<&str>) {
+    let Some((candidate_id, revision)) = brain.active_policy_job.take() else {
+        return;
+    };
+    brain.policy_results.push(PolicyJobResult {
+        candidate_id,
+        revision,
+        state,
+        reason: reason.map(str::to_owned),
+    });
+    const MAX_POLICY_RESULTS: usize = 32;
+    if brain.policy_results.len() > MAX_POLICY_RESULTS {
+        brain
+            .policy_results
+            .drain(..brain.policy_results.len() - MAX_POLICY_RESULTS);
+    }
+}
+
+pub(crate) fn deliver_policy_feedback<T, E>(
+    brain: &mut Brain,
+    call: impl FnOnce(&[PolicyJobResult]) -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    let result = call(&brain.policy_results)?;
+    if result.is_some() {
+        brain.policy_results.clear();
+    }
+    Ok(result)
 }
 
 /// Minimum spacing between survival preempts for one NPC. See
@@ -583,14 +605,6 @@ const MAX_GOTO_TIMEOUT_SECS: f32 = 120.0;
 const MAX_INTERACT_TIMEOUT_SECS: f32 = 120.0;
 const MIN_REST_SECS: f32 = 0.5;
 const MAX_REST_SECS: f32 = 60.0;
-/// Interaction duration is read from the block's
-/// [`Interactable::duration_secs`](block_junk_mod_api::blocks::Interactable::duration_secs).
-/// The brain clamps to `[0.1, 120.0]` so a typo or a misbehaving mod
-/// can't park an NPC for an hour or strobe through the action in
-/// one tick. The registry validator enforces the lower bound at
-/// boot too (≥ 1.0 for exclusive blocks, ≥ 0.1 otherwise).
-const MIN_INTERACT_DURATION_SECS: f32 = 0.1;
-const MAX_INTERACT_DURATION_SECS: f32 = 120.0;
 /// Plan-pickup scan radius (Manhattan via the Chebyshev pre-filter).
 /// Same magnitude as sleepers/consumables — plans on the far side of
 /// the map shouldn't keep luring a villager from local tasks.
@@ -658,19 +672,31 @@ pub struct NpcServerPlugin;
 impl Plugin for NpcServerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NpcIdAllocator>();
+        app.init_resource::<crate::facility_interactions::FacilityInteractions>();
+        app.add_systems(
+            PreUpdate,
+            (
+                crate::facility_interactions::reconcile_exits,
+                crate::facility_interactions::activate,
+            )
+                .chain(),
+        );
+        app.add_systems(PostUpdate, crate::facility_interactions::reconcile_exits);
+        app.add_message::<crate::facility_interactions::InteractionCompleted>();
         app.init_resource::<NpcEntityIndex>();
-        app.init_resource::<SmokeClusterSpawned>();
-        // Spawn deferred to first client connect rather than Startup —
-        // chunks aren't loaded until a client's AoI requests them, and
-        // an NPC spawned into an empty world falls past unloaded chunks
-        // forever (no candidates to collide against).
-        app.add_observer(spawn_initial_npc_on_first_connect);
+        app.init_resource::<PopulationInitialized>();
+        // Startup supplies the initial simulation neighborhood before actors spawn.
+        app.add_systems(
+            Startup,
+            spawn_initial_population.after(crate::scripting::WorldHooks),
+        );
         // Lifecycle backstop: ANY NPC despawn (death, debug removal, a
         // mod) releases every claim/booking/reservation keyed by its
         // id. Without this a removed NPC's bed/plan/station claims and
         // item reservations would lock permanently — every claim table
         // assumes this observer exists.
         app.add_observer(release_claims_on_npc_despawn);
+        app.add_observer(release_claims_on_brain_disable);
         app.add_systems(
             Update,
             maintain_npc_entity_index.in_set(GameSet::PostSimulation),
@@ -680,9 +706,6 @@ impl Plugin for NpcServerPlugin {
         // BlockEdit + clears the plan tag. Splits these concerns so the
         // brain tick stays under the SystemParam cap.
         app.add_message::<NpcWorkCompleted>();
-        // Same split for the S4 eat-a-bush transform (see
-        // NpcConsumedInteractable): brain emits, server applies.
-        app.add_message::<NpcConsumedInteractable>();
         // Brain → mover order matters: the brain commits/advances goals
         // this tick, the kinematic mover executes them, and the brain
         // reads the results (edge cursor, blocked flag) next tick. Both
@@ -690,7 +713,12 @@ impl Plugin for NpcServerPlugin {
         // advance together.
         app.add_systems(
             FixedUpdate,
-            (npc_brain_tick, crate::npc_mover::npc_mover_step).chain(),
+            (
+                crate::facility_interactions::advance,
+                npc_brain_tick,
+                crate::npc_mover::npc_mover_step,
+            )
+                .chain(),
         );
         // Activity is derived from Goal and replicated to drive client
         // animation. Updates after the brain tick so the broadcast
@@ -812,163 +840,166 @@ fn refresh_npc_activity(
 /// runs it through `apply_block_edit` so the world mutation, the
 /// broadcast, and the plan-tag auto-clear all happen through the
 /// same code path that handles player edits.
-#[derive(Message, Clone, Copy, Debug)]
+#[derive(Message, Clone, Debug)]
 pub struct NpcWorkCompleted {
+    pub project_token: (u64, u64),
+    pub worker: NpcId,
     pub cell: IVec3,
     pub plan_kind: PlanKind,
-}
-
-/// Server-internal signal that an NPC finished eating a self-consuming
-/// interactable at `cell` — a berry bush. `apply_npc_consumption`
-/// resolves the block's `depleted_block` and swaps it in place *without*
-/// spawning drops (the villager ate the berries), which is what
-/// separates eating from harvesting the same bush. Mirrors the
-/// [`NpcWorkCompleted`] → `apply_npc_work` split: the brain can't mutate
-/// chunks in place, so it emits and a server system applies.
-#[derive(Message, Clone, Copy, Debug)]
-pub struct NpcConsumedInteractable {
-    pub cell: IVec3,
+    pub need_restore: Option<NeedRestore>,
 }
 
 /// Observer: an NPC entity is despawning — release everything keyed by
 /// its id or entity across the four claim tables. Components are still
 /// readable inside a `Remove` observer, so the id lookup works.
-fn release_claims_on_npc_despawn(
+pub(crate) fn release_claims_on_npc_despawn(
     trigger: On<Remove, Npc>,
     ids: Query<&NpcId>,
     mut plan_claims: ResMut<crate::plan_claims::PlanClaims>,
     mut interaction_claims: ResMut<crate::interactables::InteractionClaims>,
     mut haul_store: ResMut<crate::haul::HaulStore>,
     mut bookings: ResMut<crate::craft_stations::CraftBookings>,
+    mut facility_jobs: ResMut<crate::facility_interactions::FacilityInteractions>,
 ) {
     let Ok(&id) = ids.get(trigger.entity) else {
         return;
     };
     plan_claims.release_all_for(id);
+    facility_jobs.interrupt_actor(id.0, "actor removed", &mut interaction_claims);
     interaction_claims.release_all_for(id);
     haul_store.release_for_npc(id);
     bookings.release_npc_booking(id, trigger.entity);
     info!(npc = id.0, "npc despawned; released all claims");
 }
 
+type DisableActors<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static NpcId,
+        Option<&'static mut Brain>,
+        Option<&'static mut crate::protocol::MovementIntent>,
+        Has<crate::facility_interactions::FacilityOccupancy>,
+    ),
+>;
+
+/// Disabling behavior ends transient ownership, never material commitments.
+pub(crate) fn release_claims_on_brain_disable(
+    trigger: On<Add, BrainDisabled>,
+    mut actors: DisableActors,
+    mut plan_claims: ResMut<crate::plan_claims::PlanClaims>,
+    mut interactions: crate::facility_interactions::InteractionService,
+    mut hauls: ResMut<crate::haul::HaulStore>,
+    mut bookings: ResMut<crate::craft_stations::CraftBookings>,
+    mut commands: Commands,
+) {
+    let Ok((id, brain, intent, occupied)) = actors.get_mut(trigger.entity) else {
+        return;
+    };
+    plan_claims.release_all_for(*id);
+    interactions.interrupt_actor(id.0, "actor behavior disabled");
+    interactions.claims.release_all_for(*id);
+    hauls.release_for_npc(*id);
+    bookings.release_npc_booking(*id, trigger.entity);
+    if let Some(mut brain) = brain {
+        finish_policy_job(
+            &mut brain,
+            PolicyJobState::Interrupted,
+            Some("actor behavior disabled"),
+        );
+        brain.awaiting_construction = None;
+        brain.goal = Goal::Idle;
+    }
+    if let Some(mut intent) = intent {
+        *intent = crate::protocol::MovementIntent::default();
+    }
+    if !occupied {
+        commands.entity(trigger.entity).remove::<KinematicLock>();
+    }
+}
+
 /// Server-side monotonic [`NpcId`] source. EVERY runtime NPC spawn must
 /// allocate from here — ids key the claim tables (plans, interactions,
 /// hauls, craft bookings), so two NPCs sharing an id silently share
-/// claims. `load_from_save` bumps the counter past the highest saved id
-/// before any runtime spawn can fire.
-#[derive(Resource)]
+/// claims. The complete allocator and retired identity set persist; loading never
+/// reconstructs it from only the surviving actors.
+#[derive(Resource, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NpcIdAllocator {
-    next: u64,
+    pub next: u64,
+    pub retired: std::collections::BTreeSet<u64>,
 }
 
 impl Default for NpcIdAllocator {
     fn default() -> Self {
-        Self { next: 1 }
+        Self {
+            next: 1,
+            retired: Default::default(),
+        }
     }
 }
 
 impl NpcIdAllocator {
-    pub fn allocate(&mut self) -> NpcId {
+    pub fn allocate(&mut self) -> Result<NpcId, String> {
+        if self.next == 0 {
+            return Err("invalid NPC identity allocator".into());
+        }
+        let next = self
+            .next
+            .checked_add(1)
+            .ok_or("NPC identity space exhausted")?;
         let id = NpcId(self.next);
-        self.next += 1;
-        id
+        self.next = next;
+        Ok(id)
     }
-
-    /// Bump the counter past an id already in use (saved NPCs keep
-    /// their persisted ids). Idempotent; safe to call per loaded NPC.
-    pub fn reserve_through(&mut self, used: u64) {
-        self.next = self.next.max(used + 1);
+    pub fn retire(&mut self, id: u64) -> Result<(), String> {
+        if id == 0 || id >= self.next || !self.retired.insert(id) {
+            return Err("NPC identity missing or retired".into());
+        }
+        Ok(())
+    }
+    pub fn contains(&self, id: u64) -> bool {
+        id > 0 && id < self.next
     }
 }
 
-/// Once-per-session latch for the smoke-test cluster. A `Resource` (not
-/// a process-wide static) so a future in-process server restart starts
-/// fresh with its own App state.
+/// Persisted bootstrap latch; an empty loaded colony must not respawn.
 #[derive(Resource, Default)]
-struct SmokeClusterSpawned(bool);
+pub(crate) struct PopulationInitialized(pub bool);
 
-/// Smoke-test cluster — a small ring of NPCs near the player's default
-/// landing spot (player spawn = (0, 32, 60)). Each is offset by a few
-/// metres so they don't all stack on one cell and so a player can
-/// visibly tell them apart at a glance.
-///
-/// The cluster is small on purpose: planner state per NPC is keyed by
-/// `NpcId` in Lua, so a multi-NPC smoke test is what validates that
-/// per-id state actually isolates. One NPC can't reveal the bug
-/// "everyone shares the same alternation state."
-///
-/// Replicated to all clients with interpolation (no client predicts
-/// NPCs — there's no per-client "owner" of one).
-///
-/// Default needs come from the [`NpcKindRegistry`] entry for
-/// `vanilla:wanderer`; if no mod registered that kind we still spawn
-/// (with an empty need map) and let the native fallback drive the
-/// brain. That's what the design memo's "trivial native NPC for engine
-/// smoke tests" is — same entity, the brain just falls back to native
-/// logic when there's no Lua planner.
-fn spawn_initial_npc_on_first_connect(
-    _: On<Add, crate::protocol::GameReady>,
-    mut commands: Commands,
-    kinds: Res<NpcKindRegistry>,
-    existing: Query<(), With<Npc>>,
-    mut spawned: ResMut<SmokeClusterSpawned>,
-    mut allocator: ResMut<NpcIdAllocator>,
-) {
-    if std::mem::replace(&mut spawned.0, true) {
-        return;
-    }
-    // If a save was loaded at startup, NPCs already exist with their
-    // persisted ids — the cluster would just pile more bodies onto the
-    // spawn point. Skip silently; the latch above still holds so
-    // subsequent reconnects don't re-attempt.
-    if !existing.is_empty() {
-        info!("NPCs already present (loaded from save); skipping smoke-test cluster spawn");
-        return;
-    }
-    let kind_id = "vanilla:wanderer";
-    let (default_needs, stat_defs) = match kinds.get(kind_id) {
-        Some(def) => (def.default_needs.clone(), def.stats.clone()),
-        None => {
-            warn!(
-                kind = kind_id,
-                "no NPC kind registered; spawning with empty needs (native fallback brain)"
-            );
-            (HashMap::new(), Vec::new())
-        }
-    };
-    // Offset positions east + south of the player spawn (0, 32, 60).
-    // Y picks one cell above so the controller settles them onto the
-    // floor on the first physics step. Small XZ spread keeps them all
-    // visible in the player's initial frame without overlapping.
-    let cluster = [
-        Vec3::new(4.0, 32.0, 60.0),
-        Vec3::new(6.0, 32.0, 62.0),
-        Vec3::new(2.0, 32.0, 62.0),
-        Vec3::new(4.0, 32.0, 64.0),
-    ];
-    for translation in cluster.into_iter() {
-        let id = allocator.allocate();
-        // Roll stats from the same rng the brain keeps: the roll
-        // advances the state, and the advanced state goes into Brain so
-        // save/load reproduces neither the roll nor the wander stream.
-        let mut rng = 0xDEAD_BEEF_CAFE_F00D ^ id.0;
-        let stats = roll_stats(&stat_defs, &mut rng);
-        // Nested tuples work around Bevy's 15-element Bundle cap. Two
-        // groups: identity/brain (cheap markers + structured state) and
-        // physics + replication (per-frame state + lightyear).
-        commands.spawn((
+/// Shared creation service: preset bootstrap and accepted mod commands construct
+/// the same authoritative actor, rolled stats, movement and replicated state.
+pub(crate) fn spawn_new_npc(
+    commands: &mut Commands,
+    id: NpcId,
+    def: &block_junk_mod_api::npcs::NpcKindDef,
+    translation: Vec3,
+) -> Entity {
+    // Roll stats from the same rng the brain keeps: the roll
+    // advances the state, and the advanced state goes into Brain so
+    // save/load reproduces neither the roll nor the wander stream.
+    let mut rng = 0xDEAD_BEEF_CAFE_F00D ^ id.0;
+    let stats = roll_stats(&def.stats, &mut rng);
+    // Nested tuples work around Bevy's 15-element Bundle cap. Two
+    // groups: identity/brain (cheap markers + structured state) and
+    // physics + replication (per-frame state + lightyear).
+    commands
+        .spawn((
             (
                 Actor,
                 Npc,
                 id,
-                NpcKind(kind_id.into()),
-                Needs(default_needs.clone()),
+                NpcKind(def.id.to_string()),
+                Needs(def.default_needs.clone()),
                 NpcStats(stats),
                 Brain {
                     goal: Goal::Idle,
                     rng,
-                    home_cluster: None,
+                    home_facility: None,
                     preempt_cooldown_secs: 0.0,
+                    policy_results: Vec::new(),
+                    active_policy_job: None,
+                    awaiting_construction: None,
                 },
                 crate::protocol::Carrying::default(),
                 crate::protocol::EquippedTool::default(),
@@ -987,12 +1018,75 @@ fn spawn_initial_npc_on_first_connect(
                 translation,
             )),
             Name::new(format!("npc:{}", id.0)),
-        ));
+        ))
+        .id()
+}
+
+/// Populate a fresh world once, independently of player connections.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "atomic population bootstrap owns identities and its initial geometry demand"
+)]
+pub(crate) fn spawn_initial_population(
+    mut commands: Commands,
+    kinds: Res<NpcKindRegistry>,
+    mut spawned: ResMut<PopulationInitialized>,
+    mut allocator: ResMut<NpcIdAllocator>,
+    preset: Res<crate::scripting::SelectedWorld>,
+    slots: Res<crate::blocks::TerrainSlots>,
+    mut chunks: ResMut<ChunkMap>,
+    guard: Res<crate::server::SaveWriteGuard>,
+) {
+    if guard.reason.is_some() {
+        return;
+    }
+    if spawned.0 {
+        return;
+    }
+    let mut next = allocator.clone();
+    let Ok(ids) = preset
+        .0
+        .population
+        .iter()
+        .map(|_| next.allocate())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    *allocator = next;
+    spawned.0 = true;
+    for (entry, id) in preset.0.population.iter().zip(ids) {
+        let kind_id = entry.kind.as_str();
+        let def = kinds.get(kind_id).expect("validated population kind");
+        let translation = Vec3::from_array(entry.position);
+        let center = crate::protocol::ChunkCoord(
+            translation
+                .floor()
+                .as_ivec3()
+                .div_euclid(IVec3::splat(crate::protocol::CHUNK_SIZE as i32)),
+        );
+        for x in -1..=1 {
+            for y in -1..=1 {
+                for z in -1..=1 {
+                    let coord = crate::protocol::ChunkCoord(center.0 + IVec3::new(x, y, z));
+                    chunks.0.entry(coord).or_insert_with(|| {
+                        commands
+                            .spawn((
+                                coord,
+                                crate::voxel::Chunk::from_terrain(coord, &slots),
+                                crate::voxel::ChunkEntities::default(),
+                            ))
+                            .id()
+                    });
+                }
+            }
+        }
+        spawn_new_npc(&mut commands, id, def, translation);
     }
     info!(
-        kind = kind_id,
-        count = cluster.len(),
-        "spawned smoke-test NPC cluster"
+        preset = preset.0.id,
+        count = preset.0.population.len(),
+        "initialized world population"
     );
 }
 
@@ -1005,11 +1099,70 @@ fn spawn_initial_npc_on_first_connect(
 /// does a body fit" logic in one place.
 pub(crate) struct WorldWalk<'q, 'w, 's> {
     pub(crate) chunks: &'q Query<'w, 's, &'static Chunk>,
+    pub(crate) sidecars: &'q Query<'w, 's, &'static ChunkEntities>,
     pub(crate) chunk_map: &'q ChunkMap,
     pub(crate) registry: &'q BlockRegistry,
 }
 
 impl<'q, 'w, 's> WorldWalk<'q, 'w, 's> {
+    fn portal_blocks(&self, cell: IVec3, slot: BlockSlot) -> Option<bool> {
+        let def = self.registry.def(slot);
+        if def.structure.portals.is_empty() {
+            return None;
+        }
+        let (coord, _) = world_to_chunk(cell);
+        let entry = self
+            .chunk_map
+            .0
+            .get(&coord)
+            .and_then(|entity| self.sidecars.get(*entity).ok())
+            .and_then(|side| side.get(cell));
+        let anchor = match entry {
+            Some(EntryKind::Ghost { anchor }) => anchor,
+            _ => cell,
+        };
+        let (coord, _) = world_to_chunk(anchor);
+        let Some(side) = self
+            .chunk_map
+            .0
+            .get(&coord)
+            .and_then(|entity| self.sidecars.get(*entity).ok())
+        else {
+            return Some(true);
+        };
+        let (orientation, open) = match side.get(anchor) {
+            Some(EntryKind::Anchor {
+                orientation,
+                portal_open,
+            }) => (orientation, portal_open),
+            _ => (Default::default(), None),
+        };
+        if def
+            .structure
+            .portals
+            .iter()
+            .enumerate()
+            .any(|(index, portal)| {
+                portal.volume.is_empty()
+                    && !open
+                        .map(|mask| mask & (1 << index) != 0)
+                        .unwrap_or(portal.initially_open)
+                    && portal.faces.iter().any(|face| {
+                        anchor + IVec3::from_array(orientation.rotate_offset(face.cell)) == cell
+                    })
+            })
+        {
+            return Some(true);
+        }
+        let lo = cell.as_vec3() + Vec3::splat(0.001);
+        let hi = cell.as_vec3() + Vec3::splat(0.999);
+        Some(
+            self.registry.collision[slot.0 as usize][orientation as usize]
+                .at(anchor, open)
+                .iter()
+                .any(|bounds| bounds.min.cmplt(hi).all() && bounds.max.cmpgt(lo).all()),
+        )
+    }
     /// Slot occupying `cell`, or `None` when the owning chunk isn't
     /// loaded. Every `Walkability` answer funnels through this so the
     /// unloaded-chunk rule stays in one place.
@@ -1031,6 +1184,9 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
         if slot.is_empty() {
             return false;
         }
+        if let Some(blocks) = self.portal_blocks(cell, slot) {
+            return blocks;
+        }
         // Doors / open gates: solid for room detection (the flood-fill
         // wants them as walls so the room is bounded) but pathing
         // treats them as passable so NPCs walk through rather than
@@ -1040,29 +1196,7 @@ impl<'q, 'w, 's> Walkability for WorldWalk<'q, 'w, 's> {
     }
 
     fn blocks_body(&self, cell: IVec3) -> bool {
-        let Some(slot) = self.slot_at(cell) else {
-            return true;
-        };
-        if slot.is_empty() {
-            return false;
-        }
-        // Nav-passable furniture (beds): the body may occupy the cell,
-        // at a cost — see `cost` below. `is_solid` stays true for these
-        // cells, so they still support standing on top and stop items.
-        let flags = &self.registry.def(slot).flags;
-        !flags.walkable_boundary && !flags.nav_passable
-    }
-
-    fn cost(&self, cell: IVec3) -> f32 {
-        // Occupied nav-passable cells cost extra so A* prefers any
-        // reasonable aisle over cutting through furniture. Future road
-        // tags hook in here without changing the algorithm.
-        match self.slot_at(cell) {
-            Some(slot) if !slot.is_empty() && self.registry.def(slot).flags.nav_passable => {
-                NAV_PASSABLE_COST_MULT
-            }
-            _ => 1.0,
-        }
+        self.is_solid(cell)
     }
 }
 
@@ -1113,8 +1247,10 @@ struct HaulCtx<'w, 's> {
 /// civ too, without busting the SystemParam ceiling.
 #[derive(bevy::ecs::system::SystemParam)]
 struct WorldAnchorsCtx<'w> {
-    rooms: Res<'w, RoomMap>,
-    civilization: Res<'w, crate::civilization::Civilization>,
+    spaces: Res<'w, PublishedSpaces>,
+    capabilities: Res<'w, crate::capabilities::Capabilities>,
+    civilization: Res<'w, crate::settlements::Settlements>,
+    placements: Res<'w, crate::placements::Placements>,
     civ_params: Res<'w, crate::civilization::CivilizationParamsRes>,
 }
 
@@ -1136,6 +1272,7 @@ impl<'w, 's> BrainWorldCtx<'w, 's> {
     fn walk<'a>(&'a self) -> WorldWalk<'a, 'w, 's> {
         WorldWalk {
             chunks: &self.chunks,
+            sidecars: &self.chunk_entities,
             chunk_map: &self.chunk_map,
             registry: &self.block_registry,
         }
@@ -1391,6 +1528,8 @@ fn npc_brain_tick(
     anchors: WorldAnchorsCtx,
     interactable_index: Res<InteractableIndex>,
     mut interaction_claims: ResMut<InteractionClaims>,
+    mut facility_jobs: ResMut<crate::facility_interactions::FacilityInteractions>,
+    mut placements: ResMut<crate::placements::Placements>,
     mut haul: HaulCtx,
     mut craft: CraftCtx,
     mut commands: Commands,
@@ -1405,21 +1544,31 @@ fn npc_brain_tick(
     let block_registry = &world_ctx.block_registry;
     let world_clock = *world_ctx.clock;
 
-    for (
-        entity,
-        npc_id,
-        mut pose,
-        mut needs,
-        mut brain,
-        mut npc_path,
-        mut carrying,
-        mut equipped_tool,
-        kind,
-        stats,
-        is_locked,
-        path_dirty,
-    ) in npcs.iter_mut()
-    {
+    // Reservation races are resolved by stable actor identity, independent of
+    // Bevy archetype/insertion order.
+    let mut npc_order: Vec<_> = npcs
+        .iter_mut()
+        .map(|(entity, id, ..)| (id.0, entity))
+        .collect();
+    npc_order.sort_unstable_by_key(|&(id, _)| id);
+    for (_, entity) in npc_order {
+        let Ok((
+            _,
+            npc_id,
+            mut pose,
+            mut needs,
+            mut brain,
+            mut npc_path,
+            mut carrying,
+            mut equipped_tool,
+            kind,
+            stats,
+            is_locked,
+            path_dirty,
+        )) = npcs.get_mut(entity)
+        else {
+            continue;
+        };
         // Phase 1: decay every subscribed need by its registry-defined
         // rate. Unknown ids decay at 0 (the rate-lookup returns 0) so
         // an NPC carrying a stale need from before a mod reload won't
@@ -1450,6 +1599,58 @@ fn npc_brain_tick(
             }
         }
 
+        if brain.awaiting_construction.is_some() {
+            continue;
+        }
+        let mut interrupted_approach = None;
+        if let Some(job_id) = facility_jobs.active_for(npc_id.0).map(|job| job.id) {
+            // A queued completion owns the actor until the authoritative Update
+            // transaction runs, including frames containing several fixed ticks.
+            if facility_jobs
+                .progress
+                .get(&job_id)
+                .is_some_and(|p| p.completion_queued)
+            {
+                continue;
+            }
+            let still_using = matches!(
+                brain.goal,
+                Goal::Interacting { .. }
+                    | Goal::MoveTo {
+                        on_arrive: ArrivalAction::Interact { .. },
+                        ..
+                    }
+            );
+            if !still_using {
+                facility_jobs.interrupt_actor(
+                    npc_id.0,
+                    "interaction interrupted",
+                    &mut interaction_claims,
+                );
+            } else if facility_jobs
+                .validate_target(job_id, &placements, block_registry, &interaction_claims)
+                .is_err()
+            {
+                interrupted_approach = facility_jobs
+                    .progress
+                    .get(&job_id)
+                    .map(|p| IVec3::from_array(p.approach));
+                facility_jobs.interrupt_actor(
+                    npc_id.0,
+                    "facility changed or reservation lost",
+                    &mut interaction_claims,
+                );
+                if let Goal::Interacting { remaining_secs, .. } = &mut brain.goal {
+                    *remaining_secs = 0.;
+                } else {
+                    brain.goal = Goal::Idle;
+                    npc_path.0.clear();
+                }
+            } else if matches!(brain.goal, Goal::Interacting { .. }) {
+                facility_jobs.working(job_id);
+            }
+        }
+
         // Phase 1.5: preempt check. If any need crossed its data-defined
         // `preempt_threshold` AND the NPC is doing something a survival-
         // aware planner wouldn't pick under critical need (work / haul),
@@ -1458,11 +1659,8 @@ fn npc_brain_tick(
         // Interact, Wander, Goto) — preempting an Interact would yank
         // the NPC off the very action that addresses the need, and
         // preempting Wander/Goto would thrash 60 Hz when no survival
-        // interactable is in range. The mark-preempted flag suppresses
-        // the haul scheduler at the Idle entry below so a freshly-
-        // aborted hauler doesn't get instantly reassigned to another
-        // haul before the planner gets a turn.
-        let mut preempted_this_tick = false;
+        // interactable is in range. New work is selected only by the
+        // planner, so the same decision immediately sees the urgent need.
         brain.preempt_cooldown_secs = (brain.preempt_cooldown_secs - dt).max(0.0);
         if brain.preempt_cooldown_secs <= 0.0 && preempt_eligible(&brain.goal) {
             let crossed = needs.0.iter().find_map(|(id, value)| {
@@ -1478,6 +1676,11 @@ fn npc_brain_tick(
                     value = value,
                     threshold = threshold,
                     "preempt: aborting current goal for survival",
+                );
+                finish_policy_job(
+                    &mut brain,
+                    PolicyJobState::Interrupted,
+                    Some("urgent need interrupted execution"),
                 );
                 // Craft-specific release happens BEFORE the generic
                 // preempt path mutates brain.goal — once goal is
@@ -1520,7 +1723,6 @@ fn npc_brain_tick(
                     // cancel.
                     craft.bookings.release_npc_booking(*npc_id, entity);
                 }
-                preempted_this_tick = true;
                 brain.preempt_cooldown_secs = PREEMPT_RETRY_COOLDOWN_SECS;
             }
         }
@@ -1574,14 +1776,28 @@ fn npc_brain_tick(
                     rest_done = true;
                 }
             }
-            Goal::Interacting { remaining_secs, .. } => {
-                *remaining_secs -= dt;
-                if *remaining_secs <= 0.0 {
-                    interact_completed = true;
-                }
+            Goal::Interacting { .. } => {
+                interact_completed = facility_jobs.active_for(npc_id.0).is_none();
             }
-            Goal::Working { remaining_secs, .. } => {
-                *remaining_secs -= dt;
+            Goal::Working {
+                remaining_secs,
+                target_cell,
+                project_token,
+                ..
+            } => {
+                if haul
+                    .plans
+                    .get(*target_cell)
+                    .is_some_and(|p| p.token() == *project_token)
+                    && haul.plan_claims.holder(*target_cell) == Some(*npc_id)
+                {
+                    haul.plans.edit(target_cell, 0, |p| {
+                        p.progress_secs += dt.min(remaining_secs.max(0.0))
+                    });
+                    *remaining_secs -= dt;
+                } else {
+                    *remaining_secs = 0.0;
+                }
                 if *remaining_secs <= 0.0 {
                     work_done = true;
                 }
@@ -1712,17 +1928,11 @@ fn npc_brain_tick(
                 ..
             } = &action
             {
-                let still_interactable = {
-                    let (coord, local) = world_to_chunk(*target_cell);
-                    chunk_map
-                        .0
-                        .get(&coord)
-                        .and_then(|&e| chunks.get(e).ok())
-                        .map(|chunk| chunk.get(local))
-                        .filter(|slot| !slot.is_empty())
-                        .map(|slot| block_registry.def(slot).interactable.is_some())
-                        .unwrap_or(false)
-                };
+                let still_interactable = facility_jobs.active_for(npc_id.0).is_some_and(|job| {
+                    facility_jobs
+                        .validate_target(job.id, &placements, block_registry, &interaction_claims)
+                        .is_ok()
+                });
                 if !still_interactable {
                     info!(
                         npc = npc_id.0,
@@ -1763,6 +1973,7 @@ fn npc_brain_tick(
                     };
                 }
                 ArrivalAction::Work {
+                    project_token,
                     duration_secs,
                     target_cell,
                     plan_kind,
@@ -1772,7 +1983,11 @@ fn npc_brain_tick(
                     // while we walked over — the mod-api contract says
                     // a cancelled plan's work completes silently, so
                     // don't start the timer against a stale snapshot.
-                    if haul.plans.kind(target_cell) != Some(plan_kind) {
+                    if haul
+                        .plans
+                        .get(target_cell)
+                        .is_none_or(|p| p.token() != project_token)
+                    {
                         info!(
                             npc = npc_id.0,
                             cell = ?target_cell.to_array(),
@@ -1783,7 +1998,10 @@ fn npc_brain_tick(
                         continue;
                     }
                     brain.goal = Goal::Working {
-                        remaining_secs: duration_secs,
+                        project_token,
+                        remaining_secs: (duration_secs
+                            - haul.plans.get(target_cell).map_or(0.0, |p| p.progress_secs))
+                        .max(0.0),
                         target_cell,
                         plan_kind,
                         need_restore,
@@ -1903,7 +2121,18 @@ fn npc_brain_tick(
                             continue;
                         }
                     };
-                    let accepted = haul.plans.deposit(plan_cell, carry_item, carry_count);
+                    let token = haul
+                        .plans
+                        .get(plan_cell)
+                        .map(|project| project.token())
+                        .unwrap_or((0, 0));
+                    let accepted = crate::construction::transfer_carried_materials(
+                        &mut haul.plans,
+                        plan_cell,
+                        token,
+                        &mut carrying,
+                        carry_count,
+                    );
                     if accepted == 0 {
                         // Plan no longer needs this kind (another
                         // hauler or the player filled it between
@@ -1922,18 +2151,7 @@ fn npc_brain_tick(
                         brain.goal = Goal::Idle;
                         continue;
                     }
-                    {
-                        carrying.count = carry_count - accepted;
-                        if carrying.count == 0 {
-                            carrying.item = None;
-                        }
-                        info!(
-                            npc = npc_id.0,
-                            cell = ?plan_cell.to_array(),
-                            accepted,
-                            "haul deposit complete",
-                        );
-                    }
+
                     // Decide what's next. After a deposit the queue
                     // may still have items (multi-trip haul); a
                     // plan-satisfied state ends the assignment.
@@ -1998,11 +2216,7 @@ fn npc_brain_tick(
                         .stations
                         .get(station_cell)
                         .map(|s| {
-                            if !s.can_deposit_with_refund_reserve(
-                                carry_item,
-                                &craft.recipes,
-                                &haul.item_registry,
-                            ) {
+                            if !s.can_deposit_with_refund_reserve(carry_item, carry_count) {
                                 return 0;
                             }
                             crate::haul::compute_station_demand(
@@ -2026,13 +2240,14 @@ fn npc_brain_tick(
                         brain.goal = Goal::Idle;
                         continue;
                     }
-                    let accepted = want.min(carry_count);
-                    craft.stations.edit_or_insert(station_cell, |state| {
-                        state.deposit(carry_item, accepted);
+                    let amount = want.min(carry_count);
+                    let accepted = craft.stations.edit_or_insert(station_cell, |state| {
+                        state.transfer_from_carry(&mut carrying, amount)
                     });
-                    carrying.count = carry_count - accepted;
-                    if carrying.count == 0 {
-                        carrying.item = None;
+                    if accepted == 0 {
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
                     }
                     info!(
                         npc = npc_id.0,
@@ -2160,7 +2375,12 @@ fn npc_brain_tick(
                         continue;
                     }
                     let want = reserved_count.min(available);
-                    let taken = carrying.pickup_many(item_slot, want, cap);
+                    let taken = haul
+                        .containers
+                        .edit_existing(cell, |state| {
+                            state.transfer_to_carry(&mut carrying, item_slot, want, cap)
+                        })
+                        .unwrap_or(0);
                     if taken == 0 {
                         info!(
                             npc = npc_id.0,
@@ -2169,17 +2389,6 @@ fn npc_brain_tick(
                         haul.store.release_for_npc(*npc_id);
                         brain.goal = Goal::Idle;
                         continue;
-                    }
-                    {
-                        let Some(()) = haul.containers.edit_existing(cell, |state| {
-                            state.withdraw_up_to(item_slot, taken);
-                        }) else {
-                            // Checked non-empty above; unreachable in
-                            // practice, but don't panic on a race.
-                            haul.store.release_for_npc(*npc_id);
-                            brain.goal = Goal::Idle;
-                            continue;
-                        };
                     }
                     haul.containers.remove_if_empty(cell);
                     info!(
@@ -2256,12 +2465,13 @@ fn npc_brain_tick(
                         brain.goal = Goal::Idle;
                         continue;
                     }
-                    haul.containers.edit_or_insert(cell, |state| {
-                        state.deposit(carry_item, accepted);
+                    let accepted = haul.containers.edit_or_insert(cell, |state| {
+                        state.transfer_from_carry(&mut carrying, accepted, cfg, &haul.item_registry)
                     });
-                    carrying.count = carry_count - accepted;
-                    if carrying.count == 0 {
-                        carrying.item = None;
+                    if accepted == 0 {
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
                     }
                     info!(
                         npc = npc_id.0,
@@ -2319,8 +2529,25 @@ fn npc_brain_tick(
                         .unwrap_or(pose.translation);
                     // Swap into tool slot. Same logic as the player
                     // pickup path.
-                    let displaced = equipped_tool.item.replace(item_slot);
-                    commands.entity(item_entity).despawn();
+                    let count = haul
+                        .world_items
+                        .get(item_entity)
+                        .map(|(_, wi)| wi.count)
+                        .unwrap_or(0);
+                    let Some((remaining, displaced)) =
+                        crate::item_placement::exchange_tool(&mut equipped_tool, item_slot, count)
+                    else {
+                        haul.store.release_for_npc(*npc_id);
+                        brain.goal = Goal::Idle;
+                        continue;
+                    };
+                    crate::server::shrink_or_despawn_stack(
+                        &mut commands,
+                        item_entity,
+                        item_slot,
+                        pickup_pos,
+                        remaining,
+                    );
                     info!(
                         npc = npc_id.0,
                         new_tool = item_slot.0,
@@ -2396,17 +2623,27 @@ fn npc_brain_tick(
                             .unwrap_or(false)
                         && craft.bookings.worker_at(station_cell).is_none();
                     let started = if resumable {
-                        craft.bookings.register_worker(station_cell, entity);
+                        let registered = craft
+                            .bookings
+                            .resume_job(
+                                station_cell,
+                                crate::craft_stations::WorkerAuthority::npc(entity, *npc_id),
+                                craft
+                                    .stations
+                                    .get(station_cell)
+                                    .expect("observed paused work"),
+                            )
+                            .is_ok();
                         info!(
                             npc = npc_id.0,
                             station = ?station_cell.to_array(),
                             "craft arrival: resuming paused in-progress work",
                         );
-                        true
+                        registered
                     } else if let Some(station_def) = station_def {
                         crate::craft_stations::try_start_first_satisfiable_order(
                             station_cell,
-                            entity,
+                            crate::craft_stations::WorkerAuthority::npc(entity, *npc_id),
                             equipped_tool.item,
                             &station_def,
                             crate::craft_stations::CraftStartContext {
@@ -2502,6 +2739,13 @@ fn npc_brain_tick(
             }
         }
         if move_abandoned || rest_done {
+            if move_abandoned {
+                finish_policy_job(
+                    &mut brain,
+                    PolicyJobState::Failed,
+                    Some("movement failed or timed out"),
+                );
+            }
             brain.goal = Goal::Idle;
             if !npc_path.0.is_empty() {
                 npc_path.0.clear();
@@ -2511,194 +2755,54 @@ fn npc_brain_tick(
         // the matching per-action branch; consumed by the generic
         // post-interaction block (eject + kinematic unlock + Idle).
         let mut interact_done: Option<IVec3> = None;
-        if interact_completed {
-            // Generic completion path for every interactable. Apply
-            // the captured need delta if any, release the claim if
-            // the block was exclusive. Captured values come from the
-            // planner snapshot — if the block was broken or replaced
-            // between commit and completion, "did the action against
-            // a stale snapshot" is the consistent outcome at every
-            // upstream layer, and we still credit the NPC for
-            // sticking it out.
-            // Capture the bits we need before mutating brain.home_cluster
-            // below — &brain.goal borrows the brain.
-            let mut sleep_cell: Option<IVec3> = None;
-            if let Goal::Interacting {
-                need_restore,
-                anchor_cell,
-                target_cell,
-                exclusive,
-                ..
-            } = &brain.goal
-            {
-                let need_restore = need_restore.clone();
-                let anchor_cell = *anchor_cell;
-                let target_cell = *target_cell;
-                let exclusive = *exclusive;
-
-                // Resolve the block we just used; finite-food behaviour
-                // keys off its def. A container-backed interactable (a
-                // food basket) draws stock down; a `depleted_block`
-                // interactable (a berry bush) self-consumes. These are
-                // mutually exclusive in vanilla — a block is one or the
-                // other — so they're handled independently below.
-                let (is_container, depleted) = match world.slot_at(target_cell) {
-                    Some(s) if !s.is_empty() => {
-                        let d = block_registry.def(s);
-                        (d.container.is_some(), d.depleted_block.is_some())
-                    }
-                    _ => (false, false),
-                };
-
-                // S4 finite food: eating from a container withdraws one
-                // unit of stock. If it emptied between planning and now
-                // (another villager took the last berry), the eat
-                // restores nothing — "empty basket = no restore." A
-                // successful withdraw broadcasts the new stock so the
-                // client inspect panel + planner stay in sync.
-                let mut restore_ok = true;
-                if is_container {
-                    restore_ok = false;
-                    if let Some(Some(())) = haul.containers.edit_existing(target_cell, |state| {
-                        let food = state.any_stocked()?;
-                        (state.withdraw_up_to(food, 1) == 1).then_some(())
-                    }) {
-                        restore_ok = true;
-                        haul.containers.remove_if_empty(target_cell);
-                    }
-                }
-
-                if restore_ok {
-                    if let Some(nr) = &need_restore {
-                        if let Some(value) = needs.0.get_mut(&nr.need) {
-                            *value = (*value - nr.restores).max(0.0);
-                            info!(
-                                npc = npc_id.0,
-                                need = %nr.need,
-                                restored = nr.restores,
-                                remaining_deficit = *value,
-                                "interaction complete",
-                            );
-                        } else {
-                            warn!(
-                                npc = npc_id.0,
-                                need = %nr.need,
-                                "interaction complete but NPC has no entry for need; ignoring",
-                            );
-                        }
-                        // Provisional home-cluster claim: finishing a
-                        // sleep anywhere claims the cluster that owns
-                        // that cell. Match is by need id ("sleep"), not
-                        // block kind, so any future sleep-restoring
-                        // interactable counts.
-                        if nr.need == "sleep" {
-                            sleep_cell = Some(target_cell);
-                        }
-                    } else {
-                        info!(
-                            npc = npc_id.0,
-                            target = ?target_cell.to_array(),
-                            "interaction complete (no need change)",
-                        );
-                    }
-                } else {
-                    info!(
-                        npc = npc_id.0,
-                        cell = ?target_cell.to_array(),
-                        "interaction complete against an empty container; no restore",
-                    );
-                }
-
-                // S4 forage: eating a self-consuming interactable (berry
-                // bush) depletes it to its bare form. No drops — the
-                // villager ate the berries — so it can't reuse the
-                // harvest path; a server system does the in-place swap.
-                if depleted {
-                    commands.write_message(NpcConsumedInteractable { cell: target_cell });
-                }
-
-                if exclusive {
-                    interaction_claims.release(anchor_cell, *npc_id);
-                }
-                interact_done = Some(target_cell);
-            }
-            if let Some(cell) = sleep_cell
-                && let Some(cluster) = anchors
-                    .civilization
-                    .cluster_containing_cell(cell, &anchors.rooms)
-            {
-                if brain.home_cluster != Some(cluster) {
-                    info!(
-                        npc = npc_id.0,
-                        cluster = cluster.0,
-                        cell = ?cell.to_array(),
-                        "claimed home cluster on sleep",
-                    );
-                }
-                brain.home_cluster = Some(cluster);
-            }
+        if interact_completed && let Goal::Interacting { target_cell, .. } = brain.goal {
+            interact_done = Some(target_cell);
         }
         if work_done {
-            // Action-specific completion: apply restore, release
-            // the plan claim, emit the world-mutation message.
-            // Generic post-action handling runs below. `need_restore`
-            // was captured at goal commit from the targeted block's
-            // `work_action` or the engine-wide `WorkDefaults` — a
-            // mod that wants per-block payoff scales it from there.
+            // Queue both the world edit and its benefit. Neither a timer nor a
+            // canceled project may publish success before the service commits.
             if let Goal::Working {
+                project_token,
                 target_cell,
                 plan_kind,
                 need_restore,
                 ..
             } = &brain.goal
             {
-                if let Some(nr) = need_restore {
-                    if let Some(value) = needs.0.get_mut(&nr.need) {
-                        *value = (*value - nr.restores).max(0.0);
-                        info!(
-                            npc = npc_id.0,
-                            cell = ?target_cell.to_array(),
-                            kind = ?plan_kind,
-                            need = %nr.need,
-                            restored = nr.restores,
-                            remaining_deficit = *value,
-                            "work complete",
-                        );
-                    } else {
-                        warn!(
-                            npc = npc_id.0,
-                            need = %nr.need,
-                            "work complete but NPC has no entry for need; ignoring",
-                        );
-                    }
-                } else {
-                    info!(
-                        npc = npc_id.0,
-                        cell = ?target_cell.to_array(),
-                        kind = ?plan_kind,
-                        "work complete (no need change)",
-                    );
-                }
-                // Cancelled mid-work → the effort still counts (the
-                // need restore above already applied) but the world
-                // mutation must NOT happen: "cancel cancels" is the
-                // player-facing contract, and a Remove plan firing
-                // after its tag was cleared destroys a block the
-                // player decided to keep.
-                if haul.plans.kind(*target_cell) == Some(*plan_kind) {
+                if haul
+                    .plans
+                    .get(*target_cell)
+                    .is_some_and(|p| p.token() == *project_token)
+                {
                     commands.write_message(NpcWorkCompleted {
+                        project_token: *project_token,
+                        worker: *npc_id,
                         cell: *target_cell,
                         plan_kind: *plan_kind,
+                        need_restore: need_restore.clone(),
                     });
                 } else {
                     info!(
                         npc = npc_id.0,
                         cell = ?target_cell.to_array(),
-                        "work complete but plan was cancelled; completing silently",
+                        "work interrupted because the project was canceled or replaced",
                     );
                 }
-                haul.plan_claims.release(*target_cell, *npc_id);
+                let token = *project_token;
                 interact_done = Some(*target_cell);
+                if haul
+                    .plans
+                    .get(*target_cell)
+                    .is_some_and(|p| p.token() == token)
+                {
+                    brain.awaiting_construction = Some(token);
+                } else {
+                    finish_policy_job(
+                        &mut brain,
+                        PolicyJobState::Interrupted,
+                        Some("project canceled or replaced"),
+                    );
+                }
             }
         }
         // Generic post-interaction cleanup. Eject + unlock happen
@@ -2719,7 +2823,17 @@ fn npc_brain_tick(
                     resolve_anchor_with_orientation(target_cell, chunk_entities_q, chunk_map);
                 if !try_eject_to_cells(
                     &mut pose,
-                    eject_candidates_for_slot(slot.as_ref(), anchor_cell, orientation),
+                    interrupted_approach
+                        .map(|cell| vec![cell])
+                        .or_else(|| {
+                            facility_jobs
+                                .active_for(npc_id.0)
+                                .and_then(|job| facility_jobs.progress.get(&job.id))
+                                .map(|progress| vec![IVec3::from_array(progress.approach)])
+                        })
+                        .unwrap_or_else(|| {
+                            eject_candidates_for_slot(slot.as_ref(), anchor_cell, orientation)
+                        }),
                     &world,
                 ) {
                     warn!(
@@ -2745,8 +2859,40 @@ fn npc_brain_tick(
                 "crafting complete or interrupted; releasing station",
             );
             brain.goal = Goal::Idle;
+            finish_policy_job(
+                &mut brain,
+                PolicyJobState::Interrupted,
+                Some("craft worker released or order canceled"),
+            );
+        }
+        if brain.awaiting_construction.is_some() {
+            continue;
         }
         if matches!(brain.goal, Goal::Idle) {
+            if brain.active_policy_job.is_some()
+                && !haul.store.has_assignment(*npc_id)
+                && !craft.bookings.contains_npc(*npc_id)
+            {
+                finish_policy_job(
+                    &mut brain,
+                    PolicyJobState::Failed,
+                    Some("job ended without an authoritative completion"),
+                );
+            }
+            if let Some(id) = facility_jobs.active_for(npc_id.0).map(|job| job.id) {
+                if facility_jobs
+                    .progress
+                    .get(&id)
+                    .is_some_and(|p| p.completion_queued)
+                {
+                    continue;
+                }
+                facility_jobs.interrupt_actor(
+                    npc_id.0,
+                    "interaction ended before completion",
+                    &mut interaction_claims,
+                );
+            }
             // Self-rescue: if the NPC's pose isn't standable, A* will
             // bail on every goal the planner picks and we'll loop
             // forever emitting `reason=start_unstandable`. This
@@ -2786,130 +2932,9 @@ fn npc_brain_tick(
                     }
                 }
             }
-            // Phase 6c-A: craft scheduler runs BEFORE haul. "Skills
-            // first, hauling fallback" — an NPC who can do useful work
-            // at a nearby station (inventory satisfies an order, tool
-            // matches) takes that work in preference to hauling
-            // materials around. This delivers the user's natural-
-            // fallout requirement: free NPCs do skilled work when
-            // workable; only idle-skilled-NPCs fall back to hauling.
-            if !preempted_this_tick
-                && !craft.bookings.contains_npc(*npc_id)
-                && !haul.store.has_assignment(*npc_id)
-                && let Some(station_cell) = crate::craft_stations::try_schedule_craft_for_npc(
-                    *npc_id,
-                    pose.translation,
-                    &equipped_tool,
-                    &craft.stations,
-                    &mut craft.bookings,
-                    block_registry,
-                    &craft.recipes,
-                    &haul.item_registry,
-                    chunks,
-                    chunk_map,
-                )
-            {
-                // Walk to a standable neighbour of the station block.
-                // Station cells are solid (the workbench itself), so
-                // the path target is one of the surrounding floor
-                // cells. Same pattern as the WorkPlan dispatch below.
-                let foot = pose_to_standable_foot(&pose, &world)
-                    .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                let stand_cell = nearest_standable_neighbor(station_cell, foot, &world);
-                let path = stand_cell.and_then(|stand| {
-                    if stand == foot {
-                        Some(vec![foot])
-                    } else {
-                        find_path(foot, stand, &world, ASTAR_NODE_BUDGET, ASTAR_PATH_BUDGET)
-                            .map(|raw| smooth_path(raw, &world))
-                            .filter(|p| !p.is_empty())
-                    }
-                });
-                match path {
-                    Some(path) if path.len() >= 2 => {
-                        npc_path.set_if_neq(NpcPath(path.clone()));
-                        brain.goal = Goal::move_to(
-                            path,
-                            60.0,
-                            ArrivalAction::WorkStation { station_cell },
-                            None,
-                        );
-                        continue;
-                    }
-                    Some(_) => {
-                        // Already adjacent to the station — skip the
-                        // walk, jump straight to the arrival handler
-                        // by synthesising a one-cell path. Same trick
-                        // the WorkPlan path uses when foot == stand.
-                        if !npc_path.0.is_empty() {
-                            npc_path.0.clear();
-                        }
-                        brain.goal = Goal::move_to(
-                            vec![foot],
-                            1.0,
-                            ArrivalAction::WorkStation { station_cell },
-                            None,
-                        );
-                        continue;
-                    }
-                    None => {
-                        // No standable neighbour or A* failed.
-                        // Release the booking; next tick may find a
-                        // different station or fall through to haul.
-                        info!(
-                            npc = npc_id.0,
-                            station = ?station_cell.to_array(),
-                            "craft commit: no path to station; releasing booking",
-                        );
-                        craft.bookings.release_npc_booking(*npc_id, entity);
-                        brain.goal = Goal::Resting {
-                            remaining_secs: MIN_REST_SECS,
-                        };
-                        continue;
-                    }
-                }
-            }
-            // Per-NPC haul matchmaker runs here (NOT a standalone
-            // system) because the brain tick is monolithic — an NPC
-            // transitions Idle → next-goal in one iteration, so a
-            // standalone scheduler in Update would never observe
-            // Goal::Idle. Calling per-NPC at the Idle moment is the
-            // only place where the scheduler can catch an unassigned
-            // NPC. Cheap: one O(items) index build + one O(plans)
-            // scan. Runs for *any* NPC without an existing
-            // assignment, including ones with non-empty carry — the
-            // matcher's deposit-only branch handles that case
-            // (save/load mid-haul, hand-offs from future systems).
-            //
-            // Skipped on a tick where preempt fired: a hauler that just
-            // peeled off for survival would otherwise be instantly
-            // reassigned to another haul before the planner could
-            // route them to food/sleep.
-            if !preempted_this_tick && !haul.store.has_assignment(*npc_id) {
-                crate::haul::try_schedule_haul_for_npc(
-                    *npc_id,
-                    &kind.0,
-                    pose.translation,
-                    &carrying,
-                    &equipped_tool,
-                    &haul.kind_registry,
-                    &haul.plans,
-                    &craft.stations,
-                    block_registry,
-                    &haul.item_registry,
-                    &craft.recipes,
-                    chunks,
-                    chunk_map,
-                    &haul.world_items,
-                    &haul.storage,
-                    &haul.containers,
-                    &haul.container_index,
-                    &mut haul.store,
-                    now_secs,
-                );
-            }
-            // Engine-driven haul takes priority over the Lua planner.
-            // If the scheduler (above, or a previous tick) queued an
+            // An accepted haul continues under engine authority until it reaches
+            // a terminal state. Candidate enumeration below never reserves work.
+            // If a previous policy decision queued an
             // assignment for this NPC, plan the first leg directly
             // and skip the planner call. The planner sees
             // `pending_assignments` in its snapshot when it is called
@@ -2940,14 +2965,18 @@ fn npc_brain_tick(
                 }
             }
             let kind_id = NpcKindId(kind.0.clone());
-            let snapshot = build_snapshot(
+            let mut snapshot = build_snapshot(
                 *npc_id,
                 &kind_id,
                 &pose,
                 &needs,
                 stats,
                 &equipped_tool,
-                &anchors.rooms,
+                &anchors.spaces,
+                &anchors.capabilities,
+                &anchors.placements,
+                &anchors.civilization,
+                &haul.kind_registry,
                 &interactable_index,
                 &interaction_claims,
                 &haul.containers,
@@ -2963,6 +2992,21 @@ fn npc_brain_tick(
                 world_clock,
                 now_secs,
             );
+            populate_job_candidates(
+                &mut snapshot,
+                *npc_id,
+                kind,
+                &pose,
+                &carrying,
+                &equipped_tool,
+                &haul,
+                &craft,
+                chunks,
+                chunk_map,
+                block_registry,
+                now_secs,
+            );
+
             // One-line per-NPC trace at every planner call so a
             // session log shows what each NPC saw on each decision.
             // Includes every need-id the snapshot carries (vanilla:
@@ -2983,10 +3027,13 @@ fn npc_brain_tick(
                 work = ?need_work,
                 nearby_plans = snapshot.nearby_plans.len(),
                 nearby_interactions = snapshot.nearby_interactions.len(),
-                nearby_rooms = snapshot.nearby_rooms.len(),
+                nearby_spaces = snapshot.nearby_spaces.len(),
                 "planner snapshot",
             );
-            let planner_goal = match mods.0.call_planner(&kind_id, &snapshot) {
+            let mut planner_goal = match deliver_policy_feedback(&mut brain, |results| {
+                snapshot.job_results = results.to_vec();
+                mods.0.call_planner(&kind_id, &snapshot)
+            }) {
                 Ok(Some(g)) => g,
                 Ok(None) => native_fallback_goal(),
                 Err(e) => {
@@ -3012,6 +3059,204 @@ fn npc_brain_tick(
                     continue;
                 }
             };
+            if let PlannerGoal::TakeJob {
+                candidate_id,
+                revision,
+            } = &planner_goal
+            {
+                let selected = snapshot
+                    .job_candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate.id == *candidate_id
+                            && candidate.revision == *revision
+                            && candidate.available
+                    })
+                    .cloned();
+                let Some(selected) = selected else {
+                    brain.policy_results.push(PolicyJobResult {
+                        candidate_id: candidate_id.clone(),
+                        revision: *revision,
+                        state: PolicyJobState::Rejected,
+                        reason: Some(
+                            "candidate is stale, unavailable, or was not enumerated".into(),
+                        ),
+                    });
+                    brain.goal = Goal::Resting {
+                        remaining_secs: MIN_REST_SECS,
+                    };
+                    continue;
+                };
+
+                match selected.class {
+                    JobClass::Construction => {
+                        brain.policy_results.push(PolicyJobResult {
+                            candidate_id: selected.id.clone(),
+                            revision: selected.revision,
+                            state: PolicyJobState::Accepted,
+                            reason: None,
+                        });
+                        brain.active_policy_job = Some((selected.id, selected.revision));
+                        planner_goal = PlannerGoal::WorkPlan {
+                            cell: selected.target,
+                            timeout_secs: MAX_WORK_TIMEOUT_SECS,
+                        };
+                    }
+                    JobClass::Crafting => {
+                        let expected =
+                            IVec3::new(selected.target.x, selected.target.y, selected.target.z);
+                        let scheduled = crate::craft_stations::try_schedule_craft_for_npc(
+                            *npc_id,
+                            pose.translation,
+                            &equipped_tool,
+                            &craft.stations,
+                            &mut craft.bookings,
+                            block_registry,
+                            &craft.recipes,
+                            &haul.item_registry,
+                            chunks,
+                            chunk_map,
+                        );
+                        if scheduled != Some(expected) {
+                            craft.bookings.release_npc_booking(*npc_id, entity);
+                            brain.policy_results.push(PolicyJobResult {
+                                candidate_id: selected.id,
+                                revision: selected.revision,
+                                state: PolicyJobState::Rejected,
+                                reason: Some(
+                                    "craft station changed or lost its reservation".into(),
+                                ),
+                            });
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            continue;
+                        }
+                        let foot = pose_to_standable_foot(&pose, &world)
+                            .unwrap_or_else(|| pose_to_foot_cell(&pose));
+                        let path =
+                            nearest_standable_neighbor(expected, foot, &world).and_then(|stand| {
+                                if stand == foot {
+                                    Some(vec![foot])
+                                } else {
+                                    find_path(
+                                        foot,
+                                        stand,
+                                        &world,
+                                        ASTAR_NODE_BUDGET,
+                                        ASTAR_PATH_BUDGET,
+                                    )
+                                    .map(|raw| smooth_path(raw, &world))
+                                    .filter(|path| !path.is_empty())
+                                }
+                            });
+                        let Some(path) = path else {
+                            craft.bookings.release_npc_booking(*npc_id, entity);
+                            brain.policy_results.push(PolicyJobResult {
+                                candidate_id: selected.id,
+                                revision: selected.revision,
+                                state: PolicyJobState::Failed,
+                                reason: Some("no route to craft station".into()),
+                            });
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            continue;
+                        };
+                        brain.policy_results.push(PolicyJobResult {
+                            candidate_id: selected.id.clone(),
+                            revision: selected.revision,
+                            state: PolicyJobState::Accepted,
+                            reason: None,
+                        });
+                        brain.active_policy_job = Some((selected.id, selected.revision));
+                        npc_path.set_if_neq(NpcPath(path.clone()));
+                        brain.goal = Goal::move_to(
+                            path,
+                            60.0,
+                            ArrivalAction::WorkStation {
+                                station_cell: expected,
+                            },
+                            None,
+                        );
+                        continue;
+                    }
+                    JobClass::Hauling => {
+                        let accepted =
+                            crate::haul::try_schedule_haul_for_npc(
+                                *npc_id,
+                                &kind.0,
+                                pose.translation,
+                                &carrying,
+                                &equipped_tool,
+                                &haul.kind_registry,
+                                &haul.plans,
+                                &craft.stations,
+                                block_registry,
+                                &haul.item_registry,
+                                &craft.recipes,
+                                chunks,
+                                chunk_map,
+                                &haul.world_items,
+                                &haul.storage,
+                                &haul.containers,
+                                &haul.container_index,
+                                &mut haul.store,
+                                now_secs,
+                            ) && haul.store.assignment_of(*npc_id).is_some_and(|assignment| {
+                                assignment.target.cell()
+                                    == IVec3::new(
+                                        selected.target.x,
+                                        selected.target.y,
+                                        selected.target.z,
+                                    )
+                            });
+                        if !accepted {
+                            haul.store.release_for_npc(*npc_id);
+                            brain.policy_results.push(PolicyJobResult {
+                                candidate_id: selected.id,
+                                revision: selected.revision,
+                                state: PolicyJobState::Rejected,
+                                reason: Some(
+                                    "haul sources or target changed before reservation".into(),
+                                ),
+                            });
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                            continue;
+                        }
+                        brain.policy_results.push(PolicyJobResult {
+                            candidate_id: selected.id.clone(),
+                            revision: selected.revision,
+                            state: PolicyJobState::Accepted,
+                            reason: None,
+                        });
+                        brain.active_policy_job = Some((selected.id, selected.revision));
+                        if !continue_haul_or_release(
+                            *npc_id,
+                            kind,
+                            now_secs,
+                            &pose,
+                            &carrying,
+                            &mut brain,
+                            &mut npc_path,
+                            &mut haul.store,
+                            &haul.plans,
+                            &haul.kind_registry,
+                            &haul.item_registry,
+                            &craft.stations,
+                            &craft.recipes,
+                            &world,
+                        ) {
+                            brain.goal = Goal::Resting {
+                                remaining_secs: MIN_REST_SECS,
+                            };
+                        }
+                        continue;
+                    }
+                }
+            }
             // Single-line summary of what the planner *chose*, paired
             // with the "planner snapshot" log just above. Distinguishes
             // between the planner's primitive kinds (Idle/Rest/Wander/
@@ -3026,6 +3271,7 @@ fn npc_brain_tick(
                 PlannerGoal::Goto { .. } => "Goto",
                 PlannerGoal::Interact { .. } => "Interact",
                 PlannerGoal::WorkPlan { .. } => "WorkPlan",
+                PlannerGoal::TakeJob { .. } => "TakeJob",
                 PlannerGoal::SleepGround { .. } => "SleepGround",
             };
             let chosen_target: Option<BlockPos> = match &planner_goal {
@@ -3045,6 +3291,9 @@ fn npc_brain_tick(
             // arm a timer. Clamps protect against a misbehaving
             // planner returning absurd values.
             match planner_goal {
+                PlannerGoal::TakeJob { .. } => {
+                    unreachable!("take_job is resolved before execution")
+                }
                 PlannerGoal::Idle => {
                     // "Ask me again soon", not "ask me every tick" —
                     // arm a minimum rest so the planner-call cadence
@@ -3098,13 +3347,19 @@ fn npc_brain_tick(
                     // cluster's inflated bbox so they don't drift across
                     // the map. A dangling claim (cluster pruned after
                     // its last room was destroyed) lazy-clears here.
-                    let home_bbox = match brain.home_cluster {
+                    let home_bbox = match brain.home_facility {
                         Some(id) => {
                             let inflated = anchors
                                 .civilization
-                                .cluster_bbox_inflated(id, anchors.civ_params.0.buffer_cells);
-                            if inflated.is_none() {
-                                brain.home_cluster = None;
+                                .bounds_for_facility(id, anchors.civ_params.0.buffer_cells);
+                            if anchors
+                                .placements
+                                .records
+                                .get(&id)
+                                .is_none_or(|record| !record.active)
+                                || (inflated.is_none() && !anchors.civilization.pending)
+                            {
+                                brain.home_facility = None;
                             }
                             inflated
                         }
@@ -3147,17 +3402,9 @@ fn npc_brain_tick(
                     let foot = pose_to_standable_foot(&pose, &world)
                         .unwrap_or_else(|| pose_to_foot_cell(&pose));
                     let planner_target = IVec3::new(cell.x, cell.y, cell.z);
-                    // If the planner picked the floor anchor of a known
-                    // room, jitter to *any* floor cell of that room.
-                    // Stops every villager visiting the same building
-                    // from converging on one tile and tripping the new
-                    // actor-vs-actor collision into a stampede. For
-                    // out-of-room Gotos (raw waypoint cells) the helper
-                    // returns None and the planner cell is used as-is.
-                    let target = anchors
-                        .rooms
-                        .random_floor_cell_in_same_room(planner_target, rand_unit(&mut brain.rng))
-                        .unwrap_or(planner_target);
+                    // A policy-selected waypoint is exact. Facility intents
+                    // reserve their own authored approaches through the service.
+                    let target = planner_target;
                     // Already at the target: the planner picked a cell
                     // the NPC's already standing on (typically the
                     // anchor of the room they're currently in). Drop
@@ -3206,98 +3453,80 @@ fn npc_brain_tick(
                 PlannerGoal::Interact { cell, timeout_secs } => {
                     let timeout = timeout_secs.clamp(1.0, MAX_INTERACT_TIMEOUT_SECS);
                     let target_cell = IVec3::new(cell.x, cell.y, cell.z);
-                    // Re-resolve the block on current world state +
-                    // pull its `interactable` and optional `use_slot`.
-                    // Action-agnostic: the engine doesn't ask whether
-                    // the block "is a bed" vs "is a basket," only what
-                    // the def's metadata says about claim semantics,
-                    // duration, and need delta.
-                    let Some((interactable, slot, def_id)) = interactable_with_slot_at_cell(
-                        target_cell,
-                        chunks,
-                        chunk_map,
+                    let (anchor_cell, orientation) =
+                        resolve_anchor_with_orientation(target_cell, chunk_entities_q, chunk_map);
+                    let Some(block) = world.slot_at(anchor_cell).filter(|slot| !slot.is_empty())
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = placements.index_existing(
+                        anchor_cell,
+                        block,
+                        orientation,
                         block_registry,
-                    ) else {
-                        info!(
-                            npc = npc_id.0,
-                            target = ?target_cell.to_array(),
-                            "interact target no longer interactable; parking briefly",
-                        );
+                        |cell| world.slot_at(cell),
+                    ) {
+                        warn!(%error,"interaction placement unavailable");
+                        continue;
+                    }
+                    let Some(placement) = placements.at(anchor_cell) else {
+                        continue;
+                    };
+                    let def = block_registry.def(block);
+                    let Some((named,action_key,action))=block_registry.architecture[usize::from(block.0)][orientation as usize].slots.iter().find_map(|slot|slot.interactions.iter().find_map(|key|match def.facility_actions.get(key) {Some(action @ block_junk_mod_api::architecture::FacilityAction::Timed{..})=>Some((slot,key,action)),_=>None})) else {continue;};
+                    let block_junk_mod_api::architecture::FacilityAction::Timed {
+                        duration_secs,
+                        need_restore,
+                        ..
+                    } = action
+                    else {
+                        unreachable!()
+                    };
+                    let foot = pose_to_standable_foot(&pose, &world)
+                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
+                    let Some((stand_cell, snap)) =
+                        crate::facility_interactions::approach(named, anchor_cell, foot, &world)
+                    else {
                         brain.goal = Goal::Resting {
                             remaining_secs: MIN_REST_SECS,
                         };
                         continue;
                     };
-                    // Anchor is the claim key for exclusive blocks
-                    // (multi-cell entities contend on one slot).
-                    // Orientation rotates both `use_slot.approach`
-                    // and `use_slot.pose` into world space.
-                    let (anchor_cell, orientation) =
-                        resolve_anchor_with_orientation(target_cell, chunk_entities_q, chunk_map);
-                    // Atomic claim — only attempted for exclusive
-                    // blocks. Non-exclusive interactions (food on a
-                    // shelf, water at a well) don't contend; a
-                    // queue of NPCs can use them in parallel from
-                    // different cells.
-                    if interactable.exclusive && !interaction_claims.try_claim(anchor_cell, *npc_id)
-                    {
-                        info!(
-                            npc = npc_id.0,
-                            target = ?target_cell.to_array(),
-                            anchor = ?anchor_cell.to_array(),
-                            block = %def_id,
-                            "exclusive interact target taken by another NPC; parking briefly",
-                        );
+                    let owner =
+                        block_junk_mod_api::authority::ReservationOwner::Npc { id: npc_id.0 };
+                    if let Err(error) = facility_jobs.prepare(
+                        crate::facility_interactions::InteractionRequest {
+                            placement,
+                            slot_key: &named.key,
+                            action: action_key,
+                            actor: owner.clone(),
+                            controller: owner,
+                            cause: None,
+                            approach: stand_cell,
+                        },
+                        block_registry,
+                        &mut interaction_claims,
+                    ) {
+                        debug!(%error,"interaction rejected");
                         brain.goal = Goal::Resting {
                             remaining_secs: MIN_REST_SECS,
                         };
                         continue;
                     }
-                    let foot = pose_to_standable_foot(&pose, &world)
-                        .unwrap_or_else(|| pose_to_foot_cell(&pose));
-                    // Resolve approach cell + (optional) snap from the
-                    // use_slot. Slot-bearing blocks land the NPC on
-                    // a precise pose with KinematicLock applied;
-                    // slotless blocks fall back to any standable
-                    // cardinal neighbour with no snap and no lock —
-                    // works for any-angle interactions like a fruit
-                    // basket or a water well.
-                    let (stand_cell, snap) = match resolve_use_slot_target(
-                        slot.as_ref(),
-                        anchor_cell,
-                        orientation,
-                        target_cell,
-                        foot,
-                        &world,
-                    ) {
-                        Some(pair) => pair,
-                        None => {
-                            info!(
-                                npc = npc_id.0,
-                                target = ?target_cell.to_array(),
-                                block = %def_id,
-                                "no standable approach for interactable; releasing claim and parking briefly",
-                            );
-                            if interactable.exclusive {
-                                interaction_claims.release(anchor_cell, *npc_id);
-                            }
-                            brain.goal = Goal::Resting {
-                                remaining_secs: MIN_REST_SECS,
-                            };
-                            continue;
-                        }
-                    };
-                    let duration = interactable
-                        .duration_secs
-                        .clamp(MIN_INTERACT_DURATION_SECS, MAX_INTERACT_DURATION_SECS);
-                    let need_restore = interactable.need_restore.clone();
-                    let exclusive = interactable.exclusive;
-                    // Capture the slot's animation override (if any)
-                    // at goal-commit time. Carried through to
-                    // Goal::Interacting so the per-tick activity
-                    // refresh doesn't have to re-look-up the block
-                    // def to drive the client's anim override.
-                    let animation = slot.as_ref().and_then(|s| s.animation.clone());
+                    let job_id = facility_jobs
+                        .active_for(npc_id.0)
+                        .expect("accepted interaction")
+                        .id;
+                    commands.entity(entity).insert(
+                        crate::facility_interactions::FacilityOccupancy {
+                            job_id,
+                            approach: stand_cell,
+                        },
+                    );
+                    let duration = *duration_secs;
+                    let need_restore = need_restore.clone();
+                    let exclusive = named.exclusive;
+                    let animation = named.animation.clone();
                     if stand_cell == foot {
                         // Already standing on the approach cell —
                         // apply the snap in place and enter
@@ -3348,6 +3577,11 @@ fn npc_brain_tick(
                             );
                         }
                         None => {
+                            facility_jobs.interrupt_actor(
+                                npc_id.0,
+                                "interaction path unavailable",
+                                &mut interaction_claims,
+                            );
                             // Classify the A* miss: `find_path` bails
                             // up front when either endpoint isn't
                             // standable, otherwise it ran out of
@@ -3391,6 +3625,16 @@ fn npc_brain_tick(
                     }
                 }
                 PlannerGoal::WorkPlan { cell, timeout_secs } => {
+                    if !haul
+                        .kind_registry
+                        .get(&kind.0)
+                        .is_some_and(|def| def.job_classes.contains(&JobClass::Construction))
+                    {
+                        brain.goal = Goal::Resting {
+                            remaining_secs: MIN_REST_SECS,
+                        };
+                        continue;
+                    }
                     let timeout = timeout_secs.clamp(1.0, MAX_WORK_TIMEOUT_SECS);
                     let target_cell = IVec3::new(cell.x, cell.y, cell.z);
                     // Re-resolve against the authoritative `Plans`. The
@@ -3535,7 +3779,14 @@ fn npc_brain_tick(
                             npc_path.0.clear();
                         }
                         brain.goal = Goal::Working {
-                            remaining_secs: work_duration_secs,
+                            project_token: haul
+                                .plans
+                                .get(target_cell)
+                                .expect("current plan")
+                                .token(),
+                            remaining_secs: (work_duration_secs
+                                - haul.plans.get(target_cell).map_or(0.0, |p| p.progress_secs))
+                            .max(0.0),
                             target_cell,
                             plan_kind,
                             need_restore: work_need_restore,
@@ -3558,6 +3809,11 @@ fn npc_brain_tick(
                                 path,
                                 timeout,
                                 ArrivalAction::Work {
+                                    project_token: haul
+                                        .plans
+                                        .get(target_cell)
+                                        .expect("current plan")
+                                        .token(),
                                     duration_secs: work_duration_secs,
                                     target_cell,
                                     plan_kind,
@@ -3806,6 +4062,14 @@ fn continue_haul_or_release<W: Walkability>(
         .get(&kind.0)
         .map(|d| d.carry_capacity)
         .unwrap_or(DEFAULT_NPC_CARRY_CAPACITY);
+    let target_exists =
+        store
+            .assignment_of(npc_id)
+            .is_some_and(|assignment| match assignment.target {
+                HaulTarget::Plan(cell) => plans.get(cell).is_some(),
+                HaulTarget::Station(cell) => stations.get(cell).is_some(),
+                HaulTarget::Storage(_) | HaulTarget::Container(_) => true,
+            });
     let leg = match store.assignment_of(npc_id) {
         None => Ok(None),
         Some(a) => pick_next_haul_leg(
@@ -3832,6 +4096,21 @@ fn continue_haul_or_release<W: Walkability>(
             true
         }
         Ok(None) => {
+            if brain
+                .active_policy_job
+                .as_ref()
+                .is_some_and(|(id, _)| id.starts_with("haul:"))
+            {
+                finish_policy_job(
+                    brain,
+                    if target_exists {
+                        PolicyJobState::Completed
+                    } else {
+                        PolicyJobState::Interrupted
+                    },
+                    (!target_exists).then_some("haul target or assignment removed"),
+                );
+            }
             // Assignment naturally done (or already gone); clean release.
             store.release_for_npc(npc_id);
             brain.goal = Goal::Idle;
@@ -3841,6 +4120,11 @@ fn continue_haul_or_release<W: Walkability>(
             false
         }
         Err(target) => {
+            finish_policy_job(
+                brain,
+                PolicyJobState::Failed,
+                Some("haul route is unreachable"),
+            );
             info!(
                 npc = npc_id.0,
                 target = ?target,
@@ -4018,6 +4302,234 @@ fn pose_to_foot_cell_of(translation: Vec3) -> IVec3 {
 /// `anchor`.
 #[allow(
     clippy::too_many_arguments,
+    reason = "candidate enumeration reads the same authoritative services as execution"
+)]
+fn populate_job_candidates(
+    snapshot: &mut NpcSnapshot,
+    npc_id: NpcId,
+    kind: &NpcKind,
+    pose: &AvatarPose,
+    carrying: &Carrying,
+    equipped_tool: &EquippedTool,
+    haul: &HaulCtx<'_, '_>,
+    craft: &CraftCtx<'_>,
+    chunks: &Query<&Chunk>,
+    chunk_map: &ChunkMap,
+    block_registry: &BlockRegistry,
+    now_secs: f32,
+) {
+    const MAX_JOB_CANDIDATES: usize = 64;
+
+    let classes = haul.kind_registry.get(&kind.0).map(|def| &def.job_classes);
+    let participates = |class| classes.is_some_and(|classes| classes.contains(&class));
+    let foot = pose_to_foot_cell(pose);
+    let estimated_cost = |target: IVec3| {
+        let delta = target - foot;
+        delta.x.unsigned_abs() + delta.y.unsigned_abs() + delta.z.unsigned_abs()
+    };
+
+    if participates(JobClass::Construction) {
+        for nearby in &snapshot.nearby_plans {
+            let cell = IVec3::new(nearby.cell.x, nearby.cell.y, nearby.cell.z);
+            let Some(project) = haul.plans.get(cell) else {
+                continue;
+            };
+            snapshot.job_candidates.push(JobCandidate {
+                id: format!("construction:{}", project.project_id),
+                revision: project.revision,
+                class: JobClass::Construction,
+                target: nearby.cell,
+                estimated_cost: estimated_cost(cell),
+                requirements: project
+                    .materials
+                    .iter()
+                    .filter(|material| material.present < material.needed)
+                    .map(|material| {
+                        format!(
+                            "item:{}:{}/{}",
+                            material.item.0, material.present, material.needed
+                        )
+                    })
+                    .collect(),
+                capability: None,
+                available: project.is_satisfied(),
+            });
+        }
+    } else {
+        // Legacy planners cannot use WorkPlan to escape an explicit job policy.
+        snapshot.nearby_plans.clear();
+    }
+
+    if participates(JobClass::Crafting) {
+        let mut probe = craft.bookings.clone();
+        if let Some(cell) = crate::craft_stations::try_schedule_craft_for_npc(
+            npc_id,
+            pose.translation,
+            equipped_tool,
+            &craft.stations,
+            &mut probe,
+            block_registry,
+            &craft.recipes,
+            &haul.item_registry,
+            chunks,
+            chunk_map,
+        ) {
+            let revision = craft
+                .stations
+                .get(cell)
+                .and_then(|station| {
+                    let order_id = station
+                        .active_work
+                        .as_ref()
+                        .map(|work| work.order_id)
+                        .or_else(|| station.orders.first().map(|order| order.id))?;
+                    station
+                        .orders
+                        .iter()
+                        .find(|order| order.id == order_id)
+                        .map(|order| order.revision)
+                })
+                .unwrap_or(1);
+            snapshot.job_candidates.push(JobCandidate {
+                id: format!("craft:{},{},{}", cell.x, cell.y, cell.z),
+                revision,
+                class: JobClass::Crafting,
+                target: BlockPos {
+                    x: cell.x,
+                    y: cell.y,
+                    z: cell.z,
+                },
+                estimated_cost: estimated_cost(cell),
+                requirements: Vec::new(),
+                capability: Some("crafting".into()),
+                available: true,
+            });
+        }
+    }
+
+    if participates(JobClass::Hauling) {
+        let mut probe = haul.store.clone();
+        if crate::haul::try_schedule_haul_for_npc(
+            npc_id,
+            &kind.0,
+            pose.translation,
+            carrying,
+            equipped_tool,
+            &haul.kind_registry,
+            &haul.plans,
+            &craft.stations,
+            block_registry,
+            &haul.item_registry,
+            &craft.recipes,
+            chunks,
+            chunk_map,
+            &haul.world_items,
+            &haul.storage,
+            &haul.containers,
+            &haul.container_index,
+            &mut probe,
+            now_secs,
+        ) && let Some(assignment) = probe.assignment_of(npc_id)
+        {
+            let (target, revision) = match assignment.target {
+                HaulTarget::Plan(cell) => (
+                    cell,
+                    haul.plans.get(cell).map(|plan| plan.revision).unwrap_or(1),
+                ),
+                HaulTarget::Station(cell) => {
+                    let revision = craft
+                        .stations
+                        .get(cell)
+                        .and_then(|station| station.orders.first().map(|order| order.revision))
+                        .unwrap_or(1);
+                    (cell, revision)
+                }
+                HaulTarget::Storage(cell) => (cell, 1),
+                HaulTarget::Container(cell) => (cell, 1),
+            };
+            snapshot.job_candidates.push(JobCandidate {
+                id: format!("haul:{},{},{}", target.x, target.y, target.z),
+                revision,
+                class: JobClass::Hauling,
+                target: BlockPos {
+                    x: target.x,
+                    y: target.y,
+                    z: target.z,
+                },
+                estimated_cost: estimated_cost(target),
+                requirements: Vec::new(),
+                capability: None,
+                available: true,
+            });
+        }
+    }
+
+    snapshot.job_candidates.sort_by(|a, b| {
+        a.estimated_cost
+            .cmp(&b.estimated_cost)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    snapshot.job_candidates.truncate(MAX_JOB_CANDIDATES);
+}
+
+fn attach_interaction_capabilities(
+    interactions: &mut [NearbyInteraction],
+    kind: &NpcKindId,
+    spaces: &PublishedSpaces,
+    capabilities: &crate::capabilities::Capabilities,
+    placements: &crate::placements::Placements,
+    kind_registry: &NpcKindRegistry,
+) {
+    use block_junk_mod_api::capabilities::CapabilityStatus;
+
+    let Some(profile) = kind_registry
+        .get(kind.as_str())
+        .and_then(|definition| definition.movement_profile.as_deref())
+    else {
+        return;
+    };
+    for interaction in interactions {
+        let cell = IVec3::new(interaction.cell.x, interaction.cell.y, interaction.cell.z);
+        let Some(placement) = placements.at(cell) else {
+            continue;
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        for (space_id, space) in &spaces.geometry {
+            if !space.placements.contains(&placement.id.0) {
+                continue;
+            }
+            if let Some(results) = capabilities
+                .snapshot
+                .spaces
+                .get(space_id)
+                .and_then(|profiles| profiles.profiles.get(profile))
+            {
+                ids.extend(
+                    results
+                        .iter()
+                        .filter(|result| result.status == CapabilityStatus::Supported)
+                        .map(|result| result.id.clone()),
+                );
+            }
+        }
+        ids.extend(
+            capabilities
+                .snapshot
+                .outdoor
+                .iter()
+                .filter(|result| {
+                    result.anchor.placement == placement.id
+                        && result.profile == profile
+                        && result.result.status == CapabilityStatus::Supported
+                })
+                .map(|result| result.result.id.clone()),
+        );
+        interaction.capabilities = ids.into_iter().collect();
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
     reason = "snapshot builder collates many subsystems"
 )]
 fn build_snapshot(
@@ -4027,7 +4539,11 @@ fn build_snapshot(
     needs: &Needs,
     stats: &NpcStats,
     equipped_tool: &EquippedTool,
-    rooms: &RoomMap,
+    spaces: &PublishedSpaces,
+    capabilities: &crate::capabilities::Capabilities,
+    placements: &crate::placements::Placements,
+    settlements: &crate::settlements::Settlements,
+    kind_registry: &NpcKindRegistry,
     interactables: &InteractableIndex,
     interaction_claims: &InteractionClaims,
     containers: &crate::containers::Containers,
@@ -4044,8 +4560,8 @@ fn build_snapshot(
     now_secs: f32,
 ) -> NpcSnapshot {
     let foot = pose_to_foot_cell(pose);
-    let nearby_rooms = collect_nearby_rooms(rooms, foot, SNAPSHOT_ROOM_LIMIT);
-    let nearby_interactions = collect_nearby_interactions(
+    let nearby_spaces = collect_nearby_spaces(spaces, settlements, foot, SNAPSHOT_ROOM_LIMIT);
+    let mut nearby_interactions = collect_nearby_interactions(
         interactables,
         interaction_claims,
         containers,
@@ -4057,6 +4573,14 @@ fn build_snapshot(
         SNAPSHOT_INTERACTION_RADIUS_CELLS,
         SNAPSHOT_INTERACTION_LIMIT,
         now_secs,
+    );
+    attach_interaction_capabilities(
+        &mut nearby_interactions,
+        kind,
+        spaces,
+        capabilities,
+        placements,
+        kind_registry,
     );
     let nearby_plans = collect_nearby_plans(
         plans,
@@ -4074,13 +4598,8 @@ fn build_snapshot(
         item_registry,
         work_defaults,
     );
-    // Engine-assigned haul work for *this* NPC. Today the engine
-    // bypasses the planner whenever an assignment is live, so this
-    // field arrives empty in every snapshot a planner actually sees —
-    // populated only for the (currently unreachable) future where a
-    // planner gets to weigh in even mid-haul. Wire it through anyway
-    // so the surface is stable and the bypass becomes an enable/disable
-    // knob rather than a shape change.
+    // Accepted work is visible for inspection. Candidate enumeration never
+    // inserts an assignment; only a validated TakeJob decision can do that.
     let pending_assignments = haul_store
         .assignment_of(id)
         .map(|a| {
@@ -4105,11 +4624,13 @@ fn build_snapshot(
         },
         needs: needs.0.clone(),
         stats: stats.0.clone(),
-        nearby_rooms,
+        nearby_spaces,
         nearby_interactions,
         nearby_plans,
         is_night: world_clock.is_night(),
         pending_assignments,
+        job_candidates: Vec::new(),
+        job_results: Vec::new(),
     }
 }
 
@@ -4313,7 +4834,7 @@ fn resolve_anchor_with_orientation(
         return (cell, Cardinal::default());
     };
     match entries.get(cell) {
-        Some(EntryKind::Anchor { orientation }) => (cell, orientation),
+        Some(EntryKind::Anchor { orientation, .. }) => (cell, orientation),
         Some(EntryKind::Ghost { anchor }) => {
             // Look up the anchor's own entry to read its orientation;
             // ghost entries don't carry one.
@@ -4325,7 +4846,7 @@ fn resolve_anchor_with_orientation(
                 return (anchor, Cardinal::default());
             };
             let orientation = match a_entries.get(anchor) {
-                Some(EntryKind::Anchor { orientation }) => orientation,
+                Some(EntryKind::Anchor { orientation, .. }) => orientation,
                 _ => Cardinal::default(),
             };
             (anchor, orientation)
@@ -4334,102 +4855,6 @@ fn resolve_anchor_with_orientation(
     }
 }
 
-/// Resolve an interactable-bearing block at a cell, returning its
-/// [`Interactable`] metadata, optional [`UseSlot`], and id (for log
-/// lines). `None` when the cell is empty, the chunk isn't loaded,
-/// or the def has no interactable metadata. Pulled into one lookup
-/// so the planner commit path doesn't make three separate trips
-/// through the same chunk + registry.
-fn interactable_with_slot_at_cell(
-    cell: IVec3,
-    chunks: &Query<&Chunk>,
-    chunk_map: &ChunkMap,
-    registry: &BlockRegistry,
-) -> Option<(
-    Interactable,
-    Option<UseSlot>,
-    block_junk_mod_api::blocks::BlockId,
-)> {
-    let (coord, local) = world_to_chunk(cell);
-    let entity = *chunk_map.0.get(&coord)?;
-    let chunk = chunks.get(entity).ok()?;
-    let slot = chunk.get(local);
-    if slot.is_empty() {
-        return None;
-    }
-    let def = registry.def(slot);
-    let interactable = def.interactable.clone()?;
-    Some((interactable, def.use_slot.clone(), def.id.clone()))
-}
-
-/// Pick a stand cell + (optional) snap for a goal whose target block
-/// may carry a [`UseSlot`]. Two modes:
-///
-/// - **Slot present**: rotate each `slot.approach` cell offset by the
-///   block's [`Cardinal`] and add the anchor cell to get a world-space
-///   candidate. Among the candidates that are currently `standable`,
-///   pick whichever has the smallest Manhattan distance to the NPC's
-///   foot (ties broken by listing order — authors put the "preferred"
-///   approach first if it matters). Compute the snap once from the
-///   anchor + rotated `slot.pose` + `slot.yaw`; arrival just teleports
-///   to it.
-/// - **Slot absent**: fall back to the consume-pattern. Pick a
-///   standable cardinal neighbour of `target_cell` closest to `foot`,
-///   and return `snap = None`. The body lands at the path's last cell
-///   with no pose snap and no kinematic lock — the legacy behaviour
-///   for blocks that read naturally from any side (fruit basket).
-///
-/// Returns `None` only when neither a slot-approach nor a neighbour
-/// stand cell is available — the goal should abandon and let the
-/// planner pick something else.
-fn resolve_use_slot_target<W: Walkability>(
-    slot: Option<&UseSlot>,
-    anchor_cell: IVec3,
-    orientation: Cardinal,
-    target_cell: IVec3,
-    foot: IVec3,
-    world: &W,
-) -> Option<(IVec3, Option<UseSlotSnap>)> {
-    match slot {
-        Some(slot) => {
-            let mut best: Option<(IVec3, i32)> = None;
-            for off in &slot.approach {
-                let rotated = orientation.rotate_offset(*off);
-                let cand = anchor_cell + IVec3::new(rotated[0], rotated[1], rotated[2]);
-                if !standable(world, cand) {
-                    continue;
-                }
-                let d = cand - foot;
-                let dist = d.x.abs() + d.y.abs() + d.z.abs();
-                match best {
-                    None => best = Some((cand, dist)),
-                    Some((_, prev)) if dist < prev => best = Some((cand, dist)),
-                    _ => {}
-                }
-            }
-            let stand = best?.0;
-            Some((
-                stand,
-                Some(compute_use_slot_snap(slot, anchor_cell, orientation)),
-            ))
-        }
-        None => {
-            let stand = nearest_standable_neighbor(target_cell, foot, world)?;
-            Some((stand, None))
-        }
-    }
-}
-
-/// World-space pose snap implied by a slot at a given anchor +
-/// orientation. The author writes `slot.pose` in default-orientation
-/// model space (origin at the anchor cell's bottom-centre, +X = the
-/// default extends direction), so converting to world is: rotate the
-/// XZ components by the block's [`Cardinal`], shift Y by the anchor's
-/// cell-origin Y, and shift XZ by the anchor cell's *centre* (the
-/// model frame's origin is the bottom-*centre* of the anchor, not the
-/// cell's min corner). Yaw is the block's cardinal yaw plus the
-/// slot's authored offset — that's where "while using, orient this
-/// way" lives.
 /// Look up the optional [`UseSlot`] for whatever block lives at this
 /// cell. Generic over interaction type — the slot is the same field
 /// on the def regardless of whether the block is a sleeper,
@@ -4462,7 +4887,7 @@ fn slot_at_cell(
 /// empty rather than failing — the brain still wants to commit a goal,
 /// and the alternative (silent abort) hides the underlying issue at a
 /// layer the planner can't react to.
-fn resolve_work_action(
+pub(crate) fn resolve_work_action(
     plan_kind: PlanKind,
     target_cell: IVec3,
     chunks: &Query<&Chunk>,
@@ -4504,7 +4929,7 @@ fn resolve_work_action(
 /// `use_slot.approach` cells first (NPCs leave the way they came
 /// in), then "above the AABB" fallbacks so a sealed-in NPC still
 /// has somewhere to go.
-fn try_eject_to_cells<W: Walkability>(
+pub(crate) fn try_eject_to_cells<W: Walkability>(
     pose: &mut AvatarPose,
     candidates: impl IntoIterator<Item = IVec3>,
     world: &W,
@@ -4552,30 +4977,6 @@ fn eject_candidates_for_slot(
     out
 }
 
-fn compute_use_slot_snap(slot: &UseSlot, anchor_cell: IVec3, orientation: Cardinal) -> UseSlotSnap {
-    // Float rotation matches Cardinal::rotate_offset's integer matrix
-    // — fractional pose components (mid-cell, half-height) survive
-    // the trip into world space.
-    let (rx, rz) = match orientation {
-        Cardinal::East => (slot.pose[0], slot.pose[2]),
-        Cardinal::North => (slot.pose[2], -slot.pose[0]),
-        Cardinal::West => (-slot.pose[0], -slot.pose[2]),
-        Cardinal::South => (-slot.pose[2], slot.pose[0]),
-    };
-    let anchor_origin = anchor_cell.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
-    // `slot.pose` puts the rig's model origin (its "feet" plane)
-    // at this point. `pose.translation` is the eye position, so we
-    // raise by the standing eye-offset to get the actual translation.
-    // This is the symmetric of `attach_npc_visuals`'s `foot_offset`
-    // — the child Transform shifts the model origin down by that
-    // same amount, so the round trip leaves the body where the
-    // author asked.
-    let model_origin = anchor_origin + Vec3::new(rx, slot.pose[1], rz);
-    let translation = model_origin + Vec3::Y * (EYE_OFFSET_FROM_CENTRE + PLAYER_HALF_EXTENTS.y);
-    let yaw = orientation.yaw() + slot.yaw;
-    UseSlotSnap { translation, yaw }
-}
-
 /// K nearest interactable cells within `radius_cells` (Chebyshev) of
 /// `foot`, one entry per *block* (collapsed by anchor so multi-cell
 /// interactables don't appear twice). Each entry pulls its
@@ -4589,7 +4990,7 @@ fn compute_use_slot_snap(slot: &UseSlot, anchor_cell: IVec3, orientation: Cardin
 /// (two planners tick the same instant) but resolved atomically at
 /// the brain's `try_claim` step.
 ///
-/// Distance is Manhattan (consistent with `nearby_rooms.distance`);
+/// Distance is Manhattan (consistent with `nearby_spaces.distance`);
 /// the radius filter uses Chebyshev because that matches how the
 /// index's `iter_within` is bounded.
 #[allow(
@@ -4665,6 +5066,7 @@ fn collect_nearby_interactions(
             restores,
             exclusive: i.exclusive,
             distance,
+            capabilities: Vec::new(),
         });
     }
     out.sort_by_key(|n| n.distance);
@@ -4731,29 +5133,49 @@ fn nearest_standable_neighbor<W: Walkability>(
     None
 }
 
-/// K nearest matched rooms by Manhattan distance from `foot`. Returns a
-/// sorted Vec (closest first). Touches every matched room (typically a
-/// handful in a small world), so it's `O(rooms)` per call — fine at
-/// goal-transition cadence.
-fn collect_nearby_rooms(rooms: &RoomMap, foot: IVec3, limit: usize) -> Vec<NearbyRoom> {
-    let mut out: Vec<NearbyRoom> = rooms
-        .iter_matched()
-        .map(|(room_id, pattern, anchor)| {
-            let d = anchor - foot;
-            let distance = (d.x.abs() + d.y.abs() + d.z.abs()) as u32;
-            NearbyRoom {
-                id: room_id.0,
-                pattern: pattern.0.clone(),
+/// Nearby coherent architectural spaces activated by participating facilities.
+/// Natural cave recognition alone never creates a policy destination.
+fn collect_nearby_spaces(
+    spaces: &PublishedSpaces,
+    settlements: &crate::settlements::Settlements,
+    foot: IVec3,
+    limit: usize,
+) -> Vec<NearbySpace> {
+    let mut out: Vec<_> = spaces
+        .geometry
+        .iter()
+        .filter_map(|(id, space)| {
+            if space.pending
+                || spaces
+                    .basis
+                    .get(id)
+                    .is_some_and(|basis| basis.keys().any(|chunk| spaces.pending.contains(chunk)))
+                || !space.placements.iter().any(|id| {
+                    settlements
+                        .by_facility
+                        .contains_key(&block_junk_mod_api::architecture::PlacementId(*id))
+                })
+            {
+                return None;
+            }
+            let anchor = space.floor.iter().min_by_key(|cell| {
+                let d = IVec3::new(cell.0, cell.1, cell.2) - foot;
+                (d.abs().element_sum(), **cell)
+            })?;
+            let anchor = IVec3::new(anchor.0, anchor.1, anchor.2);
+            Some(NearbySpace {
+                id: id.0,
+                revision: spaces.revision,
                 anchor: BlockPos {
                     x: anchor.x,
                     y: anchor.y,
                     z: anchor.z,
                 },
-                distance,
-            }
+                distance: (anchor - foot).abs().element_sum() as u32,
+            })
         })
         .collect();
-    out.sort_by_key(|r| r.distance);
+    out.sort_by_key(|space| (space.distance, space.id));
     out.truncate(limit);
     out
 }
@@ -5057,6 +5479,7 @@ mod tests {
 
     fn dummy_work_goal(cell: IVec3) -> Goal {
         Goal::Working {
+            project_token: (1, 1),
             remaining_secs: 4.0,
             target_cell: cell,
             plan_kind: PlanKind::Remove,
@@ -5094,6 +5517,7 @@ mod tests {
             blocked: false,
             deadline_secs: 30.0,
             on_arrive: ArrivalAction::Work {
+                project_token: (1, 1),
                 duration_secs: 4.0,
                 target_cell: cell,
                 plan_kind: PlanKind::Remove,
@@ -5259,12 +5683,52 @@ mod tests {
     #[test]
     fn npc_id_allocator_is_monotonic_and_respects_loaded_ids() {
         let mut alloc = NpcIdAllocator::default();
-        assert_eq!(alloc.allocate(), NpcId(1));
-        assert_eq!(alloc.allocate(), NpcId(2));
-        // Loading a save with ids up to 9 must push the counter past
-        // them — and reserving something already-passed is a no-op.
-        alloc.reserve_through(9);
-        alloc.reserve_through(3);
-        assert_eq!(alloc.allocate(), NpcId(10));
+        assert_eq!(alloc.allocate().unwrap(), NpcId(1));
+        assert_eq!(alloc.allocate().unwrap(), NpcId(2));
+        alloc.retire(2).unwrap();
+        let encoded = serde_json::to_vec(&alloc).unwrap();
+        let mut restored: NpcIdAllocator = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.allocate().unwrap(), NpcId(3));
+        assert!(restored.retire(2).is_err());
+        restored.next = u64::MAX;
+        assert!(restored.allocate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod policy_feedback_tests {
+    use super::*;
+    #[test]
+    fn failed_or_absent_planner_preserves_feedback_until_success() {
+        let mut brain = Brain {
+            goal: Goal::Idle,
+            rng: 1,
+            home_facility: None,
+            preempt_cooldown_secs: 0.,
+            policy_results: vec![PolicyJobResult {
+                candidate_id: "construction:7".into(),
+                revision: 1,
+                state: PolicyJobState::Failed,
+                reason: Some("blocked completion".into()),
+            }],
+            active_policy_job: None,
+            awaiting_construction: None,
+        };
+        let before = serde_json::to_vec(&brain.policy_results).unwrap();
+        let failed: Result<Option<()>, &str> = deliver_policy_feedback(&mut brain, |results| {
+            assert_eq!(results.len(), 1);
+            Err("injected callback failure")
+        });
+        assert!(failed.is_err());
+        assert_eq!(serde_json::to_vec(&brain.policy_results).unwrap(), before);
+        let absent: Result<Option<()>, &str> = deliver_policy_feedback(&mut brain, |_| Ok(None));
+        assert!(absent.unwrap().is_none());
+        assert_eq!(serde_json::to_vec(&brain.policy_results).unwrap(), before);
+        let delivered: Result<Option<()>, &str> = deliver_policy_feedback(&mut brain, |results| {
+            assert_eq!(serde_json::to_vec(results).unwrap(), before);
+            Ok(Some(()))
+        });
+        assert!(delivered.unwrap().is_some());
+        assert!(brain.policy_results.is_empty());
     }
 }

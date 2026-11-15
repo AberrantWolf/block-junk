@@ -51,6 +51,65 @@ impl Plugin for InspectPanelPlugin {
                 .in_set(GameSet::Input)
                 .run_if(in_state(AppState::InGame)),
         );
+        app.add_systems(
+            Update,
+            highlight_failed_capability_evidence.run_if(in_state(AppState::InGame)),
+        );
+    }
+}
+
+fn highlight_failed_capability_evidence(
+    target: Res<InspectTarget>,
+    spaces: Res<crate::space_network::ClientSpaces>,
+    capabilities: Res<crate::capability_network::ClientCapabilities>,
+    placements: Res<crate::placement_network::ClientPlacements>,
+    mut gizmos: Gizmos,
+) {
+    use block_junk_mod_api::capabilities::Value;
+    let cell = match target.state {
+        InspectState::Block { cell, .. } | InspectState::Plan { cell } => cell,
+        _ => return,
+    };
+    if spaces.waiting_for_terrain || capabilities.waiting_for_spaces {
+        return;
+    }
+    let placement = placements.at(cell).map(|record| record.id);
+    let Some((_, profiles)) = capabilities.visible.spaces.iter().find(|(id, _)| {
+        spaces
+            .visible
+            .spaces
+            .iter()
+            .any(|space| space.id == *id && space.contains_cell(cell, placement))
+    }) else {
+        return;
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for result in profiles.profiles.values().flatten() {
+        for evidence in result.requirements.values().filter(|evidence| {
+            evidence.value != Some(Value::Boolean(true)) || evidence.problem.is_some()
+        }) {
+            collect_evidence_placements(evidence, &mut ids);
+        }
+    }
+    for id in ids {
+        if let Some(placement) = placements.lookup(&id.0) {
+            gizmos.cube(
+                Transform::from_translation(placement.anchor.as_vec3() + Vec3::splat(0.5))
+                    .with_scale(Vec3::splat(1.08)),
+                Color::srgb(1.0, 0.35, 0.12),
+            );
+        }
+    }
+}
+
+fn collect_evidence_placements(
+    evidence: &block_junk_mod_api::capabilities::Evidence,
+    output: &mut std::collections::BTreeSet<block_junk_mod_api::architecture::PlacementId>,
+) {
+    output.extend(evidence.placements.iter().copied());
+    output.extend(evidence.slots.iter().map(|slot| slot.placement));
+    for child in &evidence.children {
+        collect_evidence_placements(child, output);
     }
 }
 
@@ -334,23 +393,22 @@ fn refresh_inspect_panel(
     plans: Res<Plans>,
     stations: Res<CraftStations>,
     containers: Res<crate::containers::Containers>,
-    rooms: Res<crate::room_sync::ClientRooms>,
-    room_patterns: Res<crate::rooms::RoomPatternRegistry>,
+    spaces: Res<crate::space_network::ClientSpaces>,
+    placements: Res<crate::placement_network::ClientPlacements>,
+    capabilities: Res<crate::capability_network::ClientCapabilities>,
     mut mods: ResMut<crate::scripting::ClientMods>,
     mut roots: Query<&mut Visibility, With<InspectPanelRoot>>,
     mut texts: Query<&mut Text, With<InspectPanelText>>,
 ) {
-    // Re-render on target change *or* plans/stations/containers/rooms
-    // mutation. Deposits land as `Plans` mutations, station updates as
-    // `CraftStations` mutations, container stock as `Containers`
-    // mutations, room recognition as `ClientRooms` mutations — none
-    // touches `target` directly, so without these branches a hovered
-    // panel would freeze at the initial state.
+    // Service and architectural revisions can change while the cursor remains
+    // still; refresh those results without asking the player to move the aim.
     if !target.is_changed()
         && !plans.is_changed()
         && !stations.is_changed()
         && !containers.is_changed()
-        && !rooms.is_changed()
+        && !spaces.is_changed()
+        && !placements.is_changed()
+        && !capabilities.is_changed()
     {
         return;
     }
@@ -362,8 +420,9 @@ fn refresh_inspect_panel(
         &plans,
         &stations,
         &containers,
-        &rooms,
-        &room_patterns,
+        &spaces,
+        &placements,
+        &capabilities,
     );
     // Mod contributions (`engine.ui.on_inspect`) append below the
     // engine-rendered body. Only consulted on actual re-render — Lua
@@ -455,24 +514,46 @@ fn render_body(
     plans: &Plans,
     stations: &CraftStations,
     containers: &crate::containers::Containers,
-    rooms: &crate::room_sync::ClientRooms,
-    room_patterns: &crate::rooms::RoomPatternRegistry,
+    spaces: &crate::space_network::ClientSpaces,
+    placements: &crate::placement_network::ClientPlacements,
+    capabilities: &crate::capability_network::ClientCapabilities,
 ) -> Option<String> {
-    // Room membership line, appended to any cell-anchored inspection:
-    // the mirrored bboxes are the only client-side room knowledge, and
-    // surfacing the room's type on hover is half the point of
-    // replicating them.
     let room_line = |cell: IVec3| -> String {
-        match rooms.room_at(cell) {
-            Some(room) => {
-                let name = room_patterns
-                    .get(&room.pattern.as_str().into())
-                    .map(|p| p.display_name.clone())
-                    .unwrap_or_else(|| room.pattern.clone());
-                format!("\nRoom: {} ({} floor)\n", name, room.floor_area)
+        let placement = placements.at(cell).map(|record| record.id);
+        let mut lines = String::new();
+        for space in spaces.visible.spaces.iter() {
+            if space.contains_cell(cell, placement) {
+                use std::fmt::Write;
+                let _ = write!(
+                    lines,
+                    "\nSpace #{} · revision {}\nStructural area: {} · covered: {} · roof unknown: {}\nVolume: {:?}{}\n",
+                    space.id,
+                    space.revision,
+                    space.structural_area,
+                    space.covered,
+                    space.unknown_roof,
+                    space.volume,
+                    if space.pending || spaces.waiting_for_terrain {
+                        " · geometry pending"
+                    } else {
+                        ""
+                    }
+                );
+                append_capabilities(&mut lines, space.id, capabilities);
             }
-            None => String::new(),
+            if space.connections.iter().any(|connection| {
+                connection.threshold.iter().any(|threshold| {
+                    threshold.0 == cell.x && threshold.1 == cell.y && threshold.2 == cell.z
+                })
+            }) {
+                lines.push_str("\nArchitectural threshold — excluded from adjoining floor area\n");
+                break;
+            }
         }
+        if lines.is_empty() {
+            lines.push_str("\nNo resolved architectural membership at this cell\n");
+        }
+        lines
     };
     match state {
         InspectState::None => None,
@@ -487,6 +568,19 @@ fn render_body(
         InspectState::Npc(details) => Some(format_npc(details, false)),
         InspectState::Block { cell, slot } => {
             let mut out = format_block(*cell, *slot, registry);
+            if let Some(placement) = placements.at(*cell)
+                && let Some((index, portal)) =
+                    crate::portal_service::inspected_portal(placement, *cell, registry)
+            {
+                let open = placement
+                    .portal_open
+                    .map_or(portal.initially_open, |mask| mask & (1 << index) != 0);
+                out.push_str(&format!(
+                    "\n[E] {} {}\n",
+                    if open { "Close" } else { "Open" },
+                    portal.key
+                ));
+            }
             // Station info appends when the inspected block is a
             // station — lists every recipe registered at the station
             // tag so the player knows what they could craft.
@@ -531,6 +625,92 @@ fn render_body(
             Some(format!("{header}{body}{}", room_line(*cell)))
         }
         InspectState::Item { slot, count } => Some(format_item(*slot, *count, items)),
+    }
+}
+
+fn append_capabilities(
+    out: &mut String,
+    space_id: u64,
+    capabilities: &crate::capability_network::ClientCapabilities,
+) {
+    if capabilities.waiting_for_spaces {
+        out.push_str("Capabilities: pending architectural revision\n");
+        return;
+    }
+    let Some((_, result)) = capabilities
+        .visible
+        .spaces
+        .iter()
+        .find(|(id, _)| *id == space_id)
+    else {
+        out.push_str("Capabilities: pending\n");
+        return;
+    };
+    append_space_capabilities(out, result);
+}
+
+pub(crate) fn append_space_capabilities(
+    out: &mut String,
+    result: &crate::capabilities::SpaceCapabilities,
+) {
+    use block_junk_mod_api::capabilities::{CapabilityStatus, EvaluationProblem, Value};
+    use std::fmt::Write;
+
+    for (profile, values) in &result.profiles {
+        let _ = writeln!(out, "Capabilities for {profile}:");
+        for capability in values {
+            let status = match capability.status {
+                CapabilityStatus::Supported => "supported",
+                CapabilityStatus::Unsupported => "requirements unmet",
+                CapabilityStatus::Pending => "pending",
+                CapabilityStatus::Invalid => "invalid rule",
+            };
+            let capacity = capability
+                .capacity
+                .as_ref()
+                .and_then(|evidence| evidence.value.as_ref())
+                .map(|value| match value {
+                    Value::Number(value) => format!(" · capacity {value}"),
+                    Value::Unbounded => " · unbounded".into(),
+                    Value::Boolean(value) => format!(" · {value}"),
+                })
+                .unwrap_or_default();
+            let _ = writeln!(out, "  {}: {status}{capacity}", capability.display_name);
+            for (name, evidence) in &capability.attributes {
+                let value = match &evidence.value {
+                    Some(Value::Number(value)) => value.to_string(),
+                    Some(Value::Unbounded) => "unbounded".into(),
+                    Some(Value::Boolean(value)) => value.to_string(),
+                    None => match &evidence.problem {
+                        Some(EvaluationProblem::Invalid(reason)) => format!("invalid: {reason}"),
+                        Some(EvaluationProblem::Unknown(reason)) => format!("pending: {reason}"),
+                        None => "pending".into(),
+                    },
+                };
+                let _ = writeln!(out, "    {name}: {value}");
+            }
+            for evidence in capability.requirements.values().filter(|evidence| {
+                evidence.value != Some(Value::Boolean(true)) || evidence.problem.is_some()
+            }) {
+                let observed = match &evidence.value {
+                    Some(Value::Number(value)) => format!("observed {value}"),
+                    Some(Value::Boolean(false)) => "not satisfied".into(),
+                    Some(Value::Boolean(true)) => "satisfied".into(),
+                    Some(Value::Unbounded) => "observed unbounded".into(),
+                    None => match &evidence.problem {
+                        Some(EvaluationProblem::Unknown(reason)) => format!("pending: {reason}"),
+                        Some(EvaluationProblem::Invalid(reason)) => format!("invalid: {reason}"),
+                        None => "unavailable".into(),
+                    },
+                };
+                let _ = writeln!(out, "    {} — {observed}", evidence.description);
+                for child in evidence.children.iter().filter(|child| {
+                    child.value != Some(Value::Number(1.)) || child.problem.is_some()
+                }) {
+                    let _ = writeln!(out, "      {}", child.description);
+                }
+            }
+        }
     }
 }
 
@@ -737,4 +917,30 @@ fn format_block(cell: IVec3, slot: BlockSlot, registry: &BlockRegistry) -> Strin
         out.push_str(&format!("  exclusive: {}\n", i.exclusive));
     }
     out
+}
+
+#[cfg(test)]
+mod capacity_inspection_tests {
+    use super::*;
+    use block_junk_mod_api::capabilities::*;
+    #[test]
+    fn fully_reserved_facility_shows_support_and_zero_availability() {
+        let result: CapabilityResult = serde_json::from_value(serde_json::json!({
+            "id":"test:sleeping", "display_name":"Sleeping", "status":"supported",
+            "requirements":{}, "capacity":Evidence::number("usable".into(), 2.),
+            "attributes": {"installed": Evidence::number("installed".into(), 2.), "usable": Evidence::number("usable".into(), 2.), "available": Evidence::number("available".into(), 0.)}
+        })).unwrap();
+        let mut text = String::new();
+        append_space_capabilities(
+            &mut text,
+            &crate::capabilities::SpaceCapabilities {
+                profiles: std::collections::BTreeMap::from([("humanoid".into(), vec![result])]),
+            },
+        );
+        assert!(text.contains("Sleeping: supported"));
+        assert!(text.contains("installed: 2"));
+        assert!(text.contains("usable: 2"));
+        assert!(text.contains("available: 0"));
+        assert!(!text.contains("Sleeping: available"));
+    }
 }

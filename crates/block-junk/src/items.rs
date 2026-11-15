@@ -84,6 +84,15 @@ pub enum ItemBootstrapError {
     #[error("block {block} materials references unregistered item {item}")]
     MaterialItemUnknown { block: String, item: ItemId },
     #[error(
+        "block {block} materials[{duplicate}] repeats item {item} from materials[{first}]; use one entry per item (indices are 1-based)"
+    )]
+    DuplicateMaterial {
+        block: String,
+        item: ItemId,
+        first: usize,
+        duplicate: usize,
+    },
+    #[error(
         "block {block} materials entry for item {item} has count = 0; remove the entry or set count > 0"
     )]
     MaterialCountZero { block: String, item: ItemId },
@@ -204,7 +213,16 @@ impl ItemRegistry {
                     });
                 }
             }
-            for mat in &def.materials {
+            let mut seen_materials = HashMap::new();
+            for (index, mat) in def.materials.iter().enumerate() {
+                if let Some(first) = seen_materials.insert(&mat.item, index + 1) {
+                    return Err(ItemBootstrapError::DuplicateMaterial {
+                        block: def.id.to_string(),
+                        item: mat.item.clone(),
+                        first,
+                        duplicate: index + 1,
+                    });
+                }
                 if self.slot_of(&mat.item).is_none() {
                     return Err(ItemBootstrapError::MaterialItemUnknown {
                         block: def.id.to_string(),

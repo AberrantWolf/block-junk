@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+block-junk-scripting = { path = "../block-junk-scripting" }
 # Same mlua config as block-junk-scripting so the workspace builds one Lua.
 mlua = { version = "0.11", features = ["lua54", "vendored", "send"] }
 rayon = "1"

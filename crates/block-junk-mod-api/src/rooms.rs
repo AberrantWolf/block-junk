@@ -192,6 +192,7 @@ pub enum Constraint {
 /// match time, an ancestor's constraints must pass before a descendant's
 /// are evaluated.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoomPattern {
     pub id: RoomPatternId,
     pub display_name: String,
@@ -209,6 +210,7 @@ pub struct RoomPattern {
 
 /// A single tag occurrence count within a region.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TagCount {
     pub tag: TagId,
     pub count: u32,
@@ -219,6 +221,7 @@ pub struct TagCount {
 /// [`Constraint::AdjacentPair`]. Ordered: `(seat, table)` counts seats
 /// touching tables, `(table, seat)` counts tables touching seats.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdjacentPairCount {
     pub a: TagId,
     pub b: TagId,
@@ -228,6 +231,7 @@ pub struct AdjacentPairCount {
 /// Fraction breakdown of floor support by [`FloorKind`]. Sums to ≤ 1.0;
 /// the remainder is "other" (only reachable once new support kinds land).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FloorComposition {
     pub solid: f32,
     pub water_below: f32,
@@ -236,6 +240,7 @@ pub struct FloorComposition {
 
 /// Inclusive integer-cell axis-aligned bounding box.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BBox {
     pub min: BlockPos,
     pub max: BlockPos,
@@ -245,6 +250,7 @@ pub struct BBox {
 /// region; the matcher walks the pattern tree using only this — no chunk
 /// access needed at match time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoomSignature {
     pub domain: PatternDomain,
     pub bbox: BBox,

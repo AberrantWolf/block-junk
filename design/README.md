@@ -6,6 +6,13 @@ finding again lives here.
 
 ## Contents
 
+- **[colony-foundation-rework.md](colony-foundation-rework.md)** — September 2026
+  implementation plan for structural spaces, additive capabilities, transactional
+  construction, replaceable core content, and mod-controlled NPC policy.
+- **[colony-foundation-ledger.md](colony-foundation-ledger.md)** — completion status,
+  delivered behavior, gate evidence, versions, and remaining measured limits.
+- **[colony-foundation-performance.md](colony-foundation-performance.md)** —
+  reproducible spatial/NPC scale, allocation, latency, and network-frame measurements.
 - **[systemic-remediation-plan.md](systemic-remediation-plan.md)** — prioritized
   repository-wide correctness, authority, networking, persistence, and lifecycle
   remediation plan, including validation and rollout gates.

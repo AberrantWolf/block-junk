@@ -21,6 +21,8 @@ pub struct ChunkMap(pub HashMap<ChunkCoord, Entity>);
 
 #[derive(Component, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chunk {
+    /// Authoritative interior revision; padding updates do not advance it.
+    pub revision: u64,
     /// Flat array indexed by `ChunkShape`. Padded by one voxel per side so meshing
     /// has neighbour data at chunk borders.
     pub blocks: Vec<BlockSlot>,
@@ -57,7 +59,10 @@ pub struct EntityEntry {
 pub enum EntryKind {
     /// The anchor cell of a block-entity. Carries the orientation the
     /// entity was placed at; the slot at this cell tells you which entity.
-    Anchor { orientation: Cardinal },
+    Anchor {
+        orientation: Cardinal,
+        portal_open: Option<u64>,
+    },
     /// A non-anchor cell of a block-entity whose anchor is at `anchor`
     /// (world cell). The slot at this cell echoes the anchor's slot —
     /// that's how the cube mesher knows to skip these cells (their slot's
@@ -104,7 +109,10 @@ impl Chunk {
             let world = chunk_local_to_world(coord, IVec3::new(lx as i32, ly as i32, lz as i32));
             blocks[i as usize] = terrain_block(world, slots);
         }
-        Self { blocks }
+        Self {
+            blocks,
+            revision: 0,
+        }
     }
 
     pub fn get(&self, cell: IVec3) -> BlockSlot {
@@ -117,6 +125,7 @@ impl Chunk {
     /// Returns true if the block actually changed. Edits at padding cells are
     /// rejected — `block-mesh` only generates faces for interior cells, so a
     /// block placed at a padding index would mutate state but never render.
+    #[cfg(test)]
     pub fn set(&mut self, cell: IVec3, block: BlockSlot) -> bool {
         if !Self::is_interior(cell) {
             return false;
@@ -126,7 +135,26 @@ impl Chunk {
         if self.blocks[i] == block {
             return false;
         }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
         self.blocks[i] = block;
+        self.revision = revision;
+        true
+    }
+
+    /// Transaction writers assign the validated logical revision after all cells
+    /// are written. Per-cell increments could exhaust the counter halfway
+    /// through one otherwise valid multi-cell commit.
+    pub(crate) fn apply_committed_cell(&mut self, cell: IVec3, block: BlockSlot) -> bool {
+        if !Self::is_interior(cell) {
+            return false;
+        }
+        let index = Self::cell_index(cell).expect("interior index");
+        if self.blocks[index] == block {
+            return false;
+        }
+        self.blocks[index] = block;
         true
     }
 
@@ -222,21 +250,36 @@ impl Chunk {
     }
 
     /// True for cells in the meshable interior (excludes the 1-cell padding ring).
-    fn is_interior(cell: IVec3) -> bool {
+    pub(crate) fn is_interior(cell: IVec3) -> bool {
         let lo = 1;
         let hi = (CHUNK_PADDED - 1) as i32;
         cell.x >= lo && cell.y >= lo && cell.z >= lo && cell.x < hi && cell.y < hi && cell.z < hi
     }
 
-    pub fn build_mesh(&self, registry: &BlockRegistry) -> Option<Mesh> {
+    pub fn build_mesh(
+        &self,
+        registry: &BlockRegistry,
+        coord: ChunkCoord,
+        read: impl Fn(IVec3) -> Option<(BlockSlot, Option<EntryKind>)>,
+    ) -> Option<Mesh> {
         // Convert to MeshVoxels so the greedy mesher sees mesh-bearing
         // slots as Empty (those render as ECS entities elsewhere).
         let voxels: Vec<MeshVoxel> = self
             .blocks
             .iter()
-            .map(|&slot| MeshVoxel {
-                slot,
-                visibility: registry.voxel_visibility(slot),
+            .enumerate()
+            .map(|(index, &slot)| {
+                let [x, y, z] = ChunkShape::delinearize(index as u32);
+                let cell = chunk_local_to_world(coord, IVec3::new(x as i32, y as i32, z as i32));
+                let hidden = portal_cell_hidden(cell, slot, registry, &read);
+                MeshVoxel {
+                    slot,
+                    visibility: if hidden {
+                        block_mesh::VoxelVisibility::Empty
+                    } else {
+                        registry.voxel_visibility(slot)
+                    },
+                }
             })
             .collect();
         let mut buffer = GreedyQuadsBuffer::new(voxels.len());
@@ -416,7 +459,7 @@ pub fn chunk_world_transform(coord: ChunkCoord) -> Transform {
 /// no shared mutable state between cells — so chunks regenerate the
 /// same way no matter the cell-iteration order.
 fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
-    let h_here = surface_height(world.x, world.z);
+    let h_here = configured_surface_height(world.x, world.z, &slots.generation);
     // Ground layers first. Trees only stamp into cells the ground
     // function would otherwise return `empty`, so a tree near a hill
     // doesn't bury its trunk inside the slope.
@@ -425,12 +468,12 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
             // Sparse gravel outcrops replace the grass surface: the
             // no-tool-gate stone source a fresh player scrapes their
             // first chunks from (real stone is 10x slow bare-handed).
-            if in_gravel_patch(world.x, world.z) {
+            if slots.generation.gravel && in_gravel_patch(world.x, world.z, &slots.generation) {
                 slots.gravel
             } else {
                 slots.grass
             }
-        } else if world.y >= h_here - 4 {
+        } else if world.y >= h_here - slots.generation.soil_depth as i32 {
             slots.dirt
         } else {
             slots.stone
@@ -439,28 +482,41 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
     // Air above the surface — check whether any nearby tree's stamp
     // claims this cell. STAMP_RADIUS bounds the (x, z) search; bigger
     // radius = more lookups per cell. 2 covers the 5-wide canopy.
-    const STAMP_RADIUS: i32 = 2;
-    for dx in -STAMP_RADIUS..=STAMP_RADIUS {
-        for dz in -STAMP_RADIUS..=STAMP_RADIUS {
+    let radius = if slots.generation.trees {
+        slots.generation.features.canopy_radius as i32
+    } else {
+        0
+    };
+    for dx in -radius..=radius {
+        for dz in -radius..=radius {
             let rx = world.x + dx;
             let rz = world.z + dz;
-            if !is_tree_root(rx, rz) {
+            if !slots.generation.trees
+                || !is_tree_root(
+                    rx.wrapping_add(slots.generation.seed as i32),
+                    rz,
+                    &slots.generation.features,
+                )
+            {
                 continue;
             }
-            let root_h = surface_height(rx, rz);
+            let root_h = configured_surface_height(rx, rz, &slots.generation);
             let local_y = world.y - root_h;
-            let trunk_h = tree_height(rx, rz);
+            let trunk_h = tree_height(rx, rz, &slots.generation.features);
             // Trunk: 4-5-tall column of wood, centred on the root.
             if dx == 0 && dz == 0 && (0..trunk_h).contains(&local_y) {
                 return slots.wood;
             }
             // Canopy layer 1: 5x5 minus the four corners, wrapping the
             // trunk top — the corner cut is what rounds the silhouette.
-            if local_y == trunk_h && !(dx.abs() == 2 && dz.abs() == 2) {
+            if local_y == trunk_h && !(radius > 0 && dx.abs() == radius && dz.abs() == radius) {
                 return slots.leaves;
             }
             // Canopy layer 2: 3x3 crown one above.
-            if local_y == trunk_h + 1 && dx.abs() <= 1 && dz.abs() <= 1 {
+            if local_y == trunk_h + 1
+                && dx.abs() <= (radius - 1).max(0)
+                && dz.abs() <= (radius - 1).max(0)
+            {
                 return slots.leaves;
             }
         }
@@ -469,7 +525,15 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
     // air cell above the grass surface — the S4 wild-food stamp. A
     // tree-root column already returned its trunk above, so a bush never
     // lands on a trunk; skip gravel scree (bushes grow from grass).
-    if world.y == h_here && is_berry_bush(world.x, world.z) && !in_gravel_patch(world.x, world.z) {
+    if slots.generation.forage
+        && world.y == h_here
+        && is_berry_bush(
+            world.x.wrapping_add(slots.generation.seed as i32),
+            world.z,
+            &slots.generation.features,
+        )
+        && !(slots.generation.gravel && in_gravel_patch(world.x, world.z, &slots.generation))
+    {
         return slots.berry_bush;
     }
     slots.empty
@@ -479,15 +543,27 @@ fn terrain_block(world: IVec3, slots: &TerrainSlots) -> BlockSlot {
 /// picked from high bits of the same hash `is_tree_root` masks low bits
 /// of, so height varies independently of placement. Pure — chunk
 /// regeneration must agree on both sides of the wire.
-fn tree_height(x: i32, z: i32) -> i32 {
-    4 + ((tree_hash(x, z) >> 8) & 1) as i32
+fn tree_height(x: i32, z: i32, f: &block_junk_mod_api::worlds::SurfaceFeatures) -> i32 {
+    (f.tree_height[0] + tree_hash(x, z).rotate_right(8) % (f.tree_height[1] - f.tree_height[0] + 1))
+        as i32
 }
 
 /// Floor of the sine-wave heightmap at column `(x, z)`. Pulled out so
 /// the tree generator can call it for candidate root columns without
 /// re-deriving the math.
+#[cfg(test)]
 fn surface_height(x: i32, z: i32) -> i32 {
-    let h = (x as f32 * 0.07).sin() * 4.0 + (z as f32 * 0.05).sin() * 4.0 + 8.0;
+    configured_surface_height(x, z, &Default::default())
+}
+
+fn configured_surface_height(
+    x: i32,
+    z: i32,
+    g: &block_junk_mod_api::worlds::GenerationConfig,
+) -> i32 {
+    let h = (x.wrapping_add(g.seed as i32) as f32 * g.frequency[0]).sin() * g.amplitude[0]
+        + (z as f32 * g.frequency[1]).sin() * g.amplitude[1]
+        + g.base_height;
     h.floor() as i32
 }
 
@@ -499,16 +575,22 @@ fn surface_height(x: i32, z: i32) -> i32 {
 /// not a gravel biome. Uses bits 5+ of `tree_hash` so patch centres
 /// don't correlate with tree roots (which mask bits 0-4; a shared
 /// low-bit mask would put a tree on top of every outcrop).
-fn in_gravel_patch(x: i32, z: i32) -> bool {
-    const PATCH_RADIUS_MAX: i32 = 2;
-    for dx in -PATCH_RADIUS_MAX..=PATCH_RADIUS_MAX {
-        for dz in -PATCH_RADIUS_MAX..=PATCH_RADIUS_MAX {
+fn in_gravel_patch(x: i32, z: i32, g: &block_junk_mod_api::worlds::GenerationConfig) -> bool {
+    let f = &g.features;
+    if f.gravel_one_in == 0 {
+        return false;
+    }
+    let radius_max = f.gravel_radius[1] as i32;
+    for dx in -radius_max..=radius_max {
+        for dz in -radius_max..=radius_max {
             let (cx, cz) = (x + dx, z + dz);
             let h = tree_hash(cx, cz);
-            if (h >> 5) & 0x1FF != 0 {
+            if !h.rotate_right(5).is_multiple_of(f.gravel_one_in) {
                 continue;
             }
-            let radius = 1 + ((h >> 16) & 1) as i32;
+            let radius = (f.gravel_radius[0]
+                + h.rotate_right(16) % (f.gravel_radius[1] - f.gravel_radius[0] + 1))
+                as i32;
             if dx.abs().max(dz.abs()) <= radius {
                 return true;
             }
@@ -521,11 +603,11 @@ fn in_gravel_patch(x: i32, z: i32) -> bool {
 /// across runs, no per-chunk state, no neighbour communication. Density
 /// is roughly one tree per 32 columns on average; tune by tightening or
 /// loosening the mask.
-fn is_tree_root(x: i32, z: i32) -> bool {
+fn is_tree_root(x: i32, z: i32, f: &block_junk_mod_api::worlds::SurfaceFeatures) -> bool {
     // ~1 in 32 columns: dense enough to recognise as "a forest" along a
     // path, sparse enough that flat-grass-with-occasional-tree still
     // reads as the dominant terrain.
-    (tree_hash(x, z) & 0x1F) == 0
+    f.tree_one_in != 0 && tree_hash(x, z).is_multiple_of(f.tree_one_in)
 }
 
 /// Whether column `(x, z)` grows a ripe berry bush — a single-cell
@@ -534,8 +616,11 @@ fn is_tree_root(x: i32, z: i32) -> bool {
 /// thicket. Reads bits 20+ of the shared hash, disjoint from tree
 /// roots (bits 0-4/8) and gravel (bits 5-13/16), so bushes don't
 /// correlate with either feature.
-fn is_berry_bush(x: i32, z: i32) -> bool {
-    (tree_hash(x, z) >> 20) & 0x3F == 0
+fn is_berry_bush(x: i32, z: i32, f: &block_junk_mod_api::worlds::SurfaceFeatures) -> bool {
+    f.forage_one_in != 0
+        && tree_hash(x, z)
+            .rotate_right(20)
+            .is_multiple_of(f.forage_one_in)
 }
 
 /// Integer hash mixing (large primes, xorshift-style finalizer) shared
@@ -552,6 +637,41 @@ fn tree_hash(x: i32, z: i32) -> u32 {
     h
 }
 
+/// Rendering follows explicit visual metadata and authored state. Missing anchor
+/// data keeps the ordinary appearance until its chunk becomes available.
+pub(crate) fn portal_cell_hidden(
+    cell: IVec3,
+    slot: BlockSlot,
+    registry: &BlockRegistry,
+    read: &impl Fn(IVec3) -> Option<(BlockSlot, Option<EntryKind>)>,
+) -> bool {
+    if registry.def(slot).portal_visuals.is_empty() {
+        return false;
+    }
+    let anchor = match read(cell).and_then(|(_, entry)| entry) {
+        Some(EntryKind::Ghost { anchor }) => anchor,
+        _ => cell,
+    };
+    let Some((anchor_slot, entry)) = read(anchor) else {
+        return false;
+    };
+    if anchor_slot != slot {
+        return false;
+    }
+    let (orientation, open) = match entry {
+        Some(EntryKind::Anchor {
+            orientation,
+            portal_open,
+        }) => (orientation, portal_open),
+        _ => (Default::default(), None),
+    };
+    let open =
+        open.unwrap_or(registry.collision[slot.0 as usize][orientation as usize].default_open);
+    registry.portal_visuals[slot.0 as usize][orientation as usize]
+        .get(&(cell - anchor).to_array())
+        .is_some_and(|mask| open & mask != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +680,7 @@ mod tests {
 
     fn empty_chunk() -> Chunk {
         Chunk {
+            revision: 0,
             blocks: vec![BlockSlot::EMPTY; ChunkShape::USIZE],
         }
     }
@@ -589,6 +710,7 @@ mod tests {
     /// unambiguous per block kind in the forage-stamp test.
     fn test_slots() -> TerrainSlots {
         TerrainSlots {
+            generation: Default::default(),
             empty: BlockSlot::EMPTY,
             stone: BlockSlot(1),
             dirt: BlockSlot(2),
@@ -604,17 +726,46 @@ mod tests {
     /// tree trunk or gravel scree) grows a ripe bush in the first air
     /// cell above a grass surface, and a bush never overwrites a trunk.
     #[test]
+    fn preset_owns_surface_feature_density_and_tree_dimensions() {
+        let mut features = block_junk_mod_api::worlds::SurfaceFeatures {
+            tree_one_in: 0,
+            forage_one_in: 0,
+            ..Default::default()
+        };
+        for x in -20..20 {
+            assert!(!is_tree_root(x, 0, &features));
+            assert!(!is_berry_bush(x, 0, &features));
+        }
+        features.tree_one_in = 1;
+        features.forage_one_in = 1;
+        features.tree_height = [9, 9];
+        for x in -20..20 {
+            assert!(is_tree_root(x, 0, &features));
+            assert!(is_berry_bush(x, 0, &features));
+            assert_eq!(tree_height(x, 0, &features), 9);
+        }
+        let mut config = block_junk_mod_api::worlds::GenerationConfig::default();
+        config.features.gravel_one_in = 0;
+        assert!(!in_gravel_patch(0, 0, &config));
+        config.features.gravel_one_in = 1;
+        config.features.gravel_radius = [0, 0];
+        assert!(in_gravel_patch(0, 0, &config));
+    }
+
+    #[test]
     fn berry_bushes_stamp_on_grass_above_surface() {
         let slots = test_slots();
         let mut bush_count = 0;
         for x in -90..90 {
             for z in -90..90 {
-                if !is_berry_bush(x, z) || in_gravel_patch(x, z) {
+                if !is_berry_bush(x, z, &Default::default())
+                    || in_gravel_patch(x, z, &Default::default())
+                {
                     continue;
                 }
                 let h = surface_height(x, z);
                 let at = terrain_block(IVec3::new(x, h, z), &slots);
-                if is_tree_root(x, z) {
+                if is_tree_root(x, z, &Default::default()) {
                     // A trunk owns its column's ground cell — the bush
                     // stamp must yield to it, never overwrite it.
                     assert_ne!(

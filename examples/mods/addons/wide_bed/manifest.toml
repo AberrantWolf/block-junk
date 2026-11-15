@@ -1,0 +1,7 @@
+id = "wide_bed"
+name = "Compatible furnishing upgrade example"
+version = "0.1.0"
+api_version = "0.6.0"
+
+[dependencies]
+foundation = "^1.0"

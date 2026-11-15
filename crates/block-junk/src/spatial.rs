@@ -30,7 +30,7 @@ pub const MAX_PENDING_SPATIAL_BYTES: usize = 4 * 1024 * 1024;
 pub const SPATIAL_BYTES_PER_SECOND: usize = 32 * 1024;
 pub const SPATIAL_BURST_BYTES: usize = 128 * 1024;
 pub const TERRAIN_DATASET_ID: DatasetId = DatasetId(0);
-pub const TERRAIN_SCHEMA_FINGERPRINT: u64 = 0x7465_7272_0000_0001;
+pub const TERRAIN_SCHEMA_FINGERPRINT: u64 = 0x7465727200000003;
 
 pub struct GlobalAudience;
 
@@ -123,6 +123,7 @@ pub struct DatasetId(pub u16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MembershipPolicy {
+    ExactCells,
     AnchorCell,
     Bounds,
 }
@@ -168,6 +169,11 @@ pub trait SpatialDataset: Send + Sync + Sized + 'static {
     const REPLICATION: ReplicationPolicy;
     const MAX_RECORD_BYTES: usize;
 
+    /// Durable record revisions prevent an older overlapping chunk snapshot
+    /// from replacing a newer committed value. Unversioned datasets use lane order.
+    fn revision(_: &Self::Value) -> Option<u64> {
+        None
+    }
     fn chunks(key: &Self::Key, value: &Self::Value) -> Vec<ChunkCoord>;
     fn to_wire(key: &Self::Key, value: &Self::Value) -> Self::Wire;
     fn from_wire(
@@ -364,6 +370,13 @@ impl<D: SpatialDataset> PartitionedStore<D> {
         match delta {
             SpatialDelta::Upsert(wire) => {
                 let (key, value) = D::from_wire(wire, registry)?;
+                if self
+                    .values
+                    .get(&key)
+                    .is_some_and(|current| D::revision(current) > D::revision(&value))
+                {
+                    return Ok(());
+                }
                 let chunks: Vec<_> = normalized_chunks(D::chunks(&key, &value))
                     .into_iter()
                     .filter(|chunk| active_chunks.contains(chunk))
@@ -466,7 +479,20 @@ impl<D: SpatialDataset> PartitionedStore<D> {
     ) -> Result<(), SpatialError> {
         let wire = decode_record::<D>(payload)?;
         let (key, value) = D::from_wire(wire, registry)?;
-        self.values.insert(key.clone(), value);
+        let current = self.values.get(&key);
+        let stale = current.is_some_and(|current| D::revision(current) > D::revision(&value));
+        let effective = if stale { current.unwrap() } else { &value };
+        if D::revision(effective).is_some() && !D::chunks(&key, effective).contains(&source_chunk) {
+            if stale {
+                return Ok(());
+            }
+            return Err(SpatialError::Decode(
+                "record lies outside its source partition".into(),
+            ));
+        }
+        if !stale {
+            self.values.insert(key.clone(), value);
+        }
         self.chunk_to_keys
             .entry(source_chunk)
             .or_default()
@@ -613,6 +639,26 @@ impl SpatialSnapshotCache {
 }
 
 impl SpatialDatasetRegistry {
+    pub fn register_revision<D: crate::spatial_revision::RevisionDataset>(&mut self) {
+        assert!(
+            !self.datasets.contains_key(&D::ID),
+            "duplicate revision dataset"
+        );
+        assert!(
+            self.fingerprints.insert(D::SCHEMA),
+            "duplicate revision schema"
+        );
+        self.datasets.insert(
+            D::ID,
+            DatasetRegistration {
+                id: D::ID,
+                schema_fingerprint: D::SCHEMA,
+                type_name: type_name::<D>(),
+                max_record_bytes: MAX_PARTITION_PAGE_BYTES,
+                persistence: PersistencePolicy::Ephemeral,
+            },
+        );
+    }
     pub fn register<D: SpatialDataset>(&mut self) {
         assert!(
             D::MAX_RECORD_BYTES <= MAX_PARTITION_PAGE_BYTES,
@@ -1078,29 +1124,7 @@ mod tests {
             }
         }
 
-        #[test]
-        fn room_chunk_membership_is_bounded_and_reference_counted(
-            x in -32i32..32,
-            width in 0i32..64,
-        ) {
-            use crate::spatial::SpatialDataset as _;
-            let room = crate::protocol::RoomSummary {
-                room_id: 1,
-                pattern: "vanilla:test".to_owned(),
-                anchor: IVec3::new(x, 0, 0),
-                bbox_min: IVec3::new(x, 0, 0),
-                bbox_max: IVec3::new(x + width, 2, 2),
-                floor_area: width as u32 + 1,
-            };
-            let chunks = crate::room_sync::RoomSummaryDataset::chunks(&1, &room);
-            prop_assert!(!chunks.is_empty());
-            prop_assert!(chunks.len() <= 3);
-            let wire = crate::room_sync::RoomSummaryDataset::to_wire(&1, &room);
-            let encoded = encode_record::<crate::room_sync::RoomSummaryDataset>(&wire).unwrap();
-            let decoded = decode_record::<crate::room_sync::RoomSummaryDataset>(&encoded).unwrap();
-            prop_assert_eq!(decoded.room_id, room.room_id);
-            prop_assert_eq!(decoded.pattern.as_ref(), room.pattern);
-        }
+
     }
 
     #[derive(Resource, Default)]

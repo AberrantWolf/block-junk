@@ -2289,17 +2289,21 @@ name = "block-junk"
 version = "0.1.0"
 dependencies = [
  "avian3d",
+ "base64",
  "bevy",
  "bevy_egui",
  "bincode",
  "blake3",
  "block-junk-mod-api",
  "block-junk-scripting",
+ "block-junk-spaces",
  "block-junk-textures",
  "block-mesh",
  "ctrlc",
  "ed25519-dalek",
  "getrandom 0.3.4",
+ "gltf",
+ "image",
  "lightyear",
  "ndshape",
  "proptest",
@@ -2314,6 +2318,7 @@ name = "block-junk-mod-api"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2322,17 +2327,24 @@ version = "0.1.0"
 dependencies = [
  "block-junk-mod-api",
  "mlua",
+ "semver",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "toml",
  "tracing",
 ]
 
 [[package]]
+name = "block-junk-spaces"
+version = "0.1.0"
+
+[[package]]
 name = "block-junk-textures"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "block-junk-scripting",
  "egui",
  "mlua",
  "png",
@@ -4402,6 +4414,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

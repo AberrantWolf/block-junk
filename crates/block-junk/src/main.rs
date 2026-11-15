@@ -1,24 +1,40 @@
+mod action_jobs;
 #[cfg(test)]
 mod architecture;
+mod architecture_solver;
 mod block_textures;
 mod blocks;
 mod build_palette;
 mod camera;
+mod capabilities;
+mod capability_input;
+mod capability_network;
 mod civilization;
 mod client;
 mod client_chunks;
 mod collision;
+mod construction;
 mod containers;
+mod content_contracts;
+#[cfg(test)]
+mod content_validation;
 mod craft_progress_hud;
 mod craft_stations;
 mod craft_ui;
 mod debug;
+mod facility_access;
+mod facility_interactions;
+mod facility_inventory;
 mod haul;
 mod identity;
 mod inspect_panel;
 mod interactables;
+mod item_placement;
 mod items;
+mod live_spaces;
 mod menu;
+mod mod_assets;
+mod mod_commands;
 mod modset;
 mod network;
 mod npc;
@@ -26,26 +42,84 @@ mod npc_mover;
 mod npc_registry;
 mod pathfinding;
 mod physics;
+mod placement_network;
+mod placement_preview;
+mod placements;
 mod plan_claims;
 mod plan_ghosts;
 mod plans;
 mod player_mode;
+mod portal_service;
 mod preview;
 mod protocol;
 mod recipes;
 mod regrow;
-mod room_sync;
+mod reservations;
+#[cfg(test)]
 mod rooms;
 mod save;
+mod save_upgrade;
 mod scripting;
 mod server;
+mod settlements;
+mod space_identity;
+mod space_network;
 mod spatial;
+mod spatial_events;
+mod spatial_geometry;
+mod spatial_revision;
 mod storage;
+mod surface_navigation;
 mod target_outline;
+mod terrain_transaction;
 mod ui_capture;
 mod ui_theme;
 mod voxel;
+mod world_rules;
 mod worldspace_toast;
+
+#[cfg(test)]
+mod allocation_counter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static REQUESTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    struct CountingAllocator;
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            REQUESTED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            // SAFETY: forwards the unchanged allocation contract to System.
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: forwards the original pointer and layout to System.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            REQUESTED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+            // SAFETY: forwards the original allocation contract to System.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    pub fn reset() {
+        CALLS.store(0, Ordering::Relaxed);
+        REQUESTED_BYTES.store(0, Ordering::Relaxed);
+    }
+    pub fn snapshot() -> (u64, u64) {
+        (
+            CALLS.load(Ordering::Relaxed),
+            REQUESTED_BYTES.load(Ordering::Relaxed),
+        )
+    }
+}
 
 use core::sync::atomic::{AtomicBool, AtomicU8};
 use core::time::Duration;
@@ -68,6 +142,29 @@ const TICK_HZ: f64 = 60.0;
 /// headless server App's update loop.
 fn tick_duration() -> Duration {
     Duration::from_secs_f64(1.0 / TICK_HZ)
+}
+
+#[derive(Default)]
+struct ContentLaunch {
+    mods_dir: Option<std::ffi::OsString>,
+    preset: Option<String>,
+}
+static CONTENT_LAUNCH: std::sync::OnceLock<ContentLaunch> = std::sync::OnceLock::new();
+fn content_launch() -> &'static ContentLaunch {
+    CONTENT_LAUNCH.get_or_init(Default::default)
+}
+
+fn game_arguments() -> Vec<String> {
+    let mut args = std::env::args().skip(1);
+    let mut result = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "--mods-dir" || arg == "--preset" {
+            args.next();
+        } else {
+            result.push(arg);
+        }
+    }
+    result
 }
 
 enum CliMode {
@@ -96,7 +193,7 @@ enum CliMode {
 const DEDICATED_DEFAULT_SAVE: &str = "dedicated";
 
 fn parse_cli() -> CliMode {
-    let mut args = std::env::args().skip(1);
+    let mut args = game_arguments().into_iter();
     let Some(first) = args.next() else {
         return CliMode::Solo;
     };
@@ -179,6 +276,25 @@ fn parse_cli() -> CliMode {
 }
 
 fn main() {
+    let raw: Vec<_> = std::env::args().skip(1).collect();
+    if raw.first().is_some_and(|arg| arg == "validate-mods") {
+        std::process::exit(crate::scripting::validate_mods(&raw[1..]));
+    }
+    let mut options = ContentLaunch::default();
+    let mut args = raw.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--mods-dir" => {
+                options.mods_dir =
+                    Some(args.next().expect("--mods-dir requires a directory").into())
+            }
+            "--preset" => {
+                options.preset = Some(args.next().expect("--preset requires an id").clone())
+            }
+            _ => {}
+        }
+    }
+    let _ = CONTENT_LAUNCH.set(options);
     match parse_cli() {
         CliMode::DedicatedServer {
             save_name,
@@ -231,6 +347,7 @@ fn run_dedicated_server(
         eprintln!("WARNING: cannot install Ctrl-C handler ({e}); kill will skip the quit-save");
     }
     let config = ServerSaveConfig {
+        preset: content_launch().preset.clone(),
         save_name: Some(save_name),
         load_existing,
         no_save_on_exit: false,
@@ -324,12 +441,21 @@ fn run_client(preset: Option<LaunchMode>, invite_secret: Option<[u8; 32]>) {
     let tick = tick_duration();
     let mut app = App::new();
 
-    // Register the `mods://` asset source so block defs can reference
-    // mod-shipped meshes by `mods://<modname>/path/to/file.glb`. Must
-    // run before `DefaultPlugins` initialises `AssetPlugin`.
+    let root = content_launch()
+        .mods_dir
+        .clone()
+        .or_else(|| std::env::var_os("BLOCK_JUNK_MODS_DIR"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "mods".into());
+    let roots = block_junk_scripting::resources::ResourceRoots::discover(&root)
+        .unwrap_or_else(|e| panic!("mod resource discovery failed: {e}"));
     app.register_asset_source(
         "mods",
-        bevy::asset::io::AssetSourceBuilder::platform_default("mods", None),
+        bevy::asset::io::AssetSourceBuilder::new(move || {
+            Box::new(crate::mod_assets::ModAssetReader {
+                roots: roots.clone(),
+            })
+        }),
     );
 
     app.add_plugins(

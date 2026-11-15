@@ -13,7 +13,7 @@
 --   { kind = "rest",   duration_secs = T }
 --   { kind = "goto",     cell = {x,y,z}, timeout_secs = T }
 --   { kind = "interact", cell = {x,y,z}, timeout_secs = T }
---   { kind = "work_plan", cell = {x,y,z}, timeout_secs = T }
+--   { kind = "take_job", candidate_id = ID, revision = N }
 --
 -- The native brain side already handles path selection, A*, steering,
 -- stuck-detection, interaction duration, and physics; the planner only
@@ -96,12 +96,19 @@ local function nearest_plan(snapshot)
     return nil
 end
 
+local function nearest_job(snapshot)
+    if snapshot.job_candidates and #snapshot.job_candidates > 0 then
+        return snapshot.job_candidates[1]
+    end
+    return nil
+end
+
 engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- snapshot.id                  — stable u64 id of this NPC (table key)
     -- snapshot.kind                 — NpcKindId we registered
     -- snapshot.foot                 — { x, y, z } NPC's current foot cell
     -- snapshot.needs                — table keyed by need id (e.g. needs.hunger)
-    -- snapshot.nearby_rooms         — sorted nearest-first list
+    -- snapshot.nearby_spaces         — sorted nearest-first list
     -- snapshot.nearby_interactions  — sorted nearest-first list of every
     --                                 reachable interactable; each entry
     --                                 has `need` (string or nil),
@@ -172,13 +179,13 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
     -- with a queue of tags will work through them rather than wander.
     local work = snapshot.needs.work or 0.0
     if work >= WORK_THRESHOLD then
-        local plan_cell = nearest_plan(snapshot)
-        if plan_cell ~= nil then
+        local job = nearest_job(snapshot)
+        if job ~= nil then
             last_action[snapshot.id] = "work"
             return {
-                kind = "work_plan",
-                cell = plan_cell,
-                timeout_secs = 60.0,
+                kind = "take_job",
+                candidate_id = job.id,
+                revision = job.revision,
             }
         end
     end
@@ -210,9 +217,9 @@ engine.npcs.set_planner("vanilla:wanderer", function(snapshot)
 
     -- After resting, pick a fresh motion: visit a known room or
     -- wander. Visit only fires when we know of at least one room.
-    if #snapshot.nearby_rooms > 0 and math.random() < VISIT_PROBABILITY then
+    if #snapshot.nearby_spaces > 0 and math.random() < VISIT_PROBABILITY then
         last_action[snapshot.id] = "visit"
-        local target = snapshot.nearby_rooms[1]  -- nearest
+        local target = snapshot.nearby_spaces[1]  -- nearest
         return {
             kind = "goto",
             cell = target.anchor,

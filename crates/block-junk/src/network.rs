@@ -209,7 +209,7 @@ fn persist_access(path: &std::path::Path, access: &PersistedAccess) -> Result<()
 // …0005: WorldItem gained `count` — piles ride the same replication (2026-07, S2).
 // …0006: container stock protocol (2026-07, S3).
 // …0008: unified ordered spatial envelope and trait-driven datasets.
-pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0008;
+pub const NETCODE_PROTOCOL_ID: u64 = 0xB10C_6A31_0000_0012;
 
 /// Which address the server socket binds. Inserted by
 /// `run_server_inner`; the dedicated CLI can override the default.
@@ -270,10 +270,21 @@ impl Plugin for NetworkPlugin {
 
 /// Wire-protocol registration. Messages, channels, and entity-mapping bits
 /// for anything that crosses the client/server boundary.
-struct ProtocolPlugin;
+pub(crate) struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<crate::spatial::SpatialDatasetRegistry>();
+        app.world_mut()
+            .resource_mut::<crate::spatial::SpatialDatasetRegistry>()
+            .register_revision::<crate::space_network::SpaceDataset>();
+        app.world_mut()
+            .resource_mut::<crate::spatial::SpatialDatasetRegistry>()
+            .register_revision::<crate::capability_network::CapabilityDataset>();
+        app.register_message::<crate::space_network::RequestSpaceSnapshot>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<crate::capability_network::RequestCapabilitySnapshot>()
+            .add_direction(NetworkDirection::ClientToServer);
         app.add_channel::<WorldChannel>(ChannelSettings {
             mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
             ..default()
@@ -346,6 +357,10 @@ impl Plugin for ProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<DropToolRequest>()
             .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<crate::portal_service::PortalRequest>()
+            .add_direction(NetworkDirection::ClientToServer);
+        app.register_message::<crate::portal_service::PortalResult>()
+            .add_direction(NetworkDirection::ServerToClient);
         app.register_message::<DepositRequest>()
             .add_direction(NetworkDirection::ClientToServer);
         // Phase 6b craft-order messages. Retired the Phase 6a

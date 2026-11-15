@@ -25,6 +25,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum NpcBootstrapError {
+    #[error("{definition} {field}: {problem}")]
+    InvalidValue {
+        definition: String,
+        field: String,
+        problem: &'static str,
+    },
     #[error("duplicate npc kind id {0}")]
     DuplicateKind(String),
     #[error("duplicate need id {0}")]
@@ -79,7 +85,14 @@ impl NpcKindRegistry {
     ) -> Result<Self, NpcBootstrapError> {
         let mut defs = HashMap::with_capacity(pending.len());
         for def in pending {
-            for need_id in def.default_needs.keys() {
+            for (need_id, value) in &def.default_needs {
+                if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                    return Err(NpcBootstrapError::InvalidValue {
+                        definition: def.id.to_string(),
+                        field: format!("default_needs/{need_id}"),
+                        problem: "must be finite and between 0 and 1",
+                    });
+                }
                 if !needs.contains(need_id) {
                     return Err(NpcBootstrapError::KindNeedsUnknownNeed {
                         kind: def.id.0.clone(),
@@ -105,7 +118,10 @@ impl NpcKindRegistry {
             for (i, stat) in def.stats.iter().enumerate() {
                 let problem = if stat.id.is_empty() {
                     Some("empty id")
-                } else if !stat.min.is_finite() || !stat.max.is_finite() {
+                } else if !stat.min.is_finite()
+                    || !stat.max.is_finite()
+                    || !(stat.max - stat.min).is_finite()
+                {
                     Some("non-finite range")
                 } else if stat.min > stat.max {
                     Some("min > max")
@@ -155,8 +171,46 @@ pub struct NeedRegistry {
 
 impl NeedRegistry {
     pub fn build(pending: Vec<NeedDef>) -> Result<Self, NpcBootstrapError> {
+        let names: std::collections::BTreeSet<_> =
+            pending.iter().map(|def| def.id.0.clone()).collect();
         let mut defs = HashMap::with_capacity(pending.len());
         for def in pending {
+            let invalid = |field: &str, problem| NpcBootstrapError::InvalidValue {
+                definition: def.id.to_string(),
+                field: field.into(),
+                problem,
+            };
+            if !def.decay_per_sec.is_finite() || def.decay_per_sec < 0. {
+                return Err(invalid("decay_per_sec", "must be finite and nonnegative"));
+            }
+            for (name, value) in [
+                ("urge_threshold", def.urge_threshold),
+                ("preempt_threshold", def.preempt_threshold),
+            ] {
+                if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+                    return Err(invalid(name, "must be between 0 and 1, or omitted"));
+                }
+            }
+            if let Some(boost) = &def.decay_boost {
+                if !names.contains(&boost.need) {
+                    return Err(NpcBootstrapError::InvalidValue {
+                        definition: def.id.to_string(),
+                        field: format!("decay_boost/need ({})", boost.need),
+                        problem: "references an unregistered need",
+                    });
+                }
+                if !boost.above.is_finite()
+                    || !(0.0..=1.0).contains(&boost.above)
+                    || !boost.multiplier.is_finite()
+                    || boost.multiplier < 0.
+                    || !(def.decay_per_sec * boost.multiplier).is_finite()
+                {
+                    return Err(invalid(
+                        "decay_boost",
+                        "threshold must be 0–1 and scaled decay must be finite and nonnegative",
+                    ));
+                }
+            }
             let key = def.id.0.clone();
             if defs.insert(key.clone(), def).is_some() {
                 return Err(NpcBootstrapError::DuplicateNeed(key));
@@ -224,7 +278,7 @@ impl WorkDefaultsRes {
         needs: &NeedRegistry,
     ) -> Result<Self, NpcBootstrapError> {
         let defaults = pending.unwrap_or_default();
-        if defaults.duration_secs <= 0.0 {
+        if !defaults.duration_secs.is_finite() || defaults.duration_secs <= 0.0 {
             return Err(NpcBootstrapError::WorkDefaultsBadDuration(
                 defaults.duration_secs,
             ));
@@ -233,6 +287,34 @@ impl WorkDefaultsRes {
             && !needs.contains(&nr.need)
         {
             return Err(NpcBootstrapError::WorkDefaultsUnknownNeed(nr.need.clone()));
+        }
+        if defaults.need_restore.as_ref().is_some_and(|restore| {
+            !restore.restores.is_finite() || restore.restores <= 0. || restore.restores > 1.
+        }) {
+            return Err(NpcBootstrapError::InvalidValue {
+                definition: "npcs/work_defaults".into(),
+                field: "need_restore/restores".into(),
+                problem: "must be positive and at most 1",
+            });
+        }
+        if let Some(worn) = &defaults.worn_down {
+            if !needs.contains(&worn.need) {
+                return Err(NpcBootstrapError::WorkDefaultsUnknownNeed(
+                    worn.need.clone(),
+                ));
+            }
+            if !worn.above.is_finite()
+                || !(0.0..=1.0).contains(&worn.above)
+                || !worn.multiplier.is_finite()
+                || worn.multiplier <= 0.
+                || !(defaults.duration_secs * worn.multiplier).is_finite()
+            {
+                return Err(NpcBootstrapError::InvalidValue {
+                    definition: "npcs/work_defaults".into(),
+                    field: "worn_down".into(),
+                    problem: "threshold must be 0–1 and scaled work duration must be finite and positive",
+                });
+            }
         }
         Ok(Self(defaults))
     }

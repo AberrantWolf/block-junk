@@ -6,8 +6,8 @@
 //! replica on each client. Client edits are typed requests; accepted state
 //! is journaled and streamed by the generic dataset framework.
 //!
-//! Phase 3 is the data + wire + replication layer. Phase 4 adds drag-
-//! AABB batching, Phase 6 wires NPC pickup against this map.
+//! ConstructionLedger owns designation, replacement and cancellation; worker
+//! completion consumes escrow only after the authoritative edit succeeds.
 
 use bevy::prelude::*;
 use block_junk_mod_api::blocks::Cardinal;
@@ -33,6 +33,10 @@ pub const MAX_PLAN_MATERIAL_KINDS: usize = 64;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PlanWireRecord {
+    project_id: u64,
+    revision: u64,
+    footprint: crate::protocol::BoundedVec<IVec3, { crate::protocol::MAX_BLOCK_FOOTPRINT_CELLS }>,
+    progress_secs: f32,
     cell: IVec3,
     kind: PlanKind,
     materials: crate::protocol::BoundedVec<MaterialEntry, MAX_PLAN_MATERIAL_KINDS>,
@@ -44,17 +48,29 @@ impl crate::spatial::SpatialDataset for PlanDataset {
     type Wire = PlanWireRecord;
     type Persistence = crate::spatial::PersistedDataset;
     const ID: crate::spatial::DatasetId = crate::spatial::DatasetId(1);
-    const SCHEMA_FINGERPRINT: u64 = 0x706c_616e_0000_0001;
-    const MEMBERSHIP: crate::spatial::MembershipPolicy =
-        crate::spatial::MembershipPolicy::AnchorCell;
+    const SCHEMA_FINGERPRINT: u64 = 0x706c_616e_0000_0002;
+    const MEMBERSHIP: crate::spatial::MembershipPolicy = crate::spatial::MembershipPolicy::Bounds;
     const REPLICATION: crate::spatial::ReplicationPolicy =
         crate::spatial::ReplicationPolicy::Immediate;
-    const MAX_RECORD_BYTES: usize = 4096;
-    fn chunks(key: &Self::Key, _: &Self::Value) -> Vec<crate::protocol::ChunkCoord> {
-        vec![crate::voxel::world_to_chunk(*key).0]
+    const MAX_RECORD_BYTES: usize = 8192;
+    fn chunks(key: &Self::Key, value: &Self::Value) -> Vec<crate::protocol::ChunkCoord> {
+        let mut chunks: Vec<_> = value
+            .footprint
+            .iter()
+            .chain(std::iter::once(key))
+            .map(|cell| crate::voxel::world_to_chunk(*cell).0)
+            .collect();
+        chunks.sort_by_key(|c| (c.0.x, c.0.y, c.0.z));
+        chunks.dedup();
+        chunks
     }
     fn to_wire(key: &Self::Key, value: &Self::Value) -> Self::Wire {
         PlanWireRecord {
+            project_id: value.project_id,
+            revision: value.revision,
+            footprint: crate::protocol::BoundedVec::new(value.footprint.clone())
+                .expect("validated project footprint"),
+            progress_secs: value.progress_secs,
             cell: *key,
             kind: value.kind,
             materials: crate::protocol::BoundedVec::new(value.materials.clone())
@@ -65,6 +81,29 @@ impl crate::spatial::SpatialDataset for PlanDataset {
         wire: Self::Wire,
         registry: &crate::spatial::SpatialDecodeRegistry,
     ) -> Result<(Self::Key, Self::Value), crate::spatial::SpatialError> {
+        if wire.project_id == 0
+            || wire.revision == 0
+            || wire.footprint.is_empty()
+            || !wire.footprint.contains(&wire.cell)
+            || !wire.progress_secs.is_finite()
+            || wire.progress_secs < 0.0
+        {
+            return Err(crate::spatial::SpatialError::Decode(
+                "invalid construction project".into(),
+            ));
+        }
+        let mut cells = std::collections::HashSet::new();
+        let mut items = std::collections::HashSet::new();
+        if wire.footprint.iter().any(|c| !cells.insert(*c))
+            || wire
+                .materials
+                .iter()
+                .any(|m| m.needed == 0 || m.present > m.needed || !items.insert(m.item))
+        {
+            return Err(crate::spatial::SpatialError::Decode(
+                "invalid project footprint or escrow".into(),
+            ));
+        }
         if let PlanKind::Build { slot, .. } = wire.kind {
             registry.require("block", slot.0 as u32)?;
         }
@@ -74,6 +113,10 @@ impl crate::spatial::SpatialDataset for PlanDataset {
         Ok((
             wire.cell,
             PlanState {
+                project_id: wire.project_id,
+                revision: wire.revision,
+                footprint: wire.footprint.into_inner(),
+                progress_secs: wire.progress_secs,
                 kind: wire.kind,
                 materials: wire.materials.into_inner(),
             },
@@ -96,14 +139,6 @@ impl Plans {
     /// materials. Copies so the caller doesn't borrow the map.
     pub fn kind(&self, cell: IVec3) -> Option<PlanKind> {
         self.get(cell).map(|s| s.kind)
-    }
-
-    pub fn set(&mut self, cell: IVec3, state: PlanState) {
-        self.upsert(cell, state, 0);
-    }
-
-    pub fn clear(&mut self, cell: IVec3) {
-        self.delete(&cell, 0);
     }
 
     pub(crate) fn restore_all(&mut self, entries: impl IntoIterator<Item = (IVec3, PlanState)>) {
@@ -147,6 +182,14 @@ pub struct PlansClientPlugin;
 impl Plugin for PlansServerPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(crate::spatial::SpatialFeaturePlugin::<PlanDataset>::server());
+        app.init_resource::<crate::construction::ConstructionLedger>();
+        app.init_resource::<crate::npc_registry::WorkDefaultsRes>();
+        app.add_systems(PreUpdate, crate::construction::activate_jobs);
+        app.add_systems(PostUpdate, crate::construction::reconcile_jobs);
+        app.add_systems(
+            Update,
+            crate::construction::deliver_pending_refunds.in_set(GameSet::PostSimulation),
+        );
         // Observer fires per new client connection — same shape as
         // `register_new_client` sending `BlockManifest`. Late observers
         // are safe because lightyear has already installed the per-
@@ -512,12 +555,11 @@ fn commit_batch(
     let Ok(mut sender) = sender.single_mut() else {
         return;
     };
-    // Client request: materials is server-set. Empty on the wire here.
+    // Requirements come exclusively from authoritative content.
     sender.send::<StateSyncChannel>(PlanEditBatch {
         kind,
         cells: crate::protocol::BoundedVec::new(cells)
             .expect("client plan batches are truncated before send"),
-        materials: Vec::new(),
     });
 }
 
@@ -651,7 +693,7 @@ fn cell_centre_dist(cell: IVec3, origin: Vec3) -> f32 {
 /// `present` starts at 0; deposits fill it. Returns an empty vec for
 /// Remove plans or when the block declares no materials (Phase 0
 /// blocks with empty materials — free to build).
-fn build_initial_materials(
+pub(crate) fn build_initial_materials(
     kind: PlanKind,
     block_registry: &BlockRegistry,
     item_registry: &crate::items::ItemRegistry,
@@ -686,8 +728,9 @@ fn receive_plan_edits(
         (Entity, &mut MessageReceiver<PlanEdit>),
         With<crate::protocol::GameReady>,
     >,
-    mut plans: ResMut<Plans>,
+    mut construction: crate::construction::ConstructionService,
     chunks: Query<&Chunk>,
+    sidecars: Query<&ChunkEntities>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
     item_registry: Res<crate::items::ItemRegistry>,
@@ -747,12 +790,20 @@ fn receive_plan_edits(
                     Some(PlanState::new(kind, materials))
                 }
                 None => {
-                    plans.clear(edit.cell);
+                    construction.cancel(edit.cell);
                     None
                 }
             };
             if let Some(state) = accepted_state {
-                plans.set(edit.cell, state);
+                designate_live(
+                    &mut construction,
+                    edit.cell,
+                    state,
+                    &chunks,
+                    &chunk_map,
+                    &block_registry,
+                    &sidecars,
+                );
             }
         }
     }
@@ -768,8 +819,9 @@ fn receive_plan_edit_batches(
         (Entity, &mut MessageReceiver<PlanEditBatch>),
         With<crate::protocol::GameReady>,
     >,
-    mut plans: ResMut<Plans>,
+    mut construction: crate::construction::ConstructionService,
     chunks: Query<&Chunk>,
+    sidecars: Query<&ChunkEntities>,
     chunk_map: Res<ChunkMap>,
     block_registry: Res<BlockRegistry>,
     item_registry: Res<crate::items::ItemRegistry>,
@@ -827,16 +879,32 @@ fn receive_plan_edit_batches(
                         if !cell_is_solid(cell, &chunks, &chunk_map) {
                             continue;
                         }
-                        plans.set(cell, PlanState::new(PlanKind::Remove, Vec::new()));
+                        designate_live(
+                            &mut construction,
+                            cell,
+                            PlanState::new(PlanKind::Remove, Vec::new()),
+                            &chunks,
+                            &chunk_map,
+                            &block_registry,
+                            &sidecars,
+                        );
                     }
                     Some(kind @ PlanKind::Build { .. }) => {
                         if cell_is_solid(cell, &chunks, &chunk_map) {
                             continue;
                         }
-                        plans.set(cell, PlanState::new(kind, shared_materials.clone()));
+                        designate_live(
+                            &mut construction,
+                            cell,
+                            PlanState::new(kind, shared_materials.clone()),
+                            &chunks,
+                            &chunk_map,
+                            &block_registry,
+                            &sidecars,
+                        );
                     }
                     None => {
-                        plans.clear(cell);
+                        construction.cancel(cell);
                     }
                 }
             }
@@ -855,6 +923,90 @@ pub(crate) fn cell_is_solid(cell: IVec3, chunks: &Query<&Chunk>, chunk_map: &Chu
         .and_then(|&entity| chunks.get(entity).ok())
         .map(|chunk| !chunk.get(local).is_empty())
         .unwrap_or(false)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "designation validates grid and sidecar geometry together"
+)]
+fn designate_live(
+    construction: &mut crate::construction::ConstructionService,
+    cell: IVec3,
+    state: PlanState,
+    chunks: &Query<&Chunk>,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+    sidecars: &Query<&ChunkEntities>,
+) -> bool {
+    prepare_designation(cell, state, chunks, map, registry, sidecars)
+        .is_some_and(|(anchor, state)| construction.designate(anchor, state))
+}
+
+pub(crate) fn prepare_designation(
+    cell: IVec3,
+    state: PlanState,
+    chunks: &Query<&Chunk>,
+    map: &ChunkMap,
+    registry: &BlockRegistry,
+    sidecars: &Query<&ChunkEntities>,
+) -> Option<(IVec3, PlanState)> {
+    prepare_designation_view(cell, state, registry, &|cell| {
+        let (coord, local) = world_to_chunk(cell);
+        let entity = *map.0.get(&coord)?;
+        Some((
+            chunks.get(entity).ok()?.get(local),
+            sidecars.get(entity).ok().and_then(|s| s.get(cell)),
+        ))
+    })
+}
+
+pub(crate) fn prepare_designation_view(
+    mut cell: IVec3,
+    mut state: PlanState,
+    registry: &BlockRegistry,
+    read: &impl Fn(IVec3) -> Option<(BlockSlot, Option<crate::voxel::EntryKind>)>,
+) -> Option<(IVec3, PlanState)> {
+    if cell.to_array().iter().any(|v| v.unsigned_abs() > 1_000_000) {
+        return None;
+    }
+    let (def, orientation) = match state.kind {
+        PlanKind::Build { slot, orientation } => {
+            let def = registry.try_def(slot)?;
+            if !def.flags.placeable {
+                return None;
+            }
+            (def, orientation)
+        }
+        PlanKind::Remove => {
+            let (_, entry) = read(cell)?;
+            if let Some(crate::voxel::EntryKind::Ghost { anchor }) = entry {
+                cell = anchor;
+            }
+            let (slot, entry) = read(cell)?;
+            if slot.is_empty() {
+                return None;
+            }
+            let orientation = match entry {
+                Some(crate::voxel::EntryKind::Anchor { orientation, .. }) => orientation,
+                _ => Cardinal::default(),
+            };
+            (registry.try_def(slot)?, orientation)
+        }
+    };
+    state.footprint = def
+        .footprint
+        .iter()
+        .map(|offset| cell + IVec3::from_array(orientation.rotate_offset(*offset)))
+        .collect();
+    let build = matches!(state.kind, PlanKind::Build { .. });
+    if !state
+        .footprint
+        .iter()
+        .all(|cell| read(*cell).is_some_and(|(slot, _)| slot.is_empty() == build))
+    {
+        return None;
+    }
+    Some((cell, state))
 }
 
 #[cfg(test)]

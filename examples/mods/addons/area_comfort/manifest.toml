@@ -1,0 +1,8 @@
+id = "area_comfort"
+name = "Space per sleeper"
+version = "0.1.0"
+api_version = "0.6.0"
+
+[optional_dependencies]
+vanilla = "^0.1"
+foundation = "^1.0"

@@ -1,32 +1,7 @@
-//! Spatial index of interactable cells + per-block claim table
-//! (server-only).
-//!
-//! Unifies what used to be `ConsumableIndex` + `SleeperIndex` +
-//! `BedClaims`: now that every NPC-usable block carries one
-//! [`Interactable`](block_junk_mod_api::blocks::Interactable) struct
-//! regardless of the action it represents (eat, sleep, enchant, sit),
-//! one index + one claim table covers them all.
-//!
-//! Two resources:
-//!
-//! - [`InteractableIndex`] — world-cell → [`BlockSlot`] for every cell
-//!   whose def has `interactable` metadata. The snapshot builder
-//!   surfaces "what interactions are nearby?" to NPC planners by
-//!   scanning this; the planner reads `Interactable::need_restore` /
-//!   `exclusive` via the [`BlockRegistry`] to decide which entries are
-//!   relevant.
-//! - [`InteractionClaims`] — per-anchor reservation table for
-//!   *exclusive* interactables (today: beds; tomorrow: enchantment
-//!   altars, forges). Non-exclusive interactables (food, water) skip
-//!   the claim path entirely so a queue of hungry NPCs can use one
-//!   basket without serialising on it.
-//!
-//! The index keys per-cell because a multi-cell interactable
-//! (bed, large altar) exposes every footprint cell as a candidate
-//! "this is an interaction" hit. Claims key per-anchor so foot/head
-//! of a bed (or any other multi-cell interactable) contend for the
-//! same slot — the brain resolves the anchor before claiming via the
-//! chunk sidecar.
+//! Legacy planner discovery index and shared named-slot reservation table.
+//! The discovery view still offers one candidate per anchor until the bounded
+//! policy candidate provider replaces it. Execution reserves exact use-slot IDs
+//! through `facility_interactions`; furniture cells are never separate seats.
 
 use std::collections::HashMap;
 
@@ -75,16 +50,13 @@ impl InteractableIndex {
     }
 }
 
-/// Per-anchor-cell reservation map for *exclusive* interactables.
-/// Anchor (not target cell) so foot/head of a multi-cell interactable
-/// contend for the same slot. Claims are released by the brain on
-/// every transition out of `Goal::Interacting` (clean completion,
-/// abandonment, despawn) and on `BrainDisabled` insertion. Claims do
-/// NOT survive save/load — the brain resets to Idle on load so any
-/// in-flight interaction restarts from scratch.
-#[derive(Resource, Default, Debug)]
+/// Exclusive leases key stable placement plus authored slot name. Different
+/// seats on one object do not contend. Leases are transient; durable interaction
+/// jobs retain progress and require revalidation after loading.
+#[derive(Resource, Default, Debug, Clone)]
 pub struct InteractionClaims {
-    by_anchor: HashMap<IVec3, NpcId>,
+    by_slot: crate::reservations::ReservationTable<block_junk_mod_api::architecture::UseSlotId>,
+    slot_anchors: HashMap<block_junk_mod_api::architecture::UseSlotId, IVec3>,
     /// Anchors whose approach recently defeated an NPC (physically
     /// stuck mid-walk or no A* path) → world-time when retries may
     /// resume. Same 30 s backoff pattern as `HaulStore`'s unreachable
@@ -95,30 +67,51 @@ pub struct InteractionClaims {
 }
 
 impl InteractionClaims {
-    /// Try to claim `anchor` for `npc`. Succeeds if the slot is empty
-    /// or already held by the same NPC (re-claim is a no-op rather
-    /// than a contention failure — the brain may re-call this if a
-    /// goal restarts mid-flight).
-    pub fn try_claim(&mut self, anchor: IVec3, npc: NpcId) -> bool {
-        match self.by_anchor.get(&anchor) {
-            Some(holder) if holder.0 == npc.0 => true,
-            Some(_) => false,
-            None => {
-                self.by_anchor.insert(anchor, npc);
-                true
-            }
+    pub fn slot_reserved(&self, slot: &block_junk_mod_api::architecture::UseSlotId) -> bool {
+        self.by_slot.holder(slot).is_some()
+    }
+    pub fn claim_slot(
+        &mut self,
+        anchor: IVec3,
+        slot: block_junk_mod_api::architecture::UseSlotId,
+        owner: block_junk_mod_api::authority::ReservationOwner,
+    ) -> Option<crate::reservations::Lease> {
+        let lease = self.by_slot.acquire(slot.clone(), owner)?;
+        self.slot_anchors.insert(slot, anchor);
+        Some(lease)
+    }
+    pub fn matches_slot(
+        &self,
+        slot: &block_junk_mod_api::architecture::UseSlotId,
+        lease: &crate::reservations::Lease,
+    ) -> bool {
+        self.by_slot.holder(slot) == Some(lease)
+    }
+    pub fn release_slot(
+        &mut self,
+        slot: &block_junk_mod_api::architecture::UseSlotId,
+        lease: &crate::reservations::Lease,
+    ) {
+        if self.by_slot.release(slot, lease) {
+            self.slot_anchors.remove(slot);
         }
     }
-
-    /// Release `anchor`'s claim if `npc` holds it. Releasing a claim
-    /// not held by `npc` is silently a no-op — protects against
-    /// double-release on transitions where multiple paths dispatch
-    /// the same release (e.g. abandon + arrive racing).
+    /// Transitional goal cleanup; the action service also checks its exact lease.
     pub fn release(&mut self, anchor: IVec3, npc: NpcId) {
-        if let Some(holder) = self.by_anchor.get(&anchor)
-            && holder.0 == npc.0
-        {
-            self.by_anchor.remove(&anchor);
+        let owner = block_junk_mod_api::authority::ReservationOwner::Npc { id: npc.0 };
+        let leases: Vec<_> = self
+            .slot_anchors
+            .iter()
+            .filter(|(_, cell)| **cell == anchor)
+            .filter_map(|(slot, _)| {
+                self.by_slot
+                    .holder(slot)
+                    .filter(|lease| lease.owner == owner)
+                    .map(|lease| (slot.clone(), lease.clone()))
+            })
+            .collect();
+        for (slot, lease) in leases {
+            self.release_slot(&slot, &lease);
         }
     }
 
@@ -126,7 +119,10 @@ impl InteractionClaims {
     /// brain-disable so a single NPC can't permanently lock an
     /// interactable by failing in some unanticipated way.
     pub fn release_all_for(&mut self, npc: NpcId) {
-        self.by_anchor.retain(|_, holder| holder.0 != npc.0);
+        self.by_slot
+            .release_owner(&block_junk_mod_api::authority::ReservationOwner::Npc { id: npc.0 });
+        self.slot_anchors
+            .retain(|slot, _| self.by_slot.holder(slot).is_some());
     }
 
     /// True if `anchor` is currently claimed by anyone other than
@@ -135,10 +131,13 @@ impl InteractionClaims {
     /// taking happens later, atomically, when the brain commits to
     /// the Interact goal.
     pub fn is_taken_by_other(&self, anchor: IVec3, npc: NpcId) -> bool {
-        match self.by_anchor.get(&anchor) {
-            Some(holder) => holder.0 != npc.0,
-            None => false,
-        }
+        self.slot_anchors.iter().any(|(slot, cell)| {
+            *cell == anchor
+                && self.by_slot.holder(slot).is_some_and(|lease| {
+                    lease.owner
+                        != block_junk_mod_api::authority::ReservationOwner::Npc { id: npc.0 }
+                })
+        })
     }
 
     /// Record that reaching `anchor` just failed (A* miss or physical

@@ -94,6 +94,52 @@ pub struct ContainerState {
 }
 
 impl ContainerState {
+    pub fn transfer_to_carry(
+        &mut self,
+        carry: &mut crate::protocol::Carrying,
+        item: ItemSlot,
+        count: u32,
+        capacity: u32,
+    ) -> u32 {
+        let mut next = *carry;
+        let taken = next.pickup_many(item, count.min(self.available(item)), capacity);
+        if taken == 0 {
+            return 0;
+        }
+        self.withdraw_up_to(item, taken);
+        *carry = next;
+        taken
+    }
+    pub fn transfer_from_carry(
+        &mut self,
+        carry: &mut crate::protocol::Carrying,
+        count: u32,
+        config: &block_junk_mod_api::blocks::ContainerConfig,
+        items: &crate::items::ItemRegistry,
+    ) -> u32 {
+        let Some(item) = carry.item else {
+            return 0;
+        };
+        if !config.accepts.is_empty()
+            && !config
+                .accepts
+                .iter()
+                .any(|tag| items.def(item).tags.contains(tag))
+        {
+            return 0;
+        }
+        let taken = count
+            .min(carry.count)
+            .min(room_for(Some(self), config, items, item));
+        if taken == 0 || !self.deposit(item, taken) {
+            return 0;
+        }
+        carry.count -= taken;
+        if carry.count == 0 {
+            carry.item = None;
+        }
+        taken
+    }
     /// True when nothing is stocked — caller drops the entry from the
     /// by-cell map.
     pub fn is_empty(&self) -> bool {
@@ -110,8 +156,10 @@ impl ContainerState {
         {
             return false;
         }
-        let entry = self.inventory.entry(item).or_insert(0);
-        *entry = entry.saturating_add(count);
+        let Some(total) = self.available(item).checked_add(count) else {
+            return false;
+        };
+        self.inventory.insert(item, total);
         true
     }
 
@@ -120,17 +168,7 @@ impl ContainerState {
         self.inventory.get(&item).copied().unwrap_or(0)
     }
 
-    /// Any stocked item slot (counts are always > 0 — zeros are
-    /// scrubbed). Used by the S4 finite-food eat to pick something to
-    /// draw down from a food container: a food-only basket holds nothing
-    /// but food, so "any stocked item" is "a berry to eat." Iteration
-    /// order is unspecified; a mixed-food basket feeds an arbitrary kind.
-    pub fn any_stocked(&self) -> Option<ItemSlot> {
-        self.inventory.keys().copied().next()
-    }
-
-    /// Remove up to `count` of `item`; returns how many actually came
-    /// out (short stock withdraws what's there). Zero entries scrub.
+    /// Withdraw at most the requested count, removing empty entries.
     pub fn withdraw_up_to(&mut self, item: ItemSlot, count: u32) -> u32 {
         let Some(entry) = self.inventory.get_mut(&item) else {
             return 0;
@@ -147,8 +185,8 @@ impl ContainerState {
     pub fn used_bulk(&self, item_registry: &crate::items::ItemRegistry) -> u32 {
         self.inventory
             .iter()
-            .map(|(slot, count)| count * item_registry.def(*slot).bulk.max(1))
-            .sum()
+            .map(|(slot, count)| count.saturating_mul(item_registry.def(*slot).bulk.max(1)))
+            .fold(0, u32::saturating_add)
     }
 }
 
@@ -189,10 +227,6 @@ impl Containers {
         {
             self.delete(&cell, 0);
         }
-    }
-
-    pub fn remove(&mut self, cell: IVec3) -> Option<ContainerState> {
-        self.delete(&cell, 0)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &ContainerState)> {
@@ -342,9 +376,7 @@ impl Plugin for ContainersServerPlugin {
             Update,
             apply_cell_edits_to_index.in_set(GameSet::PostSimulation),
         );
-        // `clear_destroyed_containers` registers in server.rs alongside
-        // `clear_destroyed_stations` — it must order after
-        // `receive_block_edits`, which is private to that module.
+        // Inventory retirement occurs inside the authoritative terrain transaction.
     }
 }
 
@@ -354,57 +386,29 @@ impl Plugin for ContainersClientPlugin {
     }
 }
 
-/// Server: a container block was broken or replaced — spill its stock
-/// as loose world items and drop the state, mirroring
-/// `clear_destroyed_stations`. Spills one `WorldItem` *stack* per
-/// stocked kind (counts survived as a pile), positioned with the same
-/// per-unit jitter drops use so a busted crate reads as a burst.
-pub(crate) fn clear_destroyed_containers(
-    mut reader: MessageReader<crate::protocol::CellEdit>,
-    block_registry: Res<crate::blocks::BlockRegistry>,
-    mut containers: ResMut<Containers>,
-    mut commands: Commands,
-) {
-    for edit in reader.read() {
-        if edit.prev_slot.is_empty() || block_registry.def(edit.prev_slot).container.is_none() {
-            continue;
-        }
-        let Some(state) = containers.remove(edit.world) else {
-            continue;
-        };
-        let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
-        let mut spilled = 0u32;
-        for (kind_index, (slot, count)) in state.inventory.iter().enumerate() {
-            let translation = centre + crate::items::drop_jitter(edit.world, kind_index as u32);
-            spilled += count;
-            commands.spawn((
-                crate::protocol::WorldItem {
-                    item: *slot,
-                    translation,
-                    count: *count,
-                },
-                Transform::from_translation(translation),
-                GlobalTransform::default(),
-                crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
-                    translation,
-                )),
-                Name::new(format!("WorldItem(container_spill:{})", slot.0)),
-            ));
-        }
-        info!(
-            cell = ?edit.world.to_array(),
-            spilled,
-            "container destroyed; spilled stock",
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn slot(n: u16) -> ItemSlot {
         ItemSlot(n)
+    }
+
+    #[test]
+    fn facility_transfers_withdraw_only_accepted_stock() {
+        let mut state = ContainerState::default();
+        assert!(state.deposit(slot(1), 7));
+        let mut carry = crate::protocol::Carrying::default();
+        assert_eq!(state.transfer_to_carry(&mut carry, slot(1), 7, 3), 3);
+        assert_eq!(state.available(slot(1)), 4);
+        assert_eq!(carry.count, 3);
+        assert_eq!(state.transfer_to_carry(&mut carry, slot(1), 7, 3), 0);
+        carry.item = Some(slot(2));
+        assert_eq!(state.transfer_to_carry(&mut carry, slot(1), 7, 8), 0);
+        carry.item = None;
+        assert_eq!(state.transfer_to_carry(&mut carry, slot(1), 7, 8), 0);
+        assert_eq!(state.available(slot(1)), 4);
+        assert_eq!(carry.count, 3);
     }
 
     #[test]
@@ -418,6 +422,14 @@ mod tests {
         assert_eq!(s.withdraw_up_to(slot(3), 10), 3);
         assert_eq!(s.available(slot(3)), 0);
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn overflowing_deposit_preserves_original_stock() {
+        let mut state = ContainerState::default();
+        assert!(state.deposit(slot(1), u32::MAX));
+        assert!(!state.deposit(slot(1), 1));
+        assert_eq!(state.available(slot(1)), u32::MAX);
     }
 
     #[test]

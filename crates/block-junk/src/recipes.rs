@@ -46,6 +46,15 @@ pub enum RecipeBootstrapError {
     SlotOverflow { slots: usize },
     #[error("recipe {recipe} input references unregistered item {item}")]
     InputItemUnknown { recipe: RecipeId, item: ItemId },
+    #[error(
+        "recipe {recipe} inputs[{duplicate}] repeats item {item} from inputs[{first}]; use one entry per item (indices are 1-based)"
+    )]
+    DuplicateInput {
+        recipe: RecipeId,
+        item: ItemId,
+        first: usize,
+        duplicate: usize,
+    },
     #[error("recipe {recipe} output references unregistered item {item}")]
     OutputItemUnknown { recipe: RecipeId, item: ItemId },
     #[error(
@@ -109,7 +118,16 @@ impl RecipeRegistry {
                     max: MAX_RECIPE_DURATION_SECS,
                 });
             }
-            for input in &def.inputs {
+            let mut seen_inputs = HashMap::new();
+            for (index, input) in def.inputs.iter().enumerate() {
+                if let Some(first) = seen_inputs.insert(&input.item, index + 1) {
+                    return Err(RecipeBootstrapError::DuplicateInput {
+                        recipe: def.id.clone(),
+                        item: input.item.clone(),
+                        first,
+                        duplicate: index + 1,
+                    });
+                }
                 if items.slot_of(&input.item).is_none() {
                     return Err(RecipeBootstrapError::InputItemUnknown {
                         recipe: def.id.clone(),

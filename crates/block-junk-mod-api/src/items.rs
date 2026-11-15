@@ -62,6 +62,7 @@ impl core::fmt::Display for ItemId {
 /// the carrier can perform. Mods may set it on day-one items so the
 /// migration to tools doesn't require touching content.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ItemDef {
     pub id: ItemId,
     pub display_name: String,
@@ -127,6 +128,7 @@ pub struct ItemDef {
 /// fields optional in Lua: `hold_transform = { scale = 0.35 }` is the
 /// common case (shrink a bulky resource to hand size).
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HoldTransform {
     /// Offset from the hand socket, in metres (local to the socket).
     #[serde(default)]
@@ -147,6 +149,7 @@ fn default_hold_scale() -> f32 {
 /// Per-item pile tuning. All fields optional in Lua — an item that just
 /// wants default capacity and a base-mesh-only look can write `pile = {}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PileConfig {
     /// Max units in one pile. `None` ⇒ derive from `bulk` against
     /// [`PILE_CAPACITY_BULK`]. An explicit value wins (clamped ≥ 1).
@@ -163,6 +166,7 @@ pub struct PileConfig {
 
 /// One count→mesh step in a [`PileConfig`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PileTier {
     /// Minimum unit count at which this mesh applies.
     pub min: u32,
@@ -288,6 +292,7 @@ mod tests {
 ///
 /// `count = 0` is legal but pointless — engines may warn and skip it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ItemDrop {
     pub item: ItemId,
     /// How many [`WorldItem`] entities to spawn at the destroyed cell.

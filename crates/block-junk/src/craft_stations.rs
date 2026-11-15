@@ -33,6 +33,8 @@ pub const MAX_STATION_INVENTORY_KINDS: usize = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StationOrderWire {
+    id: u64,
+    revision: u64,
     recipe_id: crate::protocol::BoundedString<{ crate::protocol::MAX_WIRE_ID_BYTES }>,
     total: u32,
     completed: u32,
@@ -40,6 +42,8 @@ pub struct StationOrderWire {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActiveWorkWire {
+    order_id: u64,
+    committed_inputs: crate::protocol::BoundedVec<(ItemSlot, u32), MAX_STATION_INVENTORY_KINDS>,
     recipe_id: crate::protocol::BoundedString<{ crate::protocol::MAX_WIRE_ID_BYTES }>,
     total_secs: f32,
     elapsed_secs: f32,
@@ -59,7 +63,7 @@ impl crate::spatial::SpatialDataset for StationDataset {
     type Wire = StationWireRecord;
     type Persistence = crate::spatial::PersistedDataset;
     const ID: crate::spatial::DatasetId = crate::spatial::DatasetId(4);
-    const SCHEMA_FINGERPRINT: u64 = 0x7374_6174_0000_0001;
+    const SCHEMA_FINGERPRINT: u64 = 0x7374_6174_0000_0003;
     const MEMBERSHIP: crate::spatial::MembershipPolicy =
         crate::spatial::MembershipPolicy::AnchorCell;
     const REPLICATION: crate::spatial::ReplicationPolicy =
@@ -73,6 +77,8 @@ impl crate::spatial::SpatialDataset for StationDataset {
             .orders
             .iter()
             .map(|order| StationOrderWire {
+                id: order.id,
+                revision: order.revision,
                 recipe_id: crate::protocol::BoundedString::new(order.recipe_id.clone())
                     .expect("authoritative recipe ids enforce the wire bound"),
                 total: order.total,
@@ -92,6 +98,9 @@ impl crate::spatial::SpatialDataset for StationDataset {
             )
             .expect("authoritative stations enforce the inventory bound"),
             active_work: value.active_work.as_ref().map(|work| ActiveWorkWire {
+                order_id: work.order_id,
+                committed_inputs: crate::protocol::BoundedVec::new(work.committed_inputs.clone())
+                    .expect("craft input bundle respects inventory bound"),
                 recipe_id: crate::protocol::BoundedString::new(work.recipe_id.clone())
                     .expect("authoritative recipe ids enforce the wire bound"),
                 total_secs: work.total_secs,
@@ -104,13 +113,22 @@ impl crate::spatial::SpatialDataset for StationDataset {
         registry: &crate::spatial::SpatialDecodeRegistry,
     ) -> Result<(Self::Key, Self::Value), crate::spatial::SpatialError> {
         let mut orders = Vec::new();
+        let mut seen_orders = HashSet::new();
         for order in wire.orders {
-            if order.total == 0 || order.completed > order.total {
+            if order.id == 0
+                || !seen_orders.insert(order.id)
+                || order.revision != u64::from(order.completed) + 1
+                || order.total == 0
+                || order.total > MAX_ORDER_QUANTITY
+                || order.completed >= order.total
+            {
                 return Err(crate::spatial::SpatialError::Decode(
                     "invalid station order counts".into(),
                 ));
             }
             orders.push(CraftOrder {
+                id: order.id,
+                revision: order.revision,
                 recipe_id: order.recipe_id.to_string(),
                 total: order.total,
                 completed: order.completed,
@@ -126,12 +144,17 @@ impl crate::spatial::SpatialDataset for StationDataset {
             }
         }
         let active_work = wire.active_work.map(|work| ActiveWork {
+            order_id: work.order_id,
+            committed_inputs: work.committed_inputs.into_inner(),
             recipe_id: work.recipe_id.to_string(),
             total_secs: work.total_secs,
             elapsed_secs: work.elapsed_secs,
         });
         if active_work.as_ref().is_some_and(|work| {
-            !work.total_secs.is_finite()
+            !orders
+                .iter()
+                .any(|order| order.id == work.order_id && order.recipe_id == work.recipe_id)
+                || !work.total_secs.is_finite()
                 || !work.elapsed_secs.is_finite()
                 || work.total_secs <= 0.0
                 || work.elapsed_secs < 0.0
@@ -141,14 +164,78 @@ impl crate::spatial::SpatialDataset for StationDataset {
                 "invalid station active work".into(),
             ));
         }
-        Ok((
-            wire.cell,
-            StationState {
-                orders,
-                inventory,
-                active_work,
-            },
-        ))
+        let state = StationState {
+            orders,
+            inventory,
+            active_work,
+        };
+        if let Some(work) = &state.active_work {
+            let mut seen = HashSet::new();
+            for &(item, count) in &work.committed_inputs {
+                registry.require("item", item.0 as u32)?;
+                if count == 0 || !seen.insert(item) {
+                    return Err(crate::spatial::SpatialError::Decode(
+                        "invalid committed input bundle".into(),
+                    ));
+                }
+            }
+        }
+        if !state.refund_fits() {
+            return Err(crate::spatial::SpatialError::Decode(
+                "station cannot hold committed refund".into(),
+            ));
+        }
+        Ok((wire.cell, state))
+    }
+}
+
+/// World-owned monotonic order identities survive removal of empty stations and
+/// destruction/replacement of facilities. IDs are never derived from recipe names.
+#[derive(Resource, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CraftOrderIds {
+    pub next: u64,
+}
+impl Default for CraftOrderIds {
+    fn default() -> Self {
+        Self { next: 1 }
+    }
+}
+impl CraftOrderIds {
+    pub fn queue(
+        &mut self,
+        state: &mut StationState,
+        recipe: &crate::recipes::RecipeRegistry,
+        station: &StationDefView,
+        recipe_id: &str,
+        quantity: u32,
+    ) -> Result<u64, String> {
+        let slot = recipe
+            .slot_of(&recipe_id.into())
+            .ok_or("unknown craft recipe")?;
+        let def = recipe.def(slot);
+        if def.station != station.tag || def.tier > station.tier {
+            return Err("recipe is not supported by this station".into());
+        }
+        if quantity == 0 || quantity > MAX_ORDER_QUANTITY || self.next == 0 {
+            return Err("invalid craft quantity or identity".into());
+        }
+        let next = self
+            .next
+            .checked_add(1)
+            .ok_or("craft order identities exhausted")?;
+        let id = self.next;
+        if !state.try_queue(CraftOrder {
+            id,
+            revision: 1,
+            recipe_id: recipe_id.into(),
+            total: quantity,
+            completed: 0,
+        }) {
+            return Err("craft order queue is full or identity conflicts".into());
+        }
+        self.next = next;
+        Ok(id)
     }
 }
 
@@ -157,6 +244,8 @@ impl crate::spatial::SpatialDataset for StationDataset {
 /// total` the order is finished and removed from the queue.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CraftOrder {
+    pub id: u64,
+    pub revision: u64,
     /// Stable recipe id ([`block_junk_mod_api::recipes::RecipeId`]).
     /// String here so wire + save formats stay decoupled from the
     /// recipe-slot interning.
@@ -182,6 +271,9 @@ impl CraftOrder {
 /// back into the inventory.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActiveWork {
+    pub order_id: u64,
+    /// Exact inputs removed at start; never reconstructed from mutable content.
+    pub committed_inputs: Vec<(ItemSlot, u32)>,
     pub recipe_id: String,
     /// Total seconds the recipe takes (snapshot of
     /// `recipe.duration_secs` at start, so a future modifier system
@@ -210,6 +302,46 @@ pub struct StationState {
 }
 
 impl StationState {
+    pub fn transfer_from_carry(
+        &mut self,
+        carry: &mut crate::protocol::Carrying,
+        count: u32,
+    ) -> u32 {
+        let Some(item) = carry.item else {
+            return 0;
+        };
+        let taken = count.min(carry.count);
+        if taken == 0 || !self.deposit(item, taken) {
+            return 0;
+        }
+        carry.count -= taken;
+        if carry.count == 0 {
+            carry.item = None;
+        }
+        taken
+    }
+    pub fn transfer_to_carry(
+        &mut self,
+        carry: &mut crate::protocol::Carrying,
+        item: ItemSlot,
+        count: u32,
+        capacity: u32,
+    ) -> u32 {
+        let available = self.inventory.get(&item).copied().unwrap_or(0);
+        let mut next = *carry;
+        let taken = next.pickup_many(item, count.min(available), capacity);
+        if taken == 0 {
+            return 0;
+        }
+        let remaining = available - taken;
+        if remaining == 0 {
+            self.inventory.remove(&item);
+        } else {
+            self.inventory.insert(item, remaining);
+        }
+        *carry = next;
+        taken
+    }
     /// True when nothing references this station — caller drops it
     /// from the by-cell map. Active work counts as "non-empty"
     /// even when orders and inventory are both empty (mid-cancel
@@ -218,69 +350,181 @@ impl StationState {
         self.orders.is_empty() && self.inventory.is_empty() && self.active_work.is_none()
     }
 
-    /// Add `count` of `item` to the inventory. 0 is a no-op.
+    /// Accept a deposit only when both stock and committed refunds fit. Failure
+    /// leaves inventory untouched, including on integer overflow.
     pub fn deposit(&mut self, item: ItemSlot, count: u32) -> bool {
         if count == 0 {
             return true;
         }
-        if !self.inventory.contains_key(&item)
-            && self.inventory.len() >= MAX_STATION_INVENTORY_KINDS
-        {
+        if !self.can_deposit_with_refund_reserve(item, count) {
             return false;
         }
-        let entry = self.inventory.entry(item).or_insert(0);
-        *entry = entry.saturating_add(count);
+        *self.inventory.entry(item).or_insert(0) += count;
         true
     }
 
-    /// Whether a new deposit preserves enough distinct-kind slots to refund
-    /// every consumed active-work input if that order is cancelled.
-    pub fn can_deposit_with_refund_reserve(
-        &self,
-        item: ItemSlot,
-        recipes: &crate::recipes::RecipeRegistry,
-        items: &crate::items::ItemRegistry,
-    ) -> bool {
-        let adding = usize::from(!self.inventory.contains_key(&item));
-        let mut missing_refunds = HashSet::new();
-        if let Some(active) = &self.active_work
-            && let Some(recipe_slot) = recipes.slot_of(&block_junk_mod_api::recipes::RecipeId::new(
-                active.recipe_id.clone(),
-            ))
-        {
-            for input in &recipes.def(recipe_slot).inputs {
-                if let Some(slot) = items.slot_of(&input.item)
-                    && !self.inventory.contains_key(&slot)
-                    && slot != item
-                {
-                    missing_refunds.insert(slot);
+    pub fn can_deposit_with_refund_reserve(&self, item: ItemSlot, count: u32) -> bool {
+        let mut kinds: HashSet<_> = self.inventory.keys().copied().collect();
+        kinds.insert(item);
+        let mut committed = 0;
+        if let Some(active) = &self.active_work {
+            for &(slot, amount) in &active.committed_inputs {
+                kinds.insert(slot);
+                if slot == item {
+                    committed = amount;
                 }
             }
         }
-        self.inventory.len() + adding + missing_refunds.len() <= MAX_STATION_INVENTORY_KINDS
+        kinds.len() <= MAX_STATION_INVENTORY_KINDS
+            && self
+                .inventory
+                .get(&item)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(count)
+                .and_then(|v| v.checked_add(committed))
+                .is_some()
     }
 
-    /// Try to remove `count` of `item`. Returns true on success;
-    /// false (no mutation) when the inventory is short.
-    pub fn try_consume(&mut self, item: ItemSlot, count: u32) -> bool {
-        let entry = match self.inventory.get_mut(&item) {
-            Some(e) => e,
-            None => return false,
-        };
-        if *entry < count {
+    fn refund_fits(&self) -> bool {
+        self.active_work.as_ref().is_none_or(|work| {
+            work.committed_inputs
+                .iter()
+                .all(|&(item, _)| self.can_deposit_with_refund_reserve(item, 0))
+        })
+    }
+
+    /// Validate the complete bundle before any consumption. Repeated starts,
+    /// duplicate inputs, missing stock and malformed durations do nothing.
+    pub fn begin_work(
+        &mut self,
+        order_id: u64,
+        recipe_id: String,
+        total_secs: f32,
+        inputs: Vec<(ItemSlot, u32)>,
+    ) -> bool {
+        if self.active_work.is_some()
+            || order_id == 0
+            || !total_secs.is_finite()
+            || total_secs <= 0.0
+            || inputs.len() > MAX_STATION_INVENTORY_KINDS
+        {
             return false;
         }
-        *entry -= count;
-        if *entry == 0 {
-            self.inventory.remove(&item);
+        let mut seen = HashSet::new();
+        if inputs.iter().any(|&(item, count)| {
+            count == 0
+                || !seen.insert(item)
+                || self.inventory.get(&item).copied().unwrap_or(0) < count
+        }) {
+            return false;
+        }
+        for &(item, count) in &inputs {
+            let value = self.inventory.get_mut(&item).expect("validated input");
+            *value -= count;
+            if *value == 0 {
+                self.inventory.remove(&item);
+            }
+        }
+        self.active_work = Some(ActiveWork {
+            order_id,
+            recipe_id,
+            total_secs,
+            elapsed_secs: 0.0,
+            committed_inputs: inputs,
+        });
+        true
+    }
+
+    /// Refund exactly once. The deposit service reserves room for this bundle.
+    /// Invalid imported state remains intact instead of discarding its escrow.
+    pub fn cancel_work(&mut self) -> bool {
+        if self.active_work.is_none() || !self.refund_fits() {
+            return false;
+        }
+        let work = self.active_work.take().expect("checked active work");
+        for (item, count) in work.committed_inputs {
+            *self.inventory.entry(item).or_insert(0) += count;
         }
         true
+    }
+
+    pub(crate) fn prepare_order_work(
+        &mut self,
+        id: u64,
+        revision: u64,
+        station: &StationDefView,
+        tool: Option<ItemSlot>,
+        items: &crate::items::ItemRegistry,
+        recipes: &crate::recipes::RecipeRegistry,
+    ) -> Result<(), String> {
+        let order = self
+            .orders
+            .iter()
+            .find(|order| order.id == id && order.revision == revision)
+            .ok_or("craft order missing or revision stale")?;
+        let recipe = recipes
+            .slot_of(&order.recipe_id.clone().into())
+            .map(|slot| recipes.def(slot))
+            .ok_or("craft recipe missing")?;
+        if recipe.station != station.tag
+            || recipe.tier > station.tier
+            || recipe
+                .required_tool
+                .as_ref()
+                .is_some_and(|tag| !items.tool_has_tag(tool, tag))
+        {
+            return Err("station or tool does not support craft recipe".into());
+        }
+        if let Some(active) = &self.active_work {
+            return if active.order_id == id {
+                Ok(())
+            } else {
+                Err("another order has committed inputs".into())
+            };
+        }
+        let inputs = recipe
+            .inputs
+            .iter()
+            .map(|input| items.slot_of(&input.item).map(|slot| (slot, input.count)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("craft ingredient missing")?;
+        if !self.begin_work(id, recipe.id.to_string(), recipe.duration_secs, inputs) {
+            return Err("craft inputs unavailable".into());
+        }
+        Ok(())
+    }
+
+    /// Cancel precisely the selected order. Stale UI/policy cannot cancel a
+    /// different order that happens to request the same recipe.
+    pub fn cancel_order(&mut self, id: u64, revision: u64) -> Result<bool, String> {
+        let index = self
+            .orders
+            .iter()
+            .position(|order| order.id == id && order.revision == revision)
+            .ok_or("craft order missing or revision stale")?;
+        let active = self
+            .active_work
+            .as_ref()
+            .is_some_and(|work| work.order_id == id);
+        if active && !self.cancel_work() {
+            return Err("craft refund cannot fit inventory".into());
+        }
+        self.orders.remove(index);
+        Ok(active)
     }
 
     /// Queue without exceeding the protocol/save bound. Returns false and
     /// leaves the state untouched once the station already has 64 orders.
     pub fn try_queue(&mut self, order: CraftOrder) -> bool {
-        if self.orders.len() >= MAX_STATION_ORDERS {
+        if order.id == 0
+            || order.revision != u64::from(order.completed) + 1
+            || order.total == 0
+            || order.total > MAX_ORDER_QUANTITY
+            || order.completed >= order.total
+            || self.orders.iter().any(|existing| existing.id == order.id)
+            || self.orders.len() >= MAX_STATION_ORDERS
+        {
             return false;
         }
         self.orders.push(order);
@@ -308,125 +552,286 @@ impl StationState {
 /// scheduler re-pairs from scratch, same pattern as [`HaulStore`].
 ///
 /// (crate::haul::HaulStore — the HaulStore reference above.)
-#[derive(Resource, Default, Debug)]
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerAuthority {
+    pub entity: Entity,
+    pub owner: block_junk_mod_api::authority::ReservationOwner,
+}
+impl WorkerAuthority {
+    pub fn npc(entity: Entity, id: crate::npc::NpcId) -> Self {
+        Self {
+            entity,
+            owner: block_junk_mod_api::authority::ReservationOwner::Npc { id: id.0 },
+        }
+    }
+    pub fn player(entity: Entity, id: u64) -> Self {
+        Self {
+            entity,
+            owner: block_junk_mod_api::authority::ReservationOwner::Player { id },
+        }
+    }
+}
+
+#[derive(Resource, Default, Debug, Clone)]
 pub struct CraftBookings {
-    npc_by_station: HashMap<IVec3, crate::npc::NpcId>,
+    pub jobs: crate::action_jobs::JobLedger,
+    jobs_by_cell: HashMap<IVec3, u64>,
+    reservations: crate::reservations::ReservationTable<IVec3>,
     station_by_npc: HashMap<crate::npc::NpcId, IVec3>,
     worker_by_cell: HashMap<IVec3, Entity>,
 }
-
 impl CraftBookings {
-    // --- NPC assignment side ---
-
-    /// Atomically book `npc` for `station`. Succeeds only if both
-    /// sides are free (or already point at each other — re-reserve
-    /// is idempotent). Returns true on success.
-    pub fn try_book_npc(&mut self, npc: crate::npc::NpcId, station: IVec3) -> bool {
-        match (
-            self.station_by_npc.get(&npc),
-            self.npc_by_station.get(&station),
-        ) {
-            (Some(existing_cell), Some(existing_npc))
-                if *existing_cell == station && existing_npc.0 == npc.0 =>
+    pub(crate) fn prepare_job(
+        &mut self,
+        cell: IVec3,
+        actor: block_junk_mod_api::authority::ReservationOwner,
+        controller: block_junk_mod_api::authority::ReservationOwner,
+        order_id: u64,
+        order_revision: u64,
+    ) -> Result<u64, String> {
+        let mut next = self.clone();
+        let block_junk_mod_api::authority::ReservationOwner::Npc { id: actor_id } = actor else {
+            return Err("queued craft actor must be an NPC".into());
+        };
+        if !next.try_book_npc(crate::npc::NpcId(actor_id), cell) {
+            return Err("craft actor or station is reserved".into());
+        }
+        let before = next.jobs.next;
+        let id = next.jobs.start(
+            actor,
+            controller,
+            block_junk_mod_api::authority::JobTarget::CraftOrder {
+                order_id,
+                order_revision,
+            },
+        )?;
+        if id == before {
+            next.jobs.records.get_mut(&id).expect("accepted job").state =
+                block_junk_mod_api::authority::JobState::Accepted;
+        }
+        next.jobs_by_cell.insert(cell, id);
+        *self = next;
+        Ok(id)
+    }
+    pub(crate) fn begin_job(
+        &mut self,
+        cell: IVec3,
+        worker: WorkerAuthority,
+        controller: block_junk_mod_api::authority::ReservationOwner,
+        order_id: u64,
+        order_revision: u64,
+    ) -> Result<u64, String> {
+        let mut next = self.clone();
+        if !next.register_worker(cell, worker.clone()) {
+            return Err("craft station or actor is reserved".into());
+        }
+        let id = next.jobs.start(
+            worker.owner,
+            controller,
+            block_junk_mod_api::authority::JobTarget::CraftOrder {
+                order_id,
+                order_revision,
+            },
+        )?;
+        next.jobs_by_cell.insert(cell, id);
+        *self = next;
+        Ok(id)
+    }
+    pub(crate) fn resume_job(
+        &mut self,
+        cell: IVec3,
+        worker: WorkerAuthority,
+        state: &StationState,
+    ) -> Result<u64, String> {
+        let active = state
+            .active_work
+            .as_ref()
+            .ok_or("no committed craft to resume")?;
+        let order = state
+            .orders
+            .iter()
+            .find(|order| order.id == active.order_id)
+            .ok_or("committed order missing")?;
+        self.begin_job(cell, worker.clone(), worker.owner, order.id, order.revision)
+    }
+    fn complete_job(&mut self, cell: IVec3) {
+        if let Some(id) = self.jobs_by_cell.remove(&cell) {
+            self.jobs
+                .finish(id, block_junk_mod_api::authority::JobState::Completed, None);
+        }
+    }
+    pub fn fail_station(&mut self, cell: IVec3) {
+        if let Some(id) = self.jobs_by_cell.remove(&cell) {
+            self.jobs.finish(
+                id,
+                block_junk_mod_api::authority::JobState::Failed,
+                Some("craft facility removed".into()),
+            );
+        }
+        self.force_clear_station(cell);
+    }
+    pub fn disable_mod_jobs(&mut self, mod_id: &str, reason: &str) {
+        let jobs:Vec<_>=self.jobs.records.values().filter(|job|!job.state.terminal() && matches!(&job.controller,block_junk_mod_api::authority::ReservationOwner::Behavior {mod_id:owner,..} if owner==mod_id)).map(|job|job.id).collect();
+        for id in jobs {
+            self.jobs.finish(
+                id,
+                block_junk_mod_api::authority::JobState::Failed,
+                Some(format!("controller disabled: {reason}")),
+            );
+            if let Some(cell) = self
+                .jobs_by_cell
+                .iter()
+                .find(|(_, job)| **job == id)
+                .map(|(cell, _)| *cell)
             {
-                true
+                self.force_clear_station(cell);
             }
-            (None, None) => {
-                self.station_by_npc.insert(npc, station);
-                self.npc_by_station.insert(station, npc);
-                true
-            }
-            _ => false,
         }
     }
-
-    /// True when `station` is booked by some NPC other than `npc`.
-    /// Scheduler uses this to skip targets already taken.
+    pub fn fail_actor(&mut self, id: crate::npc::NpcId) {
+        let jobs: Vec<_> = self
+            .jobs
+            .records
+            .values()
+            .filter(|job| {
+                job.actor == block_junk_mod_api::authority::ReservationOwner::Npc { id: id.0 }
+                    && !job.state.terminal()
+            })
+            .map(|job| job.id)
+            .collect();
+        for job in jobs {
+            self.jobs.finish(
+                job,
+                block_junk_mod_api::authority::JobState::Failed,
+                Some("actor removed".into()),
+            );
+        }
+        if let Some(cell) = self.station_by_npc.get(&id).copied() {
+            self.force_clear_station(cell);
+        }
+    }
+    pub fn try_book_npc(&mut self, npc: crate::npc::NpcId, station: IVec3) -> bool {
+        if self
+            .station_by_npc
+            .get(&npc)
+            .is_some_and(|existing| *existing != station)
+        {
+            return false;
+        }
+        if self
+            .reservations
+            .acquire(
+                station,
+                block_junk_mod_api::authority::ReservationOwner::Npc { id: npc.0 },
+            )
+            .is_none()
+        {
+            return false;
+        }
+        self.station_by_npc.insert(npc, station);
+        true
+    }
     pub fn station_taken_by_other(&self, station: IVec3, npc: crate::npc::NpcId) -> bool {
-        match self.npc_by_station.get(&station) {
-            Some(holder) => holder.0 != npc.0,
-            None => false,
-        }
+        self.reservations.holder(&station).is_some_and(|lease| {
+            lease.owner != block_junk_mod_api::authority::ReservationOwner::Npc { id: npc.0 }
+        })
     }
-
     pub fn station_of_npc(&self, npc: crate::npc::NpcId) -> Option<IVec3> {
         self.station_by_npc.get(&npc).copied()
     }
-
     pub fn contains_npc(&self, npc: crate::npc::NpcId) -> bool {
         self.station_by_npc.contains_key(&npc)
     }
-
-    /// Atomic cleanup for an NPC leaving its craft station: drop
-    /// both the booking AND the active-worker registration (if it
-    /// was this NPC's entity). Called from every preempt / abandon /
-    /// completion path so the two tables can't drift. `npc_entity`
-    /// is the ECS entity that backs the NPC — needed because the
-    /// worker side is keyed by Entity, not NpcId.
-    pub fn release_npc_booking(&mut self, npc: crate::npc::NpcId, npc_entity: Entity) {
-        if let Some(station) = self.station_by_npc.remove(&npc) {
-            self.npc_by_station.remove(&station);
-            // Only clear the worker registration if it was *this NPC's
-            // entity*. If a different entity grabbed the slot in the
-            // meantime, leave it alone — same logic as the original
-            // `ActiveWorkers::release` guard.
-            if let Some(existing) = self.worker_by_cell.get(&station)
-                && *existing == npc_entity
-            {
-                self.worker_by_cell.remove(&station);
-            }
-        }
-    }
-
-    // --- Worker registration side (also used by players) ---
-
-    /// Register `worker` as powering `cell`'s active_work. Called on
-    /// WorkStart (player) and NPC arrival.
-    pub fn register_worker(&mut self, cell: IVec3, worker: Entity) {
-        self.worker_by_cell.insert(cell, worker);
-    }
-
-    /// Release a worker registration if `worker` is the current
-    /// holder. Lets a stale cleanup not nuke a fresh worker who
-    /// replaced them mid-tick.
-    pub fn release_worker(&mut self, cell: IVec3, worker: Entity) {
-        if let Some(existing) = self.worker_by_cell.get(&cell)
-            && *existing == worker
+    pub fn release_npc_booking(&mut self, npc: crate::npc::NpcId, entity: Entity) {
+        if self
+            .station_by_npc
+            .get(&npc)
+            .and_then(|cell| self.worker_at(*cell))
+            .is_some_and(|worker| worker != entity)
         {
-            self.worker_by_cell.remove(&cell);
+            return;
+        }
+        if let Some(station) = self.station_by_npc.remove(&npc)
+            && self.reservations.holder(&station).is_some_and(|lease| {
+                lease.owner == block_junk_mod_api::authority::ReservationOwner::Npc { id: npc.0 }
+            })
+        {
+            self.force_clear_station(station);
         }
     }
-
-    /// Unconditional clear. Called when active_work auto-completes /
-    /// cancels and the station is fully transitioning to "idle" —
-    /// any future worker (player or NPC) can start fresh.
+    pub(crate) fn register_worker(&mut self, cell: IVec3, worker: WorkerAuthority) -> bool {
+        if self.worker_by_cell.iter().any(|(at, entity)| {
+            (*at == cell && *entity != worker.entity) || (*at != cell && *entity == worker.entity)
+        }) {
+            return false;
+        }
+        if let block_junk_mod_api::authority::ReservationOwner::Npc { id } = worker.owner
+            && self
+                .station_by_npc
+                .get(&crate::npc::NpcId(id))
+                .is_some_and(|at| *at != cell)
+        {
+            return false;
+        }
+        if self
+            .reservations
+            .acquire(cell, worker.owner.clone())
+            .is_none()
+        {
+            return false;
+        }
+        if let block_junk_mod_api::authority::ReservationOwner::Npc { id } = worker.owner {
+            self.station_by_npc.insert(crate::npc::NpcId(id), cell);
+        }
+        self.worker_by_cell.insert(cell, worker.entity);
+        true
+    }
+    pub fn release_worker(&mut self, cell: IVec3, worker: Entity) {
+        if self.worker_by_cell.get(&cell) == Some(&worker) {
+            self.force_clear_station(cell);
+        }
+    }
     pub fn force_clear_worker(&mut self, cell: IVec3) {
-        self.worker_by_cell.remove(&cell);
+        self.force_clear_station(cell);
     }
-
-    /// Drop every worker registration held by `entity`. Used on
-    /// player disconnect.
     pub fn release_all_workers_for(&mut self, entity: Entity) {
-        self.worker_by_cell.retain(|_, w| *w != entity);
-    }
-
-    /// Tear down everything pointing at `station`: the NPC booking
-    /// pair and the worker registration. Called when the station
-    /// block itself is destroyed — the cell no longer exists as a
-    /// workplace, whoever was attached re-plans on their next tick.
-    pub fn force_clear_station(&mut self, station: IVec3) {
-        if let Some(npc) = self.npc_by_station.remove(&station) {
-            self.station_by_npc.remove(&npc);
+        let cells: Vec<_> = self
+            .worker_by_cell
+            .iter()
+            .filter(|(_, worker)| **worker == entity)
+            .map(|(cell, _)| *cell)
+            .collect();
+        for cell in cells {
+            self.force_clear_station(cell);
         }
+    }
+    pub fn force_clear_station(&mut self, station: IVec3) {
+        if let Some(id) = self.jobs_by_cell.remove(&station) {
+            self.jobs.finish(
+                id,
+                block_junk_mod_api::authority::JobState::Interrupted,
+                Some("worker released or order canceled".into()),
+            );
+        }
+        if let Some(lease) = self.reservations.holder(&station)
+            && let block_junk_mod_api::authority::ReservationOwner::Npc { id } = lease.owner
+        {
+            self.station_by_npc.remove(&crate::npc::NpcId(id));
+        }
+        self.reservations.revoke(&station);
         self.worker_by_cell.remove(&station);
     }
-
     pub fn has_worker(&self, cell: IVec3) -> bool {
         self.worker_by_cell.contains_key(&cell)
     }
-
     pub fn worker_at(&self, cell: IVec3) -> Option<Entity> {
         self.worker_by_cell.get(&cell).copied()
+    }
+    pub(crate) fn worker_authority(&self, cell: IVec3) -> Option<WorkerAuthority> {
+        Some(WorkerAuthority {
+            entity: self.worker_at(cell)?,
+            owner: self.reservations.holder(&cell)?.owner.clone(),
+        })
     }
 }
 
@@ -523,14 +928,6 @@ impl CraftStations {
             self.delete(&cell, 0);
             self.force_flush(&cell);
         }
-    }
-
-    pub fn remove(&mut self, cell: IVec3) -> Option<StationState> {
-        let removed = self.delete(&cell, 0);
-        if removed.is_some() {
-            self.force_flush(&cell);
-        }
-        removed
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&IVec3, &StationState)> {
@@ -726,13 +1123,13 @@ pub struct QueueOrder {
     pub quantity: u32,
 }
 
-/// Client → server: drop the first matching queued order at
-/// `station_cell`. Inventory is not refunded — same convention as
-/// Plans (canceling a tag doesn't return materials).
+/// Client → server: cancel one durable order at its observed revision.
+/// If that exact order is active, its committed inputs return to inventory.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct CancelOrder {
     pub station_cell: IVec3,
-    pub recipe_id: String,
+    pub order_id: u64,
+    pub revision: u64,
 }
 
 /// Client → server: drain the player's carry into the station's
@@ -780,6 +1177,8 @@ pub struct CraftStationsClientPlugin;
 
 impl Plugin for CraftStationsServerPlugin {
     fn build(&self, app: &mut App) {
+        crate::spatial::init_session_resource::<CraftOrderIds>(app);
+        app.add_systems(PreUpdate, activate_accepted_jobs);
         app.add_plugins(crate::spatial::SpatialFeaturePlugin::<StationDataset>::server());
         crate::spatial::init_session_resource::<CraftBookings>(app);
         app.add_observer(release_workers_on_disconnect);
@@ -853,7 +1252,7 @@ pub fn sync_craft_modal_capture(
 /// scrolls forever and the server's order tick stalls; gameplay-wise
 /// nobody plausibly wants 1000 of one item from one click. The modal
 /// also clamps client-side; this is the server-of-record cap.
-const MAX_ORDER_QUANTITY: u32 = 99;
+pub(crate) const MAX_ORDER_QUANTITY: u32 = 99;
 pub const MAX_STATION_ORDERS: usize = 64;
 
 #[allow(
@@ -873,9 +1272,9 @@ fn receive_queue_orders(
     block_registry: Res<crate::blocks::BlockRegistry>,
     recipes: Res<crate::recipes::RecipeRegistry>,
     mut stations: ResMut<CraftStations>,
+    mut order_ids: ResMut<CraftOrderIds>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
-    use block_junk_mod_api::recipes::RecipeId;
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
             if validation
@@ -905,22 +1304,16 @@ fn receive_queue_orders(
             else {
                 continue;
             };
-            // Recipe must exist + match the station's tag + tier.
-            let recipe_id = RecipeId::new(req.recipe_id.clone());
-            let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
-                continue;
-            };
-            let recipe = recipes.def(recipe_slot);
-            if recipe.station != station_def.tag || recipe.tier > station_def.tier {
-                continue;
-            }
-            let quantity = req.quantity.min(MAX_ORDER_QUANTITY);
-            if quantity == 0 {
-                continue;
-            }
-            if stations
-                .get(req.station_cell)
-                .is_some_and(|state| state.orders.len() >= MAX_STATION_ORDERS)
+            let mut state = stations.get(req.station_cell).cloned().unwrap_or_default();
+            if order_ids
+                .queue(
+                    &mut state,
+                    &recipes,
+                    &station_def,
+                    &req.recipe_id,
+                    req.quantity,
+                )
+                .is_err()
             {
                 send_rejection(
                     &mut rejections,
@@ -930,18 +1323,12 @@ fn receive_queue_orders(
                 );
                 continue;
             }
-            stations.edit_or_insert(req.station_cell, |state| {
-                let queued = state.try_queue(CraftOrder {
-                    recipe_id: req.recipe_id.clone(),
-                    total: quantity,
-                    completed: 0,
-                });
-                debug_assert!(queued, "queue bound was checked before insertion");
-            });
+            stations.upsert(req.station_cell, state, 0);
+            stations.force_flush(&req.station_cell);
             info!(
                 cell = ?req.station_cell.to_array(),
                 recipe = %req.recipe_id,
-                quantity,
+                quantity = req.quantity,
                 "craft order queued",
             );
         }
@@ -960,12 +1347,10 @@ fn receive_cancel_orders(
     mut rejections: Query<&mut MessageSender<ActionRejected>>,
     avatars: Res<crate::server::ClientAvatars>,
     poses: Query<&crate::protocol::AvatarPose, With<crate::protocol::Avatar>>,
-    recipes: Res<crate::recipes::RecipeRegistry>,
-    item_registry: Res<crate::items::ItemRegistry>,
     mut stations: ResMut<CraftStations>,
+    mut bookings: ResMut<CraftBookings>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
-    use block_junk_mod_api::recipes::RecipeId;
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
             if validation
@@ -996,45 +1381,18 @@ fn receive_cancel_orders(
             let Some(mut state) = stations.get(req.station_cell).cloned() else {
                 continue;
             };
-            let before = state.orders.len();
-            // Drop the first matching order, leave the rest.
-            if let Some(idx) = state
-                .orders
-                .iter()
-                .position(|o| o.recipe_id == req.recipe_id)
-            {
-                state.orders.remove(idx);
-            }
-            let order_removed = state.orders.len() < before;
-            // If the active work matches the cancelled order, refund
-            // its consumed inputs to the inventory and clear it.
-            // Otherwise active work for a *different* order keeps
-            // running.
-            let mut refunded = false;
-            if let Some(active) = &state.active_work
-                && active.recipe_id == req.recipe_id
-            {
-                let recipe_id = RecipeId::new(active.recipe_id.clone());
-                if let Some(recipe_slot) = recipes.slot_of(&recipe_id) {
-                    let recipe = recipes.def(recipe_slot);
-                    for input in &recipe.inputs {
-                        if let Some(slot) = item_registry.slot_of(&input.item) {
-                            state.deposit(slot, input.count);
-                        }
-                    }
-                }
-                state.active_work = None;
-                refunded = true;
-            }
-            if !order_removed && !refunded {
+            let Ok(refunded) = state.cancel_order(req.order_id, req.revision) else {
                 continue;
+            };
+            if refunded {
+                bookings.force_clear_station(req.station_cell);
             }
             stations.upsert(req.station_cell, state, 0);
             stations.force_flush(&req.station_cell);
             stations.remove_if_empty(req.station_cell);
             info!(
                 cell = ?req.station_cell.to_array(),
-                recipe = %req.recipe_id,
+                order_id = req.order_id,
                 refunded,
                 "craft order cancelled",
             );
@@ -1060,8 +1418,6 @@ fn receive_deposit_to_station(
     chunks: Query<&crate::voxel::Chunk>,
     chunk_map: Res<crate::voxel::ChunkMap>,
     block_registry: Res<crate::blocks::BlockRegistry>,
-    recipes: Res<crate::recipes::RecipeRegistry>,
-    item_registry: Res<crate::items::ItemRegistry>,
     mut stations: ResMut<CraftStations>,
     mut validation: crate::server::ValidatedRequestContext,
 ) {
@@ -1097,9 +1453,10 @@ fn receive_deposit_to_station(
             let Some(item) = carry.item else {
                 continue;
             };
-            if stations.get(req.station_cell).is_some_and(|state| {
-                !state.can_deposit_with_refund_reserve(item, &recipes, &item_registry)
-            }) {
+            if stations
+                .get(req.station_cell)
+                .is_some_and(|state| !state.can_deposit_with_refund_reserve(item, carry.count))
+            {
                 send_rejection(
                     &mut rejections,
                     connection,
@@ -1108,12 +1465,16 @@ fn receive_deposit_to_station(
                 );
                 continue;
             }
-            let Some((item, count)) = carry.drop_all() else {
+            let count = carry.count;
+            if count == 0 {
                 continue;
-            };
-            stations.edit_or_insert(req.station_cell, |state| {
-                debug_assert!(state.deposit(item, count));
+            }
+            let accepted = stations.edit_or_insert(req.station_cell, |state| {
+                state.transfer_from_carry(&mut carry, count)
             });
+            if accepted == 0 {
+                continue;
+            }
             info!(
                 cell = ?req.station_cell.to_array(),
                 item = item.0,
@@ -1164,12 +1525,11 @@ fn receive_work_start(
 ) {
     for (connection, mut receiver) in receivers.iter_mut() {
         for req in receiver.receive() {
-            if validation
-                .authorize(connection, crate::server::RequestClass::Ordinary)
-                .is_none()
-            {
+            let Some(auth) =
+                validation.authorize(connection, crate::server::RequestClass::Ordinary)
+            else {
                 continue;
-            }
+            };
             let Some(&avatar) = avatars.0.get(&connection) else {
                 continue;
             };
@@ -1223,7 +1583,13 @@ fn receive_work_start(
                 {
                     continue;
                 }
-                bookings.register_worker(req.station_cell, connection);
+                let _ = bookings.resume_job(
+                    req.station_cell,
+                    WorkerAuthority::player(connection, auth.player_id),
+                    stations
+                        .get(req.station_cell)
+                        .expect("observed active craft"),
+                );
                 continue;
             }
             // Case 2: no active_work. Find the first queued order
@@ -1236,7 +1602,7 @@ fn receive_work_start(
             }
             let started = try_start_first_satisfiable_order(
                 req.station_cell,
-                connection,
+                WorkerAuthority::player(connection, auth.player_id),
                 worker_tool,
                 &station_def,
                 CraftStartContext {
@@ -1281,91 +1647,6 @@ fn receive_work_stop(
     }
 }
 
-/// Server: a station block was broken or replaced — tear its state
-/// down instead of leaking it. Deposited inventory AND the active
-/// craft's already-consumed inputs spill as world items at the cell;
-/// bookings clear so the scheduler stops treating the cell as taken;
-/// clients get a `None` update so their mirrors drop the entry.
-/// Without this, the orphaned state resurrected when any station was
-/// later placed at the same cell, a player-worked craft kept ticking
-/// against the missing block (output from thin air), and everything
-/// deposited was silently destroyed.
-#[derive(bevy::ecs::system::SystemParam)]
-pub(crate) struct DestroyedStationContext<'w> {
-    block_registry: Res<'w, crate::blocks::BlockRegistry>,
-    recipes: Res<'w, crate::recipes::RecipeRegistry>,
-    item_registry: Res<'w, crate::items::ItemRegistry>,
-    stations: ResMut<'w, CraftStations>,
-    bookings: ResMut<'w, CraftBookings>,
-}
-
-pub(crate) fn clear_destroyed_stations(
-    mut reader: MessageReader<crate::protocol::CellEdit>,
-    context: DestroyedStationContext,
-    mut commands: Commands,
-) {
-    let DestroyedStationContext {
-        block_registry,
-        recipes,
-        item_registry,
-        mut stations,
-        mut bookings,
-    } = context;
-    use block_junk_mod_api::recipes::RecipeId;
-    for edit in reader.read() {
-        if edit.prev_slot.is_empty() || block_registry.def(edit.prev_slot).station_tag.is_none() {
-            continue;
-        }
-        bookings.force_clear_station(edit.world);
-        let Some(mut state) = stations.remove(edit.world) else {
-            continue;
-        };
-        // Inputs the active craft consumed up-front go back into the
-        // inventory tally so they spill with everything else — the
-        // craft can never complete now, so "locked in" no longer
-        // applies. Same refund the cancel path does.
-        if let Some(active) = state.active_work.take() {
-            let recipe_id = RecipeId::new(active.recipe_id);
-            if let Some(recipe_slot) = recipes.slot_of(&recipe_id) {
-                for input in &recipes.def(recipe_slot).inputs {
-                    if let Some(slot) = item_registry.slot_of(&input.item) {
-                        state.deposit(slot, input.count);
-                    }
-                }
-            }
-        }
-        let centre = edit.world.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
-        let mut unit_index = 0u32;
-        let mut spilled = 0u32;
-        for (slot, count) in state.inventory.iter() {
-            for _ in 0..*count {
-                let translation = centre + crate::items::drop_jitter(edit.world, unit_index);
-                unit_index += 1;
-                spilled += 1;
-                commands.spawn((
-                    crate::protocol::WorldItem {
-                        item: *slot,
-                        translation,
-                        count: 1,
-                    },
-                    Transform::from_translation(translation),
-                    GlobalTransform::default(),
-                    crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
-                        translation,
-                    )),
-                    Name::new(format!("WorldItem(station_spill:{})", slot.0)),
-                ));
-            }
-        }
-        info!(
-            cell = ?edit.world.to_array(),
-            spilled,
-            dropped_orders = state.orders.len(),
-            "station destroyed; cleared state and spilled inventory",
-        );
-    }
-}
-
 /// Observer: a player disconnect clears every work registration
 /// they held, so a half-finished craft pauses cleanly. The
 /// `active_work` itself (consumed inputs + elapsed_secs) persists;
@@ -1375,6 +1656,127 @@ fn release_workers_on_disconnect(
     mut bookings: ResMut<CraftBookings>,
 ) {
     bookings.release_all_workers_for(trigger.entity);
+}
+
+type JobActors<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static crate::npc::NpcId,
+        &'static mut crate::npc::Brain,
+        &'static crate::protocol::AvatarPose,
+        &'static crate::protocol::EquippedTool,
+        Has<crate::npc::BrainDisabled>,
+    ),
+>;
+
+/// Accepted script work binds to runtime actors only after the batch's deferred
+/// spawns have committed. This also supports spawn-and-start in one transaction.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct JobActivationWorld<'w, 's> {
+    bookings: ResMut<'w, CraftBookings>,
+    stations: Res<'w, CraftStations>,
+    items: Res<'w, crate::items::ItemRegistry>,
+    recipes: Res<'w, crate::recipes::RecipeRegistry>,
+    blocks: Res<'w, crate::blocks::BlockRegistry>,
+    map: Res<'w, crate::voxel::ChunkMap>,
+    chunks: Query<'w, 's, &'static crate::voxel::Chunk>,
+    actors: JobActors<'w, 's>,
+}
+pub(crate) fn activate_accepted_jobs(mut world: JobActivationWorld) {
+    use block_junk_mod_api::authority::{JobState, JobTarget, ReservationOwner};
+    let pending: Vec<_> = world
+        .bookings
+        .jobs
+        .records
+        .values()
+        .filter(|job| job.state == JobState::Accepted)
+        .take(32)
+        .cloned()
+        .collect();
+    for job in pending {
+        let cell = world
+            .bookings
+            .jobs_by_cell
+            .iter()
+            .find(|(_, id)| **id == job.id)
+            .map(|(cell, _)| *cell);
+        let result = (|| -> Result<(), String> {
+            let cell = cell.ok_or("craft reservation lost")?;
+            let ReservationOwner::Npc { id } = job.actor else {
+                return Err("invalid queued craft actor".into());
+            };
+            let (entity, _, mut brain, pose, tool, disabled) = world
+                .actors
+                .iter_mut()
+                .find(|(_, npc, _, _, _, _)| npc.0 == id)
+                .ok_or("craft actor removed")?;
+            if disabled
+                || !(matches!(brain.goal, crate::npc::Goal::Idle)
+                    || matches!(brain.goal,crate::npc::Goal::CraftingAtStation {station_cell} if station_cell==cell))
+            {
+                return Err("craft actor interrupted before activation".into());
+            }
+            if !within_reach(pose, cell.as_vec3() + Vec3::splat(0.5), INTERACT_REACH) {
+                return Err("craft actor moved out of reach".into());
+            }
+            let station = lookup_station_def(cell, &world.chunks, &world.map, &world.blocks)
+                .ok_or("craft facility removed")?;
+            let state = world
+                .stations
+                .get(cell)
+                .ok_or("craft station state removed")?;
+            let JobTarget::CraftOrder {
+                order_id,
+                order_revision,
+            } = job.target
+            else {
+                return Err("invalid crafting job target".into());
+            };
+            if state
+                .active_work
+                .as_ref()
+                .is_none_or(|work| work.order_id != order_id)
+            {
+                return Err("craft commitment changed".into());
+            }
+            let mut validation = state.clone();
+            validation.prepare_order_work(
+                order_id,
+                order_revision,
+                &station,
+                tool.item,
+                &world.items,
+                &world.recipes,
+            )?;
+            if !world
+                .bookings
+                .register_worker(cell, WorkerAuthority::npc(entity, crate::npc::NpcId(id)))
+            {
+                return Err("craft reservation changed".into());
+            }
+            brain.goal = crate::npc::Goal::CraftingAtStation { station_cell: cell };
+            let committed = world
+                .bookings
+                .jobs
+                .records
+                .get_mut(&job.id)
+                .expect("accepted job remains borrowed");
+            committed.state = JobState::Working;
+            committed.revision += 1;
+            Ok(())
+        })();
+        if let Err(reason) = result {
+            world
+                .bookings
+                .jobs
+                .finish(job.id, JobState::Failed, Some(reason));
+            if let Some(cell) = cell {
+                world.bookings.force_clear_station(cell);
+            }
+        }
+    }
 }
 
 /// Tick every station's active work toward completion. On completion:
@@ -1396,6 +1798,7 @@ fn tick_station_work(
     mut stations: ResMut<CraftStations>,
     mut bookings: ResMut<CraftBookings>,
     mut commands: Commands,
+    sidecars: Query<&'static crate::voxel::ChunkEntities>,
     chunks: Query<&'static crate::voxel::Chunk>,
     chunk_map: Res<crate::voxel::ChunkMap>,
     block_registry: Res<crate::blocks::BlockRegistry>,
@@ -1403,6 +1806,7 @@ fn tick_station_work(
     tools: Query<&crate::protocol::EquippedTool>,
     actor_state: Query<(&crate::protocol::AvatarPose, &crate::protocol::EquippedTool)>,
     client_avatars: Res<crate::server::ClientAvatars>,
+    mut brains: Query<&mut crate::npc::Brain>,
 ) {
     use block_junk_mod_api::recipes::RecipeId;
     let dt = time.delta_secs();
@@ -1464,15 +1868,15 @@ fn tick_station_work(
         let Some(active) = state.active_work.as_mut() else {
             continue;
         };
-        active.elapsed_secs += dt;
+        active.elapsed_secs = (active.elapsed_secs + dt).min(active.total_secs);
         if active.elapsed_secs < active.total_secs {
             stations.upsert(cell, state, 0);
             continue;
         }
         // Completion path. Clone the recipe id out of the active
         // entry before taking it.
+        let order_id = active.order_id;
         let recipe_id_str = active.recipe_id.clone();
-        state.active_work = None;
         let recipe_id = RecipeId::new(recipe_id_str.clone());
         let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
             warn!(
@@ -1523,48 +1927,41 @@ fn tick_station_work(
                 .map(|ch| ch.get(local).is_empty())
                 .unwrap_or(false)
         };
-        let spawn_cell = candidates
-            .into_iter()
-            .find(|&c| cell_is_empty(c))
-            .unwrap_or_else(|| {
-                warn!(
-                    cell = ?cell.to_array(),
-                    "station fully enclosed; crafted output spawning inside solid cell",
-                );
-                above
-            });
+        let Some(spawn_cell) = candidates.into_iter().find(|&c| cell_is_empty(c)) else {
+            stations.upsert(cell, state, 0);
+            continue;
+        };
+        let policy_owned = brains.get(actor).is_ok_and(|brain| {
+            brain
+                .active_policy_job
+                .as_ref()
+                .is_some_and(|(id, _)| id == &format!("craft:{},{},{}", cell.x, cell.y, cell.z))
+        });
+        state.active_work = None;
+        bookings.complete_job(cell);
         let spawn_base = spawn_cell.as_vec3() + Vec3::new(0.5, 0.05, 0.5);
         let walk = crate::npc::WorldWalk {
             chunks: &chunks,
+            sidecars: &sidecars,
             chunk_map: &chunk_map,
             registry: &block_registry,
         };
-        for unit in 0..recipe.output.count {
-            let angle = (unit as f32) * std::f32::consts::TAU / recipe.output.count.max(1) as f32;
-            let offset = Vec3::new(angle.cos() * 0.12, 0.0, angle.sin() * 0.12);
-            let translation = crate::server::settled_translation(&walk, spawn_base + offset);
-            commands.spawn((
-                crate::protocol::WorldItem {
-                    item: output_slot,
-                    translation,
-                    count: 1,
-                },
-                Transform::from_translation(translation),
-                GlobalTransform::default(),
-                crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(
-                    translation,
-                )),
-                Name::new(format!("WorldItem(crafted:{})", recipe.output.item)),
-            ));
-        }
+        let translation = crate::server::settled_translation(&walk, spawn_base);
+        crate::item_placement::spawn_stack(
+            &mut commands,
+            output_slot,
+            recipe.output.count,
+            translation,
+        );
         // Bump the matching order's completed counter; remove the
         // order if it just finished.
         let order_done = if let Some(idx) = state
             .orders
             .iter()
-            .position(|o| o.recipe_id == recipe_id_str && !o.is_done())
+            .position(|o| o.id == order_id && !o.is_done())
         {
             state.orders[idx].completed += 1;
+            state.orders[idx].revision += 1;
             let done = state.orders[idx].is_done();
             if done {
                 state.orders.remove(idx);
@@ -1600,15 +1997,25 @@ fn tick_station_work(
         let mut auto_continued = false;
         stations.upsert(cell, state, 0);
         stations.force_flush(&cell);
-        if worker_is_npc && let Some(worker) = worker_entity {
+        if policy_owned && let Ok(mut brain) = brains.get_mut(actor) {
+            crate::npc::finish_policy_job(
+                &mut brain,
+                block_junk_mod_api::npcs::PolicyJobState::Completed,
+                None,
+            );
+        }
+        if worker_is_npc
+            && !policy_owned
+            && let Some(worker) = bookings.worker_authority(cell)
+        {
             // Look up the station def fresh in case the block was
             // replaced mid-craft (degenerate but defensive).
             if let Some(station_def) =
                 lookup_station_def(cell, &chunks, &chunk_map, &block_registry)
                 && try_start_first_satisfiable_order(
                     cell,
-                    worker,
-                    tools.get(worker).ok().and_then(|t| t.item),
+                    worker.clone(),
+                    tools.get(worker.entity).ok().and_then(|t| t.item),
                     &station_def,
                     CraftStartContext {
                         item_registry: &item_registry,
@@ -1692,7 +2099,7 @@ pub(crate) struct CraftStartContext<'a> {
 
 pub(crate) fn try_start_first_satisfiable_order(
     station_cell: IVec3,
-    worker_entity: Entity,
+    worker: WorkerAuthority,
     worker_tool: Option<crate::items::ItemSlot>,
     station_def: &StationDefView,
     context: CraftStartContext<'_>,
@@ -1703,56 +2110,50 @@ pub(crate) fn try_start_first_satisfiable_order(
         stations,
         bookings,
     } = context;
-    use block_junk_mod_api::recipes::RecipeId;
     let mut state = stations.get(station_cell).cloned()?;
-    let mut started_recipe_id: Option<String> = None;
-    for order_idx in 0..state.orders.len() {
-        let order = &state.orders[order_idx];
-        if order.is_done() {
-            continue;
-        }
-        let recipe_id = RecipeId::new(order.recipe_id.clone());
-        let Some(recipe_slot) = recipes.slot_of(&recipe_id) else {
-            continue;
-        };
-        let recipe = recipes.def(recipe_slot);
-        if recipe.station != station_def.tag || recipe.tier > station_def.tier {
-            continue;
-        }
-        // Tool gate — the same check the NPC scheduler applies before
-        // walking over. Previously only the scheduler enforced it, so
-        // players (and NPC auto-continue) crafted tool-gated recipes
-        // bare-handed.
-        if let Some(tag) = &recipe.required_tool
-            && !item_registry.tool_has_tag(worker_tool, tag)
+    if state.active_work.is_some()
+        || bookings
+            .worker_at(station_cell)
+            .is_some_and(|entity| entity != worker.entity)
+    {
+        return None;
+    }
+    let mut started_recipe_id = None;
+    for order in state.orders.clone() {
+        if state
+            .prepare_order_work(
+                order.id,
+                order.revision,
+                station_def,
+                worker_tool,
+                item_registry,
+                recipes,
+            )
+            .is_ok()
         {
-            continue;
+            started_recipe_id = Some(order.recipe_id);
+            break;
         }
-        let inputs_ok = recipe.inputs.iter().all(|input| {
-            let Some(slot) = item_registry.slot_of(&input.item) else {
-                return false;
-            };
-            state.inventory.get(&slot).copied().unwrap_or(0) >= input.count
-        });
-        if !inputs_ok {
-            continue;
-        }
-        let recipe_id_str = order.recipe_id.clone();
-        let total_secs = recipe.duration_secs;
-        for input in &recipe.inputs {
-            let slot = item_registry.slot_of(&input.item).expect("checked");
-            state.try_consume(slot, input.count);
-        }
-        state.active_work = Some(ActiveWork {
-            recipe_id: recipe_id_str.clone(),
-            total_secs,
-            elapsed_secs: 0.0,
-        });
-        started_recipe_id = Some(recipe_id_str);
-        break;
     }
     if let Some(recipe_id_str) = &started_recipe_id {
-        bookings.register_worker(station_cell, worker_entity);
+        let active = state.active_work.as_ref().expect("started work");
+        let order = state
+            .orders
+            .iter()
+            .find(|order| order.id == active.order_id)
+            .expect("selected order");
+        if bookings
+            .begin_job(
+                station_cell,
+                worker.clone(),
+                worker.owner,
+                order.id,
+                order.revision,
+            )
+            .is_err()
+        {
+            return None;
+        }
         info!(
             cell = ?station_cell.to_array(),
             recipe = %recipe_id_str,
@@ -1768,6 +2169,105 @@ pub(crate) fn try_start_first_satisfiable_order(
 mod tests {
     use super::*;
     use crate::npc::NpcId;
+
+    #[test]
+    fn canceling_duplicate_recipes_targets_the_exact_order_and_revision() {
+        let mut state = StationState::default();
+        for id in [1, 2] {
+            assert!(state.try_queue(CraftOrder {
+                id,
+                revision: 1,
+                recipe_id: "test:recipe".into(),
+                total: 1,
+                completed: 0,
+            }));
+        }
+        let item = ItemSlot(1);
+        assert!(state.deposit(item, 3));
+        assert!(state.begin_work(1, "test:recipe".into(), 2., vec![(item, 2)]));
+        let before = state.clone();
+        assert!(state.cancel_order(1, 2).is_err());
+        assert_eq!(state, before);
+        assert_eq!(state.cancel_order(2, 1), Ok(false));
+        assert_eq!(state.active_work.as_ref().unwrap().order_id, 1);
+        assert_eq!(state.inventory[&item], 1);
+        assert!(state.cancel_order(2, 1).is_err());
+        assert_eq!(state.cancel_order(1, 1), Ok(true));
+        assert_eq!(state.inventory[&item], 3);
+        assert!(state.active_work.is_none());
+        assert!(state.orders.is_empty());
+        assert!(state.cancel_order(1, 1).is_err());
+        assert_eq!(state.inventory[&item], 3);
+    }
+
+    #[test]
+    fn facility_transfers_cannot_withdraw_committed_inputs_or_overfill_refunds() {
+        let item = ItemSlot(1);
+        let mut state = StationState::default();
+        assert!(state.deposit(item, 5));
+        assert!(state.begin_work(1, "test:recipe".into(), 2.0, vec![(item, 3)]));
+        let mut carry = crate::protocol::Carrying::default();
+        assert_eq!(state.transfer_to_carry(&mut carry, item, 5, 20), 2);
+        assert_eq!(carry.count, 2);
+        assert_eq!(state.transfer_to_carry(&mut carry, item, 5, 20), 0);
+        assert_eq!(
+            state.active_work.as_ref().unwrap().committed_inputs,
+            vec![(item, 3)]
+        );
+        assert!(state.deposit(item, u32::MAX - 3));
+        let before = state.clone();
+        assert_eq!(state.transfer_from_carry(&mut carry, 2), 0);
+        assert_eq!(state, before);
+        assert_eq!(carry.count, 2);
+        assert!(state.cancel_work());
+        assert_eq!(state.inventory[&item], u32::MAX);
+    }
+
+    #[test]
+    fn craft_commitment_is_atomic_and_refunds_actual_inputs_once() {
+        let mut state = StationState::default();
+        let wood = ItemSlot(1);
+        let iron = ItemSlot(2);
+        assert!(state.deposit(wood, 5));
+        let original = state.clone();
+        assert!(!state.begin_work(1, "test:recipe".into(), 2.0, vec![(wood, 3), (iron, 1)]));
+        assert_eq!(state, original);
+        assert!(!state.begin_work(1, "test:recipe".into(), 2.0, vec![(wood, 3), (wood, 3)]));
+        assert_eq!(state, original);
+        assert!(state.begin_work(1, "test:recipe".into(), 2.0, vec![(wood, 3)]));
+        assert_eq!(state.inventory[&wood], 2);
+        let running = state.clone();
+        assert!(!state.begin_work(1, "test:other".into(), 2.0, vec![(wood, 1)]));
+        assert_eq!(state, running);
+        assert!(state.cancel_work());
+        assert_eq!(state, original);
+        assert!(!state.cancel_work());
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn deposits_reserve_refund_kind_slots_and_integer_headroom() {
+        let mut state = StationState::default();
+        let wood = ItemSlot(1);
+        assert!(state.deposit(wood, u32::MAX));
+        assert!(state.begin_work(1, "test:recipe".into(), 2.0, vec![(wood, 3)]));
+        let running = state.clone();
+        assert!(!state.deposit(wood, 1));
+        assert_eq!(state, running);
+        assert!(state.cancel_work());
+        assert_eq!(state.inventory[&wood], u32::MAX);
+        state.inventory.clear();
+        assert!(state.deposit(wood, 1));
+        assert!(state.begin_work(1, "test:recipe".into(), 2.0, vec![(wood, 1)]));
+        for slot in 2..=64 {
+            assert!(state.deposit(ItemSlot(slot), 1));
+        }
+        let running = state.clone();
+        assert!(!state.deposit(ItemSlot(65), 1));
+        assert_eq!(state, running);
+        assert!(state.cancel_work());
+        assert_eq!(state.inventory.len(), 64);
+    }
 
     fn entity(id: u32) -> Entity {
         Entity::from_raw_u32(id).expect("nonzero entity id")
@@ -1818,7 +2318,7 @@ mod tests {
         let npc_entity = entity(70);
         let cell = IVec3::new(0, 0, 0);
         assert!(b.try_book_npc(npc, cell));
-        b.register_worker(cell, npc_entity);
+        assert!(b.register_worker(cell, WorkerAuthority::npc(npc_entity, npc)));
         assert!(b.has_worker(cell));
 
         b.release_npc_booking(npc, npc_entity);
@@ -1839,7 +2339,9 @@ mod tests {
         let cell = IVec3::new(1, 2, 3);
         assert!(b.try_book_npc(npc, cell));
         // Someone else grabbed the worker slot in the meantime.
-        b.register_worker(cell, other_entity);
+        assert!(!b.register_worker(cell, WorkerAuthority::player(other_entity, 9)));
+        b.release_npc_booking(npc, npc_entity);
+        assert!(b.register_worker(cell, WorkerAuthority::player(other_entity, 9)));
 
         b.release_npc_booking(npc, npc_entity);
 
@@ -1854,11 +2356,30 @@ mod tests {
         let a = entity(1);
         let other = entity(2);
         let cell = IVec3::new(0, 0, 0);
-        b.register_worker(cell, a);
+        assert!(b.register_worker(cell, WorkerAuthority::player(a, 1)));
         b.release_worker(cell, other); // wrong holder
         assert_eq!(b.worker_at(cell), Some(a));
         b.release_worker(cell, a); // correct
         assert!(!b.has_worker(cell));
+    }
+
+    #[test]
+    fn station_owners_exclude_players_npcs_and_double_work() {
+        let mut bookings = CraftBookings::default();
+        let npc = NpcId(1);
+        let a = IVec3::ZERO;
+        let b = IVec3::X;
+        let player = WorkerAuthority::player(entity(10), 1);
+        assert!(bookings.try_book_npc(npc, a));
+        assert!(!bookings.register_worker(a, player.clone()));
+        assert!(bookings.register_worker(a, WorkerAuthority::npc(entity(11), npc)));
+        bookings.release_npc_booking(npc, entity(11));
+        assert!(bookings.register_worker(a, player.clone()));
+        assert!(!bookings.try_book_npc(npc, a));
+        assert!(!bookings.register_worker(b, player.clone()));
+        assert!(!bookings.has_worker(b));
+        bookings.release_all_workers_for(player.entity);
+        assert!(bookings.register_worker(b, player));
     }
 
     #[test]
@@ -1868,8 +2389,8 @@ mod tests {
         let c = entity(2);
         let cell_a = IVec3::new(0, 0, 0);
         let cell_c = IVec3::new(1, 0, 0);
-        b.register_worker(cell_a, a);
-        b.register_worker(cell_c, c);
+        assert!(b.register_worker(cell_a, WorkerAuthority::player(a, 1)));
+        assert!(b.register_worker(cell_c, WorkerAuthority::player(c, 2)));
         b.release_all_workers_for(a);
         assert!(!b.has_worker(cell_a));
         assert_eq!(b.worker_at(cell_c), Some(c));
@@ -1880,6 +2401,8 @@ mod tests {
         let mut state = StationState::default();
         for index in 0..MAX_STATION_ORDERS {
             assert!(state.try_queue(CraftOrder {
+                id: state.orders.len() as u64 + 1,
+                revision: 1,
                 recipe_id: format!("recipe:{index}"),
                 total: 1,
                 completed: 0,
@@ -1887,6 +2410,8 @@ mod tests {
         }
         let before = state.clone();
         assert!(!state.try_queue(CraftOrder {
+            id: state.orders.len() as u64 + 1,
+            revision: 1,
             recipe_id: "recipe:overflow".to_owned(),
             total: 1,
             completed: 0,

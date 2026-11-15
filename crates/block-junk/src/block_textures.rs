@@ -47,24 +47,8 @@ pub struct TextureRegistry {
 }
 
 impl TextureRegistry {
-    /// Scan `mods_dir` for `<mod>/textures.lua` files and parse them all.
-    /// Missing files are fine (a mod without textures is normal); parse
-    /// or validation errors are not.
-    pub fn load_from_mods_dir(mods_dir: &Path) -> Result<Self, TexError> {
-        let mut dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(mods_dir) {
-            Ok(entries) => entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.is_dir() && p.join("manifest.toml").exists())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        // Same deterministic order as ModRegistry::load_dir.
-        dirs.sort_by(|a, b| {
-            let a_van = a.file_name().and_then(|n| n.to_str()) == Some("vanilla");
-            let b_van = b.file_name().and_then(|n| n.to_str()) == Some("vanilla");
-            b_van.cmp(&a_van).then_with(|| a.cmp(b))
-        });
-
+    /// Consume resolved mod order from the production content pipeline.
+    pub fn load_ordered<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Result<Self, TexError> {
         let mut docs = Vec::new();
         let mut ids = HashSet::new();
         for dir in dirs {

@@ -146,9 +146,14 @@ impl<'de, const N: usize> Deserialize<'de> for BoundedString<N> {
 /// A vector capped at `N` elements during deserialization. The visitor
 /// checks a declared length before reserving and also checks every element,
 /// covering formats that omit or lie about their size hint.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct BoundedVec<T, const N: usize>(Vec<T>);
+impl<T, const N: usize> Default for BoundedVec<T, N> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
 
 impl<T, const N: usize> BoundedVec<T, N> {
     pub fn new(value: Vec<T>) -> Result<Self, BoundExceeded> {
@@ -230,7 +235,8 @@ where
                         actual: size,
                     }));
                 }
-                let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(N));
+                // Grow large paged datasets only after decoding actual values.
+                let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(N).min(4096));
                 while let Some(value) = seq.next_element()? {
                     if values.len() == N {
                         return Err(serde::de::Error::custom(BoundExceeded {
@@ -311,10 +317,38 @@ pub struct AuthoritativeCellState {
 /// directly and never reconstruct a destructive footprint from stale state.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct TerrainEditRecord {
+    pub revisions: BoundedVec<(ChunkCoord, u64), MAX_APPLIED_BLOCK_CELLS>,
     pub anchor: IVec3,
     pub old_slot: BlockSlot,
     pub orientation: Cardinal,
     pub cells: BoundedVec<AuthoritativeCellState, MAX_APPLIED_BLOCK_CELLS>,
+}
+
+impl TerrainEditRecord {
+    /// Reject ambiguous ownership or revision coverage before touching a replica.
+    pub fn validate(&self) -> bool {
+        let mut cells = std::collections::HashSet::new();
+        let mut chunks = std::collections::HashSet::new();
+        for cell in &self.cells {
+            if cell
+                .world
+                .to_array()
+                .iter()
+                .any(|v| v.unsigned_abs() > 1_000_000)
+                || !cells.insert(cell.world)
+            {
+                return false;
+            }
+            chunks.insert(crate::voxel::world_to_chunk(cell.world).0);
+        }
+        let mut revisions = std::collections::HashSet::new();
+        for (coord, revision) in &self.revisions {
+            if *revision == 0 || !revisions.insert(*coord) {
+                return false;
+            }
+        }
+        !cells.is_empty() && cells.contains(&self.anchor) && chunks == revisions
+    }
 }
 
 /// The ONE reach for direct world interactions — mine, place, pickup,
@@ -387,6 +421,8 @@ impl RejectReason {
 /// footprint doesn't multiply a once-per-block effect.
 #[derive(Message, Clone, Copy, Debug)]
 pub struct CellEdit {
+    pub yield_drops: bool,
+    pub cause: Option<block_junk_scripting::events::EventCause>,
     pub world: IVec3,
     pub slot: BlockSlot,
     pub prev_slot: BlockSlot,
@@ -402,7 +438,7 @@ pub struct CellEdit {
 /// in `modset.rs`.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct ModSetManifest {
-    /// Slot index = position in this Vec. Slot 0 is always `vanilla:empty`.
+    /// Slot index = position in this Vec. Slot 0 is always `engine:air`.
     pub blocks: Vec<BlockId>,
     /// Slot index = position, same convention as `blocks`.
     pub items: Vec<block_junk_mod_api::items::ItemId>,
@@ -410,11 +446,9 @@ pub struct ModSetManifest {
     pub recipes: Vec<String>,
     /// NPC kind ids, sorted (the registry is keyed by string, not slot).
     pub npc_kinds: Vec<String>,
-    /// Room pattern ids in registration order. Pattern ids cross the
-    /// wire in [`RoomSummary`] and the client resolves display names /
-    /// constraints locally, so disagreement here desyncs the room UI.
-    pub room_patterns: Vec<String>,
-    /// Stable FNV-1a over the serialized block/item/recipe/room-pattern
+    /// Capability ids are sorted because rules are keyed by stable strings.
+    pub capabilities: Vec<String>,
+    /// Stable FNV-1a over the final composed content
     /// defs in slot order. Catches same-ids-but-different-definitions.
     pub defs_hash: u64,
 }
@@ -426,6 +460,7 @@ pub const READY_DOMAIN: &[u8] = b"block-junk/client-ready/v1\0";
 /// answered and verified.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct ServerHello {
+    pub world_preset: block_junk_mod_api::worlds::WorldPreset,
     pub protocol_id: u64,
     pub connection_nonce: [u8; 32],
     pub manifest_hash: [u8; 32],
@@ -638,7 +673,9 @@ impl Ease for AvatarPose {
 /// client and applied atomically with the staged terrain.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub enum SpatialMessage {
+    Revision(crate::spatial_revision::RevisionFrame),
     BeginChunk {
+        revision: u64,
         transaction: u64,
         coord: ChunkCoord,
         terrain: ChunkData,
@@ -702,6 +739,9 @@ impl Carrying {
     /// Empty hand always accepts a single unit; a partial matching stack
     /// accepts up to `cap - count` more.
     pub fn can_accept(&self, item: ItemSlot, cap: u32) -> bool {
+        if self.item.is_none() && self.count != 0 {
+            return false;
+        }
         if self.is_empty() {
             cap > 0
         } else {
@@ -714,6 +754,11 @@ impl Carrying {
     /// rule. Returns how many units were actually added (0 if the hand
     /// holds a different item or is already full).
     pub fn pickup_many(&mut self, item: ItemSlot, want: u32, cap: u32) -> u32 {
+        // Reject malformed imported state rather than turning an untyped count
+        // into newly minted material (or overflowing it).
+        if self.item.is_none() && self.count != 0 {
+            return 0;
+        }
         let room = if self.is_empty() {
             cap
         } else if self.item == Some(item) {
@@ -836,26 +881,33 @@ impl PlanKind {
     }
 }
 
-/// Full state of one tagged cell: what it should become *plus* the
-/// progress of material delivery for Build plans. Remove plans have an
-/// empty `materials` vec (nothing needs to be delivered to break a
-/// block); Build plans carry one entry per item kind required, with
-/// `present` rising toward `needed` as the player or NPCs deposit
-/// resources.
-///
-/// Replicated to every client so each can render the right outline
-/// colour (desaturated green when materials still pending, full green
-/// when ready) and decide self-work eligibility locally.
+/// Authoritative construction project, mirrored through the spatial dataset.
+/// Material `present` counts are escrow owned by this project's stable identity.
+/// Footprint reservations and progress outlive individual worker sessions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanState {
+    pub project_id: u64,
+    pub revision: u64,
+    pub footprint: Vec<IVec3>,
+    pub progress_secs: f32,
     pub kind: PlanKind,
     #[serde(default)]
     pub materials: Vec<MaterialEntry>,
 }
 
 impl PlanState {
+    pub fn token(&self) -> (u64, u64) {
+        (self.project_id, self.revision)
+    }
     pub fn new(kind: PlanKind, materials: Vec<MaterialEntry>) -> Self {
-        Self { kind, materials }
+        Self {
+            kind,
+            materials,
+            project_id: 0,
+            revision: 1,
+            footprint: Vec::new(),
+            progress_secs: 0.0,
+        }
     }
 
     /// True when every material entry has its full count delivered, or
@@ -887,54 +939,14 @@ pub struct MaterialEntry {
     pub present: u32,
 }
 
-/// Client → server: tag (`kind = Some`) or untag (`kind = None`) a cell.
-/// Server → client: the canonical applied edit, broadcast to everyone in
-/// the world. Same bidirectional shape as [`BlockEdit`] for symmetry.
-///
-/// Server validation:
-///   - `Some(Remove)` rejected if the cell is currently empty.
-///   - `Some(Build {..})` rejected if the cell is currently solid.
-///   - `None` succeeds even if no tag exists (idempotent untag).
-///
-/// `materials` is **server-set only**. Client requests leave it empty
-/// (the field defaults via `serde(default)`); the server populates it
-/// from [`BlockDef::materials`](block_junk_mod_api::blocks::BlockDef::materials)
-/// on a Build tag and rebroadcasts. Subsequent deposits / fills also
-/// fire `PlanEdit` broadcasts so clients see the updated `present`
-/// counts in their mirrors without a separate message type.
+/// Client designation intent. Requirements and escrow are exclusively server
+/// state; accepted projects are replicated through the spatial dataset.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct PlanEdit {
     pub cell: IVec3,
     pub kind: Option<PlanKind>,
-    #[serde(default)]
-    pub materials: Vec<MaterialEntry>,
 }
 
-/// Server → client on connect: the current state of the [`Plans`] map.
-/// Sparse — only tagged cells. Each entry carries the full PlanState
-/// (kind + materials progress) so a fresh-connecting client renders
-/// the right outline state immediately.
-/// Wire snapshot of one *matched* room. Detection stays server-side;
-/// clients mirror just enough to surface feedback: the toast on
-/// recognition, the inspect-panel "Room: …" line, debug outlines.
-/// `pattern` is the pattern id — the client resolves the display name
-/// through its own `RoomPatternRegistry` (the mod-set gate guarantees
-/// both sides registered identical patterns).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RoomSummary {
-    pub room_id: u32,
-    pub pattern: String,
-    /// Floor cell nearest the room's centroid — walkable by
-    /// construction; where recognition toasts anchor.
-    pub anchor: IVec3,
-    pub bbox_min: IVec3,
-    pub bbox_max: IVec3,
-    pub floor_area: u32,
-}
-
-/// Server → clients when a room gains or changes a matched pattern
-/// (upsert by `room_id`). Rooms that lose their match arrive as
-/// [`RoomRemove`] instead.
 /// Bulk version of [`PlanEdit`]. All cells in `cells` are tagged with
 /// the same `kind` (or cleared if `kind` is `None`). Server validates
 /// each cell against the same rules as `PlanEdit` and drops the ones
@@ -946,16 +958,10 @@ pub struct RoomSummary {
 /// count at [`PLAN_EDIT_BATCH_MAX`] and splits bigger selections into
 /// multiple messages.
 ///
-/// `materials` is shared across the whole batch: every cell tagged
-/// Build by this batch uses the same block (the request's `kind`
-/// carries one slot), so the materials_needed list is uniform.
-/// Server-set on broadcast, defaulted empty on client request.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 pub struct PlanEditBatch {
     pub kind: Option<PlanKind>,
     pub cells: BoundedVec<IVec3, PLAN_EDIT_BATCH_MAX>,
-    #[serde(default)]
-    pub materials: Vec<MaterialEntry>,
 }
 
 /// Client → server: deposit one or more units of the player's

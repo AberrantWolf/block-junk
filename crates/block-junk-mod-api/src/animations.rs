@@ -58,6 +58,7 @@ impl core::fmt::Display for AnimationId {
 /// registry at boot, loads each `asset` once, and builds a unified
 /// `AnimationGraph` keyed by [`AnimationId`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnimationDef {
     pub id: AnimationId,
     /// Asset path resolved by the engine's asset server. Use the

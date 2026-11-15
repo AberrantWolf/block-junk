@@ -178,77 +178,155 @@ impl WorldCollision<'_, '_, '_> {
                         continue;
                     };
                     let Ok((chunk, sidecar)) = self.chunks.get(chunk_entity) else {
+                        out.push(unit_cube_aabb(world));
                         continue;
                     };
                     let slot = chunk.get(local);
                     if slot.is_empty() {
                         continue;
                     }
-                    let def = self.registry.def(slot);
-                    if !def.flags.solid {
+                    let anchor = match sidecar.get(world) {
+                        Some(EntryKind::Ghost { anchor }) => anchor,
+                        _ => world,
+                    };
+                    let (anchor_coord, anchor_local) = world_to_chunk(anchor);
+                    let Some((anchor_chunk, anchor_sidecar)) = self
+                        .chunk_map
+                        .0
+                        .get(&anchor_coord)
+                        .and_then(|entity| self.chunks.get(*entity).ok())
+                    else {
+                        // Each unresolved ghost remains an obstacle. Do not mark
+                        // its anchor seen until authoritative geometry is available.
+                        out.push(unit_cube_aabb(world));
+                        continue;
+                    };
+                    if anchor_chunk.get(anchor_local) != slot {
+                        out.push(unit_cube_aabb(world));
                         continue;
                     }
-                    if def.flags.walkable_boundary {
-                        // Doors / open gates: solid for room detection
-                        // but not for collision. The block-entity render
-                        // (e.g. door mesh) still draws.
+                    if !entity_anchors_seen.insert(anchor) {
                         continue;
                     }
-                    // Block-entity? Find its anchor + AABB. Otherwise it's
-                    // a plain cube cell.
-                    let entry = sidecar.get(world);
-                    match entry {
-                        Some(EntryKind::Anchor { orientation }) => {
-                            if entity_anchors_seen.insert(world) {
-                                let aabb = def
-                                    .entity_aabb
-                                    .unwrap_or_else(|| EntityAabb::cube_union(&def.footprint))
-                                    .rotated(orientation);
-                                out.push(model_aabb_at(world, aabb));
-                            }
-                        }
-                        Some(EntryKind::Ghost { anchor }) => {
-                            if !entity_anchors_seen.insert(anchor) {
-                                continue;
-                            }
-                            // Look up the anchor cell to read its
-                            // orientation. Anchor may live in a
-                            // neighbouring (loaded) chunk.
-                            let (a_coord, a_local) = world_to_chunk(anchor);
-                            let Some(&a_entity) = self.chunk_map.0.get(&a_coord) else {
-                                // Anchor's chunk not loaded yet — fall
-                                // back to the cube to be safe.
-                                out.push(unit_cube_aabb(world));
-                                continue;
-                            };
-                            let Ok((a_chunk, a_side)) = self.chunks.get(a_entity) else {
-                                continue;
-                            };
-                            let a_slot = a_chunk.get(a_local);
-                            if a_slot.is_empty() {
-                                continue;
-                            }
-                            let a_def = self.registry.def(a_slot);
-                            let orientation = match a_side.get(anchor) {
-                                Some(EntryKind::Anchor { orientation }) => orientation,
-                                _ => Default::default(),
-                            };
-                            let aabb = a_def
-                                .entity_aabb
-                                .unwrap_or_else(|| EntityAabb::cube_union(&a_def.footprint))
-                                .rotated(orientation);
-                            out.push(model_aabb_at(anchor, aabb));
-                        }
-                        None => {
-                            // Plain cube block.
-                            out.push(unit_cube_aabb(world));
-                        }
-                    }
+                    let (orientation, open) = match anchor_sidecar.get(anchor) {
+                        Some(EntryKind::Anchor {
+                            orientation,
+                            portal_open,
+                        }) => (orientation, portal_open),
+                        _ => (Default::default(), None),
+                    };
+                    out.extend(
+                        self.registry.collision[slot.0 as usize][orientation as usize]
+                            .at(anchor, open),
+                    );
                 }
             }
         }
         out
     }
+}
+
+/// Collision geometry is compiled once for each orientation. Runtime portal
+/// changes select leaves; they never rebuild or rotate a frame during movement.
+#[derive(Clone, Debug)]
+pub(crate) struct CollisionShapes {
+    pub frame: Vec<Aabb>,
+    pub leaves: Vec<Vec<Aabb>>,
+    pub default_open: u64,
+}
+impl CollisionShapes {
+    pub fn compile(
+        def: &block_junk_mod_api::blocks::BlockDef,
+        orientation: block_junk_mod_api::blocks::Cardinal,
+    ) -> Self {
+        let mut frame = if def.flags.solid && !def.flags.walkable_boundary {
+            vec![model_aabb_at(
+                IVec3::ZERO,
+                def.entity_aabb
+                    .unwrap_or_else(|| EntityAabb::cube_union(&def.footprint))
+                    .rotated(orientation),
+            )]
+        } else {
+            Vec::new()
+        };
+        let mut leaves = Vec::new();
+        let mut default_open = 0;
+        for (index, portal) in def.structure.portals.iter().enumerate() {
+            default_open |= u64::from(portal.initially_open) << index;
+            let mut leaf = Vec::new();
+            if portal.volume.is_empty() {
+                for face in &portal.faces {
+                    let cell = IVec3::from_array(orientation.rotate_offset(face.cell));
+                    let normal = orientation.rotate_offset(face.normal);
+                    let axis = normal
+                        .iter()
+                        .position(|component| *component != 0)
+                        .expect("validated face");
+                    let plane = cell[axis] as f32 + u8::from(normal[axis] > 0) as f32;
+                    let mut bounds = unit_cube_aabb(cell);
+                    bounds.min[axis] = plane - 0.001;
+                    bounds.max[axis] = plane + 0.001;
+                    leaf.push(bounds);
+                }
+            }
+            for offset in &portal.volume {
+                let cut = unit_cube_aabb(IVec3::from_array(orientation.rotate_offset(*offset)));
+                frame = frame
+                    .into_iter()
+                    .flat_map(|bounds| subtract_box(bounds, cut))
+                    .collect();
+                leaf.push(cut);
+            }
+            leaves.push(leaf);
+        }
+        Self {
+            frame,
+            leaves,
+            default_open,
+        }
+    }
+    pub fn at(&self, anchor: IVec3, open: Option<u64>) -> Vec<Aabb> {
+        let open = open.unwrap_or(self.default_open);
+        self.frame
+            .iter()
+            .chain(
+                self.leaves
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| open & (1 << index) == 0)
+                    .flat_map(|(_, leaf)| leaf.iter()),
+            )
+            .map(|bounds| Aabb {
+                min: bounds.min + anchor.as_vec3(),
+                max: bounds.max + anchor.as_vec3(),
+            })
+            .collect()
+    }
+}
+
+fn subtract_box(bounds: Aabb, cut: Aabb) -> Vec<Aabb> {
+    let lo = bounds.min.max(cut.min);
+    let hi = bounds.max.min(cut.max);
+    if lo.cmpge(hi).any() {
+        return vec![bounds];
+    }
+    let mut remainder = bounds;
+    let mut parts = Vec::with_capacity(6);
+    for axis in 0..3 {
+        if remainder.min[axis] < lo[axis] {
+            let mut part = remainder;
+            part.max[axis] = lo[axis];
+            parts.push(part);
+            remainder.min[axis] = lo[axis];
+        }
+        if remainder.max[axis] > hi[axis] {
+            let mut part = remainder;
+            part.min[axis] = hi[axis];
+            parts.push(part);
+            remainder.max[axis] = hi[axis];
+        }
+    }
+    parts
 }
 
 fn unit_cube_aabb(cell: IVec3) -> Aabb {
@@ -265,4 +343,44 @@ fn model_aabb_at(anchor: IVec3, aabb: EntityAabb) -> Aabb {
         centre + Vec3::from_array(aabb.min),
         centre + Vec3::from_array(aabb.max),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn procedural_furnishing_uses_authored_collision_before_sidecar_materialization() {
+        let registry = BlockRegistry::build(serde_json::from_value(serde_json::json!([
+            {"id":"test:stool","display_name":"Stool","color":[1,1,1],"flags":{"solid":true},"mesh":"fixture.gltf",
+             "entity_aabb":{"min":[-0.25,0,-0.25],"max":[0.25,0.5,0.25]}}
+        ])).unwrap()).unwrap().0;
+        let mut world = World::new();
+        let mut chunk = Chunk {
+            revision: 1,
+            blocks: vec![
+                crate::blocks::BlockSlot::EMPTY;
+                (crate::protocol::CHUNK_PADDED as usize).pow(3)
+            ],
+        };
+        chunk.set(world_to_chunk(IVec3::Y).1, registry.require("test:stool"));
+        let entity = world.spawn((chunk, ChunkEntities::default())).id();
+        let mut map = ChunkMap::default();
+        map.0
+            .insert(crate::protocol::ChunkCoord(IVec3::ZERO), entity);
+        let mut state =
+            bevy::ecs::system::SystemState::<Query<(&Chunk, &ChunkEntities)>>::new(&mut world);
+        let query = state.get(&world).unwrap();
+        let collision = WorldCollision {
+            chunks: &query,
+            chunk_map: &map,
+            registry: &registry,
+        };
+        let bounds = collision.candidates(Aabb {
+            min: Vec3::Y,
+            max: Vec3::new(1., 2., 1.),
+        });
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].min, Vec3::new(0.25, 1., 0.25));
+        assert_eq!(bounds[0].max, Vec3::new(0.75, 1.5, 0.75));
+    }
 }

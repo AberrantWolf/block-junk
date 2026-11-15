@@ -209,7 +209,7 @@ fn draw_craft_modal(
     // `show` borrows the response, and we don't want long borrows on
     // resources inside it. Same pattern the F3 debug panel uses.
     let mut to_queue: Option<(String, u32)> = None;
-    let mut to_cancel: Option<String> = None;
+    let mut to_cancel: Option<(u64, u64)> = None;
     let mut to_deposit = false;
     let mut to_close = false;
 
@@ -284,7 +284,7 @@ fn draw_craft_modal(
                         None => format!("{} (unknown recipe)", order.recipe_id),
                     };
                     let is_active = work_in_progress
-                        .map(|aw| aw.recipe_id == order.recipe_id)
+                        .map(|aw| aw.order_id == order.id)
                         .unwrap_or(false);
                     // Status line: ready / waiting on Nx Item / paused at NN%.
                     let status = if is_active
@@ -327,7 +327,7 @@ fn draw_craft_modal(
                             order.completed, order.total
                         ));
                         if ui.button("Cancel").clicked() {
-                            to_cancel = Some(order.recipe_id.clone());
+                            to_cancel = Some((order.id,order.revision));
                         }
                     });
                     if let Some((pct, text)) = status {
@@ -411,12 +411,13 @@ fn draw_craft_modal(
     if to_deposit && let Ok(mut s) = deposit_sender.single_mut() {
         s.send::<WorldChannel>(DepositToStation { station_cell: cell });
     }
-    if let Some(recipe_id) = to_cancel
+    if let Some((order_id, revision)) = to_cancel
         && let Ok(mut s) = cancel_sender.single_mut()
     {
         s.send::<WorldChannel>(CancelOrder {
             station_cell: cell,
-            recipe_id,
+            order_id,
+            revision,
         });
     }
     if let Some((recipe_id, quantity)) = to_queue

@@ -35,9 +35,7 @@ pub trait Walkability {
     fn is_solid(&self, cell: IVec3) -> bool;
 
     /// True if `cell` blocks an actor's body from occupying it. Defaults
-    /// to `is_solid`; the game world overrides this so blocks flagged
-    /// `nav_passable` (low furniture) let bodies through while still
-    /// counting as solid for support and item settling.
+    /// to `is_solid`; profile-aware worlds may apply exact traversal geometry.
     fn blocks_body(&self, cell: IVec3) -> bool {
         self.is_solid(cell)
     }
@@ -56,11 +54,6 @@ pub trait Walkability {
 /// so a smoothed diagonal never grazes a solid the collision sweep
 /// would catch.
 pub const NAV_BODY_HALF_EXTENT: f32 = 0.3;
-
-/// Cost multiplier for walking through an occupied nav-passable cell
-/// (bed, low furniture). High enough that A* takes any reasonable
-/// aisle detour first, low enough that furniture never walls an NPC in.
-pub const NAV_PASSABLE_COST_MULT: f32 = 4.0;
 
 /// True when an actor with a 1×2-cell body can stand at `foot_cell`:
 /// foot and head cells passable to the body, supporting cell solid.
@@ -544,7 +537,7 @@ mod tests {
 
         fn cost(&self, cell: IVec3) -> f32 {
             if self.passable.contains(&cell) {
-                NAV_PASSABLE_COST_MULT
+                4.0
             } else {
                 1.0
             }

@@ -6,3 +6,6 @@ description = "Public extension surface for block-junk mods. Versioned independe
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

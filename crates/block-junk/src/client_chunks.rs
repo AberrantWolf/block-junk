@@ -25,9 +25,10 @@ type ChangedChunkMeshQuery<'w, 's> = Query<
     (
         Entity,
         &'static Chunk,
+        &'static ChunkCoord,
         Option<&'static MeshMaterial3d<ChunkMaterial>>,
     ),
-    Changed<Chunk>,
+    Or<(Changed<Chunk>, Changed<ChunkEntities>)>,
 >;
 
 type ChangedBlockEntityChunks<'w, 's> = Query<
@@ -37,6 +38,12 @@ type ChangedBlockEntityChunks<'w, 's> = Query<
     Or<(Changed<Chunk>, Changed<ChunkEntities>)>,
 >;
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct MeshWorld<'w, 's> {
+    geometry: Query<'w, 's, (&'static Chunk, &'static ChunkEntities)>,
+    map: Res<'w, ChunkMap>,
+}
+
 pub(crate) fn mesh_chunks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -44,9 +51,15 @@ pub(crate) fn mesh_chunks(
     registry: Res<BlockRegistry>,
     textures: Res<BlockTextures>,
     chunks: ChangedChunkMeshQuery,
+    world: MeshWorld,
 ) {
-    for (entity, chunk, material) in chunks.iter() {
-        let Some(mesh) = chunk.build_mesh(&registry) else {
+    for (entity, chunk, coord, material) in chunks.iter() {
+        let Some(mesh) = chunk.build_mesh(&registry, *coord, |cell| {
+            let (coord, local) = crate::voxel::world_to_chunk(cell);
+            let (chunk, sidecar) = world.geometry.get(*world.map.0.get(&coord)?).ok()?;
+            Some((chunk.get(local), sidecar.get(cell)))
+        }) else {
+            commands.entity(entity).remove::<Mesh3d>();
             continue;
         };
         let mesh_handle = meshes.add(mesh);
@@ -150,7 +163,7 @@ pub(crate) fn refresh_block_entities(
             let def = registry.def(slot);
             let mesh_path = def.mesh.as_ref().expect("non-mesh slot filtered above");
             let orientation = match sidecar.get(*cell) {
-                Some(EntryKind::Anchor { orientation }) => orientation,
+                Some(EntryKind::Anchor { orientation, .. }) => orientation,
                 _ => Cardinal::default(),
             };
             let scene: Handle<WorldAsset> = asset_server.load(format!("{mesh_path}#Scene0"));

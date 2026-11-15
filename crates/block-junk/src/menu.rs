@@ -82,6 +82,7 @@ pub enum LaunchMode {
 /// For the dedicated-server CLI path, `save_name` is `None`.
 #[derive(Clone, Debug, Resource)]
 pub struct ServerSaveConfig {
+    pub preset: Option<String>,
     pub save_name: Option<String>,
     pub load_existing: bool,
     pub no_save_on_exit: bool,
@@ -452,8 +453,15 @@ fn pause_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     )
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct WorldChoice<'w> {
+    catalog: Res<'w, crate::scripting::WorldCatalog>,
+    selection: ResMut<'w, crate::scripting::WorldSelection>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn main_menu_ui(
+    mut world_choice: WorldChoice,
     mut contexts: EguiContexts,
     mut next_state: ResMut<NextState<AppState>>,
     mut commands: Commands,
@@ -505,6 +513,7 @@ fn main_menu_ui(
                     &mut status,
                     &mut confirm_delete.0,
                     &mut host_access,
+                    &mut world_choice,
                 ),
                 MenuPage::Multiplayer => multiplayer_page(
                     ui,
@@ -577,6 +586,7 @@ fn play_page(
     status: &mut SaveStatus,
     confirm_delete: &mut Option<String>,
     host_access: &mut HostAccessSelection,
+    world_choice: &mut WorldChoice,
 ) {
     ui.add_space(screen_h * 0.08);
     ui.label(egui::RichText::new("Play").size(40.0).strong());
@@ -687,6 +697,25 @@ fn play_page(
     }
 
     ui.add_space(12.0);
+    egui::ComboBox::from_label("World preset")
+        .selected_text(
+            world_choice
+                .selection
+                .0
+                .as_ref()
+                .and_then(|id| world_choice.catalog.presets.iter().find(|p| &p.id == id))
+                .map(|p| p.display_name.as_str())
+                .unwrap_or("Select a preset"),
+        )
+        .show_ui(ui, |ui| {
+            for preset in &world_choice.catalog.presets {
+                ui.selectable_value(
+                    &mut world_choice.selection.0,
+                    Some(preset.id.clone()),
+                    &preset.display_name,
+                );
+            }
+        });
     ui.horizontal(|ui| {
         ui.label("New world name:");
         ui.add(
@@ -694,7 +723,13 @@ fn play_page(
                 .desired_width(160.0)
                 .hint_text("worldN"),
         );
-        if ui.button("Create").clicked() {
+        if ui
+            .add_enabled(
+                world_choice.selection.0.is_some(),
+                egui::Button::new("Create"),
+            )
+            .clicked()
+        {
             let trimmed = new_name.0.trim().to_string();
             match validate_name(&trimmed) {
                 Ok(()) => {
@@ -1278,7 +1313,12 @@ fn cleanup_lifecycle_resources(mut commands: Commands) {
 
 /// On entering InGame in a host mode, spawn the server thread. On JoinRemote
 /// this is a no-op.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "host startup carries the selected content configuration"
+)]
 pub(crate) fn spawn_server_if_hosting(
+    selection: Res<crate::scripting::WorldSelection>,
     launch: Option<Res<LaunchMode>>,
     debug_no_save: Res<DebugNoSaveOnExit>,
     mut session: ResMut<ServerSession>,
@@ -1296,6 +1336,7 @@ pub(crate) fn spawn_server_if_hosting(
     let Some(launch) = launch else {
         warn!("entering InGame with no LaunchMode resource; defaulting to HostNew");
         let cfg = ServerSaveConfig {
+            preset: selection.0.clone(),
             save_name: Some("autosave".to_string()),
             load_existing: false,
             no_save_on_exit,
@@ -1310,11 +1351,13 @@ pub(crate) fn spawn_server_if_hosting(
     };
     let cfg = match &*launch {
         LaunchMode::HostNew { save_name } => ServerSaveConfig {
+            preset: selection.0.clone(),
             save_name: Some(save_name.clone()),
             load_existing: false,
             no_save_on_exit,
         },
         LaunchMode::HostLoad { save_name } => ServerSaveConfig {
+            preset: selection.0.clone(),
             save_name: Some(save_name.clone()),
             load_existing: true,
             no_save_on_exit,

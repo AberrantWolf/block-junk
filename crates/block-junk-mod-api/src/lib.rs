@@ -31,13 +31,16 @@
 //! - [`rooms`] — room pattern registry types. Side-agnostic.
 
 pub mod animations;
+pub mod architecture;
 pub mod blocks;
+pub mod capabilities;
 pub mod civilization;
 pub mod items;
 pub mod npcs;
 pub mod recipes;
 pub mod rooms;
 pub mod ui;
+pub mod worlds;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,11 +48,12 @@ use serde::{Deserialize, Serialize};
 /// manifest; the host refuses to load mods whose target is incompatible.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
-    minor: 1,
+    minor: 6,
     patch: 0,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiVersion {
     pub major: u32,
     pub minor: u32,
@@ -106,11 +110,26 @@ impl core::fmt::Display for ApiVersion {
 /// see the crate-level docs for the `data.lua` / `events.lua` split.
 /// The manifest is metadata only; no script paths.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModManifest {
+    /// Stable identity; independent of directory and display name.
+    pub id: String,
     pub name: String,
     pub version: String,
     /// Target API version, e.g. "0.1.0".
     pub api_version: String,
+    #[serde(default)]
+    pub dependencies: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub optional_dependencies: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub incompatibilities: std::collections::BTreeMap<String, String>,
+    /// Explicit override edges also establish ordering; targets must be installed.
+    #[serde(default)]
+    pub overrides: Vec<String>,
+    /// Files available to imports, relative to this mod directory.
+    #[serde(default)]
+    pub resources: Vec<String>,
 }
 
 /// Which side of the engine a mod registry runs on. Determines which scripts
@@ -158,3 +177,7 @@ pub mod client {
     // This module stays as the partition marker for future client-only
     // surfaces that aren't UI-shaped.
 }
+
+pub mod authority;
+
+pub mod upgrades;

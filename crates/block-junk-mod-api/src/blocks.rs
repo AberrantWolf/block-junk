@@ -85,6 +85,7 @@ impl core::fmt::Display for TagId {
 /// from `false`; omitted fields stay default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct BlockFlags {
     /// Collides with the player and occludes neighbour mesh faces.
     pub solid: bool,
@@ -111,10 +112,33 @@ pub struct BlockFlags {
     pub placeable: bool,
 }
 
+/// Voxel cells hidden when one named portal is open. This is rendering data;
+/// it does not define collision, structural support, or architectural membership.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortalVisual {
+    pub portal: String,
+    pub hidden_cells_when_open: Vec<[i32; 3]>,
+}
+
 /// Full registered block definition. The engine holds one per [`BlockId`];
 /// mods construct these and pass them to the engine's block-registration API.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockDef {
+    /// Authored environmental contribution, counted once per placement.
+    #[serde(default)]
+    pub environmental_attributes: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    pub portal_visuals: Vec<PortalVisual>,
+    #[serde(default)]
+    pub settlement: crate::architecture::SettlementParticipation,
+    #[serde(default)]
+    pub structure: crate::architecture::StructuralMetadata,
+    #[serde(default)]
+    pub facility_slots: Vec<crate::architecture::FacilitySlot>,
+    #[serde(default)]
+    pub facility_actions: std::collections::BTreeMap<String, crate::architecture::FacilityAction>,
     pub id: BlockId,
     pub display_name: String,
     pub flags: BlockFlags,
@@ -263,6 +287,7 @@ pub struct BlockDef {
     /// [`drops`](Self::drops); empty vec means "build is free" (the
     /// Phase 0 fallback). Cross-validated at boot against the item
     /// registry on the same boot pass as `drops`.
+    /// Item IDs must be unique; repeated requirements fail at load time.
     ///
     /// Asymmetric with drops on purpose: a block can drop items
     /// without requiring them to build (e.g. grass dropping a dirt
@@ -307,11 +332,15 @@ impl BlockDef {
     /// Explicit drops — including an explicit empty list — pass through
     /// untouched: the multiplier is a default-economy knob, not a
     /// global loot scalar.
-    pub fn resolve_drops(&mut self, material_drop_multiplier: f32) {
+    pub fn resolve_drops(&mut self, material_drop_multiplier: f32) -> Result<(), String> {
         if self.drops.is_some() {
-            return;
+            return Ok(());
         }
-        self.drops = Some(scale_drops(&self.materials, material_drop_multiplier));
+        self.drops = Some(
+            scale_drops(&self.materials, material_drop_multiplier)
+                .map_err(|reason| format!("block {} drops: {reason}", self.id))?,
+        );
+        Ok(())
     }
 
     /// The drop list as resolved by [`resolve_drops`](Self::resolve_drops).
@@ -326,21 +355,34 @@ impl BlockDef {
 /// (a 3-log bed at ×0.5 refunds 2, not 1 — the player-favouring half).
 /// Entries that round to 0 disappear rather than survive as zero-count
 /// drops the boot validator would reject.
-fn scale_drops(materials: &[ItemDrop], multiplier: f32) -> Vec<ItemDrop> {
-    materials
-        .iter()
-        .map(|m| ItemDrop {
-            item: m.item.clone(),
-            count: (f64::from(m.count) * f64::from(multiplier)).round() as u32,
-        })
-        .filter(|d| d.count > 0)
-        .collect()
+fn scale_drops(materials: &[ItemDrop], multiplier: f32) -> Result<Vec<ItemDrop>, String> {
+    if !multiplier.is_finite() || multiplier < 0. {
+        return Err("material_drop_multiplier must be finite and nonnegative".into());
+    }
+    let mut drops = Vec::new();
+    for material in materials {
+        let count = (f64::from(material.count) * f64::from(multiplier)).round();
+        if count > f64::from(u32::MAX) {
+            return Err(format!(
+                "derived count for {} exceeds the item stack limit",
+                material.item
+            ));
+        }
+        if count > 0. {
+            drops.push(ItemDrop {
+                item: material.item.clone(),
+                count: count as u32,
+            });
+        }
+    }
+    Ok(drops)
 }
 
 /// Storage-container tuning for a block (see [`BlockDef::container`]).
 /// Capacity is measured in bulk, not units, so heavy items (tools,
 /// logs) crowd a container faster than berries do.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerConfig {
     /// Total [`ItemDef::bulk`](crate::items::ItemDef::bulk) this
     /// container holds across all stocked kinds.
@@ -356,6 +398,7 @@ pub struct ContainerConfig {
 /// The bare/depleted end of a forage loop carries this so the server
 /// knows to grow it back into a productive block after a delay.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Regrow {
     /// The block this one becomes once the timer elapses.
     pub into: BlockId,
@@ -430,6 +473,7 @@ impl BlockTextureRef {
 /// interaction (sit in a chair, no need restore) sets `need_restore
 /// = None` and still gets the snap + lock + duration behaviour.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Interactable {
     /// Optional need change applied when the interaction completes.
     /// `None` ⇒ purely positional (the NPC stood / sat for
@@ -468,6 +512,7 @@ pub struct Interactable {
 /// engine-default work duration so a chunky castle wall can feel
 /// weightier than a sapling.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkAction {
     #[serde(default)]
     pub need_restore: Option<NeedRestore>,
@@ -552,6 +597,7 @@ pub enum WorkVerb {
 /// positional interaction (no need change) is just `None` instead of
 /// having to encode "ignore these values."
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NeedRestore {
     /// Id of the need this interaction reduces. Cross-validated
     /// against the registered [`NeedDef`](crate::npcs::NeedDef)s at
@@ -593,6 +639,7 @@ pub struct NeedRestore {
 /// brain falls back to the existing nearest-standable-neighbour
 /// behaviour.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UseSlot {
     /// Where the body's **model origin** (the rig's "feet" point —
     /// the model y=0 plane the rig was authored around) lands when
@@ -652,6 +699,7 @@ fn default_footprint() -> Vec<[i32; 3]> {
 /// "extends" direction. The box is inclusive on both ends — points on a
 /// face count as inside.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntityAabb {
     pub min: [f32; 3],
     pub max: [f32; 3],
@@ -870,7 +918,7 @@ mod tests {
     #[test]
     fn scale_drops_identity_at_one() {
         let materials = vec![drop("m:wood", 3), drop("m:stone", 1)];
-        let scaled = scale_drops(&materials, 1.0);
+        let scaled = scale_drops(&materials, 1.0).unwrap();
         assert_eq!(scaled.len(), 2);
         assert_eq!(scaled[0].count, 3);
         assert_eq!(scaled[1].count, 1);
@@ -880,7 +928,7 @@ mod tests {
     /// and 1×0.5 → 1 (not 0).
     #[test]
     fn scale_drops_rounds_not_floors() {
-        let scaled = scale_drops(&[drop("m:wood", 3), drop("m:wood2", 1)], 0.5);
+        let scaled = scale_drops(&[drop("m:wood", 3), drop("m:wood2", 1)], 0.5).unwrap();
         assert_eq!(scaled[0].count, 2);
         assert_eq!(scaled[1].count, 1);
     }
@@ -889,7 +937,7 @@ mod tests {
     /// drops (which the boot validator rejects).
     #[test]
     fn scale_drops_filters_rounded_to_zero() {
-        let scaled = scale_drops(&[drop("m:wood", 1), drop("m:stone", 2)], 0.4);
+        let scaled = scale_drops(&[drop("m:wood", 1), drop("m:stone", 2)], 0.4).unwrap();
         // 1×0.4 = 0.4 → 0 → removed; 2×0.4 = 0.8 → 1 → kept.
         assert_eq!(scaled.len(), 1);
         assert_eq!(scaled[0].item.as_str(), "m:stone");

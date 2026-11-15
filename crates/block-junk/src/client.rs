@@ -42,6 +42,7 @@ use crate::protocol::{
     TerrainEditRecord, WorldChannel, WorldClock, WorldClockSync, WorldItem,
 };
 use crate::spatial::SpatialDataset as _;
+use crate::spatial_revision::RevisionDataset as _;
 use crate::target_outline::TargetOutlinePlugin;
 use crate::voxel::{Chunk, ChunkEntities, ChunkMap, EntryKind};
 
@@ -59,6 +60,7 @@ struct PendingSpatialTransaction {
 }
 
 struct StagedTerrain {
+    revision: u64,
     coord: ChunkCoord,
     data: ChunkData,
     entities: Vec<crate::voxel::EntityEntry>,
@@ -71,6 +73,8 @@ struct StagedTerrain {
 fn receive_spatial_messages(
     mut receivers: Query<&mut MessageReceiver<crate::protocol::SpatialMessage>>,
     mut pending: ResMut<PendingSpatialTransaction>,
+    mut spaces: ResMut<crate::space_network::ClientSpaces>,
+    mut capabilities: ResMut<crate::capability_network::ClientCapabilities>,
     catalog: Res<crate::spatial::SpatialDatasetRegistry>,
     blocks: Res<BlockRegistry>,
     items: Res<ItemRegistry>,
@@ -78,10 +82,9 @@ fn receive_spatial_messages(
     mut storage: ResMut<crate::storage::StorageZones>,
     mut containers: ResMut<crate::containers::Containers>,
     mut stations: ResMut<crate::craft_stations::CraftStations>,
-    mut rooms: ResMut<crate::room_sync::ClientRooms>,
-    room_patterns: Res<crate::rooms::RoomPatternRegistry>,
-    mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
+    mut placements: ResMut<crate::placement_network::ClientPlacements>,
     active_chunk_map: Res<ChunkMap>,
+    mut toasts: ResMut<crate::worldspace_toast::PendingToasts>,
 ) {
     let mut references = crate::spatial::SpatialDecodeRegistry::default();
     for (slot, _) in blocks.iter() {
@@ -93,7 +96,20 @@ fn receive_spatial_messages(
     for mut receiver in receivers.iter_mut() {
         for message in receiver.receive() {
             match message {
+                crate::protocol::SpatialMessage::Revision(frame) => {
+                    let result = if frame.dataset() == crate::space_network::SpaceDataset::ID {
+                        spaces.receive(frame)
+                    } else if frame.dataset() == crate::capability_network::CapabilityDataset::ID {
+                        capabilities.receive(frame)
+                    } else {
+                        Err("unknown revision dataset".into())
+                    };
+                    if let Err(error) = result {
+                        warn!(%error, "rejected spatial revision");
+                    }
+                }
                 crate::protocol::SpatialMessage::BeginChunk {
+                    revision,
                     transaction,
                     coord,
                     terrain,
@@ -109,6 +125,7 @@ fn receive_spatial_messages(
                     pending.current = Some((
                         transaction,
                         StagedTerrain {
+                            revision,
                             coord,
                             data: terrain,
                             entities: entities.into_inner(),
@@ -139,8 +156,8 @@ fn receive_spatial_messages(
                                 containers.apply_replica_record(source, &payload, &references)
                             } else if dataset == crate::craft_stations::StationDataset::ID {
                                 stations.apply_replica_record(source, &payload, &references)
-                            } else if dataset == crate::room_sync::RoomSummaryDataset::ID {
-                                rooms.apply_replica_record(source, &payload, &references)
+                            } else if dataset == crate::placement_network::PlacementDataset::ID {
+                                placements.apply_replica_record(source, &payload, &references)
                             } else {
                                 continue;
                             };
@@ -165,17 +182,17 @@ fn receive_spatial_messages(
                                 &mut storage,
                                 &mut containers,
                                 &mut stations,
-                                &mut rooms,
-                                &room_patterns,
-                                &mut toasts,
+                                &mut placements,
                                 &active_chunks,
                             );
                         }
                         pending.buffered_bytes = 0;
+                        spaces.enter(coord);
                         pending.committed.push(snapshot);
                     }
                 }
                 crate::protocol::SpatialMessage::LeaveChunk { coord } => {
+                    spaces.leave(coord);
                     if pending
                         .current
                         .as_ref()
@@ -191,7 +208,7 @@ fn receive_spatial_messages(
                     storage.unload_replica_chunk(coord);
                     containers.unload_replica_chunk(coord);
                     stations.unload_replica_chunk(coord);
-                    rooms.unload_replica_chunk(coord);
+                    placements.unload_replica_chunk(coord);
                 }
                 crate::protocol::SpatialMessage::Toast { cell, text } => {
                     toasts.push(crate::worldspace_toast::SpawnToast {
@@ -218,6 +235,7 @@ fn receive_spatial_messages(
                             bincode::config::standard(),
                         )
                         && consumed == bytes.len()
+                        && edit.validate()
                     {
                         if pending.current.is_some() {
                             pending.buffered_bytes += bytes.len();
@@ -272,9 +290,7 @@ fn receive_spatial_messages(
                             &mut storage,
                             &mut containers,
                             &mut stations,
-                            &mut rooms,
-                            &room_patterns,
-                            &mut toasts,
+                            &mut placements,
                             &active_chunks,
                         );
                     }
@@ -298,9 +314,7 @@ fn apply_dataset_delta(
     storage: &mut crate::storage::StorageZones,
     containers: &mut crate::containers::Containers,
     stations: &mut crate::craft_stations::CraftStations,
-    rooms: &mut crate::room_sync::ClientRooms,
-    room_patterns: &crate::rooms::RoomPatternRegistry,
-    toasts: &mut crate::worldspace_toast::PendingToasts,
+    placements: &mut crate::placement_network::ClientPlacements,
     active_chunks: &bevy::platform::collections::HashSet<ChunkCoord>,
 ) {
     if catalog
@@ -317,15 +331,8 @@ fn apply_dataset_delta(
         containers.apply_replica_delta(payload, references, active_chunks)
     } else if dataset == crate::craft_stations::StationDataset::ID {
         stations.apply_replica_delta(payload, references, active_chunks)
-    } else if dataset == crate::room_sync::RoomSummaryDataset::ID {
-        apply_room_delta_with_notice(
-            payload,
-            references,
-            active_chunks,
-            rooms,
-            room_patterns,
-            toasts,
-        )
+    } else if dataset == crate::placement_network::PlacementDataset::ID {
+        placements.apply_replica_delta(payload, references, active_chunks)
     } else {
         return;
     };
@@ -334,60 +341,30 @@ fn apply_dataset_delta(
     }
 }
 
-fn apply_room_delta_with_notice(
-    payload: &[u8],
-    references: &crate::spatial::SpatialDecodeRegistry,
-    active_chunks: &bevy::platform::collections::HashSet<ChunkCoord>,
-    rooms: &mut crate::room_sync::ClientRooms,
-    patterns: &crate::rooms::RoomPatternRegistry,
-    toasts: &mut crate::worldspace_toast::PendingToasts,
-) -> Result<(), crate::spatial::SpatialError> {
-    type Delta = crate::spatial::SpatialDelta<u32, crate::room_sync::RoomSummaryWire>;
-    let (delta, consumed): (Delta, usize) = bincode::serde::decode_from_slice(
-        payload,
-        bincode::config::standard().with_limit::<{ crate::spatial::MAX_PARTITION_PAGE_BYTES }>(),
-    )
-    .map_err(|error| crate::spatial::SpatialError::Decode(error.to_string()))?;
-    if consumed != payload.len() {
-        return Err(crate::spatial::SpatialError::TrailingBytes(
-            payload.len() - consumed,
-        ));
-    }
-    let notice = match &delta {
-        Delta::Upsert(room) => {
-            let name = patterns
-                .get(&room.pattern.as_ref().into())
-                .map(|pattern| pattern.display_name.clone())
-                .unwrap_or_else(|| room.pattern.to_string());
-            match rooms.lookup(&room.room_id) {
-                None => Some((room.anchor, name)),
-                Some(previous) if previous.pattern != room.pattern.as_ref() => {
-                    Some((room.anchor, format!("Now: {name}")))
-                }
-                _ => None,
-            }
-        }
-        Delta::Remove(room_id) => rooms
-            .lookup(room_id)
-            .map(|room| (room.anchor, "No longer a room".to_owned())),
-    };
-    rooms.apply_replica_delta(payload, references, active_chunks)?;
-    if let Some((cell, text)) = notice {
-        toasts.push(crate::worldspace_toast::SpawnToast { cell, text });
-    }
-    Ok(())
-}
-
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         crate::spatial::init_session_resource::<PendingSpatialTransaction>(app);
+        crate::spatial::init_session_resource::<crate::space_network::ClientSpaces>(app);
+        crate::spatial::init_session_resource::<crate::capability_network::ClientCapabilities>(app);
+        app.add_systems(
+            PostUpdate,
+            (
+                crate::space_network::expose_ready_revision,
+                crate::capability_network::expose_ready_revision,
+                crate::space_network::request_replacement,
+                crate::capability_network::request_replacement,
+            )
+                .chain()
+                .run_if(in_state(AppState::InGame)),
+        );
         app.add_plugins(FlyCamPlugin)
             .add_plugins(PreviewPlugin)
             .add_plugins(PlayerModePlugin)
             .add_plugins(TargetOutlinePlugin)
             .add_plugins(PlansClientPlugin)
             .add_plugins(crate::storage::StorageClientPlugin)
-            .add_plugins(crate::room_sync::RoomSyncClientPlugin)
+            .add_plugins(crate::placement_network::PlacementClientPlugin)
+            .add_plugins(crate::portal_service::PortalClientPlugin)
             .add_plugins(crate::plan_ghosts::PlanGhostsPlugin)
             .add_plugins(crate::craft_stations::CraftStationsClientPlugin)
             .add_plugins(crate::containers::ContainersClientPlugin)
@@ -414,7 +391,10 @@ impl Plugin for ClientPlugin {
             // R-click Build options now.
             PlaceablePalette(reg.iter_placeable().collect())
         };
-        let terrain_slots = TerrainSlots::from_registry(app.world().resource::<BlockRegistry>());
+        let terrain_slots = TerrainSlots::from_registry(
+            app.world().resource::<BlockRegistry>(),
+            &app.world().resource::<crate::scripting::SelectedWorld>().0,
+        );
         let pins = HotbarPins::first_n(palette.0.len());
         app.insert_resource(palette);
         app.insert_resource(pins);
@@ -428,6 +408,8 @@ impl Plugin for ClientPlugin {
         crate::spatial::init_session_resource::<MovementToggleLatch>(app);
         crate::spatial::init_session_resource::<BlockEntities>(app);
         crate::spatial::init_session_resource::<PreviewState>(app);
+        crate::spatial::init_session_resource::<PlacementPreviewAssessment>(app);
+        crate::spatial::init_session_resource::<crate::placement_preview::Preview>(app);
         app.add_plugins(crate::build_palette::BuildPalettePlugin);
         app
             // Client mirror of the server's day/night clock. Starts at
@@ -1122,6 +1104,12 @@ struct PreviewState {
     /// switches to a different mesh block we have to despawn + respawn
     /// to load the new glTF.
     scene_slot: Option<BlockSlot>,
+}
+
+/// Revision-tagged result of the isolated, cooperative cursor-edit evaluation.
+#[derive(Resource, Default, Clone, Debug, PartialEq, Eq)]
+struct PlacementPreviewAssessment {
+    text: String,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1897,15 +1885,19 @@ fn update_selected_block_hud(
     selected: Res<SelectedBlock>,
     palette: Res<PlaceablePalette>,
     blocks: Res<BlockRegistry>,
+    assessment: Res<PlacementPreviewAssessment>,
     mut labels: Query<&mut Text, With<SelectedBlockHudLabel>>,
 ) {
     let text = match selected.current_block(&palette) {
-        Some(slot) => blocks.def(slot).display_name.as_str(),
-        None => "empty hand",
+        Some(slot) if !assessment.text.is_empty() => {
+            format!("{}\n{}", blocks.def(slot).display_name, assessment.text)
+        }
+        Some(slot) => blocks.def(slot).display_name.clone(),
+        None => "empty hand".into(),
     };
     for mut label in labels.iter_mut() {
         if label.0 != text {
-            label.0 = text.to_owned();
+            label.0 = text.clone();
         }
     }
 }
@@ -3016,7 +3008,7 @@ fn cell_passes_test(
     // Block-entity cell. Resolve to the anchor + orientation, then
     // ray-AABB test.
     let (anchor, orientation) = match kind {
-        Some(EntryKind::Anchor { orientation }) => (cell, orientation),
+        Some(EntryKind::Anchor { orientation, .. }) => (cell, orientation),
         Some(EntryKind::Ghost { anchor }) => {
             // Look up the anchor's orientation via its chunk's sidecar.
             let (coord, _) = crate::voxel::world_to_chunk(anchor);
@@ -3027,7 +3019,7 @@ fn cell_passes_test(
                 return true;
             };
             match entities.get(anchor) {
-                Some(EntryKind::Anchor { orientation }) => (anchor, orientation),
+                Some(EntryKind::Anchor { orientation, .. }) => (anchor, orientation),
                 _ => return true, // sidecar inconsistency; accept
             }
         }
@@ -3174,6 +3166,10 @@ fn show_placement_preview(
 /// Without this the last-frame ghost would linger on screen — the main
 /// preview system stops running thanks to the `run_if` gate, so
 /// something has to actively flip Visibility on the transition.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preview visibility spans input and UI state"
+)]
 fn hide_preview_on_mode_change(
     mode: Res<PlayerMode>,
     selected: Res<SelectedBlock>,
@@ -3181,6 +3177,7 @@ fn hide_preview_on_mode_change(
     mouse: Res<ButtonInput<MouseButton>>,
     drag: Res<crate::plans::PlanDragState>,
     state: Res<PreviewState>,
+    mut assessment: ResMut<PlacementPreviewAssessment>,
     mut vis: Query<&mut Visibility>,
 ) {
     let should_show = *mode == PlayerMode::Plan
@@ -3190,6 +3187,7 @@ fn hide_preview_on_mode_change(
     if should_show {
         return;
     }
+    assessment.text.clear();
     // Runs every frame while hidden (mouse state has no change tick to
     // gate on) — the != check keeps Visibility change-detection quiet.
     for entity in [state.cube_root, state.scene_root].into_iter().flatten() {
@@ -3222,6 +3220,11 @@ struct PreviewMaterialAccess<'w, 's> {
     /// Per-scene material handles the swap observer recorded on mesh
     /// preview roots (cursor re-tints them each frame).
     mesh_mats: Query<'w, 's, &'static GhostMeshMaterials>,
+    spaces: Res<'w, crate::space_network::ClientSpaces>,
+    assessment: ResMut<'w, PlacementPreviewAssessment>,
+    preview: ResMut<'w, crate::placement_preview::Preview>,
+    placements: Res<'w, crate::placement_network::ClientPlacements>,
+    rules: Res<'w, crate::world_rules::WorldRules>,
 }
 
 #[allow(clippy::too_many_arguments, reason = "preview spans many subsystems")]
@@ -3245,6 +3248,7 @@ fn update_placement_preview(
     // cap in Bevy 0.19. Mode gating lives in a `run_if` on the system
     // registration plus `hide_preview_on_mode_change` for the leave-Build
     // transition. SSOT input gating still happens here.
+    mats.assessment.text.clear();
     let hide = |entity: Option<Entity>, q: &mut Query<(&mut Visibility, &mut Transform)>| {
         if let Some(e) = entity
             && let Ok((mut v, _)) = q.get_mut(e)
@@ -3302,6 +3306,136 @@ fn update_placement_preview(
         return;
     }
     let valid = cells.iter().all(|&c| get_block(c).is_empty());
+    use std::collections::{BTreeMap, BTreeSet};
+    let affected_floors: BTreeSet<_> = mats
+        .spaces
+        .visible
+        .spaces
+        .iter()
+        .filter(|space| cells.iter().any(|cell| space.contains_cell(*cell, None)))
+        .flat_map(|space| {
+            space.floors.iter().map(|sample| {
+                let [x, y, z] = sample.cell;
+                crate::architecture_solver::Cell(x, y, z)
+            })
+        })
+        .collect();
+    let mut scope: BTreeSet<_> = affected_floors
+        .iter()
+        .map(|cell| {
+            crate::voxel::world_to_chunk(IVec3::new(cell.0, cell.1, cell.2))
+                .0
+                .0
+                .to_array()
+        })
+        .collect();
+    // Include approach/support neighbors across chunk seams. Missing chunks stay
+    // unknown and arrival changes the key, restarting the isolated computation.
+    for cell in &cells {
+        for offset in [
+            IVec3::ZERO,
+            IVec3::X * 2,
+            -IVec3::X * 2,
+            IVec3::Y * 2,
+            -IVec3::Y * 2,
+            IVec3::Z * 2,
+            -IVec3::Z * 2,
+        ] {
+            scope.insert(crate::voxel::world_to_chunk(*cell + offset).0.0.to_array());
+        }
+    }
+    let key = crate::placement_preview::Key {
+        anchor,
+        slot,
+        orientation,
+        spatial_revision: mats.spaces.visible.revision,
+        chunks: chunk_map
+            .0
+            .iter()
+            .filter_map(|(coord, entity)| {
+                scope
+                    .contains(&coord.0.to_array())
+                    .then(|| {
+                        chunks
+                            .get(*entity)
+                            .ok()
+                            .map(|(chunk, _)| (coord.0.to_array(), chunk.revision))
+                    })
+                    .flatten()
+            })
+            .collect(),
+        placements: mats
+            .placements
+            .entries()
+            .filter(|(_, value)| {
+                value
+                    .footprint
+                    .iter()
+                    .any(|cell| scope.contains(&crate::voxel::world_to_chunk(*cell).0.0.to_array()))
+            })
+            .map(|(id, value)| (*id, value.revision))
+            .collect(),
+    };
+    let capture_key = key.clone();
+    let placements = &mats.placements;
+    let rules = &mats.rules;
+    mats.assessment.text = mats.preview.advance(key, || {
+        let mut records = BTreeMap::new();
+        for (id, value) in placements
+            .entries()
+            .filter(|(id, _)| capture_key.placements.contains_key(id))
+        {
+            let definition = registry.def(value.slot);
+            let mut portals = serde_json::Map::new();
+            if let Some(mask) = value.portal_open {
+                for (i, portal) in definition.structure.portals.iter().enumerate() {
+                    portals.insert(
+                        portal.key.clone(),
+                        serde_json::Value::Bool(mask & (1 << i) != 0),
+                    );
+                }
+            }
+            records.insert(
+                block_junk_mod_api::architecture::PlacementId(*id),
+                crate::placements::PlacementRecord {
+                    id: block_junk_mod_api::architecture::PlacementId(*id),
+                    definition: definition.id.clone(),
+                    anchor: value.anchor.to_array(),
+                    orientation: value.orientation,
+                    revision: value.revision,
+                    active: true,
+                    authored_state: serde_json::json!({"portals": portals}).to_string(),
+                },
+            );
+        }
+        let mut staged_placements = crate::placements::Placements::default();
+        staged_placements.next_id = records
+            .keys()
+            .next_back()
+            .map_or(1, |id| id.0.saturating_add(1));
+        staged_placements.records = records;
+        crate::placement_preview::Input {
+            key: capture_key,
+            chunks: chunk_map
+                .0
+                .iter()
+                .filter_map(|(coord, entity)| {
+                    scope
+                        .contains(&coord.0.to_array())
+                        .then(|| {
+                            chunks.get(*entity).ok().map(|(chunk, sidecar)| {
+                                (coord.0.to_array(), (chunk.clone(), sidecar.clone()))
+                            })
+                        })
+                        .flatten()
+                })
+                .collect(),
+            placements: staged_placements,
+            blocks: registry.clone(),
+            rules: (*rules).clone(),
+            affected_floors,
+        }
+    });
 
     // Re-tint from validity: white passes the block's real composited
     // texture through untouched; the red multiply tells the player
@@ -3486,7 +3620,7 @@ fn receive_snapshots(
             invalid = true;
             continue;
         }
-        let chunk = match snapshot.data {
+        let mut chunk = match snapshot.data {
             ChunkData::Procedural => Chunk::from_terrain(snapshot.coord, &terrain_slots),
             ChunkData::Raw(blocks) => {
                 let blocks = blocks.into_inner();
@@ -3501,7 +3635,10 @@ fn receive_snapshots(
                     invalid = true;
                     continue;
                 }
-                Chunk { blocks }
+                Chunk {
+                    blocks,
+                    revision: 0,
+                }
             }
             ChunkData::Rle(runs) => {
                 let mut blocks = Vec::with_capacity(crate::protocol::CHUNK_PADDED_CELLS);
@@ -3529,9 +3666,13 @@ fn receive_snapshots(
                     invalid = true;
                     continue;
                 }
-                Chunk { blocks }
+                Chunk {
+                    blocks,
+                    revision: 0,
+                }
             }
         };
+        chunk.revision = snapshot.revision;
         let mut seen_entries = bevy::platform::collections::HashSet::new();
         if snapshot.entities.iter().any(|entry| {
             !seen_entries.insert(entry.cell)
@@ -3836,6 +3977,19 @@ fn handle_predicted_spawn(
     ));
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct PresetHandshake<'w> {
+    catalog: Res<'w, crate::scripting::WorldCatalog>,
+    selected: ResMut<'w, crate::scripting::SelectedWorld>,
+    content: ResMut<'w, crate::scripting::ContentFingerprint>,
+    terrain: ResMut<'w, TerrainSlots>,
+}
+
+#[cfg(test)]
+pub(crate) fn install_fixture_handshake(app: &mut App) {
+    app.add_systems(Update, receive_server_hello);
+}
+
 /// Server's mod-set fingerprint arrives once on connect. Any
 /// disagreement is fatal: log it, surface the blocking error modal,
 /// and disconnect. A divergent mod set desyncs *silently* — wrong
@@ -3853,22 +4007,40 @@ fn receive_server_hello(
         &mut MessageSender<ClientReady>,
     )>,
     identity: Res<crate::identity::ClientIdentity>,
+    mut preset_context: PresetHandshake,
     registry: Res<BlockRegistry>,
     item_registry: Res<ItemRegistry>,
     recipe_registry: Res<crate::recipes::RecipeRegistry>,
     npc_kind_registry: Res<NpcKindRegistry>,
-    room_pattern_registry: Res<crate::rooms::RoomPatternRegistry>,
+    world_rules: Res<crate::world_rules::WorldRules>,
     spatial_registry: Res<crate::spatial::SpatialDatasetRegistry>,
     mut captures: ResMut<crate::ui_capture::UiCaptures>,
 ) {
     for (connection, mut receiver, mut sender) in connections.iter_mut() {
         for hello in receiver.receive() {
+            if !preset_context
+                .catalog
+                .presets
+                .iter()
+                .any(|preset| preset == &hello.world_preset)
+            {
+                commands.insert_resource(crate::menu::ConnectionFatal {
+                    title: "Incompatible world preset".into(),
+                    details: vec!["Server world preset differs from installed content".into()],
+                });
+                commands.trigger(Disconnect { entity: connection });
+                continue;
+            }
+            *preset_context.content = preset_context.catalog.fingerprint(&hello.world_preset);
+            preset_context.selected.0 = hello.world_preset.clone();
+            *preset_context.terrain = TerrainSlots::from_registry(&registry, &hello.world_preset);
             let local = crate::modset::local_manifest(
                 &registry,
                 &item_registry,
                 &recipe_registry,
                 &npc_kind_registry,
-                &room_pattern_registry,
+                &world_rules,
+                &preset_context.content,
             );
             let mut mismatches = crate::modset::diff(&hello.manifest, &local);
             if hello.protocol_id != crate::network::NETCODE_PROTOCOL_ID {
@@ -3986,22 +4158,39 @@ fn receive_block_edit_broadcasts(
     }
 }
 
-fn apply_broadcast_edit(
+pub(crate) fn apply_broadcast_edit(
     edit: TerrainEditRecord,
     chunks: &mut Query<(&mut Chunk, &mut ChunkEntities)>,
     map: &ChunkMap,
 ) {
+    if !edit.validate() {
+        return;
+    }
+    // Decide for the whole footprint from the pre-edit revision; partial
+    // acceptance would leave a wide object's anchor and ghosts inconsistent.
+    let applicable: std::collections::HashSet<_> = edit
+        .revisions
+        .iter()
+        .filter_map(|(coord, revision)| {
+            let entity = map.0.get(coord)?;
+            let (chunk, _) = chunks.get(*entity).ok()?;
+            (*revision > chunk.revision).then_some(*coord)
+        })
+        .collect();
     let mut mirrors = Vec::with_capacity(edit.cells.len());
     for state in edit.cells {
-        mirrors.push((state.world, state.slot));
         let (coord, local) = crate::voxel::world_to_chunk(state.world);
+        if !applicable.contains(&coord) {
+            continue;
+        }
+        mirrors.push((state.world, state.slot));
         let Some(&entity) = map.0.get(&coord) else {
             continue;
         };
         let Ok((mut chunk, mut entities)) = chunks.get_mut(entity) else {
             continue;
         };
-        chunk.set(local, state.slot);
+        chunk.apply_committed_cell(local, state.slot);
         match state.entity {
             Some(kind) => {
                 entities.insert(state.world, kind);
@@ -4009,6 +4198,14 @@ fn apply_broadcast_edit(
             None => {
                 entities.remove(state.world);
             }
+        }
+    }
+    for (coord, revision) in edit.revisions {
+        if applicable.contains(&coord)
+            && let Some(entity) = map.0.get(&coord)
+            && let Ok((mut chunk, _)) = chunks.get_mut(*entity)
+        {
+            chunk.revision = revision;
         }
     }
     crate::voxel::apply_padding_mirrors(&mirrors, map, chunks);
@@ -4731,5 +4928,94 @@ fn draw_civilization_clusters(
         let centre = (min + max) * 0.5;
         let size = max - min;
         gizmos.cube(Transform::from_translation(centre).with_scale(size), color);
+    }
+}
+
+#[cfg(test)]
+mod terrain_revision_tests {
+    use super::*;
+    use crate::protocol::{AuthoritativeCellState, BoundedVec};
+    use bevy::ecs::system::SystemState;
+
+    fn record(revision: u64, slot: BlockSlot) -> TerrainEditRecord {
+        TerrainEditRecord {
+            anchor: IVec3::ZERO,
+            old_slot: BlockSlot::EMPTY,
+            orientation: Default::default(),
+            revisions: BoundedVec::new(vec![(ChunkCoord(IVec3::ZERO), revision)]).unwrap(),
+            cells: BoundedVec::new(vec![
+                AuthoritativeCellState {
+                    world: IVec3::ZERO,
+                    slot,
+                    entity: None,
+                },
+                AuthoritativeCellState {
+                    world: IVec3::X,
+                    slot,
+                    entity: None,
+                },
+            ])
+            .unwrap(),
+        }
+    }
+    #[test]
+    fn old_delta_cannot_overwrite_snapshot_or_partially_apply_wide_object() {
+        let mut world = World::new();
+        let mut chunk = Chunk {
+            revision: 0,
+            blocks: vec![BlockSlot::EMPTY; (crate::protocol::CHUNK_PADDED as usize).pow(3)],
+        };
+        chunk.set(IVec3::ONE, BlockSlot(3));
+        chunk.revision = 5;
+        let entity = world.spawn((chunk, ChunkEntities::default())).id();
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(IVec3::ZERO), entity);
+        let mut state: SystemState<Query<(&mut Chunk, &mut ChunkEntities)>> =
+            SystemState::new(&mut world);
+        for revision in [4, 5] {
+            apply_broadcast_edit(
+                record(revision, BlockSlot(1)),
+                &mut state.get_mut(&mut world).unwrap(),
+                &map,
+            );
+            assert_eq!(
+                world.get::<Chunk>(entity).unwrap().get(IVec3::ONE),
+                BlockSlot(3)
+            );
+            assert_eq!(world.get::<Chunk>(entity).unwrap().revision, 5);
+        }
+        apply_broadcast_edit(
+            record(6, BlockSlot(2)),
+            &mut state.get_mut(&mut world).unwrap(),
+            &map,
+        );
+        let chunk = world.get::<Chunk>(entity).unwrap();
+        assert_eq!(chunk.get(IVec3::ONE), BlockSlot(2));
+        assert_eq!(chunk.get(IVec3::ONE + IVec3::X), BlockSlot(2));
+        assert_eq!(chunk.revision, 6);
+        world.get_mut::<Chunk>(entity).unwrap().revision = u64::MAX - 1;
+        apply_broadcast_edit(
+            record(u64::MAX, BlockSlot(3)),
+            &mut state.get_mut(&mut world).unwrap(),
+            &map,
+        );
+        let chunk = world.get::<Chunk>(entity).unwrap();
+        assert_eq!(chunk.revision, u64::MAX);
+        assert_eq!(chunk.get(IVec3::ONE), BlockSlot(3));
+        assert_eq!(chunk.get(IVec3::ONE + IVec3::X), BlockSlot(3));
+    }
+    #[test]
+    fn malformed_revision_coverage_and_duplicate_cells_reject() {
+        let mut edit = record(1, BlockSlot(1));
+        assert!(edit.validate());
+        edit.revisions = BoundedVec::new(vec![]).unwrap();
+        assert!(!edit.validate());
+        edit = record(1, BlockSlot(1));
+        edit.revisions = BoundedVec::new(vec![(ChunkCoord(IVec3::ZERO), 1); 2]).unwrap();
+        assert!(!edit.validate());
+        edit = record(1, BlockSlot(1));
+        edit.cells = BoundedVec::new(vec![edit.cells[0]; 2]).unwrap();
+        assert!(!edit.validate());
+        assert!(!record(0, BlockSlot(1)).validate());
     }
 }

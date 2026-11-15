@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 /// Knobs for how the engine groups buildings into civilizations.
 /// Both are in world cells.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CivilizationParams {
     /// Two matched rooms join the same cluster when the Chebyshev
     /// distance between their bounding boxes is `<= max_room_distance_cells`.

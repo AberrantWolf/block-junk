@@ -51,6 +51,11 @@ impl ClientIdentity {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_identity(seed: [u8; 32]) -> ClientIdentity {
+    from_signing_key(SigningKey::from_bytes(&seed), false)
+}
+
 static ID_FILE_LOCK: OnceLock<File> = OnceLock::new();
 
 pub fn load_or_create() -> ClientIdentity {

@@ -24,6 +24,8 @@ use bevy::prelude::*;
 
 use crate::items::ItemSlot;
 use crate::npc::NpcId;
+use crate::reservations::ReservationTable;
+use block_junk_mod_api::authority::ReservationOwner;
 
 /// Where a reserved batch of units comes from. Ground items (loose
 /// drops + tidied piles) are `WorldItem` entities; container stock (S3)
@@ -138,15 +140,10 @@ pub struct HaulAssignment {
 /// atomic-on-success-with-rollback and needs to reserve items
 /// one-by-one before assembling the final assignment. External
 /// callers (the brain tick in npc.rs) only see the safe public API.
-#[derive(Resource, Default, Debug)]
+#[derive(Resource, Default, Debug, Clone)]
 pub struct HaulStore {
-    assignments: HashMap<NpcId, HaulAssignment>,
-    reservations: HashMap<Entity, NpcId>,
-    /// Container cells earmarked for withdrawal, keyed whole-cell (one
-    /// NPC works a container at a time — same coarseness as the
-    /// whole-stack rule for piles, fine at co-op scale). Deposits
-    /// don't reserve: adding stock can't invalidate anyone.
-    container_reservations: HashMap<IVec3, NpcId>,
+    assignments: HashMap<ReservationOwner, HaulAssignment>,
+    reservations: ReservationTable<HaulSource>,
     /// Targets whose last haul leg failed pathfinding, mapped to the
     /// `Time::elapsed_secs` timestamp when a retry is allowed. The
     /// scheduler skips memoized targets so one walled-off plan (or an
@@ -158,30 +155,39 @@ pub struct HaulStore {
 }
 
 impl HaulStore {
+    pub fn release_target(&mut self, target: HaulTarget) {
+        let npcs: Vec<_> = self
+            .assignments
+            .iter()
+            .filter(|(_, assignment)| assignment.target == target)
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        for npc in npcs {
+            self.release_owner(&npc);
+        }
+        self.unreachable_until.remove(&target);
+    }
+
     /// Read the assignment for `npc`, or `None` if they don't have
     /// one. The brain tick calls this on every tick to know whether
     /// to plan a haul leg or fall through to the planner.
     pub fn assignment_of(&self, npc: NpcId) -> Option<&HaulAssignment> {
-        self.assignments.get(&npc)
+        self.assignments.get(&ReservationOwner::Npc { id: npc.0 })
     }
 
     /// True if `npc` has an active assignment.
     pub fn has_assignment(&self, npc: NpcId) -> bool {
-        self.assignments.contains_key(&npc)
+        self.assignments
+            .contains_key(&ReservationOwner::Npc { id: npc.0 })
     }
 
     /// True if `source` is currently reserved by anyone other than
     /// `npc`. Used by the scheduler + arrival handlers to detect
     /// races against another NPC.
     pub fn reservation_taken_by_other(&self, source: HaulSource, npc: NpcId) -> bool {
-        let holder = match source {
-            HaulSource::Ground(entity) => self.reservations.get(&entity),
-            HaulSource::Container(cell) => self.container_reservations.get(&cell),
-        };
-        match holder {
-            Some(holder) => holder.0 != npc.0,
-            None => false,
-        }
+        self.reservations
+            .holder(&source)
+            .is_some_and(|lease| lease.owner != ReservationOwner::Npc { id: npc.0 })
     }
 
     /// Atomically clear `npc`'s assignment and release every
@@ -192,17 +198,11 @@ impl HaulStore {
     /// reservations not tracked by the assignment (shouldn't happen,
     /// but cheap to defend).
     pub fn release_for_npc(&mut self, npc: NpcId) {
-        if let Some(assignment) = self.assignments.remove(&npc) {
-            for item in &assignment.queue {
-                self.release_reservation_internal(item.source, npc);
-            }
-            if let Some(tool) = &assignment.pending_tool {
-                self.release_reservation_internal(tool.source, npc);
-            }
-        }
-        self.reservations.retain(|_, holder| holder.0 != npc.0);
-        self.container_reservations
-            .retain(|_, holder| holder.0 != npc.0);
+        self.release_owner(&ReservationOwner::Npc { id: npc.0 });
+    }
+    pub fn release_owner(&mut self, owner: &ReservationOwner) {
+        self.assignments.remove(owner);
+        self.reservations.release_owner(owner);
     }
 
     /// Record that pathing toward `target` just failed; the scheduler
@@ -237,7 +237,10 @@ impl HaulStore {
     /// arrive at a source that's no longer what the scheduler saw due
     /// to a race; the brain calls this to skip past stale entries).
     pub fn drop_queue_entry(&mut self, npc: NpcId, source: HaulSource) {
-        if let Some(assignment) = self.assignments.get_mut(&npc) {
+        if let Some(assignment) = self
+            .assignments
+            .get_mut(&ReservationOwner::Npc { id: npc.0 })
+        {
             assignment.queue.retain(|r| r.source != source);
         }
         // Release reservation regardless of whether queue had it (a
@@ -248,7 +251,9 @@ impl HaulStore {
     /// Clear `npc`'s pending_tool slot and release its reservation.
     /// Called from the PickupTool arrival once the tool is equipped.
     pub fn clear_pending_tool(&mut self, npc: NpcId) {
-        if let Some(assignment) = self.assignments.get_mut(&npc)
+        if let Some(assignment) = self
+            .assignments
+            .get_mut(&ReservationOwner::Npc { id: npc.0 })
             && let Some(tool) = assignment.pending_tool.take()
         {
             self.release_reservation_internal(tool.source, npc);
@@ -258,42 +263,19 @@ impl HaulStore {
     // --- internals; only the scheduler in this module reaches in. ---
 
     pub(super) fn try_reserve_internal(&mut self, source: HaulSource, npc: NpcId) -> bool {
-        match source {
-            HaulSource::Ground(entity) => match self.reservations.get(&entity) {
-                Some(holder) if holder.0 == npc.0 => true,
-                Some(_) => false,
-                None => {
-                    self.reservations.insert(entity, npc);
-                    true
-                }
-            },
-            HaulSource::Container(cell) => match self.container_reservations.get(&cell) {
-                Some(holder) if holder.0 == npc.0 => true,
-                Some(_) => false,
-                None => {
-                    self.container_reservations.insert(cell, npc);
-                    true
-                }
-            },
-        }
+        self.reservations
+            .acquire(source, ReservationOwner::Npc { id: npc.0 })
+            .is_some()
     }
 
     pub(super) fn release_reservation_internal(&mut self, source: HaulSource, npc: NpcId) {
-        match source {
-            HaulSource::Ground(entity) => {
-                if let Some(holder) = self.reservations.get(&entity)
-                    && holder.0 == npc.0
-                {
-                    self.reservations.remove(&entity);
-                }
-            }
-            HaulSource::Container(cell) => {
-                if let Some(holder) = self.container_reservations.get(&cell)
-                    && holder.0 == npc.0
-                {
-                    self.container_reservations.remove(&cell);
-                }
-            }
+        if let Some(lease) = self
+            .reservations
+            .holder(&source)
+            .filter(|lease| lease.owner == ReservationOwner::Npc { id: npc.0 })
+            .cloned()
+        {
+            self.reservations.release(&source, &lease);
         }
     }
 
@@ -305,7 +287,8 @@ impl HaulStore {
     /// before committing, it's responsible for releasing each
     /// individual reservation via `release_reservation_internal`.
     pub(super) fn commit_assignment(&mut self, npc: NpcId, assignment: HaulAssignment) {
-        self.assignments.insert(npc, assignment);
+        self.assignments
+            .insert(ReservationOwner::Npc { id: npc.0 }, assignment);
     }
 }
 

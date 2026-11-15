@@ -1,23 +1,68 @@
 -- Vanilla content registers from data.lua so both the server and the
 -- client end up with the same set of blocks (and the same slot order).
 --
--- Order matters: vanilla:empty MUST be the first registration so it lands
--- at slot 0. The engine bails on startup otherwise.
+-- Air is engine-owned; mods register only their own content.
 
 local function register(def)
     -- Defaults so each block table only has to list what's special about it.
     def.flags = def.flags or {}
     def.tags = def.tags or {}
     if def.flags.placeable == nil then def.flags.placeable = true end
+    local footprint = def.footprint or {{0,0,0}}
+    def.structure = def.structure or {}
+    if not def.mesh and def.flags.room_boundary and not def.flags.walkable_boundary then
+        def.structure.solid_cells = footprint
+        def.structure.shelter_cells = footprint
+    end
+    if not def.mesh and def.flags.support_below then def.structure.supports = footprint end
+    if def.flags.walkable_boundary then
+        def.portal_visuals = {{portal="passage",hidden_cells_when_open=footprint}}
+        def.structure.portals = {{key="passage", faces={{cell={0,0,0}, normal={1,0,0}, window=false}}, threshold={{0,0,0}}, volume=footprint, initially_open=true}}
+    end
+    if def.use_slot or def.interactable or def.station_tag or def.container then
+        local actions, supported = {}, {}
+        if def.interactable or def.use_slot then
+            local action = def.interactable and def.interactable.need_restore and def.interactable.need_restore.need or "use"
+            local consumption = def.depleted_block and {kind="deplete"} or (def.container and {kind="stock",count=1}) or nil
+            actions[action] = {kind="timed",duration_secs=def.interactable and def.interactable.duration_secs or 1,need_restore=def.interactable and def.interactable.need_restore or nil,consumption=consumption}
+            supported[#supported+1] = action
+        end
+        for _,tag in ipairs(def.tags) do
+            if tag=="vanilla:seat" then
+                actions.dining={kind="timed",duration_secs=1}
+                supported[#supported+1]="dining"
+                break
+            end
+        end
+        if def.station_tag then actions.crafting={kind="crafting"}; supported[#supported+1]="crafting" end
+        if def.container then actions.storage={kind="storage"}; supported[#supported+1]="storage" end
+        local approaches = def.use_slot and def.use_slot.approach or {}
+        if not def.use_slot then
+            local occupied, added = {}, {}
+            local function key(cell) return table.concat(cell,",") end
+            for _,cell in ipairs(footprint) do occupied[key(cell)]=true end
+            for _,cell in ipairs(footprint) do
+                if cell[2]==0 then
+                    for _,offset in ipairs({{1,0,0},{-1,0,0},{0,0,1},{0,0,-1}}) do
+                        local candidate={cell[1]+offset[1],0,cell[3]+offset[3]}
+                        local index=key(candidate)
+                        if not occupied[index] and not added[index] then approaches[#approaches+1]=candidate; added[index]=true end
+                    end
+                end
+            end
+        end
+        if def.station_tag or (actions.sleep ~= nil) then
+            def.settlement = "seed"
+        elseif def.use_slot or def.container then
+            def.settlement = "joiner"
+        end
+        def.facility_actions = actions
+        def.facility_slots = {{key="primary",pose=def.use_slot and def.use_slot.pose or nil,yaw=def.use_slot and def.use_slot.yaw or 0,approaches=approaches,exclusive=not def.interactable or def.interactable.exclusive,interactions=supported,animation=def.use_slot and def.use_slot.animation or nil}}
+    end
     engine.blocks.register(def)
 end
 
-register {
-    id = "vanilla:empty",
-    display_name = "Air",
-    flags = { placeable = false },
-    color = { 0.0, 0.0, 0.0 },
-}
+
 
 -- Items dropped by destroyed blocks (Phase 1). Both meshes come from
 -- KayKit Resource Bits and share the same `resource_bits_texture.png`
@@ -295,10 +340,8 @@ register {
     },
 }
 
--- Doors. `walkable_boundary` marks them as access points the room
--- detector needs at least one of for a region to count as a real room.
--- They still bound the flood-fill horizontally (`room_boundary`); future
--- NPC AI is what actually walks through them.
+-- The registration helper authors a named portal and explicit voxel leaf.
+-- Open/closed state changes traversal and appearance while preserving separation.
 register {
     id = "vanilla:door",
     display_name = "Door",
@@ -447,113 +490,31 @@ register {
     },
 }
 
--- Seed room patterns. The detector isn't wired yet (next chunk of work);
--- these prove the registry's parent-chain and domain validation.
-
-engine.rooms.register {
-    id = "vanilla:enclosed_space",
-    display_name = "Enclosed space",
-    domain = "volumetric",
-    constraints = {
-        { kind = "floor_area", min = 4, max = 4096 },
-        -- enclosure_height counts the layers above the floor where the
-        -- walls actually extend. Min 1 = at least the floor layer is
-        -- bounded by walls. A 1-high wall ring satisfies this; a row of
-        -- isolated blocks does not (no perimeter coverage).
-        { kind = "enclosure_height", min = 1 },
-        -- Every room needs an explicit access point. Without this,
-        -- accidental enclosures (a divot in the terrain, a hole the
-        -- player dug for fun) would all register as rooms. Children
-        -- inherit this so walled_yard and small_house both require it.
-        { kind = "door_count", min = 1 },
-    },
-}
-
-engine.rooms.register {
-    id = "vanilla:walled_yard",
-    display_name = "Walled yard",
-    parent = "vanilla:enclosed_space",
-    domain = "volumetric",
-    constraints = {
-        -- "Mostly open to sky", not "has_roof = false": a yard keeps its
-        -- identity with a small shed roof or awning over up to half the
-        -- floor, and a half-roofed house shell matches NEITHER yard nor
-        -- house (falls back to enclosed_space) instead of flapping
-        -- between the two while the builder works.
-        { kind = "roof_fraction", max = 0.5 },
-        { kind = "floor_fraction", surface = "solid", min = 0.6 },
-    },
-}
-
-engine.rooms.register {
-    id = "vanilla:small_house",
-    display_name = "Small house",
-    parent = "vanilla:enclosed_space",
-    domain = "volumetric",
-    priority = 1,
-    constraints = {
-        { kind = "has_roof", required = true },
-        { kind = "enclosure_height", min = 2 },
-        { kind = "floor_area", max = 50 },
-        { kind = "floor_fraction", surface = "solid", min = 0.8 },
-    },
-}
-
--- Furniture-typed rooms. Both extend small_house, so they inherit the
--- roof + headroom + size gates and deepest-match beats the plain house.
--- The tag counts read placement units (a 2-cell bed = 1 bed), scanned
--- across the room's interior including furniture sitting ON the floor.
--- Sibling priority order (F1): bedroom 4 > dining 3 > study 2 >
--- workshop 1. A house that qualifies for several reads as the most
--- domestic one — where you sleep defines home, then where you eat.
-engine.rooms.register {
-    id = "vanilla:bedroom",
-    display_name = "Bedroom",
-    parent = "vanilla:small_house",
-    domain = "volumetric",
-    priority = 4,
-    constraints = {
-        { kind = "tag_count", tag = "vanilla:bed", min = 1 },
-    },
-}
-
--- F1: a table with at least two seats pulled up to it. adjacent_pair
--- counts seat placements whose cell touches a table cell (4-dir, same
--- layer) — a lone chair in the corner doesn't make a dining room.
-engine.rooms.register {
-    id = "vanilla:dining",
-    display_name = "Dining room",
-    parent = "vanilla:small_house",
-    domain = "volumetric",
-    priority = 3,
-    constraints = {
-        { kind = "tag_count", tag = "vanilla:table", min = 1 },
-        { kind = "adjacent_pair", a = "vanilla:seat", b = "vanilla:table", min = 2 },
-    },
-}
-
--- F1: desk + shelving. Co-presence is enough here (unlike dining) —
--- a study is defined by what's in it, not how it's arranged.
-engine.rooms.register {
-    id = "vanilla:study",
-    display_name = "Study",
-    parent = "vanilla:small_house",
-    domain = "volumetric",
-    priority = 2,
-    constraints = {
-        { kind = "tag_count", tag = "vanilla:desk", min = 1 },
-        { kind = "tag_count", tag = "vanilla:shelf", min = 1 },
-    },
-}
-
-engine.rooms.register {
-    id = "vanilla:workshop",
-    display_name = "Workshop",
-    parent = "vanilla:small_house",
-    domain = "volumetric",
-    priority = 1,
-    constraints = {
-        { kind = "tag_count", tag = "vanilla:crafting", min = 1 },
+-- Functions are independent; no function inherits a house-size limit.
+local function slots(interaction, adjacent, capacity)
+    return {kind="observe",query={kind="slots",interaction=interaction,capacity=capacity or "usable",adjacent_to_tag=adjacent}}
+end
+local function at_least(expression, value)
+    return {kind="compare",operation="at_least",left=expression,right={kind="number",value=value}}
+end
+local function function_capability(id, name, interaction, adjacent)
+    local capacity = slots(interaction, adjacent)
+    engine.capabilities.register {
+        id="vanilla:"..id,display_name=name,
+        requirements={{key="usable_facility",description="At least one accessible "..name:lower().." place",condition=at_least(capacity,1)}},
+        capacity=capacity,
+        attributes={installed=slots(interaction,adjacent,"installed"),usable=capacity,available=slots(interaction,adjacent,"available")},
+    }
+end
+function_capability("sleeping","Sleeping","sleep")
+function_capability("dining","Dining","dining","vanilla:table")
+function_capability("crafting","Crafting","crafting")
+function_capability("storage","Storage","storage")
+engine.capabilities.register {
+    id="vanilla:shelter",display_name="Shelter",
+    requirements={
+        {key="active_facility",description="At least one accessible colony facility",condition={kind="any",conditions={at_least(slots("sleep"),1),at_least(slots("dining"),1),at_least(slots("crafting"),1),at_least(slots("storage"),1)}}},
+        {key="coverage",description="At least 85% roof coverage",condition=at_least({kind="observe",query={kind="measure",measurement="roof_coverage"}},0.85)},
     },
 }
 
@@ -1540,6 +1501,8 @@ engine.animations.register {
 engine.npcs.register {
     id = "vanilla:wanderer",
     display_name = "Wanderer",
+    movement_profile = "vanilla:humanoid",
+    job_classes = { "construction", "hauling", "crafting" },
     -- Per-NPC personality rolls, fixed at spawn. `laziness` multiplies
     -- the planner's post-action breather (events.lua): midpoint 1.0
     -- keeps the average exactly at the tuned 3-8 s, so the range only
@@ -1580,3 +1543,20 @@ engine.npcs.register {
         "mods://vanilla/models/characters/Engineer.glb",
     },
 }
+
+engine.worlds.register {
+    id = "vanilla:colony", display_name = "Friendly colony",
+    terrain = { stone="vanilla:stone", dirt="vanilla:dirt", grass="vanilla:grass", wood="vanilla:wood", leaves="vanilla:leaves", gravel="vanilla:gravel", forage="vanilla:berry_bush" },
+    generation = { algorithm="sine_heightmap", features={tree_one_in=32,forage_one_in=64,gravel_one_in=512,tree_height={4,5},canopy_radius=2,gravel_radius={1,2}}, version=1, seed=0, base_height=8, amplitude={4,4}, frequency={0.07,0.05}, soil_depth=4, trees=true, forage=true, gravel=true },
+    player_spawn = {0,32,60},
+    population = {
+        {kind="vanilla:wanderer", position={4,32,60}},
+        {kind="vanilla:wanderer", position={6,32,62}},
+        {kind="vanilla:wanderer", position={2,32,62}},
+        {kind="vanilla:wanderer", position={4,32,64}},
+    },
+    movement_profile="vanilla:humanoid", settlement="vanilla:colony",
+}
+
+engine.movement.register { id="vanilla:humanoid", height=1.8, radius=0.3, step_up=1, max_drop=3, stairs=true }
+engine.settlements.register { id="vanilla:colony", outdoor_link_range=32, movement_profile="vanilla:humanoid" }

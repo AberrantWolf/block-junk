@@ -86,8 +86,11 @@ use crate::voxel::{Chunk, ChunkEntities};
 /// v17 (2026-07-06): added `containers` — per-cell container stock
 ///                  (storage arc S3). v16 and earlier migrate on load
 ///                  with an empty map.
-pub const SAVE_VERSION: u32 = 18;
-const MAX_SAVE_BYTES: u64 = 1024 * 1024;
+/// v20: engine-owned air replaces the vanilla slot-zero identity.
+pub const SAVE_VERSION: u32 = 39;
+// Bounded whole-save persistence. The spatial benchmark's 64-chunk cave must
+// round-trip; the previous 1 MiB cap rejected even modest retained neighborhoods.
+const MAX_SAVE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Workspace-relative for dev. Production should land in
 /// `dirs::data_local_dir()` — flagged for the pre-ship pass.
@@ -168,7 +171,27 @@ pub struct SaveListEntry {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct SavedWorld {
+    #[serde(default)]
+    pub spaces: crate::space_identity::SpaceIdentities,
+    pub spatial_events: crate::spatial_events::SpatialJournal,
+    pub events: block_junk_scripting::events::SavedEvents,
+    pub craft_jobs: crate::action_jobs::JobLedger,
+    pub interactions: crate::facility_interactions::FacilityInteractions,
+    pub npc_ids: crate::npc::NpcIdAllocator,
+    pub craft_order_ids: crate::craft_stations::CraftOrderIds,
+    pub pending_items: crate::item_placement::ItemPlacementQueue,
+    pub placements: crate::placements::Placements,
+    pub contracts: crate::content_contracts::ContentContracts,
+    pub preset: block_junk_mod_api::worlds::WorldPreset,
+    pub population_initialized: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SaveFile {
+    pub mod_state: Vec<block_junk_scripting::state::SavedModState>,
+    pub world: Option<SavedWorld>,
+    pub construction: SavedConstruction,
     pub version: u32,
     /// Block id per slot, indexed by `BlockSlot.0`, as registered when
     /// this save was written. Chunk grids and `PlanKind::Build` store
@@ -264,6 +287,7 @@ mod obsolete_migrations {
     impl From<SavedNpcV13> for SavedNpc {
         fn from(old: SavedNpcV13) -> Self {
             SavedNpc {
+                home_facility: None,
                 id: old.id,
                 kind: old.kind,
                 pose: old.pose,
@@ -273,6 +297,8 @@ mod obsolete_migrations {
                 carrying: old.carrying,
                 tool: old.tool,
                 stats: HashMap::new(),
+                policy_results: Vec::new(),
+                active_policy_job: None,
             }
         }
     }
@@ -308,6 +334,9 @@ mod obsolete_migrations {
     impl From<SaveFileV16> for SaveFile {
         fn from(old: SaveFileV16) -> Self {
             SaveFile {
+                mod_state: Vec::new(),
+                world: None,
+                construction: SavedConstruction::default(),
                 version: SAVE_VERSION,
                 block_slots: old.block_slots,
                 edited_chunks: old.edited_chunks,
@@ -355,6 +384,9 @@ mod obsolete_migrations {
     impl From<SaveFileV15> for SaveFile {
         fn from(old: SaveFileV15) -> Self {
             SaveFile {
+                mod_state: Vec::new(),
+                world: None,
+                construction: SavedConstruction::default(),
                 version: SAVE_VERSION,
                 block_slots: old.block_slots,
                 edited_chunks: old.edited_chunks,
@@ -403,6 +435,9 @@ mod obsolete_migrations {
     impl From<SaveFileV14> for SaveFile {
         fn from(old: SaveFileV14) -> Self {
             SaveFile {
+                mod_state: Vec::new(),
+                world: None,
+                construction: SavedConstruction::default(),
                 version: SAVE_VERSION,
                 block_slots: old.block_slots,
                 edited_chunks: old.edited_chunks,
@@ -451,6 +486,9 @@ mod obsolete_migrations {
     impl From<SaveFileV13> for SaveFile {
         fn from(old: SaveFileV13) -> Self {
             SaveFile {
+                mod_state: Vec::new(),
+                world: None,
+                construction: SavedConstruction::default(),
                 version: SAVE_VERSION,
                 block_slots: old.block_slots,
                 edited_chunks: old.edited_chunks,
@@ -517,6 +555,9 @@ mod obsolete_migrations {
                 None => Vec::new(),
             };
             SaveFile {
+                mod_state: Vec::new(),
+                world: None,
+                construction: SavedConstruction::default(),
                 version: SAVE_VERSION,
                 block_slots: old.block_slots,
                 edited_chunks: old.edited_chunks,
@@ -615,6 +656,8 @@ pub struct SavedStationState {
 /// On-disk shape of an in-progress craft cycle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedActiveWork {
+    pub order_id: u64,
+    pub committed_inputs: Vec<SavedStationItem>,
     pub recipe_id: String,
     pub total_secs: f32,
     pub elapsed_secs: f32,
@@ -622,6 +665,8 @@ pub struct SavedActiveWork {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedCraftOrder {
+    pub id: u64,
+    pub revision: u64,
     pub recipe_id: String,
     pub total: u32,
     pub completed: u32,
@@ -648,6 +693,10 @@ pub struct SavedContainerState {
 /// doesn't corrupt a save mid-haul.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedPlanState {
+    pub project_id: u64,
+    pub revision: u64,
+    pub footprint: Vec<IVec3>,
+    pub progress_secs: f32,
     pub kind: PlanKind,
     #[serde(default)]
     pub materials: Vec<SavedMaterialEntry>,
@@ -683,6 +732,8 @@ pub struct SavedChunk {
 /// state, the live A* path overlay. All transient and cheap to rebuild.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SavedNpc {
+    #[serde(default)]
+    pub home_facility: Option<u64>,
     pub id: u64,
     pub kind: String,
     pub pose: AvatarPose,
@@ -711,6 +762,12 @@ pub struct SavedNpc {
     /// result, so old saves upgrade once and stay stable.
     #[serde(default)]
     pub stats: HashMap<String, f32>,
+    /// Bounded outcomes waiting for the planner after reload.
+    #[serde(default)]
+    pub policy_results: Vec<block_junk_mod_api::npcs::PolicyJobResult>,
+    /// The selected durable intent. Transient leases are rebuilt and validated.
+    #[serde(default)]
+    pub active_policy_job: Option<(String, u64)>,
 }
 
 /// Rewrite every saved [`BlockSlot`] (chunk cells — padding included,
@@ -954,7 +1011,7 @@ fn read_generation(name: &str, dir: &Path) -> Result<SaveFile, SaveError> {
             reason: "BLAKE3 checksum mismatch".to_owned(),
         });
     }
-    let config = bincode::config::standard().with_limit::<1_048_576>();
+    let config = bincode::config::standard().with_limit::<268_435_456>();
     let (save, consumed): (SaveFile, usize) = bincode::serde::decode_from_slice(&bytes, config)?;
     if consumed != bytes.len() {
         return Err(SaveError::Corrupt {
@@ -978,7 +1035,7 @@ fn read_generation(name: &str, dir: &Path) -> Result<SaveFile, SaveError> {
     Ok(save)
 }
 
-fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
+pub(crate) fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
     use std::collections::HashSet;
     let corrupt = |reason: String| SaveError::Corrupt {
         name: name.to_owned(),
@@ -987,6 +1044,15 @@ fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
     let expected = crate::voxel::ChunkShape::USIZE;
     let mut chunk_coords = HashSet::new();
     for saved in &save.edited_chunks {
+        if saved
+            .coord
+            .0
+            .to_array()
+            .iter()
+            .any(|value| value.unsigned_abs() > 1_000_000 / crate::protocol::CHUNK_SIZE + 4)
+        {
+            return Err(corrupt("chunk coordinate outside supported world".into()));
+        }
         if !chunk_coords.insert(saved.coord) {
             return Err(corrupt(format!(
                 "duplicate chunk coordinate {:?}",
@@ -1053,6 +1119,47 @@ fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
             "world clock is non-finite or out of range".to_owned(),
         ));
     }
+    let mut project_ids = HashSet::new();
+    let mut occupied = HashSet::new();
+    if save.construction.next_project_id == 0 {
+        return Err(corrupt("invalid project allocator".into()));
+    }
+    save.construction.jobs.validate().map_err(&corrupt)?;
+    for (cell, project) in &save.plans {
+        if project.project_id == 0
+            || project.project_id >= save.construction.next_project_id
+            || !project_ids.insert(project.project_id)
+            || project.revision == 0
+            || !project.progress_secs.is_finite()
+            || project.progress_secs < 0.0
+            || project.footprint.is_empty()
+            || project.footprint.len() > crate::protocol::MAX_BLOCK_FOOTPRINT_CELLS
+            || !project.footprint.contains(cell)
+            || project.footprint.iter().any(|c| !occupied.insert(*c))
+        {
+            return Err(corrupt(format!("invalid construction project at {cell:?}")));
+        }
+        let mut seen = HashSet::new();
+        if project.materials.iter().any(|m| !seen.insert(&m.item_id)) {
+            return Err(corrupt(format!("duplicate project materials at {cell:?}")));
+        }
+    }
+    for refund in &save.construction.pending_refunds {
+        let mut seen = HashSet::new();
+        if refund.project_id == 0
+            || refund.project_id >= save.construction.next_project_id
+            || !project_ids.insert(refund.project_id)
+            || refund.items.is_empty()
+            || refund.items.len() > crate::plans::MAX_PLAN_MATERIAL_KINDS
+            || refund.items.iter().any(|m| {
+                m.count == 0
+                    || m.item_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
+                    || !seen.insert(&m.item_id)
+            })
+        {
+            return Err(corrupt("invalid pending construction refund".into()));
+        }
+    }
     let mut plan_cells = HashSet::new();
     for (cell, state) in &save.plans {
         if !plan_cells.insert(*cell) {
@@ -1085,21 +1192,53 @@ fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
             "invalid world item count, position, or id".to_owned(),
         ));
     }
+    if let Some(world) = &save.world {
+        world.craft_jobs.validate().map_err(&corrupt)?;
+        world.interactions.validate().map_err(&corrupt)?;
+        world.spaces.validate().map_err(&corrupt)?;
+        world.events.validate().map_err(&corrupt)?;
+        let ids = &world.npc_ids;
+        if ids.next == 0
+            || ids.retired.iter().any(|id| !ids.contains(*id))
+            || save
+                .npcs
+                .iter()
+                .any(|npc| !ids.contains(npc.id) || ids.retired.contains(&npc.id))
+            || (save.npcs.len() as u64).checked_add(ids.retired.len() as u64) != Some(ids.next - 1)
+        {
+            return Err(corrupt(
+                "NPC identity ledger disagrees with living/retired records".into(),
+            ));
+        }
+    }
     let mut station_cells = HashSet::new();
+    let mut order_ids = HashSet::new();
     for (cell, station) in &save.craft_stations {
         if !station_cells.insert(*cell)
             || station.orders.len() > crate::craft_stations::MAX_STATION_ORDERS
             || station.inventory.len() > crate::craft_stations::MAX_STATION_INVENTORY_KINDS
             || station.orders.iter().any(|order| {
-                order.recipe_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
+                order.id == 0
+                    || !order_ids.insert(order.id)
+                    || save
+                        .world
+                        .as_ref()
+                        .is_some_and(|world| order.id >= world.craft_order_ids.next)
+                    || order.revision != u64::from(order.completed) + 1
+                    || order.recipe_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
                     || order.total == 0
-                    || order.completed > order.total
+                    || order.total > crate::craft_stations::MAX_ORDER_QUANTITY
+                    || order.completed >= order.total
             })
             || station.inventory.iter().any(|item| {
                 item.item_id.len() > crate::protocol::MAX_WIRE_ID_BYTES || item.count == 0
             })
             || station.active_work.as_ref().is_some_and(|work| {
-                work.recipe_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
+                !station
+                    .orders
+                    .iter()
+                    .any(|order| order.id == work.order_id && order.recipe_id == work.recipe_id)
+                    || work.recipe_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
                     || !work.total_secs.is_finite()
                     || !work.elapsed_secs.is_finite()
                     || work.total_secs <= 0.0
@@ -1110,6 +1249,37 @@ fn preflight_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
             return Err(corrupt(format!(
                 "invalid bounded station state at {cell:?}"
             )));
+        }
+    }
+    for (cell, station) in &save.craft_stations {
+        let mut totals = std::collections::HashMap::new();
+        for item in &station.inventory {
+            if totals.insert(&item.item_id, item.count).is_some() {
+                return Err(corrupt(format!("duplicate station inventory at {cell:?}")));
+            }
+        }
+        if let Some(work) = &station.active_work {
+            let mut seen = HashSet::new();
+            if work.committed_inputs.len() > crate::craft_stations::MAX_STATION_INVENTORY_KINDS {
+                return Err(corrupt(format!("oversized craft commitment at {cell:?}")));
+            }
+            for item in &work.committed_inputs {
+                if item.count == 0
+                    || item.item_id.len() > crate::protocol::MAX_WIRE_ID_BYTES
+                    || !seen.insert(&item.item_id)
+                {
+                    return Err(corrupt(format!("invalid craft commitment at {cell:?}")));
+                }
+                let value = totals.entry(&item.item_id).or_insert(0_u32);
+                *value = value
+                    .checked_add(item.count)
+                    .ok_or_else(|| corrupt(format!("craft refund overflows at {cell:?}")))?;
+            }
+            if totals.len() > crate::craft_stations::MAX_STATION_INVENTORY_KINDS {
+                return Err(corrupt(format!(
+                    "craft refund exceeds inventory bound at {cell:?}"
+                )));
+            }
         }
     }
     let mut storage_cells = HashSet::new();
@@ -1148,8 +1318,15 @@ fn sort_save(save: &mut SaveFile) {
     }
     save.players.sort_by_key(|player| player.client_id);
     save.npcs.sort_by_key(|npc| npc.id);
+    save.construction
+        .pending_refunds
+        .sort_by_key(|refund| refund.project_id);
+    for refund in &mut save.construction.pending_refunds {
+        refund.items.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+    }
     save.plans.sort_by_key(|(cell, _)| coord(cell));
     for (_, plan) in &mut save.plans {
+        plan.footprint.sort_by_key(coord);
         plan.materials.sort_by(|a, b| a.item_id.cmp(&b.item_id));
     }
     save.world_items.sort_by(|a, b| {
@@ -1162,6 +1339,10 @@ fn sort_save(save: &mut SaveFile) {
     save.craft_stations.sort_by_key(|(cell, _)| coord(cell));
     for (_, station) in &mut save.craft_stations {
         station.inventory.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+        if let Some(work) = &mut station.active_work {
+            work.committed_inputs
+                .sort_by(|a, b| a.item_id.cmp(&b.item_id));
+        }
     }
     save.storage_cells.sort_by_key(coord);
     save.containers.sort_by_key(|(cell, _)| coord(cell));
@@ -1200,12 +1381,9 @@ fn retain_two_generations(dir: &Path, current: &str) -> Result<(), SaveError> {
 pub fn write_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
     validate_name(name)?;
     let dir = save_dir_for(name);
-    std::fs::create_dir_all(&dir).map_err(|e| SaveError::Io {
-        path: dir.clone(),
-        source: e,
-    })?;
     let mut stable = save.clone();
     stable.version = SAVE_VERSION;
+    preflight_save(name, &stable)?;
     sort_save(&mut stable);
     let bytes = bincode::serde::encode_to_vec(&stable, bincode::config::standard())?;
     if bytes.len() as u64 > MAX_SAVE_BYTES {
@@ -1214,6 +1392,10 @@ pub fn write_save(name: &str, save: &SaveFile) -> Result<(), SaveError> {
             reason: format!("encoded size {} exceeds {MAX_SAVE_BYTES}", bytes.len()),
         });
     }
+    std::fs::create_dir_all(&dir).map_err(|e| SaveError::Io {
+        path: dir.clone(),
+        source: e,
+    })?;
     let now = now_unix()?;
     let created_at = current_metadata(&dir).map(|m| m.created_at).unwrap_or(now);
     let generation = format!("{now:016x}-{:08x}", random_generation_suffix());
@@ -1346,6 +1528,13 @@ mod tests {
 
     fn empty_save() -> SaveFile {
         SaveFile {
+            mod_state: Vec::new(),
+            world: None,
+            construction: SavedConstruction {
+                jobs: Default::default(),
+                next_project_id: 100,
+                pending_refunds: Vec::new(),
+            },
             version: SAVE_VERSION,
             block_slots: Vec::new(),
             edited_chunks: Vec::new(),
@@ -1381,6 +1570,139 @@ mod tests {
     }
 
     #[test]
+    fn construction_and_crafting_obligations_round_trip_and_reject_corruption() {
+        let mut save = empty_save();
+        save.construction.pending_refunds.push(SavedRefund {
+            project_id: 3,
+            origin: IVec3::new(2, 3, 4),
+            items: vec![SavedStationItem {
+                item_id: "test:wood".into(),
+                count: 2,
+            }],
+        });
+        save.plans.push((
+            IVec3::ZERO,
+            SavedPlanState {
+                project_id: 4,
+                revision: 7,
+                footprint: vec![IVec3::ZERO, IVec3::X],
+                progress_secs: 0.75,
+                kind: PlanKind::Remove,
+                materials: vec![],
+            },
+        ));
+        let job = save
+            .construction
+            .jobs
+            .start(
+                block_junk_mod_api::authority::ReservationOwner::Npc { id: 1 },
+                block_junk_mod_api::authority::ReservationOwner::Behavior {
+                    mod_id: "test".into(),
+                    registration_id: "builder".into(),
+                },
+                block_junk_mod_api::authority::JobTarget::Construction {
+                    project_id: 4,
+                    project_revision: 7,
+                },
+            )
+            .unwrap();
+        save.craft_stations.push((
+            IVec3::Z,
+            SavedStationState {
+                orders: vec![SavedCraftOrder {
+                    id: 1,
+                    revision: 1,
+                    recipe_id: "test:recipe".into(),
+                    total: 1,
+                    completed: 0,
+                }],
+                inventory: vec![SavedStationItem {
+                    item_id: "test:wood".into(),
+                    count: 1,
+                }],
+                active_work: Some(SavedActiveWork {
+                    order_id: 1,
+                    recipe_id: "test:recipe".into(),
+                    total_secs: 2.0,
+                    elapsed_secs: 1.0,
+                    committed_inputs: vec![SavedStationItem {
+                        item_id: "test:wood".into(),
+                        count: 3,
+                    }],
+                }),
+            },
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        write_test_generation(temp.path(), "0001", &save);
+        std::fs::write(temp.path().join(CURRENT_FILE), b"0001").unwrap();
+        let loaded = read_save_at("obligations", temp.path()).unwrap();
+        assert_eq!(loaded.construction.next_project_id, 100);
+        assert_eq!(loaded.construction.pending_refunds[0].items[0].count, 2);
+        assert_eq!(loaded.plans[0].1.revision, 7);
+        assert_eq!(loaded.plans[0].1.progress_secs, 0.75);
+        let mut jobs = loaded.construction.jobs.clone();
+        assert_eq!(
+            jobs.records[&job].state,
+            block_junk_mod_api::authority::JobState::Working
+        );
+        jobs.suspend_for_load();
+        assert_eq!(
+            jobs.records[&job].state,
+            block_junk_mod_api::authority::JobState::Interrupted
+        );
+        jobs.validate().unwrap();
+        assert_eq!(loaded.plans[0].1.footprint, vec![IVec3::ZERO, IVec3::X]);
+        assert_eq!(
+            loaded.craft_stations[0]
+                .1
+                .active_work
+                .as_ref()
+                .unwrap()
+                .committed_inputs[0]
+                .count,
+            3
+        );
+        let mut corrupt = loaded.clone();
+        corrupt.construction.pending_refunds[0].project_id = 4;
+        assert!(preflight_save("duplicate ownership", &corrupt).is_err());
+        let mut corrupt = loaded;
+        corrupt.craft_stations[0].1.inventory[0].count = u32::MAX;
+        assert!(preflight_save("refund overflow", &corrupt).is_err());
+    }
+
+    #[test]
+    fn sixty_four_chunk_save_exceeds_old_limit_and_round_trips_through_disk_decoder() {
+        let mut save = empty_save();
+        save.block_slots = vec!["engine:air".into(), "test:stone".into()];
+        for x in 0..64 {
+            save.edited_chunks.push(SavedChunk {
+                coord: ChunkCoord(IVec3::new(x, 0, 0)),
+                chunk: Chunk {
+                    revision: 1,
+                    blocks: vec![BlockSlot(1); crate::voxel::ChunkShape::USIZE],
+                },
+                entities: ChunkEntities::default(),
+            });
+        }
+        let temp = tempfile::tempdir().unwrap();
+        write_test_generation(temp.path(), "0001", &save);
+        std::fs::write(temp.path().join(CURRENT_FILE), b"0001").unwrap();
+        let blob = temp
+            .path()
+            .join(GENERATIONS_DIR)
+            .join("0001")
+            .join(BLOB_FILE);
+        assert!(std::fs::metadata(blob).unwrap().len() > 1024 * 1024);
+        let loaded = read_save_at("large-fixture", temp.path()).unwrap();
+        assert_eq!(loaded.edited_chunks.len(), 64);
+        assert_eq!(loaded.edited_chunks[63].coord.0, IVec3::new(63, 0, 0));
+        assert_eq!(
+            loaded.edited_chunks[63].chunk.blocks,
+            save.edited_chunks[63].chunk.blocks
+        );
+    }
+
+    #[test]
     fn corrupt_current_generation_falls_back_without_mutating_it() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -1408,6 +1730,10 @@ mod tests {
             (
                 IVec3::new(1, 2, 3),
                 SavedPlanState {
+                    project_id: 1,
+                    revision: 1,
+                    footprint: vec![IVec3::new(1, 2, 3)],
+                    progress_secs: 0.0,
                     kind: PlanKind::Remove,
                     materials: vec![],
                 },
@@ -1415,6 +1741,10 @@ mod tests {
             (
                 IVec3::new(-4, 5, -6),
                 SavedPlanState {
+                    project_id: 2,
+                    revision: 1,
+                    footprint: vec![IVec3::new(-4, 5, -6)],
+                    progress_secs: 0.0,
                     kind: PlanKind::Build {
                         slot: BlockSlot(7),
                         orientation: Cardinal::North,
@@ -1440,8 +1770,15 @@ mod tests {
             },
         ];
         let original = SaveFile {
+            mod_state: Vec::new(),
+            world: None,
+            construction: SavedConstruction {
+                jobs: Default::default(),
+                next_project_id: 100,
+                pending_refunds: Vec::new(),
+            },
             version: SAVE_VERSION,
-            block_slots: vec!["vanilla:empty".to_owned(), "vanilla:stone".to_owned()],
+            block_slots: vec!["engine:air".to_owned(), "vanilla:stone".to_owned()],
             edited_chunks: vec![],
             players: vec![SavedPlayer {
                 client_id: 0xFEED_F00D,
@@ -1458,6 +1795,7 @@ mod tests {
                 }),
             }],
             npcs: vec![SavedNpc {
+                home_facility: Some(42),
                 id: 7,
                 kind: "vanilla:wanderer".to_owned(),
                 pose: AvatarPose {
@@ -1475,6 +1813,13 @@ mod tests {
                     item_id: "vanilla:pickaxe".to_owned(),
                 }),
                 stats: HashMap::from([("laziness".to_owned(), 0.87)]),
+                policy_results: vec![block_junk_mod_api::npcs::PolicyJobResult {
+                    candidate_id: "craft:2,32,60".into(),
+                    revision: 4,
+                    state: block_junk_mod_api::npcs::PolicyJobState::Accepted,
+                    reason: None,
+                }],
+                active_policy_job: Some(("craft:2,32,60".into(), 4)),
             }],
             world_clock: Some(WorldClock {
                 day: 3,
@@ -1486,6 +1831,8 @@ mod tests {
                 IVec3::new(2, 32, 60),
                 SavedStationState {
                     orders: vec![SavedCraftOrder {
+                        id: 1,
+                        revision: 2,
                         recipe_id: "vanilla:planks_from_log".to_owned(),
                         total: 4,
                         completed: 1,
@@ -1495,6 +1842,11 @@ mod tests {
                         count: 2,
                     }],
                     active_work: Some(SavedActiveWork {
+                        order_id: 1,
+                        committed_inputs: vec![SavedStationItem {
+                            item_id: "vanilla:log".into(),
+                            count: 1,
+                        }],
                         recipe_id: "vanilla:planks_from_log".to_owned(),
                         total_secs: 4.0,
                         elapsed_secs: 1.25,
@@ -1521,11 +1873,14 @@ mod tests {
         assert_eq!(decoded.block_slots, original.block_slots);
         assert_eq!(decoded.npcs.len(), 1);
         let np = &decoded.npcs[0];
+        assert_eq!(np.home_facility, Some(42));
         assert_eq!(np.id, 7);
         assert_eq!(np.kind, "vanilla:wanderer");
         assert_eq!(np.movement_mode, MovementMode::Walk);
         assert_eq!(np.needs.get("hunger"), Some(&0.42));
         assert_eq!(np.rng, 0xCAFE_BABE_DEAD_BEEF);
+        assert_eq!(np.policy_results.len(), 1);
+        assert_eq!(np.active_policy_job, Some(("craft:2,32,60".into(), 4)));
         let npc_carry = np.carrying.as_ref().unwrap();
         assert_eq!(npc_carry.item_id, "vanilla:stone_chunk");
         assert_eq!(npc_carry.count, 2);
@@ -1579,7 +1934,7 @@ mod tests {
     fn v12_savefile_migrates_to_players_table() {
         let old = SaveFileV12 {
             version: 12,
-            block_slots: vec!["vanilla:empty".to_owned()],
+            block_slots: vec!["engine:air".to_owned()],
             edited_chunks: vec![],
             last_player_pose: Some(AvatarPose {
                 translation: Vec3::new(9.0, 8.0, 7.0),
@@ -1601,7 +1956,7 @@ mod tests {
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         let migrated: SaveFile = decoded.into();
         assert_eq!(migrated.version, SAVE_VERSION);
-        assert_eq!(migrated.block_slots, vec!["vanilla:empty".to_owned()]);
+        assert_eq!(migrated.block_slots, vec!["engine:air".to_owned()]);
         assert_eq!(migrated.players.len(), 1);
         let p = &migrated.players[0];
         assert_eq!(p.client_id, UNCLAIMED_PLAYER_ID);
@@ -1644,11 +1999,21 @@ mod tests {
             blocks[idx] = BlockSlot(slot);
         }
         SaveFile {
+            mod_state: Vec::new(),
+            world: None,
+            construction: SavedConstruction {
+                jobs: Default::default(),
+                next_project_id: 100,
+                pending_refunds: Vec::new(),
+            },
             version: SAVE_VERSION,
             block_slots: table.iter().map(|s| s.to_string()).collect(),
             edited_chunks: vec![SavedChunk {
                 coord: ChunkCoord(IVec3::ZERO),
-                chunk: Chunk { blocks },
+                chunk: Chunk {
+                    blocks,
+                    revision: 0,
+                },
                 entities: ChunkEntities::default(),
             }],
             players: vec![],
@@ -1657,6 +2022,10 @@ mod tests {
             plans: vec![(
                 IVec3::new(1, 2, 3),
                 SavedPlanState {
+                    project_id: 1,
+                    revision: 1,
+                    footprint: vec![IVec3::new(1, 2, 3)],
+                    progress_secs: 0.0,
                     kind: PlanKind::Build {
                         slot: BlockSlot(plan_slot),
                         orientation: Cardinal::North,
@@ -1676,7 +2045,7 @@ mod tests {
     /// written, and "gone" is no longer registered at all.
     fn reordered_lookup(id: &str) -> Option<BlockSlot> {
         match id {
-            "vanilla:empty" => Some(BlockSlot::EMPTY),
+            "engine:air" => Some(BlockSlot::EMPTY),
             "a" => Some(BlockSlot(2)),
             "b" => Some(BlockSlot(1)),
             _ => None,
@@ -1687,7 +2056,7 @@ mod tests {
     fn remap_rewrites_chunk_cells_and_build_plans() {
         // Saved with table [empty, a, b]: cell 10 holds "a" (slot 1),
         // cell 11 holds "b" (slot 2); the Build plan targets "b".
-        let mut save = remap_fixture(&["vanilla:empty", "a", "b"], &[(10, 1), (11, 2)], 2);
+        let mut save = remap_fixture(&["engine:air", "a", "b"], &[(10, 1), (11, 2)], 2);
         remap_block_slots(&mut save, reordered_lookup).unwrap();
         let blocks = &save.edited_chunks[0].chunk.blocks;
         assert_eq!(
@@ -1712,14 +2081,14 @@ mod tests {
         // "gone" is in the table but no cell/plan uses slot 3 — the
         // load must succeed (a removed mod only blocks loads of worlds
         // that actually contain its blocks).
-        let mut save = remap_fixture(&["vanilla:empty", "a", "b", "gone"], &[(5, 1)], 1);
+        let mut save = remap_fixture(&["engine:air", "a", "b", "gone"], &[(5, 1)], 1);
         remap_block_slots(&mut save, reordered_lookup).unwrap();
         assert_eq!(save.edited_chunks[0].chunk.blocks[5], BlockSlot(2));
     }
 
     #[test]
     fn remap_refuses_missing_id_in_use_and_lists_it() {
-        let mut save = remap_fixture(&["vanilla:empty", "a", "gone"], &[(5, 2)], 1);
+        let mut save = remap_fixture(&["engine:air", "a", "gone"], &[(5, 2)], 1);
         let err = remap_block_slots(&mut save, reordered_lookup).unwrap_err();
         match err {
             SaveError::MissingBlockIds { ids } => assert_eq!(ids, vec!["gone".to_owned()]),
@@ -1732,7 +2101,7 @@ mod tests {
 
     #[test]
     fn remap_refuses_slot_beyond_table() {
-        let mut save = remap_fixture(&["vanilla:empty", "a"], &[(5, 9)], 1);
+        let mut save = remap_fixture(&["engine:air", "a"], &[(5, 9)], 1);
         let err = remap_block_slots(&mut save, reordered_lookup).unwrap_err();
         assert!(
             matches!(
@@ -1760,4 +2129,28 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+/// Identity allocator and canceled-project obligations survive independently of
+/// the live project list. Item IDs retain meaning across registry slot remaps.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedConstruction {
+    pub jobs: crate::action_jobs::JobLedger,
+    pub next_project_id: u64,
+    pub pending_refunds: Vec<SavedRefund>,
+}
+impl Default for SavedConstruction {
+    fn default() -> Self {
+        Self {
+            jobs: Default::default(),
+            next_project_id: 1,
+            pending_refunds: Vec::new(),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedRefund {
+    pub project_id: u64,
+    pub origin: IVec3,
+    pub items: Vec<SavedStationItem>,
 }

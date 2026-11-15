@@ -70,6 +70,7 @@ impl core::fmt::Display for RecipeId {
 /// would model byproducts (smelting iron → ingot + slag) — same
 /// shape change with cascading downstream UX.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipeDef {
     pub id: RecipeId,
     pub display_name: String,
@@ -77,6 +78,8 @@ pub struct RecipeDef {
     /// names an [`crate::items::ItemId`] and a `count`. Empty inputs
     /// is legal (a free-action recipe — e.g. a "summon ambient
     /// sparkles" decorative crafting trigger) but unusual.
+    /// Item IDs must be unique within this list. Repeating an item is a
+    /// load-time error; express the full required count in one entry.
     #[serde(default)]
     pub inputs: Vec<ItemDrop>,
     /// What the recipe produces per craft. Spawned as
