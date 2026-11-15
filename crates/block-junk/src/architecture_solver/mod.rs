@@ -93,7 +93,7 @@ impl Budget {
         poll_fn(|_| {
             match self
                 .remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
             {
                 Ok(_) => Poll::Ready(()),
                 Err(_) => Poll::Pending,

@@ -270,7 +270,7 @@ impl Invocation {
             let id = self
                 .outbox
                 .next
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| mlua::Error::external("command identity space exhausted"))?;
             batches.push_back(CommandBatch {
                 id,
