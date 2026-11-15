@@ -74,7 +74,7 @@ pub fn apply_ingame_style(ctx: &egui::Context) {
     v.override_text_color = Some(text);
     v.window_fill = panel;
     v.panel_fill = panel;
-    v.window_stroke = egui::Stroke::new(1.0, accent);
+    v.window_stroke = egui::Stroke::new(1.0_f32, accent);
     v.window_corner_radius = egui::CornerRadius::same(8);
     v.faint_bg_color = egui::Color32::from_rgba_unmultiplied(255, 240, 200, 8);
     v.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(12, 9, 8, 245);
@@ -90,8 +90,9 @@ pub fn apply_ingame_style(ctx: &egui::Context) {
     ] {
         w.bg_fill = fill;
         w.weak_bg_fill = fill;
-        w.bg_stroke = egui::Stroke::new(1.0, accent.gamma_multiply(stroke_alpha as f32 / 255.0));
-        w.fg_stroke = egui::Stroke::new(1.0, text);
+        w.bg_stroke =
+            egui::Stroke::new(1.0_f32, accent.gamma_multiply(stroke_alpha as f32 / 255.0));
+        w.fg_stroke = egui::Stroke::new(1.0_f32, text);
         w.corner_radius = egui::CornerRadius::same(4);
     }
 
@@ -117,7 +118,7 @@ pub fn dev_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(egui::Color32::from_rgba_unmultiplied(18, 20, 22, 235))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(120, 130, 140, 160),
         ))
         .corner_radius(egui::CornerRadius::same(2))
@@ -137,9 +138,9 @@ pub fn dev_skin(ui: &mut egui::Ui) {
     v.override_text_color = None;
     // Labels / separators: muted gray, flat.
     v.widgets.noninteractive.fg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 170, 175));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(160, 170, 175));
     v.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 78, 84));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 78, 84));
     // Interactive tiers: cool slate fill + 1px border + bright text,
     // each stepping lighter so hover/press feedback is obvious.
     let slate = |l: u8| egui::Color32::from_rgb(l, l + 4, l + 8);
@@ -165,8 +166,8 @@ pub fn dev_skin(ui: &mut egui::Ui) {
     ] {
         w.bg_fill = fill;
         w.weak_bg_fill = fill;
-        w.bg_stroke = egui::Stroke::new(1.0, border);
-        w.fg_stroke = egui::Stroke::new(1.0, text);
+        w.bg_stroke = egui::Stroke::new(1.0_f32, border);
+        w.fg_stroke = egui::Stroke::new(1.0_f32, text);
         w.corner_radius = egui::CornerRadius::same(2);
     }
 }

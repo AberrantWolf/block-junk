@@ -3613,8 +3613,7 @@ fn receive_snapshots(
 ) {
     let mut staged = bevy::platform::collections::HashMap::new();
     let mut invalid = false;
-    let incoming: Vec<_> = spatial.committed.drain(..).collect();
-    for snapshot in incoming {
+    for snapshot in spatial.committed.drain(..) {
         if staged.contains_key(&snapshot.coord) {
             warn!(coord = ?snapshot.coord.0, "duplicate chunk coordinate in snapshot batch");
             invalid = true;
