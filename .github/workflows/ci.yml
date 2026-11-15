@@ -9,6 +9,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Bevy system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ pkg-config \
+            libasound2-dev libudev-dev libwayland-dev libx11-dev \
+            libxkbcommon-dev libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
