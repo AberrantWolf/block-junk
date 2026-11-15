@@ -32,6 +32,7 @@ fn exercise(mismatch: bool) {
             administrators: Vec::new(),
         })
         .add_observer(send_server_hello)
+        .add_observer(register_new_client)
         .add_systems(Update, verify_client_ready);
     server
         .init_resource::<crate::space_network::SpaceSenders>()
@@ -41,6 +42,13 @@ fn exercise(mismatch: bool) {
         .init_resource::<crate::space_identity::SpaceIdentities>()
         .init_resource::<SnapshotBudgets>()
         .init_resource::<SpatialSubscriptions>()
+        .init_resource::<ClientAvatars>()
+        .init_resource::<PlayerStates>()
+        .init_resource::<SpatialVisibilityState>()
+        .add_systems(
+            PostUpdate,
+            update_spatial_visibility.before(ReplicationSystems::Send),
+        )
         .add_systems(
             PostUpdate,
             (
@@ -51,6 +59,20 @@ fn exercise(mismatch: bool) {
     server
         .init_resource::<crate::placements::Placements>()
         .add_plugins(crate::placement_network::PlacementServerPlugin);
+    let distant = Vec3::splat(2048.0);
+    let stone = server
+        .world()
+        .resource::<ItemRegistry>()
+        .slot_of(&"foundation:stone".into())
+        .unwrap();
+    server.world_mut().spawn((
+        WorldItem {
+            item: stone,
+            count: 1,
+            translation: distant,
+        },
+        crate::spatial::ordinary_spatial_replica(crate::spatial::SpatialScope::Point(distant)),
+    ));
     let listener = server
         .world_mut()
         .spawn((
@@ -70,9 +92,11 @@ fn exercise(mismatch: bool) {
     server.cleanup();
     client.finish();
     client.cleanup();
+    let mut items = client.world_mut().query::<&WorldItem>();
     for _ in 0..250 {
         server.update();
         client.update();
+        assert!(items.iter(client.world()).next().is_none());
         std::thread::sleep(Duration::from_millis(2));
     }
     let ready = server
@@ -101,6 +125,7 @@ fn exercise(mismatch: bool) {
         assert_eq!(client.world().resource::<TerrainSlots>().generation.seed, 7);
     }
     if !mismatch {
+        exercise_avatar_visibility(&mut server, &mut client);
         exercise_architecture(&mut server, &mut client);
         exercise_portals(&mut server, &mut client);
     }
@@ -192,6 +217,50 @@ fn exercise(mismatch: bool) {
         for _ in 0..10 {
             server.update();
             reconnected.update();
+        }
+    }
+}
+
+fn exercise_avatar_visibility(server: &mut App, client: &mut App) {
+    let (&connection, &avatar) = server
+        .world()
+        .resource::<ClientAvatars>()
+        .0
+        .iter()
+        .next()
+        .unwrap();
+    let pose = server.world().get::<AvatarPose>(avatar).unwrap();
+    let spawn_chunk = world_to_chunk_coord(pose.translation);
+    let mut avatars = client.world_mut().query_filtered::<Entity, With<Avatar>>();
+    assert_eq!(avatars.iter(client.world()).count(), 0);
+
+    for subscribed in [true, false, true] {
+        let mut subscriptions = server.world_mut().resource_mut::<SpatialSubscriptions>();
+        let chunks = subscriptions.client_to_chunks.get_mut(&connection).unwrap();
+        if subscribed {
+            chunks.insert(spawn_chunk);
+        } else {
+            chunks.remove(&spawn_chunk);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            server.update();
+            client.update();
+            let entity = avatars.single(client.world()).ok();
+            if let (true, Some(entity)) = (subscribed, entity) {
+                assert!(client.world().get::<Predicted>(entity).is_some());
+                assert!(client.world().get::<Interpolated>(entity).is_none());
+                break;
+            }
+            if !subscribed && entity.is_none() {
+                assert_eq!(avatars.iter(client.world()).count(), 0);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "avatar visibility did not follow the subscription"
+            );
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }

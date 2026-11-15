@@ -71,10 +71,12 @@ fn world_point_chunk(point: Vec3) -> ChunkCoord {
 }
 
 pub fn ordinary_spatial_replica(scope: SpatialScope) -> (SpatialReplica, SpatialScope, Replicate) {
+    // Lightyear applies the replication target and dynamic visibility as
+    // separate filters. The server applies the subscription filter before send.
     (
         SpatialReplica,
         scope,
-        Replicate::to_clients(NetworkTarget::None),
+        Replicate::to_clients(NetworkTarget::All),
     )
 }
 
@@ -84,7 +86,7 @@ pub fn interpolated_spatial_replica(
     (
         SpatialReplica,
         scope,
-        Replicate::to_clients(NetworkTarget::None),
+        Replicate::to_clients(NetworkTarget::All),
         InterpolationTarget::to_clients(NetworkTarget::All),
     )
 }
@@ -102,7 +104,7 @@ pub fn predicted_owner_avatar(
     (
         SpatialReplica,
         scope,
-        Replicate::to_clients(NetworkTarget::None),
+        Replicate::to_clients(NetworkTarget::All),
         PredictionTarget::to_clients(NetworkTarget::Single(owner)),
         InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(owner)),
     )

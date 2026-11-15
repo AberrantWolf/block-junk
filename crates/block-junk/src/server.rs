@@ -216,10 +216,16 @@ impl Plugin for ServerPlugin {
                 poll_chunk_gen,
                 update_aoi,
                 refresh_spatial_scopes,
-                update_spatial_visibility,
             )
                 .chain()
                 .in_set(GameSet::Simulation),
+        );
+        app.add_systems(
+            PostUpdate,
+            update_spatial_visibility
+                .after(crate::item_placement::deliver)
+                .after(crate::civilization::sync_cluster_entities)
+                .before(ReplicationSystems::Send),
         );
         // Server-authoritative player simulation: read replicated inputs,
         // run the same controller the predicted client runs, write the
@@ -257,7 +263,6 @@ impl Plugin for ServerPlugin {
         app.add_systems(Last, (save_then_shutdown, save_on_request));
         app.add_systems(Update, (verify_client_ready, expire_ready_challenges));
         app.add_observer(send_server_hello);
-        app.add_observer(install_replication_sender);
         app.add_observer(register_new_client);
         app.add_observer(forget_disconnected_client);
     }
@@ -1969,17 +1974,6 @@ const AOI_RADIUS_Y: i32 = 1;
 /// the 40 kbps/player budget even with a handful of co-located avatars.
 const REPLICATION_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Each connection entity needs a `ReplicationSender` before any `Replicate`d
-/// component on a server-side entity can be pushed to it. Insert as soon as
-/// the link appears (before the netcode handshake completes) so the sender is
-/// ready by the time we spawn an avatar in the `Connected` observer.
-///
-/// Since lightyear 0.28 the sender is a plain marker; the send interval
-/// lives in the app-wide `ReplicationMetadata` resource instead.
-fn install_replication_sender(trigger: On<Add, GameReady>, mut commands: Commands) {
-    commands.entity(trigger.entity).insert(ReplicationSender);
-}
-
 const READY_CHALLENGE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Component)]
@@ -2129,14 +2123,6 @@ fn expire_ready_challenges(
     }
 }
 
-/// On client connect: spawn an avatar entity carrying the authoritative
-/// Transform for this player, replicated to every *other* connected client.
-/// We exclude the owner so their own camera Transform isn't periodically
-/// overwritten with a stale server copy of itself.
-///
-/// The avatar starts at the origin so AoI can begin streaming chunks before
-/// the first `PlayerPosition` message lands; without that the new client
-/// sees nothing for ~100 ms.
 #[derive(bevy::ecs::system::SystemParam)]
 struct ClientRegistration<'w, 's> {
     preset: Res<'w, crate::scripting::SelectedWorld>,
@@ -2160,15 +2146,15 @@ fn register_new_client(
     } = registration;
     let connection = trigger.entity;
     let Ok(remote) = remote_ids.get(connection) else {
-        warn!("Connected fired with no RemoteId on entity {connection:?}");
+        warn!("GameReady fired with no RemoteId on entity {connection:?}");
         return;
     };
-    // Replicated to ALL clients (owner included), with the targets
-    // splitting prediction (owner rolls back on disagreement) from
-    // interpolation (everyone else lerps between server samples). The
-    // owner's client gets `Predicted` on its copy; remote clients get
-    // `Interpolated`. ControlledBy ties the entity back to its
-    // connection so input replication knows where to deliver the inputs.
+    // Avatar spawn hooks configure prediction and interpolation on links
+    // that already have a ReplicationSender.
+    commands.entity(connection).insert(ReplicationSender);
+    // The owner receives a predicted replica. Other subscribed clients
+    // receive interpolated replicas. ControlledBy ties input replication
+    // to the owner's connection.
     //
     // Spawn state, in priority order:
     //   1. This client id's own persisted entry (returning player).
@@ -2760,27 +2746,33 @@ fn encode_chunk_data(blocks: &[BlockSlot]) -> ChunkData {
     }
 }
 
+type ConnectedClients = (With<ClientOf>, With<Connected>);
+
 fn update_spatial_visibility(
     mut commands: Commands,
     subscriptions: Res<SpatialSubscriptions>,
+    connections: Query<(Entity, Has<GameReady>), ConnectedClients>,
     replicas: Query<(Entity, &crate::spatial::SpatialScope), With<crate::spatial::SpatialReplica>>,
     mut state: ResMut<SpatialVisibilityState>,
 ) {
-    let mut desired = HashSet::default();
-    for (&connection, chunks) in &subscriptions.client_to_chunks {
+    let mut hidden = HashSet::default();
+    for (connection, ready) in &connections {
+        let chunks = subscriptions.client_to_chunks.get(&connection);
         for (entity, scope) in &replicas {
-            if scope.intersects(chunks) {
-                desired.insert((entity, connection));
+            if !ready || !chunks.is_some_and(|chunks| scope.intersects(chunks)) {
+                hidden.insert((entity, connection));
             }
         }
     }
-    for &(entity, connection) in desired.difference(&state.0) {
-        crate::spatial::gain_replica_visibility(&mut commands, entity, connection);
-    }
-    for &(entity, connection) in state.0.difference(&desired) {
+    for &(entity, connection) in hidden.difference(&state.0) {
         crate::spatial::lose_replica_visibility(&mut commands, entity, connection);
     }
-    state.0 = desired;
+    for &(entity, connection) in state.0.difference(&hidden) {
+        if connections.contains(connection) && replicas.contains(entity) {
+            crate::spatial::gain_replica_visibility(&mut commands, entity, connection);
+        }
+    }
+    state.0 = hidden;
 }
 
 type ActorScopeQuery<'w, 's> = Query<

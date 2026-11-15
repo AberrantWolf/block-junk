@@ -1250,7 +1250,6 @@ struct WorldAnchorsCtx<'w> {
     spaces: Res<'w, PublishedSpaces>,
     capabilities: Res<'w, crate::capabilities::Capabilities>,
     civilization: Res<'w, crate::settlements::Settlements>,
-    placements: Res<'w, crate::placements::Placements>,
     civ_params: Res<'w, crate::civilization::CivilizationParamsRes>,
 }
 
@@ -2974,7 +2973,7 @@ fn npc_brain_tick(
                 &equipped_tool,
                 &anchors.spaces,
                 &anchors.capabilities,
-                &anchors.placements,
+                &placements,
                 &anchors.civilization,
                 &haul.kind_registry,
                 &interactable_index,
@@ -3352,8 +3351,7 @@ fn npc_brain_tick(
                             let inflated = anchors
                                 .civilization
                                 .bounds_for_facility(id, anchors.civ_params.0.buffer_cells);
-                            if anchors
-                                .placements
+                            if placements
                                 .records
                                 .get(&id)
                                 .is_none_or(|record| !record.active)
@@ -5403,6 +5401,13 @@ mod tests {
     use crate::haul::{HaulAssignment, HaulStore, ReservedItem};
     use crate::interactables::InteractionClaims;
     use crate::items::ItemSlot;
+
+    #[test]
+    fn brain_tick_initializes_without_conflicting_world_access() {
+        use bevy::ecs::system::System;
+
+        IntoSystem::into_system(npc_brain_tick).initialize(&mut World::new());
+    }
 
     /// Minimal `Walkability` world for the path-invalidation helpers:
     /// explicit solid set, everything else air.

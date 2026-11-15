@@ -23,7 +23,7 @@ impl Plugin for CivilizationPlugin {
             );
     }
 }
-fn sync_cluster_entities(
+pub(crate) fn sync_cluster_entities(
     settlements: Res<crate::settlements::Settlements>,
     params: Res<CivilizationParamsRes>,
     mut entities: Local<BTreeMap<PlacementId, Entity>>,
